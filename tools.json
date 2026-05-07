@@ -1,0 +1,100 @@
+{
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "fetch_defects",
+        "description": "获取 ONES 项目缺陷列表。mine=True 时仅获取分配给当前用户的缺陷。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "limit": {"type": "integer", "default": 50, "description": "最大返回数量"},
+            "project_id": {"type": "string", "default": "", "description": "项目 ID，空字符串使用默认项目"},
+            "mine": {"type": "boolean", "default": false, "description": "是否只获取分配给当前用户的缺陷"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "fetch_my_defects",
+        "description": "获取当前登录用户被分配的缺陷列表",
+        "parameters": {"type": "object", "properties": {}, "required": []}
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "check_new_defects",
+        "description": "增量检测：仅返回上次检查后新增的缺陷。适合定时调用监控新缺陷。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "mine": {"type": "boolean", "default": true, "description": "是否只检查自己的缺陷"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "get_defect_detail",
+        "description": "获取单个缺陷详情，用于深入分析。传入缺陷 uuid。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "issue_id": {"type": "string", "description": "缺陷的 uuid"}
+          },
+          "required": ["issue_id"]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_projects",
+        "description": "获取当前团队可见项目列表",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "include_archived": {"type": "boolean", "default": false, "description": "是否包含已归档项目"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_codebase",
+        "description": "搜索项目代码仓库。无参数时返回目录结构；query 为关键词搜索；read_file 读取指定文件。",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "query": {"type": "string", "default": "", "description": "关键词搜索，空格分隔多个关键词"},
+            "read_file": {"type": "string", "default": "", "description": "要读取的文件相对路径"},
+            "max_depth": {"type": "integer", "default": 3, "description": "目录树最大深度"}
+          },
+          "required": []
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "push_to_wechat",
+        "description": "发送 Markdown 消息到企业微信群",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "content": {"type": "string", "description": "Markdown 格式的消息内容"}
+          },
+          "required": ["content"]
+        }
+      }
+    }
+  ]
+}
