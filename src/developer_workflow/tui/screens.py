@@ -937,6 +937,7 @@ class DashboardScreen(Screen[None]):
         self._applying_refresh = False
         self._mount_generation = 0
         self._lifecycle_active = False
+        self._teardown_started = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -959,9 +960,18 @@ class DashboardScreen(Screen[None]):
     def on_mount(self) -> None:
         self._mount_generation += 1
         self._lifecycle_active = True
+        self._teardown_started = False
         self._set_mode(self.size.width)
 
     def on_unmount(self) -> None:
+        self.begin_teardown()
+
+    def begin_teardown(self) -> None:
+        """Synchronously invalidate refresh ownership before DOM pruning."""
+
+        if self._teardown_started:
+            return
+        self._teardown_started = True
         self._lifecycle_active = False
         self._mount_generation += 1
         self._refresh_requested = False
@@ -980,6 +990,11 @@ class DashboardScreen(Screen[None]):
             and self.is_mounted
             and generation == self._mount_generation
         )
+
+    def is_tearing_down(self) -> bool:
+        """Whether Textual has begun closing even if unmount is not delivered."""
+
+        return self._teardown_started or not self.app.is_running
 
     def on_resize(self, event: events.Resize) -> None:
         self._set_mode(event.size.width)
@@ -1017,7 +1032,10 @@ class DashboardScreen(Screen[None]):
                 try:
                     await self._refresh_runs(current_activities, generation)
                 except NoMatches:
-                    if not self.owns_refresh(generation):
+                    if (
+                        not self.owns_refresh(generation)
+                        or self.is_tearing_down()
+                    ):
                         return
                     raise
                 if not self._refresh_requested:

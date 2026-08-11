@@ -124,6 +124,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         await self._close_ui()
 
     async def _close_ui(self) -> None:
+        self._dashboard.begin_teardown()
         if self._ui_closed:
             return
         self._ui_closed = True

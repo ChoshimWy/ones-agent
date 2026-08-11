@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Event
 
 import pytest
+from textual.css.query import NoMatches
 from textual.widgets import ListView
 
 from src.developer_workflow.contracts import (
@@ -25,6 +26,7 @@ from src.developer_workflow.tui.models import (
     RunSummary,
 )
 from src.developer_workflow.tui.run_index import RunIndex
+from src.developer_workflow.tui.screens import RunListPane
 from src.developer_workflow.tui.supervisor import TaskEvent
 
 
@@ -284,7 +286,7 @@ async def test_task_event_enters_ui_loop_and_updates_run_activity(tmp_path) -> N
 
 
 @pytest.mark.asyncio
-async def test_task_event_refresh_abandons_dashboard_that_unmounts_mid_load() -> None:
+async def test_task_event_refresh_abandons_tree_removed_before_unmount() -> None:
     refresh_started = Event()
     release_refresh = Event()
 
@@ -325,11 +327,44 @@ async def test_task_event_refresh_abandons_dashboard_that_unmounts_mid_load() ->
             )
         )
         assert await asyncio.to_thread(refresh_started.wait, 1)
-        await app.pop_screen()
-        release_refresh.set()
-        await handling
-        assert app.screen is not dashboard
-        assert dashboard.owns_refresh(mounted_generation) is False
+        await dashboard.query_one(RunListPane).remove()
+        assert dashboard.owns_refresh(mounted_generation) is True
+        app._running = False
+        try:
+            release_refresh.set()
+            await handling
+        finally:
+            app._running = True
+
+
+@pytest.mark.asyncio
+async def test_active_dashboard_does_not_hide_same_generation_no_matches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ActiveController:
+        cancel_calls: list[object] = []
+
+        def list_runs(self, filters: RunFilter, activities=None):
+            del filters, activities
+            return ()
+
+    app = DeveloperWorkflowTuiApp(
+        ActiveController(),  # type: ignore[arg-type]
+        3,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(120, 32)):
+        dashboard = app.screen
+        query_one = dashboard.query_one
+
+        def missing_run_list(selector, expect_type=None):
+            if selector is RunListPane:
+                raise NoMatches("controlled active-tree failure")
+            return query_one(selector, expect_type)
+
+        monkeypatch.setattr(dashboard, "query_one", missing_run_list)
+        with pytest.raises(NoMatches, match="controlled active-tree failure"):
+            await dashboard.refresh_runs()
 
 
 @pytest.mark.asyncio
