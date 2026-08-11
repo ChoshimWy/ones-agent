@@ -7,7 +7,7 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
-from textual.widgets import Button, Input, Static, TabbedContent
+from textual.widgets import Button, Input, Label, Static, TabbedContent
 
 from src.developer_workflow import tui
 from src.developer_workflow.contracts import WorkflowRun, WorkflowState, WorkflowType
@@ -183,6 +183,49 @@ async def test_app_close_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("blocked_call", ["list", "show"])
+async def test_app_refresh_does_not_read_screen_after_ui_close(
+    blocked_call: str,
+) -> None:
+    app = app_factory()
+    controller = app.controller  # type: ignore[attr-defined]
+    started, release = Event(), Event()
+
+    async with app.run_test(size=(120, 32)):
+        if blocked_call == "list":
+            original = controller.list_runs
+
+            def blocked_list(filters: RunFilter, activities=None):
+                started.set()
+                assert release.wait(2)
+                return original(filters, activities)
+
+            controller.list_runs = blocked_list  # type: ignore[method-assign]
+        else:
+            original = controller.show
+
+            def blocked_show(run_id: str) -> RunDetail:
+                started.set()
+                assert release.wait(2)
+                return original(run_id)
+
+            controller.show = blocked_show  # type: ignore[method-assign]
+
+        refresh = asyncio.create_task(app.refresh_runs())
+        assert await asyncio.to_thread(started.wait, 2)
+        await app._close_ui()
+        previous_stack = tuple(app._screen_stack)
+        app._screen_stack.clear()
+        try:
+            release.set()
+            await refresh
+        finally:
+            app._screen_stack.extend(previous_stack)
+
+        assert app._ui_closed
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("width", "expected_mode"), [(120, "three"), (80, "two"), (60, "one")]
 )
@@ -200,6 +243,28 @@ async def test_dashboard_responsive_modes(width: int, expected_mode: str) -> Non
 async def test_dashboard_responsive_boundaries(width: int, expected_mode: str) -> None:
     async with app_factory().run_test(size=(width, 32)) as pilot:
         assert pilot.app.screen.query_one("#dashboard").has_class(expected_mode)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [60, 80, 120])
+async def test_run_list_shows_safe_updated_time_without_markup(width: int) -> None:
+    app = app_factory()
+    controller = app.controller
+    raw_work_item = r"BUG-[bold]\\literal"
+    controller.runs = (  # type: ignore[attr-defined]
+        replace(
+            controller.runs[0],  # type: ignore[attr-defined]
+            work_item_id=safe_tui_text(raw_work_item),
+        ),
+    )
+
+    async with app.run_test(size=(width, 32)):
+        label = app.screen.query_one("#run-item-0 Label", Label)
+        assert label.markup is False
+        assert _plain(label) == (
+            "WAITING_APPROVAL  BUG-[bold]\\\\literal  "
+            "2026-08-11T09:00:00Z  idle"
+        )
 
 
 @pytest.mark.asyncio

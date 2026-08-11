@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 import re
 from typing import Literal
 import unicodedata
@@ -129,14 +129,19 @@ class RunListPane(Vertical):
             [
                 ListItem(
                     Label(
-                        "  ".join(
-                            (
-                                item.state.value,
-                                item.work_item_id,
-                                item.activity.value,
+                        Text.from_markup(
+                            "  ".join(
+                                (
+                                    item.state.value,
+                                    item.work_item_id,
+                                    item.updated_at.astimezone(UTC)
+                                    .isoformat(timespec="seconds")
+                                    .replace("+00:00", "Z"),
+                                    item.activity.value,
+                                )
                             )
                         ),
-                        markup=True,
+                        markup=False,
                     ),
                     id=f"run-item-{index}",
                     name=item.run_id,

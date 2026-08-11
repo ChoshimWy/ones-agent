@@ -102,7 +102,8 @@ class DeveloperWorkflowTuiApp(App[None]):
             mount_generation=mount_generation,
         )
         if (
-            self._dashboard is not dashboard
+            self._ui_closed
+            or self._dashboard is not dashboard
             or self.screen is not dashboard
             or not dashboard.owns_refresh(mount_generation)
         ):
