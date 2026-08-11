@@ -174,8 +174,12 @@ async def test_external_store_update_refreshes_list_and_selected_detail(
             "blocked safely",
             WorkflowState.CREATED,
         )
-        await pilot.pause(0.08)
-        overview = _plain(app.screen.query_one("#overview-content"))
+        overview = ""
+        for _ in range(20):
+            await pilot.pause(0.02)
+            overview = _plain(app.screen.query_one("#overview-content"))
+            if updated.state.value in overview:
+                break
         assert updated.state.value in overview
         assert f"version: {updated.version}" in overview
         assert controller.list_calls >= 2

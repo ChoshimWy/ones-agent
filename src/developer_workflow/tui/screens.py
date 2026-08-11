@@ -1315,16 +1315,19 @@ class DashboardScreen(Screen[None]):
 
     @on(events.Click, "#run-list ListItem")
     async def click_run(self, event: events.Click) -> None:
-        item_id = event.widget.id
-        if item_id is None or not item_id.startswith("run-item-"):
+        run_id = event.widget.name
+        if type(run_id) is not str:
             return
-        try:
-            index = int(item_id.removeprefix("run-item-"))
-        except ValueError:
+        matches = tuple(
+            index
+            for index, item in enumerate(self._runs)
+            if item.run_id == run_id
+        )
+        if len(matches) != 1:
             return
-        if 0 <= index < len(self._runs):
-            self.query_one("#run-list", ListView).index = index
-            await self._show_detail(index)
+        index = matches[0]
+        self.query_one("#run-list", ListView).index = index
+        await self._show_detail(index)
 
     @on(Button.Pressed, "#nav-runs")
     def show_runs(self) -> None:

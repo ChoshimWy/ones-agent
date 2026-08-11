@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import pytest
 from textual.widgets import Button, Input, Static, TabbedContent
@@ -285,6 +286,46 @@ async def test_refresh_replaces_list_atomically_and_preserves_selected_run() -> 
         assert len(screen.query("#run-list ListItem")) == 0
         overview = screen.query_one("#overview-content")
         assert str(overview.renderable) == "No run selected"
+
+
+@pytest.mark.asyncio
+async def test_stale_mouse_item_never_selects_new_run_at_reused_index() -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)):
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        stale_item = screen.query_one("#run-item-1")
+        assert stale_item.name == "run-2"
+
+        app.controller.runs = (_summary(3), _summary(4))  # type: ignore[attr-defined]
+        await screen.refresh_runs()
+        shown_before = tuple(app.controller.shown)  # type: ignore[attr-defined]
+
+        await screen.click_run(SimpleNamespace(widget=stale_item))  # type: ignore[arg-type]
+
+        assert tuple(app.controller.shown) == shown_before  # type: ignore[attr-defined]
+        assert screen.query_one("#run-list").index == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", [None, "run-3"])
+async def test_mouse_item_requires_one_unique_current_run_identity(
+    identity: str | None,
+) -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)):
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        app.controller.runs = (_summary(3), _summary(3))  # type: ignore[attr-defined]
+        await screen.refresh_runs()
+        shown_before = tuple(app.controller.shown)  # type: ignore[attr-defined]
+        event = SimpleNamespace(
+            widget=SimpleNamespace(name=identity, id="run-item-0")
+        )
+
+        await screen.click_run(event)  # type: ignore[arg-type]
+
+        assert tuple(app.controller.shown) == shown_before  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio
