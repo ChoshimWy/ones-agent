@@ -14,6 +14,7 @@ from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
@@ -934,6 +935,8 @@ class DashboardScreen(Screen[None]):
         self._detail_sequence = 0
         self._selection_generation = 0
         self._applying_refresh = False
+        self._mount_generation = 0
+        self._lifecycle_active = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -954,7 +957,29 @@ class DashboardScreen(Screen[None]):
         yield Static("", id="notice", markup=False)
 
     def on_mount(self) -> None:
+        self._mount_generation += 1
+        self._lifecycle_active = True
         self._set_mode(self.size.width)
+
+    def on_unmount(self) -> None:
+        self._lifecycle_active = False
+        self._mount_generation += 1
+        self._refresh_requested = False
+
+    @property
+    def mount_generation(self) -> int:
+        """Return the current widget-tree generation for refresh ownership."""
+
+        return self._mount_generation
+
+    def owns_refresh(self, generation: int) -> bool:
+        """Whether a refresh may still read or update this mounted tree."""
+
+        return (
+            self._lifecycle_active
+            and self.is_mounted
+            and generation == self._mount_generation
+        )
 
     def on_resize(self, event: events.Resize) -> None:
         self._set_mode(event.size.width)
@@ -968,7 +993,16 @@ class DashboardScreen(Screen[None]):
     async def refresh_runs(
         self,
         activities: Mapping[str, RunActivity] | None = None,
+        *,
+        mount_generation: int | None = None,
     ) -> None:
+        generation = (
+            self._mount_generation
+            if mount_generation is None
+            else mount_generation
+        )
+        if not self.owns_refresh(generation):
+            return
         self._refresh_activities = activities
         if self._refreshing:
             self._refresh_requested = True
@@ -980,7 +1014,12 @@ class DashboardScreen(Screen[None]):
             while True:
                 self._refresh_requested = False
                 current_activities = self._refresh_activities
-                await self._refresh_runs(current_activities)
+                try:
+                    await self._refresh_runs(current_activities, generation)
+                except NoMatches:
+                    if not self.owns_refresh(generation):
+                        return
+                    raise
                 if not self._refresh_requested:
                     break
         finally:
@@ -990,7 +1029,10 @@ class DashboardScreen(Screen[None]):
     async def _refresh_runs(
         self,
         activities: Mapping[str, RunActivity] | None,
+        mount_generation: int,
     ) -> None:
+        if not self.owns_refresh(mount_generation):
+            return
         selected_index = self._selected_index()
         selected_run_id = (
             self._runs[selected_index].run_id
@@ -1006,14 +1048,16 @@ class DashboardScreen(Screen[None]):
                 activities,
             )
         except TuiControllerError:
+            if not self.owns_refresh(mount_generation):
+                return
             runs = ()
             self._detail_sequence += 1
             self._runs = runs
-            if not self.is_mounted:
-                return
             await self.query_one(RunListPane).replace_runs(runs)
             self._detail_error = _LIST_UNAVAILABLE
             self.query_one(RunDetailPane).show_error(self._detail_error)
+            return
+        if not self.owns_refresh(mount_generation):
             return
         if selection_generation != self._selection_generation:
             current_index = self._selected_index()
@@ -1025,8 +1069,6 @@ class DashboardScreen(Screen[None]):
             )
         self._detail_sequence += 1
         self._runs = runs
-        if not self.is_mounted:
-            return
         self._applying_refresh = True
         try:
             await self.query_one(RunListPane).replace_runs(runs)

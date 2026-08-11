@@ -89,14 +89,24 @@ class DeveloperWorkflowTuiApp(App[None]):
     async def refresh_runs(self) -> None:
         """Refresh persisted runs without performing workflow mutations."""
 
+        dashboard = self._dashboard
+        mount_generation = dashboard.mount_generation
         if (
             self._ui_closed
-            or not self._dashboard.is_mounted
-            or self.screen is not self._dashboard
-            or not self._dashboard.query("#run-list")
+            or self.screen is not dashboard
+            or not dashboard.owns_refresh(mount_generation)
         ):
             return
-        await self._dashboard.refresh_runs(dict(self.activities))
+        await dashboard.refresh_runs(
+            dict(self.activities),
+            mount_generation=mount_generation,
+        )
+        if (
+            self._dashboard is not dashboard
+            or self.screen is not dashboard
+            or not dashboard.owns_refresh(mount_generation)
+        ):
+            return
 
     async def on_tui_task_message(self, message: TuiTaskMessage) -> None:
         """Apply a validated worker event on Textual's UI loop."""

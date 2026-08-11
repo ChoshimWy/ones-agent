@@ -47,8 +47,9 @@ from src.developer_workflow.requirement_flow import (
     SubprocessConfiguredTestRunner,
 )
 from src.developer_workflow.state_store import FileRunStore
-from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp, TuiTaskMessage
 from src.developer_workflow.tui.controller import TuiController
+from src.developer_workflow.tui.models import RunActivity
 from src.developer_workflow.tui.run_index import RunIndex
 
 
@@ -654,8 +655,25 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
     )
     source_before = {key: _source_facts(path) for key, path in sources.items()}
     diagnostic: object = None
+    run_id: str | None = None
+    confirmation_finished = asyncio.Event()
+    approval_finished = asyncio.Event()
+
+    def observe_ui_message(message: object) -> None:
+        if not isinstance(message, TuiTaskMessage) or run_id is None:
+            return
+        event = message.event
+        if event.run_id != run_id or event.activity is not RunActivity.IDLE:
+            return
+        if event.action == "confirm-repository":
+            confirmation_finished.set()
+        elif event.action == "approve":
+            approval_finished.set()
+
     try:
-        async with app.run_test(size=(120, 32)) as pilot:
+        async with app.run_test(
+            size=(120, 32), message_hook=observe_ui_message
+        ) as pilot:
             assert effects == []
             assert store.list_run_ids() == ()
             await pilot.press("n")
@@ -671,15 +689,9 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
             await pilot.press("enter")
             assert app.screen.query_one("#confirm-start")
             assert effects == []
-            confirm = app.screen.query_one("#confirm-start", Button)
-            confirm.post_message(Button.Pressed(confirm))
-            for _ in range(2400):
-                await asyncio.sleep(0.05)
-                if store.load(run_id, read_only=True).state in {
-                    WorkflowState.WAITING_APPROVAL,
-                    WorkflowState.BLOCKED,
-                }:
-                    break
+            await pilot.click("#confirm-start")
+            await asyncio.wait_for(confirmation_finished.wait(), 180)
+            await pilot.pause()
             waiting = store.load(run_id, read_only=True)
             assert waiting.state is WorkflowState.WAITING_APPROVAL, (
                 waiting.blocked_reason,
@@ -713,13 +725,8 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
             )
             app.screen.query_one("#actor", Input).value = "operator"
             await pilot.click("#confirm-approve")
-            for _ in range(400):
-                await asyncio.sleep(0.05)
-                if store.load(waiting.run_id, read_only=True).state in {
-                    WorkflowState.COMPLETED,
-                    WorkflowState.PARTIAL_SUCCESS,
-                }:
-                    break
+            await asyncio.wait_for(approval_finished.wait(), 180)
+            await pilot.pause()
             diagnostic = (
                 app.screen.id,
                 app.screen.query_one("#notice").render(),

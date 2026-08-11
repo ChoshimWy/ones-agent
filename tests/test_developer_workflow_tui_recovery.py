@@ -284,6 +284,55 @@ async def test_task_event_enters_ui_loop_and_updates_run_activity(tmp_path) -> N
 
 
 @pytest.mark.asyncio
+async def test_task_event_refresh_abandons_dashboard_that_unmounts_mid_load() -> None:
+    refresh_started = Event()
+    release_refresh = Event()
+
+    class TeardownController:
+        cancel_calls: list[object] = []
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def list_runs(self, filters: RunFilter, activities=None):
+            del filters, activities
+            self.calls += 1
+            if self.calls == 2:
+                refresh_started.set()
+                release_refresh.wait(2)
+            return (
+                RunSummary.from_run(
+                    _run(WorkflowState.CREATED), activity=RunActivity.IDLE
+                ),
+            )
+
+        def show(self, run_id: str) -> RunDetail:
+            del run_id
+            return RunDetail.from_run(_run(WorkflowState.CREATED))
+
+    controller = TeardownController()
+    app = DeveloperWorkflowTuiApp(
+        controller,  # type: ignore[arg-type]
+        3,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(120, 32)):
+        dashboard = app.screen
+        mounted_generation = dashboard.mount_generation
+        handling = asyncio.create_task(
+            app.on_tui_task_message(
+                TuiTaskMessage(TaskEvent.started(_run(WorkflowState.CREATED).run_id, "resume"))
+            )
+        )
+        assert await asyncio.to_thread(refresh_started.wait, 1)
+        await app.pop_screen()
+        release_refresh.set()
+        await handling
+        assert app.screen is not dashboard
+        assert dashboard.owns_refresh(mounted_generation) is False
+
+
+@pytest.mark.asyncio
 async def test_concurrent_refreshes_are_serialized_without_stale_regression() -> None:
     first_started = Event()
     release_first = Event()
