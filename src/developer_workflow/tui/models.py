@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from rich.markup import escape as escape_markup
 
-from ..approval import approval_fingerprint
+from ..approval import approval_fingerprint, validate_for_approval
 from ..command_utils import CommandArgvError, parse_command_argv
 from ..contracts import (
     ApprovalPackage,
@@ -281,7 +281,13 @@ class DangerousActionRequest:
             raise TuiDisplayError("workflow action is invalid")
         if expected_version is not None and expected_version != run.version:
             raise TuiDisplayError("workflow action is stale")
-        _, fingerprint_bound, signed = _approval_status(run.approval)
+        _, fingerprint_bound, signed = _approval_status(
+            run.approval,
+            bind_unsigned=(
+                action == "approve"
+                and run.state is WorkflowState.WAITING_APPROVAL
+            ),
+        )
         if action == "approve" and not fingerprint_bound:
             raise TuiDisplayError("workflow action is unavailable")
         if action == "resume-publication" and not signed:
@@ -356,7 +362,10 @@ def _dangerous_test_facts(
 
 def run_detail_from_run(run: WorkflowRun) -> RunDetail:
     approval = run.approval
-    fingerprint, fingerprint_bound, signed = _approval_status(approval)
+    fingerprint, fingerprint_bound, signed = _approval_status(
+        approval,
+        bind_unsigned=run.state is WorkflowState.WAITING_APPROVAL,
+    )
     if fingerprint_bound and approval is not None:
         if run.repository_group is not None:
             _validate_bound_group_facts(run, approval, include_publication=signed)
@@ -667,6 +676,8 @@ def _safe_fingerprint(value: str) -> str:
 
 def _approval_status(
     approval: ApprovalPackage | None,
+    *,
+    bind_unsigned: bool = False,
 ) -> tuple[str, bool, bool]:
     if approval is None:
         return "", False, False
@@ -678,6 +689,12 @@ def _approval_status(
             raise TuiDisplayError(_INVALID_FACTS) from None
         if not hmac.compare_digest(fingerprint, actual):
             raise TuiDisplayError(_INVALID_FACTS)
+    elif bind_unsigned:
+        try:
+            normalized = validate_for_approval(approval)
+            fingerprint = approval_fingerprint(normalized)
+        except Exception:
+            raise TuiDisplayError(_INVALID_FACTS) from None
     fingerprint_bound = bool(fingerprint)
     signed = fingerprint_bound and _has_valid_approval_metadata(approval)
     return fingerprint, fingerprint_bound, signed

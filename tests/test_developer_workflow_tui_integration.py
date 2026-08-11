@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Sequence
@@ -14,20 +15,24 @@ from typing import Sequence
 import pytest
 from textual.widgets import Button, Input
 
-from src.contracts import WikiPageSnapshot
+from src.contracts import (
+    ProjectRef,
+    RequirementRecord,
+    StatusRef,
+    WikiPageRef,
+    WikiPageSnapshot,
+)
 from src.developer_workflow import cli
-from src.developer_workflow.approval import approval_fingerprint
+from src.developer_workflow.approval_rebuilder import WorkflowApprovalRebuilder
 from src.developer_workflow.config import DeveloperWorkflowConfig
 from src.developer_workflow.contracts import (
-    ApprovalPackage,
-    CommandOutcome,
-    CommandResult,
+    AcceptanceCoverage,
+    CodexResult,
     DefectCandidate,
-    RepositoryApprovalEvidence,
+    RepositoryChangeClaim,
     RepositoryGroupMapping,
     RepositoryMapping,
     RepositoryRole,
-    RepositoryRunEvidence,
     WorkflowRun,
     WorkflowState,
 )
@@ -35,6 +40,12 @@ from src.developer_workflow.orchestrator import DeveloperWorkflowOrchestrator
 from src.developer_workflow.publisher import Publisher
 from src.developer_workflow.repository import WorktreeRepository
 from src.developer_workflow.repository_group import RepositoryGroupWorkspace
+from src.developer_workflow.requirement_flow import (
+    RequirementFlow,
+    SandboxCommandExecutor,
+    SandboxStatePolicy,
+    SubprocessConfiguredTestRunner,
+)
 from src.developer_workflow.state_store import FileRunStore
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
 from src.developer_workflow.tui.controller import TuiController
@@ -277,7 +288,10 @@ def _source_remote(
     (source / "src" / "value.py").write_text(
         f"VALUE = {key!r}\n", encoding="utf-8"
     )
-    _git("add", "src/value.py", cwd=source)
+    (source / ".gitignore").write_text(
+        "__pycache__/\n.ones-sandbox/\n", encoding="utf-8"
+    )
+    _git("add", "src/value.py", ".gitignore", cwd=source)
     _git("commit", "-m", "base", cwd=source)
     _git("clone", "--bare", str(source), str(remote), cwd=root)
     _git("remote", "add", "origin", authoritative_url, cwd=source)
@@ -387,19 +401,6 @@ class _EffectCommenter:
         return "comment-1"
 
 
-def _command(command: str) -> CommandResult:
-    now = datetime(2026, 8, 11, tzinfo=UTC)
-    return CommandResult(
-        command=command,
-        argv=tuple(command.split()),
-        exit_code=0,
-        outcome=CommandOutcome.PASSED,
-        summary="passed",
-        started_at=now,
-        finished_at=now,
-    )
-
-
 def _group_ui_runtime(tmp_path: Path):
     urls = {
         "dependency": "https://git.example.invalid/team/dependency.git",
@@ -418,7 +419,7 @@ def _group_ui_runtime(tmp_path: Path):
             repo_name="dependency",
             source_path=sources["dependency"].resolve(),
             role=RepositoryRole.DEPENDENCY,
-            test_commands=("python -m compileall src/dependency",),
+            test_commands=("python -m compileall src",),
             allowed_paths=("src",),
         ),
         RepositoryMapping(
@@ -430,7 +431,7 @@ def _group_ui_runtime(tmp_path: Path):
             source_path=sources["primary"].resolve(),
             role=RepositoryRole.PRIMARY,
             depends_on=("dependency",),
-            test_commands=("python -m compileall src/primary",),
+            test_commands=("python -m compileall src/value.py",),
             allowed_paths=("src",),
         ),
     )
@@ -440,11 +441,21 @@ def _group_ui_runtime(tmp_path: Path):
         iteration_id="I",
         primary_repository="primary",
         repositories=mappings,
-        integration_test_commands=("python -m compileall integration",),
+        integration_test_commands=("python -m compileall .",),
+    )
+    config = DeveloperWorkflowConfig(
+        run_root=(tmp_path / "runs").resolve(),
+        worktree_root=(tmp_path / "worktrees").resolve(),
+        mirror_root=(tmp_path / "mirrors").resolve(),
+        sandbox_permission_profile="test-profile",
+        max_codex_attempts=2,
+        repositories=(),
+        repository_groups=(group,),
+        publishing={"provider": "github"},
     )
     raw_repository = WorktreeRepository(
-        tmp_path / "mirrors",
-        tmp_path / "worktrees",
+        config.mirror_root,
+        config.worktree_root,
         command_runner=_MultiRemoteRunner(
             {urls[key]: remotes[key] for key in urls}
         ),
@@ -456,58 +467,10 @@ def _group_ui_runtime(tmp_path: Path):
         },
     )
     workspace = RepositoryGroupWorkspace(raw_repository)
-    run_id = "a" * 32
-    prepared = workspace.prepare_group(
-        run_id, group, "requirement", "REQ-UI", "UI group publication"
+    wiki_content = (
+        "# Acceptance Criteria\n"
+        "1. Publish both repositories safely\n"
     )
-    for item in prepared:
-        (item.prepared.path / "src" / "value.py").write_text(
-            f"VALUE = {item.repository_key!r}\nCHANGED = True\n",
-            encoding="utf-8",
-        )
-    snapshots = workspace.snapshots(prepared)
-    messages = {
-        item.repository_key: f"fix({item.repository_key}): approved UI change"
-        for item in prepared
-    }
-    trees = workspace.approval_trees(prepared, snapshots, messages)
-    evidence: list[RepositoryRunEvidence] = []
-    approval_evidence: list[RepositoryApprovalEvidence] = []
-    for item in prepared:
-        snapshot = snapshots[item.repository_key]
-        result = _command(item.mapping.test_commands[0])
-        evidence.append(
-            RepositoryRunEvidence(
-                repository_key=item.repository_key,
-                mapping=item.mapping,
-                prepared_worktree=item.prepared,
-                tested_snapshot=snapshot,
-                test_results=(result,),
-                changed_files=snapshot.changed_files,
-            )
-        )
-        approval_evidence.append(
-            RepositoryApprovalEvidence(
-                repository_key=item.repository_key,
-                mapping=item.mapping,
-                base_commit=item.prepared.base_commit,
-                head_commit=snapshot.head_commit,
-                diff_hash=snapshot.diff_sha256,
-                diff_summary=(
-                    f"changed {len(snapshot.changed_files)} file(s): "
-                    f"{', '.join(snapshot.changed_files)}"
-                ),
-                branch=item.prepared.branch,
-                changed_files=snapshot.changed_files,
-                tests=(result,),
-                tree_hash=trees[item.repository_key],
-                commit_message=messages[item.repository_key],
-                pr_title=f"REQ-UI [{item.repository_key}]",
-                pr_body=f"Approved {item.repository_key} change",
-            )
-        )
-    integration_result = _command(group.integration_test_commands[0])
-    wiki_content = "# Acceptance\nAC-1: publish both repositories safely"
     wiki = WikiPageSnapshot(
         team_id="T",
         space_id="S",
@@ -519,53 +482,135 @@ def _group_ui_runtime(tmp_path: Path):
         content_sha256=hashlib.sha256(wiki_content.encode()).hexdigest(),
         source_url="https://ones.invalid/wiki/W",
     )
-    package = ApprovalPackage(
-        work_item_id="REQ-UI",
-        work_item_title="UI group publication",
-        work_item_status="Doing",
-        source_versions={"work_item": "1"},
-        wiki_hashes={wiki.page_id: wiki.content_sha256},
-        wiki_snapshots=(wiki,),
-        repository_group=group,
-        repositories=tuple(approval_evidence),
-        integration_tests=(integration_result,),
-        coverage={"AC-1": "covered in both repositories"},
-        evidence=("verified from repository",),
-        review=("reviewed",),
-        risks=("low",),
-        unrelated_changes_checked=True,
+    requirement = RequirementRecord(
+        requirement_id="REQ-UI",
+        number="REQ-UI",
+        title="UI group publication",
+        project=ProjectRef(id="P", name="Project"),
+        iteration=ProjectRef(id="I", name="Iteration"),
+        status=StatusRef(id="doing", name="Doing", category="open"),
+        wiki_refs=[
+            WikiPageRef(
+                team_id=wiki.team_id,
+                space_id=wiki.space_id,
+                page_id=wiki.page_id,
+                source_url=wiki.source_url,
+            )
+        ],
     )
-    package = package.model_copy(
-        update={"fingerprint": approval_fingerprint(package)}
-    )
-    store = FileRunStore(tmp_path / "runs")
-    run = store.create(
-        WorkflowRun.new("requirement", "REQ-UI").validated_update(run_id=run_id)
-    )
-    for state in (
-        WorkflowState.READING_ONES,
-        WorkflowState.VALIDATING,
-        WorkflowState.PREPARING_REPO,
-        WorkflowState.IMPLEMENTING,
-        WorkflowState.TESTING,
-        WorkflowState.AI_REVIEW,
+
+    class Gateway:
+        def get_normalized_requirement_sync(self, issue_id: str):
+            assert issue_id == requirement.requirement_id
+            return requirement
+
+        def get_wiki_snapshot_sync(self, url: str):
+            assert url == wiki.source_url
+            return wiki
+
+        def get_wiki_snapshot_by_ids_sync(
+            self, space_id: str, page_id: str, *, source_url=None
+        ):
+            assert (space_id, page_id, source_url) == (
+                wiki.space_id,
+                wiki.page_id,
+                wiki.source_url,
+            )
+            return wiki
+
+    class Codex:
+        def preflight(self, **kwargs):
+            del kwargs
+            return CodexResult(summary="source preflight passed")
+
+        def run_group_stage(self, stage: str, **kwargs):
+            prepared = kwargs["prepared"]
+            claims = tuple(
+                RepositoryChangeClaim(
+                    repository_key=item.repository_key,
+                    path="src/value.py",
+                )
+                for item in prepared
+            )
+            if stage == "implementation":
+                for item in prepared:
+                    (item.prepared.path / "src" / "value.py").write_text(
+                        f"VALUE = {item.repository_key!r}\nCHANGED = True\n",
+                        encoding="utf-8",
+                    )
+                return CodexResult(
+                    summary="implemented repository group",
+                    repository_changes=claims,
+                    acceptance_coverage=(
+                        AcceptanceCoverage(
+                            criterion_id="AC-1",
+                            criterion_text="Publish both repositories safely",
+                            repository_files=claims,
+                            tests=(
+                                mappings[0].test_commands[0],
+                                mappings[1].test_commands[0],
+                                group.integration_test_commands[0],
+                            ),
+                        ),
+                    ),
+                )
+            assert stage == "review"
+            return CodexResult(
+                summary="reviewed repository group",
+                repository_changes=claims,
+                review_findings=("all repository changes reviewed",),
+                unrelated_changes_checked=True,
+            )
+
+        def analyze_testing(self, **kwargs):
+            del kwargs
+            return CodexResult(summary="configured tests passed")
+
+    def sandbox_backend(
+        command, *, cwd, env, timeout, max_output_bytes, stdin=None
     ):
-        run = store.transition(run.run_id, run.version, state, state.value)
-    run = store.save(
-        run.validated_update(
-            repository_model_version=2,
-            repository_group=group,
-            repository_evidence=tuple(evidence),
-            integration_test_results=(integration_result,),
-            approval=package,
+        del timeout, max_output_bytes, stdin
+        child = command[command.index("--") + 1 :]
+        code = child[3] if len(child) > 3 and child[1:3] == ["-I", "-c"] else ""
+        if "socket.socket" in code:
+            return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
+        if "Path(sys.argv[1]).write_text" in code:
+            target = Path(child[-2])
+            if any(
+                part.startswith(".ones-sandbox-probes-")
+                for part in target.parts
+            ):
+                return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
+        return subprocess.run(
+            child,
+            cwd=cwd,
+            env=env,
+            input=None,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    sandbox = SandboxCommandExecutor(
+        sandbox_state_provider=lambda cwd: SandboxStatePolicy(
+            payload={"policy": "local-test"},
+            working_directory=cwd,
+            writable_roots=(cwd,),
+            network_disabled=True,
         ),
-        run.version,
+        backend_executor=sandbox_backend,
+        codex_binary="codex",
     )
-    run = store.transition(
-        run.run_id,
-        run.version,
-        WorkflowState.WAITING_APPROVAL,
-        "await approval",
+    store = FileRunStore(config.run_root)
+    gateway = Gateway()
+    flow = RequirementFlow(
+        store=store,
+        gateway=gateway,  # type: ignore[arg-type]
+        config=config,
+        repository=raw_repository,
+        group_workspace=workspace,
+        codex=Codex(),  # type: ignore[arg-type]
+        test_runner=SubprocessConfiguredTestRunner(sandbox),
     )
     effects: list[str] = []
     repository = _EffectRepository(raw_repository, effects)
@@ -573,7 +618,7 @@ def _group_ui_runtime(tmp_path: Path):
     publisher = Publisher(
         store,
         repository,
-        lambda current: package,
+        WorkflowApprovalRebuilder(gateway, repository),  # type: ignore[arg-type]
         _EffectPR(effects),
         commenter,
         provider="github",
@@ -581,15 +626,15 @@ def _group_ui_runtime(tmp_path: Path):
     )
     orchestrator = DeveloperWorkflowOrchestrator(
         store=store,
-        requirement_flow=None,  # type: ignore[arg-type]
+        requirement_flow=flow,
         defect_flow=None,  # type: ignore[arg-type]
         publisher=publisher,
-        config=None,  # type: ignore[arg-type]
+        config=config,
         defect_candidates=None,  # type: ignore[arg-type]
     )
     controller = TuiController(orchestrator, RunIndex(store))
     app = DeveloperWorkflowTuiApp(controller, 3, poll_interval=10)
-    return app, controller, store, run, effects, sources, remotes, commenter
+    return app, controller, store, effects, sources, remotes, commenter
 
 
 def _source_facts(path: Path) -> tuple[str, str, str]:
@@ -604,20 +649,68 @@ def _source_facts(path: Path) -> tuple[str, str, str]:
 async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
     tmp_path: Path,
 ) -> None:
-    app, controller, store, waiting, effects, sources, remotes, commenter = (
+    app, controller, store, effects, sources, remotes, commenter = (
         _group_ui_runtime(tmp_path)
     )
     source_before = {key: _source_facts(path) for key, path in sources.items()}
     diagnostic: object = None
     try:
         async with app.run_test(size=(120, 32)) as pilot:
-            assert (
-                store.load(waiting.run_id, read_only=True).state
-                is WorkflowState.WAITING_APPROVAL
-            )
             assert effects == []
+            assert store.list_run_ids() == ()
+            await pilot.press("n")
+            await pilot.click("#workflow-requirement")
+            app.screen.query_one("#requirement-id", Input).value = "REQ-UI"
+            app.screen.query_one("#start-requirement", Button).focus()
+            await pilot.press("enter")
+            assert app.screen.query_one("#mapping-0")
+            run_id = store.list_run_ids()[0]
+            assert store.load(run_id, read_only=True).state is WorkflowState.VALIDATING
+            assert effects == []
+            app.screen.query_one("#mapping-0", Button).focus()
+            await pilot.press("enter")
+            assert app.screen.query_one("#confirm-start")
+            assert effects == []
+            confirm = app.screen.query_one("#confirm-start", Button)
+            confirm.post_message(Button.Pressed(confirm))
+            for _ in range(2400):
+                await asyncio.sleep(0.05)
+                if store.load(run_id, read_only=True).state in {
+                    WorkflowState.WAITING_APPROVAL,
+                    WorkflowState.BLOCKED,
+                }:
+                    break
+            waiting = store.load(run_id, read_only=True)
+            assert waiting.state is WorkflowState.WAITING_APPROVAL, (
+                waiting.blocked_reason,
+                waiting.resume_state,
+            )
+            assert waiting.approval is not None
+            assert waiting.approval.approved_by is None
+            targets = tuple(event.target for event in waiting.history)
+            for state in (
+                WorkflowState.READING_ONES,
+                WorkflowState.VALIDATING,
+                WorkflowState.PREPARING_REPO,
+                WorkflowState.IMPLEMENTING,
+                WorkflowState.TESTING,
+                WorkflowState.AI_REVIEW,
+                WorkflowState.WAITING_APPROVAL,
+            ):
+                assert state in targets
+            assert effects == []
+            for _ in range(100):
+                await asyncio.sleep(0.01)
+                if app.screen.id == "dashboard-screen":
+                    break
+            assert app.screen.id == "dashboard-screen"
+            await app.screen.refresh_runs()
             await pilot.press("a")
             assert effects == []
+            assert app.screen.id == "approval-modal", (
+                app._dashboard._runs,
+                app._dashboard.query_one("#notice").render(),
+            )
             app.screen.query_one("#actor", Input).value = "operator"
             await pilot.click("#confirm-approve")
             for _ in range(400):
@@ -647,6 +740,11 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
         "comment",
     ]
     assert commenter.status_updates == 0
+    assert app.supervisor.closed is True
+    assert not any(
+        path.name.startswith((".ones-sandbox", ".ones-sandbox-probes-"))
+        for path in (tmp_path / "worktrees").rglob("*")
+    )
     assert {key: _source_facts(path) for key, path in sources.items()} == source_before
     assert _git(
         "show-ref",
@@ -664,24 +762,35 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
 async def test_real_group_ui_version_drift_has_zero_remote_effects(
     tmp_path: Path,
 ) -> None:
-    app, controller, store, waiting, effects, *_ = _group_ui_runtime(tmp_path)
+    app, controller, store, effects, *_ = _group_ui_runtime(tmp_path)
     try:
         async with app.run_test(size=(120, 32)) as pilot:
+            waiting = controller.start_requirement("REQ-UI")
+            waiting = controller.confirm_repository(
+                waiting.summary.run_id,
+                "suite",
+                waiting.summary.version,
+            )
+            assert waiting.summary.state is WorkflowState.WAITING_APPROVAL
+            await app.screen.refresh_runs()
             await pilot.press("a")
             drifted = store.save(
-                store.load(waiting.run_id).validated_update(
+                store.load(waiting.summary.run_id).validated_update(
                     updated_at=datetime.now(UTC)
                 ),
-                waiting.version,
+                waiting.summary.version,
             )
-            assert drifted.version == waiting.version + 1
+            assert drifted.version == waiting.summary.version + 1
             app.screen.query_one("#actor", Input).value = "operator"
             await pilot.click("#confirm-approve")
             await pilot.pause(0.1)
     finally:
         controller.close()
     assert effects == []
-    assert store.load(waiting.run_id, read_only=True).state is WorkflowState.WAITING_APPROVAL
+    assert (
+        store.load(waiting.summary.run_id, read_only=True).state
+        is WorkflowState.WAITING_APPROVAL
+    )
 
 
 @pytest.mark.asyncio

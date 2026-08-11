@@ -89,7 +89,12 @@ class DeveloperWorkflowTuiApp(App[None]):
     async def refresh_runs(self) -> None:
         """Refresh persisted runs without performing workflow mutations."""
 
-        if self._ui_closed or not self._dashboard.is_mounted:
+        if (
+            self._ui_closed
+            or not self._dashboard.is_mounted
+            or self.screen is not self._dashboard
+            or not self._dashboard.query("#run-list")
+        ):
             return
         await self._dashboard.refresh_runs(dict(self.activities))
 
