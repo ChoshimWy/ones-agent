@@ -76,6 +76,83 @@ def test_mapping_key_must_match_requested_project_and_iteration(tmp_path: Path) 
         config.resolve_mapping_key("project-default", "other-project", "any")
 
 
+def _repository_group_payload() -> dict[str, object]:
+    return {
+        "key": "desktop-suite",
+        "project_id": "project",
+        "iteration_id": "iteration",
+        "primary_repository": "desktop-app",
+        "repositories": [
+            {
+                "key": "shared-sdk",
+                "project_id": "project",
+                "iteration_id": "iteration",
+                "repo_url": "https://example.invalid/team/shared-sdk.git",
+                "repo_name": "shared-sdk",
+                "role": "dependency",
+                "depends_on": [],
+            },
+            {
+                "key": "desktop-app",
+                "project_id": "project",
+                "iteration_id": "iteration",
+                "repo_url": "https://example.invalid/team/desktop-app.git",
+                "repo_name": "desktop-app",
+                "role": "primary",
+                "depends_on": ["shared-sdk"],
+            },
+        ],
+        "integration_test_commands": ["uv run pytest tests/integration"],
+    }
+
+
+def test_config_loads_repository_groups_and_normalizes_legacy_mappings(
+    tmp_path: Path,
+) -> None:
+    config = DeveloperWorkflowConfig.load(
+        _write_config(
+            tmp_path / "ones-dev.json",
+            repositories=[],
+            repository_groups=[_repository_group_payload()],
+        )
+    )
+
+    assert config.resolve_group_key(
+        "desktop-suite", "project", "iteration"
+    ).topological_keys() == ("shared-sdk", "desktop-app")
+    assert config.resolve_repository_group("project", "iteration").key == "desktop-suite"
+
+    legacy = DeveloperWorkflowConfig.load(_write_config(tmp_path / "legacy.json"))
+    normalized = legacy.normalized_groups()
+    assert tuple(group.key for group in normalized) == (
+        "project-default",
+        "project-iteration",
+    )
+    assert normalized[0].primary_repository == "project-default"
+    assert len(normalized[0].repositories) == 1
+
+
+def test_config_rejects_key_or_selector_conflicts_between_legacy_and_groups(
+    tmp_path: Path,
+) -> None:
+    same_key = _repository_group_payload()
+    same_key["key"] = "project-default"
+    with pytest.raises(ValidationError, match="keys must be unique"):
+        DeveloperWorkflowConfig.load(
+            _write_config(
+                tmp_path / "same-key.json", repository_groups=[same_key]
+            )
+        )
+
+    with pytest.raises(ValidationError, match="project and iteration mappings must be unique"):
+        DeveloperWorkflowConfig.load(
+            _write_config(
+                tmp_path / "same-selector.json",
+                repository_groups=[_repository_group_payload()],
+            )
+        )
+
+
 @pytest.mark.parametrize(
     "repositories",
     [

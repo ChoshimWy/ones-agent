@@ -11,7 +11,13 @@ from typing import Any
 
 from pydantic import ConfigDict, Field, field_validator, model_validator
 
-from .contracts import RepositoryMapping, WorkflowModel, validate_git_ref_name
+from .contracts import (
+    RepositoryGroupMapping,
+    RepositoryMapping,
+    RepositoryRole,
+    WorkflowModel,
+    validate_git_ref_name,
+)
 
 
 class ConfigSecretError(ValueError):
@@ -85,7 +91,8 @@ class DeveloperWorkflowConfig(WorkflowModel):
     mirror_root: Path
     sandbox_permission_profile: str
     max_codex_attempts: int = Field(ge=1, le=10)
-    repositories: tuple[RepositoryMapping, ...] = Field(min_length=1)
+    repositories: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
+    repository_groups: tuple[RepositoryGroupMapping, ...] = Field(default_factory=tuple)
     publishing: PublishingConfig
 
     @field_validator("sandbox_permission_profile")
@@ -99,15 +106,34 @@ class DeveloperWorkflowConfig(WorkflowModel):
 
     @model_validator(mode="after")
     def validate_unique_repositories(self) -> DeveloperWorkflowConfig:
-        keys = [mapping.key for mapping in self.repositories]
-        pairs = [
-            (mapping.project_id, mapping.iteration_id) for mapping in self.repositories
-        ]
+        groups = self.normalized_groups()
+        keys = [mapping.key for mapping in groups]
+        pairs = [(mapping.project_id, mapping.iteration_id) for mapping in groups]
+        if not groups:
+            raise ValueError("at least one repository mapping or group is required")
         if len(keys) != len(set(keys)):
-            raise ValueError("repository mapping keys must be unique")
+            raise ValueError("repository mapping and group keys must be unique")
         if len(pairs) != len(set(pairs)):
             raise ValueError("project and iteration mappings must be unique")
         return self
+
+    def normalized_groups(self) -> tuple[RepositoryGroupMapping, ...]:
+        legacy = tuple(
+            RepositoryGroupMapping(
+                key=mapping.key,
+                project_id=mapping.project_id,
+                iteration_id=mapping.iteration_id,
+                primary_repository=mapping.key,
+                repositories=(
+                    mapping.validated_update(
+                        role=RepositoryRole.PRIMARY,
+                        depends_on=(),
+                    ),
+                ),
+            )
+            for mapping in self.repositories
+        )
+        return (*legacy, *self.repository_groups)
 
     @classmethod
     def load(cls, path: str | Path) -> DeveloperWorkflowConfig:
@@ -178,6 +204,49 @@ class DeveloperWorkflowConfig(WorkflowModel):
                 f"mapping {key!r} is not valid for {project_id}/{iteration_id}"
             )
         return mapping
+
+    def resolve_repository_group(
+        self, project_id: str, iteration_id: str
+    ) -> RepositoryGroupMapping:
+        groups = self.normalized_groups()
+        exact = next(
+            (
+                group
+                for group in groups
+                if group.project_id == project_id and group.iteration_id == iteration_id
+            ),
+            None,
+        )
+        if exact is not None:
+            return exact
+        default = next(
+            (
+                group
+                for group in groups
+                if group.project_id == project_id and group.iteration_id == "*"
+            ),
+            None,
+        )
+        if default is not None:
+            return default
+        raise RepositoryMappingNotFound(f"no mapping for {project_id}/{iteration_id}")
+
+    def resolve_group_key(
+        self, key: str, project_id: str, iteration_id: str
+    ) -> RepositoryGroupMapping:
+        group = next(
+            (candidate for candidate in self.normalized_groups() if candidate.key == key),
+            None,
+        )
+        if (
+            group is None
+            or group.project_id != project_id
+            or group.iteration_id not in {iteration_id, "*"}
+        ):
+            raise RepositoryMappingNotFound(
+                f"mapping {key!r} is not valid for {project_id}/{iteration_id}"
+            )
+        return group
 
 
 _SECRET_TOKENS = {

@@ -15,7 +15,11 @@ from src.developer_workflow.contracts import (
     CodexResult,
     CommandResult,
     PreparedWorktree,
+    MultiRepositoryPublicationResult,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryRunEvidence,
+    RepositoryRole,
     RepositorySnapshot,
     WorkflowRun,
     WorkflowState,
@@ -80,6 +84,159 @@ def test_new_runs_have_isolated_mutable_defaults() -> None:
     assert first.updated_at.utcoffset() == timedelta(0)
     assert defect.created_at.utcoffset() == timedelta(0)
     assert defect.updated_at.utcoffset() == timedelta(0)
+
+
+def _group_repository(
+    key: str,
+    *,
+    role: RepositoryRole,
+    depends_on: tuple[str, ...] = (),
+    source_path: Path | None = None,
+) -> RepositoryMapping:
+    return RepositoryMapping(
+        key=key,
+        project_id="project",
+        iteration_id="iteration",
+        repo_url=f"https://example.invalid/team/{key}.git",
+        repo_name=key,
+        source_path=source_path,
+        role=role,
+        depends_on=depends_on,
+        test_commands=("uv run pytest",),
+        allowed_paths=("src", "tests"),
+    )
+
+
+def test_repository_group_has_stable_topological_order_and_roundtrips(
+    tmp_path: Path,
+) -> None:
+    group = RepositoryGroupMapping(
+        key="desktop-suite",
+        project_id="project",
+        iteration_id="iteration",
+        primary_repository="desktop-app",
+        repositories=(
+            _group_repository(
+                "shared-sdk",
+                role=RepositoryRole.DEPENDENCY,
+                source_path=(tmp_path / "shared-sdk").resolve(),
+            ),
+            _group_repository(
+                "desktop-app",
+                role=RepositoryRole.PRIMARY,
+                depends_on=("shared-sdk",),
+                source_path=(tmp_path / "desktop-app").resolve(),
+            ),
+        ),
+        integration_test_commands=("uv run pytest tests/integration",),
+    )
+
+    assert group.topological_keys() == ("shared-sdk", "desktop-app")
+    assert RepositoryGroupMapping.model_validate_json(group.model_dump_json()) == group
+
+
+def test_repository_group_rejects_cycle_missing_dependency_and_multiple_primaries() -> None:
+    with pytest.raises(ValidationError, match="acyclic"):
+        RepositoryGroupMapping(
+            key="cycle",
+            project_id="project",
+            iteration_id="iteration",
+            primary_repository="a",
+            repositories=(
+                _group_repository("a", role=RepositoryRole.PRIMARY, depends_on=("b",)),
+                _group_repository("b", role=RepositoryRole.DEPENDENCY, depends_on=("a",)),
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="unknown repository"):
+        RepositoryGroupMapping(
+            key="missing",
+            project_id="project",
+            iteration_id="iteration",
+            primary_repository="a",
+            repositories=(
+                _group_repository(
+                    "a", role=RepositoryRole.PRIMARY, depends_on=("not-configured",)
+                ),
+            ),
+        )
+
+    with pytest.raises(ValidationError, match="exactly one primary"):
+        RepositoryGroupMapping(
+            key="multiple",
+            project_id="project",
+            iteration_id="iteration",
+            primary_repository="a",
+            repositories=(
+                _group_repository("a", role=RepositoryRole.PRIMARY),
+                _group_repository("b", role=RepositoryRole.PRIMARY),
+            ),
+        )
+
+
+def test_repository_mapping_requires_absolute_local_source_path() -> None:
+    with pytest.raises(ValidationError, match="source_path must be absolute"):
+        _group_repository(
+            "shared-sdk", role=RepositoryRole.DEPENDENCY, source_path=Path("relative")
+        )
+
+
+def test_new_runs_use_repository_model_v2_but_legacy_json_defaults_to_v1() -> None:
+    current = WorkflowRun.new("requirement", "REQ-1")
+    legacy = current.model_dump(mode="json")
+    legacy.pop("repository_model_version")
+
+    assert current.repository_model_version == 2
+    assert WorkflowRun.model_validate(legacy).repository_model_version == 1
+
+
+def test_workflow_run_repository_group_evidence_strictly_roundtrips(tmp_path: Path) -> None:
+    group = RepositoryGroupMapping(
+        key="desktop-suite",
+        project_id="project",
+        iteration_id="iteration",
+        primary_repository="desktop-app",
+        repositories=(
+            _group_repository("shared-sdk", role=RepositoryRole.DEPENDENCY),
+            _group_repository(
+                "desktop-app",
+                role=RepositoryRole.PRIMARY,
+                depends_on=("shared-sdk",),
+            ),
+        ),
+    )
+    empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    evidence = tuple(
+        RepositoryRunEvidence(
+            repository_key=mapping.key,
+            mapping=mapping,
+            prepared_worktree=PreparedWorktree(
+                path=(tmp_path / "worktrees" / mapping.key).resolve(),
+                branch=f"codex/REQ-1-{mapping.key}",
+                base_commit="1" * 40,
+                head_commit="1" * 40,
+                mirror_path=(tmp_path / "mirrors" / mapping.key).resolve(),
+            ),
+            tested_snapshot=RepositorySnapshot(
+                head_commit="1" * 40,
+                diff_sha256=empty_hash,
+                is_clean=True,
+            ),
+        )
+        for mapping in group.repositories
+    )
+    run = WorkflowRun.new("requirement", "REQ-1").validated_update(
+        repository_group=group,
+        repository_evidence=evidence,
+        group_publication=MultiRepositoryPublicationResult(
+            order=group.topological_keys()
+        ),
+    )
+
+    assert WorkflowRun.model_validate_json(run.model_dump_json()) == run
+
+    with pytest.raises(ValidationError, match="repository evidence key"):
+        evidence[0].validated_update(repository_key="desktop-app")
 
 
 def test_workflow_run_mutable_defaults_are_fully_isolated() -> None:

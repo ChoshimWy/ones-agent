@@ -144,6 +144,11 @@ class CommandOutcome(str, Enum):
     SANDBOX_ERROR = "sandbox_error"
 
 
+class RepositoryRole(str, Enum):
+    PRIMARY = "primary"
+    DEPENDENCY = "dependency"
+
+
 class RepositoryMapping(WorkflowModel):
     key: str
     project_id: str
@@ -151,6 +156,9 @@ class RepositoryMapping(WorkflowModel):
     repo_url: str
     repo_name: str
     base_branch: str = "main"
+    source_path: Path | None = None
+    role: RepositoryRole = RepositoryRole.PRIMARY
+    depends_on: tuple[str, ...] = Field(default_factory=tuple)
     test_commands: tuple[str, ...] = Field(default_factory=tuple)
     lint_commands: tuple[str, ...] = Field(default_factory=tuple)
     build_commands: tuple[str, ...] = Field(default_factory=tuple)
@@ -203,6 +211,23 @@ class RepositoryMapping(WorkflowModel):
             return value
         raise ValueError("repo_url must be HTTP(S), SSH, git@, or an absolute local path")
 
+    @field_validator("source_path")
+    @classmethod
+    def validate_source_path(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
+            raise ValueError("source_path must be absolute")
+        return value
+
+    @field_validator("depends_on")
+    @classmethod
+    def validate_dependencies(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("repository dependencies must be unique")
+        for value in values:
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+                raise ValueError("repository dependency must be a safe repository key")
+        return values
+
     @field_validator("test_commands", "lint_commands", "build_commands")
     @classmethod
     def validate_commands(cls, commands: tuple[str, ...]) -> tuple[str, ...]:
@@ -250,6 +275,84 @@ class RepositoryMapping(WorkflowModel):
             raise ValueError("repository commands must be unique by canonical argv")
         return self
 
+
+class RepositoryGroupMapping(WorkflowModel):
+    key: str
+    project_id: str
+    iteration_id: str
+    primary_repository: str
+    repositories: tuple[RepositoryMapping, ...] = Field(min_length=1)
+    integration_test_commands: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("key", "primary_repository")
+    @classmethod
+    def validate_safe_key(cls, value: str, info: Any) -> str:
+        _non_empty(value, info.field_name)
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+            raise ValueError(f"{info.field_name} must be one safe ASCII path segment")
+        return value
+
+    @field_validator("project_id", "iteration_id")
+    @classmethod
+    def validate_scope(cls, value: str, info: Any) -> str:
+        return _non_empty(value, info.field_name)
+
+    @field_validator("integration_test_commands")
+    @classmethod
+    def validate_integration_commands(cls, commands: tuple[str, ...]) -> tuple[str, ...]:
+        for command in commands:
+            if not command.strip() or "\x00" in command:
+                raise ValueError("integration test commands must not be blank or contain NUL")
+        return commands
+
+    @model_validator(mode="after")
+    def validate_group(self) -> RepositoryGroupMapping:
+        keys = [item.key for item in self.repositories]
+        if len(keys) != len(set(keys)):
+            raise ValueError("repository keys must be unique within a group")
+        if any(
+            item.project_id != self.project_id or item.iteration_id != self.iteration_id
+            for item in self.repositories
+        ):
+            raise ValueError("repository scope must match its repository group")
+        primary = [item.key for item in self.repositories if item.role is RepositoryRole.PRIMARY]
+        if len(primary) != 1:
+            raise ValueError("repository group must contain exactly one primary repository")
+        if primary[0] != self.primary_repository:
+            raise ValueError("primary_repository must match the primary repository role")
+        known = set(keys)
+        for item in self.repositories:
+            for dependency in item.depends_on:
+                if dependency not in known:
+                    raise ValueError("repository dependency references an unknown repository")
+                if dependency == item.key:
+                    raise ValueError("repository cannot depend on itself")
+        self.topological_keys()
+        return self
+
+    def topological_keys(self) -> tuple[str, ...]:
+        order = {item.key: index for index, item in enumerate(self.repositories)}
+        indegree = {item.key: 0 for item in self.repositories}
+        children: dict[str, list[str]] = {item.key: [] for item in self.repositories}
+        for item in self.repositories:
+            for dependency in item.depends_on:
+                indegree[item.key] += 1
+                children[dependency].append(item.key)
+        ready = sorted(
+            (key for key, count in indegree.items() if count == 0), key=order.__getitem__
+        )
+        result: list[str] = []
+        while ready:
+            key = ready.pop(0)
+            result.append(key)
+            for child in sorted(children[key], key=order.__getitem__):
+                indegree[child] -= 1
+                if indegree[child] == 0:
+                    ready.append(child)
+                    ready.sort(key=order.__getitem__)
+        if len(result) != len(self.repositories):
+            raise ValueError("repository dependencies must be acyclic")
+        return tuple(result)
 
 class DefectCandidate(WorkflowModel):
     """Frozen, neutral candidate summary safe to display to callers."""
@@ -555,6 +658,42 @@ class CommandResult(WorkflowModel):
         return self
 
 
+class RepositoryRunEvidence(WorkflowModel):
+    repository_key: str
+    mapping: RepositoryMapping
+    prepared_worktree: PreparedWorktree
+    tested_snapshot: RepositorySnapshot | None = None
+    test_results: tuple[CommandResult, ...] = Field(default_factory=tuple)
+    changed_files: tuple[str, ...] = Field(default_factory=tuple)
+
+    @field_validator("repository_key")
+    @classmethod
+    def validate_repository_key(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+            raise ValueError("repository evidence key must be a safe repository key")
+        return value
+
+    @field_validator("changed_files")
+    @classmethod
+    def validate_changed_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            RepositorySnapshot._validate_repository_path(value)
+        if len(values) != len(set(values)):
+            raise ValueError("repository evidence changed files must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_mapping_and_snapshot(self) -> RepositoryRunEvidence:
+        if self.repository_key != self.mapping.key:
+            raise ValueError("repository evidence key must match its mapping")
+        if self.tested_snapshot is not None:
+            if self.tested_snapshot.head_commit != self.prepared_worktree.head_commit:
+                raise ValueError("tested snapshot HEAD must match prepared worktree HEAD")
+            if self.changed_files and self.changed_files != self.tested_snapshot.changed_files:
+                raise ValueError("repository evidence changed files must match tested snapshot")
+        return self
+
+
 class AcceptanceCoverage(WorkflowModel):
     criterion_id: str
     criterion_text: str
@@ -770,6 +909,44 @@ class PublicationResult(WorkflowModel):
         return self
 
 
+class RepositoryPublicationResult(PublicationResult):
+    repository_key: str
+
+    @field_validator("repository_key")
+    @classmethod
+    def validate_repository_key(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+            raise ValueError("publication repository key must be safe")
+        return value
+
+
+class MultiRepositoryPublicationResult(WorkflowModel):
+    order: tuple[str, ...] = Field(default_factory=tuple)
+    repositories: tuple[RepositoryPublicationResult, ...] = Field(default_factory=tuple)
+    comment_marker: str = ""
+    comment_id: str = ""
+    error: str = ""
+
+    @field_validator("order")
+    @classmethod
+    def validate_order(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(values) != len(set(values)):
+            raise ValueError("publication repository order must be unique")
+        for value in values:
+            if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+                raise ValueError("publication repository order contains an unsafe key")
+        return values
+
+    @model_validator(mode="after")
+    def validate_repositories(self) -> MultiRepositoryPublicationResult:
+        keys = tuple(item.repository_key for item in self.repositories)
+        if keys and keys != self.order:
+            raise ValueError("publication repositories must follow publication order")
+        if self.comment_id and not self.comment_marker:
+            raise ValueError("publication comment fact requires a marker")
+        return self
+
+
 class RevisionRecord(WorkflowModel):
     feedback: str
     occurred_at: datetime
@@ -778,6 +955,7 @@ class RevisionRecord(WorkflowModel):
 class WorkflowRun(WorkflowModel):
     run_id: str
     type: WorkflowType
+    repository_model_version: StrictInt = 1
     state: WorkflowState = WorkflowState.CREATED
     version: StrictInt = 0
     history: tuple[StateEvent, ...] = Field(default_factory=tuple)
@@ -791,6 +969,9 @@ class WorkflowRun(WorkflowModel):
     wiki_snapshots: tuple[WikiPageSnapshot, ...] = Field(default_factory=tuple)
     repository: RepositoryMapping | None = None
     repository_candidates: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
+    repository_group: RepositoryGroupMapping | None = None
+    repository_evidence: tuple[RepositoryRunEvidence, ...] = Field(default_factory=tuple)
+    integration_test_results: tuple[CommandResult, ...] = Field(default_factory=tuple)
     prepared_worktree: PreparedWorktree | None = None
     tested_snapshot: RepositorySnapshot | None = None
     pre_fix_snapshot: RepositorySnapshot | None = None
@@ -815,6 +996,7 @@ class WorkflowRun(WorkflowModel):
     review: CodexResult | None = None
     approval: ApprovalPackage | None = None
     publication: PublicationResult = Field(default_factory=PublicationResult)
+    group_publication: MultiRepositoryPublicationResult | None = None
     resume_state: WorkflowState | None = None
     blocked_reason: str = ""
     error: str = ""
@@ -825,6 +1007,26 @@ class WorkflowRun(WorkflowModel):
 
     @model_validator(mode="after")
     def validate_single_selected_defect(self) -> WorkflowRun:
+        if self.repository_model_version not in {1, 2}:
+            raise ValueError("repository_model_version is unsupported")
+        if self.repository_group is None:
+            if self.repository_evidence or self.integration_test_results or self.group_publication:
+                raise ValueError("repository group facts require a repository group")
+        else:
+            if self.repository_model_version != 2:
+                raise ValueError("repository groups require repository model version 2")
+            expected = self.repository_group.topological_keys()
+            evidence_keys = tuple(item.repository_key for item in self.repository_evidence)
+            if evidence_keys and evidence_keys != expected:
+                raise ValueError("repository evidence must follow complete group topology")
+            configured = {item.key: item for item in self.repository_group.repositories}
+            if any(
+                item.mapping != configured[item.repository_key]
+                for item in self.repository_evidence
+            ):
+                raise ValueError("repository evidence mapping differs from repository group")
+            if self.group_publication is not None and self.group_publication.order != expected:
+                raise ValueError("group publication order differs from repository topology")
         if self.reproduction_test_sha256 and re.fullmatch(
             r"[0-9a-f]{64}", self.reproduction_test_sha256
         ) is None:
@@ -853,6 +1055,7 @@ class WorkflowRun(WorkflowModel):
         return cls(
             run_id=uuid.uuid4().hex,
             type=workflow_type,
+            repository_model_version=2,
             state=WorkflowState.CREATED,
             version=0,
             history=(),
@@ -880,6 +1083,7 @@ class WorkflowRun(WorkflowModel):
         return cls(
             run_id=uuid.uuid4().hex,
             type=WorkflowType.DEFECT,
+            repository_model_version=2,
             state=WorkflowState.CREATED,
             version=0,
             history=(),
@@ -948,8 +1152,13 @@ __all__ = [
     "DefectCandidate",
     "DefectCheckpoint",
     "PublicationResult",
+    "RepositoryPublicationResult",
+    "MultiRepositoryPublicationResult",
     "PreparedWorktree",
     "RepositoryMapping",
+    "RepositoryGroupMapping",
+    "RepositoryRole",
+    "RepositoryRunEvidence",
     "RepositorySnapshot",
     "RequirementRecord",
     "RootCauseEvidence",
