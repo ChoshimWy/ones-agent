@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
@@ -100,6 +102,23 @@ def app_factory() -> DeveloperWorkflowTuiApp:
         provider_type="github",
         sandbox_configured=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_app_close_is_idempotent() -> None:
+    app = app_factory()
+    closes: list[object] = []
+
+    class Supervisor:
+        async def close(self) -> None:
+            closes.append(self)
+
+    app.supervisor = Supervisor()  # type: ignore[assignment]
+
+    await app._close_ui()
+    await app._close_ui()
+
+    assert len(closes) == 1
 
 
 @pytest.mark.asyncio
@@ -286,6 +305,46 @@ async def test_refresh_replaces_list_atomically_and_preserves_selected_run() -> 
         assert len(screen.query("#run-list ListItem")) == 0
         overview = screen.query_one("#overview-content")
         assert str(overview.renderable) == "No run selected"
+
+
+@pytest.mark.asyncio
+async def test_blocked_poll_never_overwrites_concurrent_mouse_selection() -> None:
+    app = app_factory()
+    controller = app.controller  # type: ignore[attr-defined]
+    original_list = controller.list_runs
+    gates: list[tuple[Event, Event]] = []
+
+    def blocked_list(filters: RunFilter, activities=None):
+        if gates:
+            started, release = gates.pop(0)
+            started.set()
+            assert release.wait(2)
+        return original_list(filters, activities)
+
+    controller.list_runs = blocked_list  # type: ignore[method-assign]
+    async with app.run_test(size=(120, 32)) as pilot:
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        for _ in range(20):
+            screen.action_cursor_up()
+            await pilot.pause()
+            assert screen.query_one("#run-list").index == 0
+            started, release = Event(), Event()
+            gates.append((started, release))
+            refresh = asyncio.create_task(screen.refresh_runs())
+            assert await asyncio.to_thread(started.wait, 2)
+
+            current_item = screen.query_one("#run-item-1")
+            await screen.click_run(  # type: ignore[arg-type]
+                SimpleNamespace(widget=current_item)
+            )
+            shown_after_click = len(controller.shown)
+            release.set()
+            await refresh
+
+            assert screen.query_one("#run-list").index == 1
+            assert controller.shown[-1] == "run-2"
+            assert "run-1" not in controller.shown[shown_after_click:]
 
 
 @pytest.mark.asyncio

@@ -195,6 +195,46 @@ _GIT_IDENTITY_ENV_ALLOWLIST = frozenset(
 )
 
 
+def validate_git_identity_environment(
+    identity: Mapping[str, str],
+) -> dict[str, str]:
+    """Validate the complete explicit Git identity without invoking Git."""
+
+    if not isinstance(identity, Mapping):
+        raise RepositoryBoundaryError("explicit Git environment is invalid")
+    identity_values = dict(identity)
+    if any(key not in _GIT_IDENTITY_ENV_ALLOWLIST for key in identity_values):
+        raise RepositoryBoundaryError(
+            "Git identity environment contains a forbidden key"
+        )
+    if identity_values and set(identity_values) != _GIT_IDENTITY_ENV_ALLOWLIST:
+        raise RepositoryBoundaryError("Git identity environment is incomplete")
+    if any(
+        type(value) is not str
+        or not value.strip()
+        or len(value) > 320
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        for value in identity_values.values()
+    ):
+        raise RepositoryBoundaryError(
+            "Git identity environment contains an invalid value"
+        )
+    try:
+        for value in identity_values.values():
+            value.encode("utf-8", "strict")
+    except UnicodeError:
+        raise RepositoryBoundaryError(
+            "Git identity environment contains invalid UTF-8"
+        ) from None
+    for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        value = identity_values.get(key)
+        if value is not None and re.fullmatch(
+            r"[^@\s<>]+@[^@\s<>]+", value
+        ) is None:
+            raise RepositoryBoundaryError("Git identity email is invalid")
+    return identity_values
+
+
 def _isolated_git_environment(
     credential_environment: Mapping[str, str] | None = None,
     *,
@@ -375,30 +415,9 @@ class WorktreeRepository:
             identity = self.identity_env_provider()
         except Exception:
             raise RepositoryBoundaryError("explicit Git environment is unavailable") from None
-        if not isinstance(supplied, Mapping) or not isinstance(identity, Mapping):
+        if not isinstance(supplied, Mapping):
             raise RepositoryBoundaryError("explicit Git environment is invalid")
-        identity_values = dict(identity)
-        if any(key not in _GIT_IDENTITY_ENV_ALLOWLIST for key in identity_values):
-            raise RepositoryBoundaryError("Git identity environment contains a forbidden key")
-        if identity_values and set(identity_values) != _GIT_IDENTITY_ENV_ALLOWLIST:
-            raise RepositoryBoundaryError("Git identity environment is incomplete")
-        if any(
-            type(value) is not str
-            or not value.strip()
-            or len(value) > 320
-            or any(ord(character) < 32 or ord(character) == 127 for character in value)
-            for value in identity_values.values()
-        ):
-            raise RepositoryBoundaryError("Git identity environment contains an invalid value")
-        try:
-            for value in identity_values.values():
-                value.encode("utf-8", "strict")
-        except UnicodeError:
-            raise RepositoryBoundaryError("Git identity environment contains invalid UTF-8") from None
-        for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
-            value = identity_values.get(key)
-            if value is not None and re.fullmatch(r"[^@\s<>]+@[^@\s<>]+", value) is None:
-                raise RepositoryBoundaryError("Git identity email is invalid")
+        identity_values = validate_git_identity_environment(identity)
         environment = _isolated_git_environment(
             supplied,
             controlled_home=self._controlled_git_home,

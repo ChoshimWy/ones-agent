@@ -16,6 +16,7 @@ from src.developer_workflow.codex_runner import (
     CodexRunner,
     CodexTimeoutError,
     UnsafeCodexRunError,
+    validate_codex_auth_source,
 )
 from src.developer_workflow.contracts import (
     PreparedWorktree,
@@ -31,6 +32,25 @@ from src.developer_workflow.repository_group import PreparedRepository
 
 OID = "a" * 40
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def test_codex_auth_source_accepts_environment_auth_without_returning_secret() -> None:
+    assert validate_codex_auth_source(
+        {"CODEX_API_KEY": "runtime-only-codex-auth"}
+    ) is None
+
+
+def test_codex_auth_source_requires_a_regular_auth_file_in_codex_home(
+    tmp_path: Path,
+) -> None:
+    codex_home = (tmp_path / "codex-home").resolve()
+    codex_home.mkdir()
+
+    with pytest.raises(UnsafeCodexRunError, match="authentication source"):
+        validate_codex_auth_source({"CODEX_HOME": str(codex_home)})
+
+    (codex_home / "auth.json").write_text("{}", encoding="utf-8")
+    assert validate_codex_auth_source({"CODEX_HOME": str(codex_home)}) == codex_home
 
 
 def _prepared(root: Path) -> PreparedWorktree:

@@ -975,10 +975,7 @@ def _resolve_codex_home(source: Mapping[str, str]) -> Path | None:
         ) from error
     try:
         resolved = candidate.resolve(strict=True)
-        if (
-            not resolved.is_dir()
-            or not resolved.is_absolute()
-        ):
+        if not resolved.is_dir() or not resolved.is_absolute():
             raise UnsafeCodexRunError(
                 "Codex authentication directory is unsafe or unavailable"
             )
@@ -991,6 +988,55 @@ def _resolve_codex_home(source: Mapping[str, str]) -> Path | None:
         raise UnsafeCodexRunError(
             "Codex authentication directory is unsafe or unavailable"
         ) from error
+
+
+def validate_codex_auth_source(source: Mapping[str, str]) -> Path | None:
+    """Validate Codex authentication shape without reading credential content."""
+
+    explicit_home = _environment_value(source, "CODEX_HOME")
+    if explicit_home is None:
+        configured_auth = tuple(
+            value
+            for name in ("CODEX_API_KEY", "CODEX_AUTH_TOKEN", "OPENAI_API_KEY")
+            if (value := _environment_value(source, name))
+        )
+        if configured_auth:
+            if any(
+                value != value.strip()
+                or len(value) > 65536
+                or any(
+                    ord(character) < 32 or ord(character) == 127
+                    for character in value
+                )
+                for value in configured_auth
+            ):
+                raise UnsafeCodexRunError(
+                    "Codex authentication source is unavailable"
+                )
+            return None
+
+    codex_home = _resolve_codex_home(source)
+    if codex_home is None:
+        raise UnsafeCodexRunError("Codex authentication source is unavailable")
+    auth_file = codex_home / "auth.json"
+    try:
+        metadata = auth_file.lstat()
+        resolved = auth_file.resolve(strict=True)
+        if (
+            _is_reparse_or_link(auth_file)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size <= 0
+            or metadata.st_size > 1024 * 1024
+            or resolved.parent != codex_home
+        ):
+            raise UnsafeCodexRunError("Codex authentication source is unavailable")
+    except UnsafeCodexRunError:
+        raise
+    except OSError:
+        raise UnsafeCodexRunError(
+            "Codex authentication source is unavailable"
+        ) from None
+    return codex_home
 
 
 @dataclass(slots=True)

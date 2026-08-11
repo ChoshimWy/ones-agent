@@ -932,6 +932,8 @@ class DashboardScreen(Screen[None]):
         self._refresh_done = asyncio.Event()
         self._refresh_done.set()
         self._detail_sequence = 0
+        self._selection_generation = 0
+        self._applying_refresh = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -996,6 +998,7 @@ class DashboardScreen(Screen[None]):
             and 0 <= selected_index < len(self._runs)
             else None
         )
+        selection_generation = self._selection_generation
         try:
             runs = await asyncio.to_thread(
                 self._controller.list_runs,
@@ -1012,11 +1015,23 @@ class DashboardScreen(Screen[None]):
             self._detail_error = _LIST_UNAVAILABLE
             self.query_one(RunDetailPane).show_error(self._detail_error)
             return
+        if selection_generation != self._selection_generation:
+            current_index = self._selected_index()
+            selected_run_id = (
+                self._runs[current_index].run_id
+                if current_index is not None
+                and 0 <= current_index < len(self._runs)
+                else None
+            )
         self._detail_sequence += 1
         self._runs = runs
         if not self.is_mounted:
             return
-        await self.query_one(RunListPane).replace_runs(runs)
+        self._applying_refresh = True
+        try:
+            await self.query_one(RunListPane).replace_runs(runs)
+        finally:
+            self._applying_refresh = False
         if not runs:
             self._detail_error = ""
             self.query_one(RunDetailPane).clear_detail()
@@ -1060,9 +1075,11 @@ class DashboardScreen(Screen[None]):
         return detail
 
     def action_cursor_down(self) -> None:
+        self._selection_generation += 1
         self.query_one("#run-list", ListView).action_cursor_down()
 
     def action_cursor_up(self) -> None:
+        self._selection_generation += 1
         self.query_one("#run-list", ListView).action_cursor_up()
 
     async def action_open_run(self) -> None:
@@ -1311,6 +1328,8 @@ class DashboardScreen(Screen[None]):
             and 0 <= index < len(self._runs)
             and event.item.name == self._runs[index].run_id
         ):
+            if not self._applying_refresh:
+                self._selection_generation += 1
             await self._show_detail(index)
 
     @on(events.Click, "#run-list ListItem")
@@ -1326,6 +1345,7 @@ class DashboardScreen(Screen[None]):
         if len(matches) != 1:
             return
         index = matches[0]
+        self._selection_generation += 1
         self.query_one("#run-list", ListView).index = index
         await self._show_detail(index)
 

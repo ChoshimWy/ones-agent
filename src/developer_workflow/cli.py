@@ -8,8 +8,10 @@ import json
 import os
 import re
 import sys
+import tempfile
 import unicodedata
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol, TextIO
 from urllib.parse import urlsplit
 
@@ -41,6 +43,10 @@ class DefectListFactory(Protocol):
 
 class TuiRunner(Protocol):
     def __call__(self, controller: object, max_concurrency: int) -> None: ...
+
+
+class SandboxProfileValidator(Protocol):
+    def __call__(self, profile: str) -> None: ...
 
 
 class _ParserExit(Exception):
@@ -491,8 +497,31 @@ def _valid_runtime_text(value: str) -> bool:
     )
 
 
+def _validate_sandbox_permission_profile(profile: str) -> None:
+    """Prove the managed profile's sandbox capabilities before service startup."""
+
+    from .requirement_flow import SandboxCommandExecutor
+
+    with tempfile.TemporaryDirectory(prefix="ones-dev-sandbox-preflight-") as raw:
+        cwd = Path(raw).resolve(strict=True)
+        executor = SandboxCommandExecutor(permission_profile=profile)
+        completed = executor(
+            [sys.executable, "-I", "-c", "print('sandbox-preflight')"],
+            cwd=cwd,
+            env=dict(os.environ),
+            timeout=20,
+            max_output_bytes=64 * 1024,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("sandbox profile is unavailable")
+
+
 def build_production_orchestrator(
     config: DeveloperWorkflowConfig,
+    *,
+    sandbox_profile_validator: SandboxProfileValidator = (
+        _validate_sandbox_permission_profile
+    ),
 ) -> DeveloperWorkflowOrchestrator:
     """Build the real local service graph from config plus explicit secret env vars."""
 
@@ -500,13 +529,13 @@ def build_production_orchestrator(
     from src.services.ones_gateway import OnesGateway
 
     from .approval_rebuilder import WorkflowApprovalRebuilder
-    from .codex_runner import CodexRunner
+    from .codex_runner import CodexRunner, validate_codex_auth_source
     from .defect_flow import DefectCandidateService, DefectFlow
     from .ones_comment import OnesCommenter
     from .pr_provider import HttpPullRequestClient, parse_repository_identity
     from .publisher import Publisher
     from .private_paths import prepare_private_roots
-    from .repository import WorktreeRepository
+    from .repository import WorktreeRepository, validate_git_identity_environment
     from .repository_group import RepositoryGroupWorkspace
     from .requirement_flow import RequirementFlow, SandboxCommandExecutor
     from .state_store import FileRunStore
@@ -561,6 +590,19 @@ def build_production_orchestrator(
     ):
         parse_repository_identity(mapping.repo_url, provider_host)
 
+    identity_values = {
+        "GIT_AUTHOR_NAME": author_name,
+        "GIT_AUTHOR_EMAIL": author_email,
+        "GIT_COMMITTER_NAME": author_name,
+        "GIT_COMMITTER_EMAIL": author_email,
+    }
+    try:
+        validate_git_identity_environment(identity_values)
+        validate_codex_auth_source(os.environ)
+        sandbox_profile_validator(config.sandbox_permission_profile)
+    except Exception:
+        raise RuntimeError("production runtime configuration is incomplete") from None
+
     run_root, mirror_root, worktree_root = prepare_private_roots(
         (config.run_root, config.mirror_root, config.worktree_root)
     )
@@ -569,12 +611,7 @@ def build_production_orchestrator(
         return dict(git_credential_values)
 
     def git_identity() -> dict[str, str]:
-        return {
-            "GIT_AUTHOR_NAME": author_name,
-            "GIT_AUTHOR_EMAIL": author_email,
-            "GIT_COMMITTER_NAME": author_name,
-            "GIT_COMMITTER_EMAIL": author_email,
-        }
+        return dict(identity_values)
 
     store = FileRunStore(run_root)
     repository = WorktreeRepository(
@@ -690,7 +727,15 @@ def _execute_tui(
 
     orchestrator = factory(config)
     controller = TuiController(orchestrator, RunIndex(orchestrator.store))
-    tui_runner(controller, config.tui_max_concurrency)
+    try:
+        tui_runner(controller, config.tui_max_concurrency)
+    except BaseException:
+        try:
+            controller.close()
+        except BaseException:
+            pass
+        raise
+    controller.close()
     return 0
 
 

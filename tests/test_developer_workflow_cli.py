@@ -726,7 +726,9 @@ def test_production_factory_fails_closed_when_runtime_secrets_are_missing(
         "ONES_DEV_PROVIDER_API_URL",
     ):
         monkeypatch.delenv(name, raising=False)
-    with pytest.raises(RuntimeError, match="production runtime configuration is incomplete"):
+    with pytest.raises(
+        RuntimeError, match="production runtime configuration is incomplete"
+    ):
         build_production_orchestrator(DeveloperWorkflowConfig.load(_config_file(tmp_path)))
 
 
@@ -795,6 +797,7 @@ def _set_complete_non_ones_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
         "ONES_DEV_PROVIDER_API_URL": "https://example.invalid/api/v3",
         "ONES_DEV_GIT_AUTHOR_NAME": "ONES Dev",
         "ONES_DEV_GIT_AUTHOR_EMAIL": "ones-dev@example.invalid",
+        "CODEX_API_KEY": "runtime-only-codex-auth",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -817,7 +820,8 @@ def test_production_factory_builds_the_real_service_graph_without_network(
     )
 
     orchestrator = build_production_orchestrator(
-        DeveloperWorkflowConfig.load(_config_file(tmp_path))
+        DeveloperWorkflowConfig.load(_config_file(tmp_path)),
+        sandbox_profile_validator=lambda profile: None,
     )
 
     assert isinstance(orchestrator.requirement_flow, RequirementFlow)
@@ -825,6 +829,100 @@ def test_production_factory_builds_the_real_service_graph_without_network(
     assert isinstance(orchestrator.publisher, Publisher)
     assert orchestrator.requirement_flow.store is orchestrator.store
     assert orchestrator.defect_flow.repository is orchestrator.requirement_flow.repository
+
+
+def test_production_factory_rejects_invalid_git_email_before_creating_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.cli import build_production_orchestrator
+
+    _set_complete_non_ones_runtime(monkeypatch)
+    monkeypatch.setenv("ONES_EMAIL", "developer@example.invalid")
+    monkeypatch.setenv("ONES_PASSWORD", "runtime-password")
+    monkeypatch.setenv(
+        "ONES_COMMENT_LIST_PATH_TEMPLATE",
+        "/project/api/project/team/{team_id}/task/{item_id}/comments",
+    )
+    monkeypatch.setenv("ONES_DEV_GIT_AUTHOR_EMAIL", "not-an-email")
+    config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
+
+    with pytest.raises(RuntimeError, match="production runtime configuration is incomplete"):
+        build_production_orchestrator(
+            config, sandbox_profile_validator=lambda profile: None
+        )
+
+    assert not config.run_root.exists()
+    assert not config.mirror_root.exists()
+    assert not config.worktree_root.exists()
+
+
+def test_production_factory_requires_a_verified_codex_auth_source_before_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.cli import build_production_orchestrator
+
+    _set_complete_non_ones_runtime(monkeypatch)
+    monkeypatch.setenv("ONES_EMAIL", "developer@example.invalid")
+    monkeypatch.setenv("ONES_PASSWORD", "runtime-password")
+    monkeypatch.setenv(
+        "ONES_COMMENT_LIST_PATH_TEMPLATE",
+        "/project/api/project/team/{team_id}/task/{item_id}/comments",
+    )
+    empty_profile = (tmp_path / "empty-profile").resolve()
+    empty_profile.mkdir()
+    monkeypatch.setenv("USERPROFILE", str(empty_profile))
+    monkeypatch.setenv("HOME", str(empty_profile))
+    for name in (
+        "CODEX_HOME",
+        "CODEX_API_KEY",
+        "CODEX_AUTH_TOKEN",
+        "OPENAI_API_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
+
+    with pytest.raises(
+        RuntimeError, match="production runtime configuration is incomplete"
+    ):
+        build_production_orchestrator(
+            config, sandbox_profile_validator=lambda profile: None
+        )
+
+    assert not config.run_root.exists()
+    assert not config.mirror_root.exists()
+    assert not config.worktree_root.exists()
+
+
+def test_production_factory_validates_managed_sandbox_profile_before_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.cli import build_production_orchestrator
+
+    _set_complete_non_ones_runtime(monkeypatch)
+    monkeypatch.setenv("ONES_EMAIL", "developer@example.invalid")
+    monkeypatch.setenv("ONES_PASSWORD", "runtime-password")
+    monkeypatch.setenv(
+        "ONES_COMMENT_LIST_PATH_TEMPLATE",
+        "/project/api/project/team/{team_id}/task/{item_id}/comments",
+    )
+    config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
+    seen: list[str] = []
+
+    def reject_profile(profile: str) -> None:
+        seen.append(profile)
+        raise RuntimeError("sandbox profile is unavailable")
+
+    with pytest.raises(
+        RuntimeError, match="production runtime configuration is incomplete"
+    ):
+        build_production_orchestrator(
+            config, sandbox_profile_validator=reject_profile
+        )
+
+    assert seen == ["managed-dev"]
+    assert not config.run_root.exists()
+    assert not config.mirror_root.exists()
+    assert not config.worktree_root.exists()
 
 
 @pytest.mark.parametrize(

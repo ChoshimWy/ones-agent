@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 
 from src.developer_workflow import cli
 from src.developer_workflow.config import DeveloperWorkflowConfig
+from src.developer_workflow.tui.controller import TuiController
 
 
 def _config_file(tmp_path: Path) -> Path:
@@ -50,10 +52,18 @@ class _Orchestrator:
 
 
 def test_tui_command_reuses_factory_orchestrator_store_and_configured_limit(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     orchestrator = _Orchestrator()
     seen: list[object] = []
+    closed: list[object] = []
+    original_close = TuiController.close
+
+    def close(controller: TuiController) -> None:
+        closed.append(controller)
+        original_close(controller)
+
+    monkeypatch.setattr(TuiController, "close", close)
 
     def factory(config: DeveloperWorkflowConfig) -> _Orchestrator:
         seen.append(config)
@@ -74,6 +84,81 @@ def test_tui_command_reuses_factory_orchestrator_store_and_configured_limit(
     assert limit == 3
     assert controller._orchestrator is orchestrator  # type: ignore[attr-defined]
     assert controller._run_index._store is orchestrator.store  # type: ignore[attr-defined]
+    assert closed == [controller]
+
+
+class _RunnerFailure(RuntimeError):
+    pass
+
+
+def test_execute_tui_preserves_runner_failure_when_controller_close_also_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
+    orchestrator = _Orchestrator()
+    closes: list[object] = []
+
+    def close(controller: TuiController) -> None:
+        closes.append(controller)
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(TuiController, "close", close)
+
+    with pytest.raises(_RunnerFailure, match="runner failed"):
+        cli._execute_tui(
+            config,
+            lambda loaded: orchestrator,  # type: ignore[arg-type]
+            lambda controller, limit: (_ for _ in ()).throw(
+                _RunnerFailure("runner failed")
+            ),
+        )
+    assert len(closes) == 1
+
+
+def test_tui_keyboard_interrupt_is_not_obscured_by_controller_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = _Orchestrator()
+    closes: list[object] = []
+
+    def close(controller: TuiController) -> None:
+        closes.append(controller)
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(TuiController, "close", close)
+
+    code = cli.main(
+        ["tui", "--config", str(_config_file(tmp_path))],
+        factory=lambda loaded: orchestrator,  # type: ignore[arg-type]
+        tui_runner=lambda controller, limit: (_ for _ in ()).throw(
+            KeyboardInterrupt()
+        ),
+    )
+
+    assert code == 130
+    assert len(closes) == 1
+
+
+def test_tui_controller_close_failure_after_normal_runner_fails_safely(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    orchestrator = _Orchestrator()
+    monkeypatch.setattr(
+        TuiController,
+        "close",
+        lambda controller: (_ for _ in ()).throw(RuntimeError("close failed")),
+    )
+    error = io.StringIO()
+
+    code = cli.main(
+        ["tui", "--config", str(_config_file(tmp_path))],
+        factory=lambda loaded: orchestrator,  # type: ignore[arg-type]
+        tui_runner=lambda controller, limit: None,
+        stderr=error,
+    )
+
+    assert code == 1
+    assert error.getvalue() == "error: command failed safely\n"
 
 
 def test_incomplete_production_runtime_fails_before_tui_runner_and_root_creation(
