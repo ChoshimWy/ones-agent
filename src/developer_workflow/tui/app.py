@@ -11,7 +11,7 @@ from textual.timer import Timer
 
 from .controller import TuiController
 from .models import RunActivity
-from .screens import DashboardScreen, SettingsView
+from .screens import DashboardScreen, HelpScreen, SettingsView
 from .supervisor import RunTaskSupervisor, TaskEvent
 
 
@@ -119,6 +119,18 @@ class DeveloperWorkflowTuiApp(App[None]):
     async def action_quit(self) -> None:
         await self._close_ui()
         self.exit()
+
+    def action_help(self) -> None:
+        if self.screen is self._dashboard:
+            self.push_screen(HelpScreen())
+
+    def action_search(self) -> None:
+        if self.screen is self._dashboard:
+            self._dashboard.action_search()
+
+    def action_filter(self) -> None:
+        if self.screen is self._dashboard:
+            self._dashboard.action_filter()
 
     async def on_unmount(self) -> None:
         await self._close_ui()

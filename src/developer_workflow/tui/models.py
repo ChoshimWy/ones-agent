@@ -229,6 +229,23 @@ class RunFilter:
     states: tuple[WorkflowState, ...] = ()
     workflow_types: tuple[WorkflowType, ...] = ()
     query: str = ""
+    updated_after: datetime | None = None
+    updated_before: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for value in (self.updated_after, self.updated_before):
+            if value is not None and (
+                type(value) is not datetime
+                or value.tzinfo is None
+                or value.utcoffset() is None
+            ):
+                raise ValueError("run filter timestamps must be timezone-aware")
+        if (
+            self.updated_after is not None
+            and self.updated_before is not None
+            and self.updated_after > self.updated_before
+        ):
+            raise ValueError("run filter timestamp range is invalid")
 
     def matches(self, item: RunSummary) -> bool:
         query = safe_tui_text(
@@ -244,6 +261,14 @@ class RunFilter:
                 not query
                 or query in item.work_item_id.casefold()
                 or query in item.run_id.casefold()
+            )
+            and (
+                self.updated_after is None
+                or item.updated_at >= self.updated_after
+            )
+            and (
+                self.updated_before is None
+                or item.updated_at <= self.updated_before
             )
         )
 

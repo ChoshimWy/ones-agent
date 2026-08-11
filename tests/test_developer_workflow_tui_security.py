@@ -29,6 +29,7 @@ from src.developer_workflow.tui.models import (
     RunFilter,
     RunSummary,
 )
+from src.developer_workflow.tui.screens import HelpScreen, RunFilterScreen
 from src.developer_workflow.tui.supervisor import TaskEvent
 
 
@@ -298,7 +299,20 @@ async def test_dashboard_settings_help_and_all_dangerous_modals_are_secret_free(
         await pilot.click("#nav-settings")
         _audit(app, "settings")
         await pilot.press("g", "?")
+        assert isinstance(app.screen, HelpScreen)
+        assert len(app.query("#help-screen")) == 1
         _audit(app, "help")
+        await pilot.press("escape")
+        assert app.screen.id == "dashboard-screen"
+        await pilot.press("/")
+        assert isinstance(app.screen, RunFilterScreen)
+        _audit(app, "search")
+        await pilot.press("escape", "f")
+        assert isinstance(app.screen, RunFilterScreen)
+        _audit(app, "filter")
+        app.screen.query_one("#filter-states", Input).value = "invalid-state"
+        await pilot.click("#apply-run-filter")
+        _audit(app, "filter-error")
         await pilot.press("escape", "a")
         _audit(app, "approval-modal")
         await pilot.press("escape", "v")

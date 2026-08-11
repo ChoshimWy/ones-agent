@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime
 import re
 from typing import Literal
 import unicodedata
@@ -28,7 +29,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from ..contracts import WorkflowState
+from ..contracts import WorkflowState, WorkflowType
 from .controller import StaleTuiActionError, TuiController, TuiControllerError
 from .models import (
     DangerousActionRequest,
@@ -39,6 +40,8 @@ from .models import (
     RunDetail,
     RunFilter,
     RunSummary,
+    TuiDisplayError,
+    safe_tui_text,
 )
 from .supervisor import RunTaskSupervisor
 
@@ -663,6 +666,162 @@ class WorkflowTypeScreen(Screen[RunDetail | None]):
             self.action_cancel()
 
 
+_HELP_TEXT = """Developer workflow help
+
+n  new workflow
+/  search by run ID or work item ID
+f  filter by state, workflow type, work item, and updated time
+r  resume selected run
+v  revise selected run
+a  approve selected run
+x  cancel selected run
+q  quit without cancelling running workflow work
+Escape  return
+
+Listing, search, and filter are read-only. Repository changes use managed worktrees.
+Remote publication requires explicit approval.
+"""
+
+
+class HelpScreen(Screen[None]):
+    """Fixed credential-free keyboard help."""
+
+    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+
+    def __init__(self) -> None:
+        super().__init__(id="help-screen")
+
+    def compose(self) -> ComposeResult:
+        yield Static(_HELP_TEXT, id="help-content", markup=False)
+
+    def action_back(self) -> None:
+        self.app.pop_screen()
+
+
+class RunFilterScreen(Screen[RunFilter | None]):
+    """Explicit read-only search/filter editor for persisted run summaries."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, current: RunFilter, *, search_only: bool) -> None:
+        super().__init__(id="search-screen" if search_only else "filter-screen")
+        self._current = current
+        self._search_only = search_only
+
+    def compose(self) -> ComposeResult:
+        yield Label("Search runs" if self._search_only else "Filter runs")
+        yield Input(
+            value=self._current.query,
+            placeholder="Run ID or work item ID",
+            id="work-item-query",
+            max_length=256,
+        )
+        if not self._search_only:
+            yield Input(
+                value=",".join(item.value for item in self._current.states),
+                placeholder="States, comma-separated",
+                id="filter-states",
+                max_length=512,
+            )
+            yield Input(
+                value=",".join(item.value for item in self._current.workflow_types),
+                placeholder="Workflow types, comma-separated",
+                id="filter-types",
+                max_length=128,
+            )
+            yield Input(
+                value=(
+                    self._current.updated_after.isoformat()
+                    if self._current.updated_after is not None
+                    else ""
+                ),
+                placeholder="Updated after, ISO 8601",
+                id="updated-after",
+                max_length=64,
+            )
+            yield Input(
+                value=(
+                    self._current.updated_before.isoformat()
+                    if self._current.updated_before is not None
+                    else ""
+                ),
+                placeholder="Updated before, ISO 8601",
+                id="updated-before",
+                max_length=64,
+            )
+        yield Static("", id="run-filter-notice", markup=False)
+        yield Button("Apply", id="apply-run-filter", variant="primary")
+        yield Button("Clear", id="clear-run-filter")
+        yield Button("Cancel", id="cancel-run-filter")
+
+    @staticmethod
+    def _timestamp(value: str) -> datetime | None:
+        if not value:
+            return None
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("timezone is required")
+        return parsed
+
+    def _build_filter(self) -> RunFilter:
+        query = safe_tui_text(
+            self.query_one("#work-item-query", Input).value,
+            maximum=256,
+            allow_empty=True,
+        ).strip()
+        if self._search_only:
+            return RunFilter(
+                states=self._current.states,
+                workflow_types=self._current.workflow_types,
+                query=query,
+                updated_after=self._current.updated_after,
+                updated_before=self._current.updated_before,
+            )
+        state_values = tuple(
+            value.strip().upper()
+            for value in self.query_one("#filter-states", Input).value.split(",")
+            if value.strip()
+        )
+        type_values = tuple(
+            value.strip().casefold()
+            for value in self.query_one("#filter-types", Input).value.split(",")
+            if value.strip()
+        )
+        return RunFilter(
+            states=tuple(WorkflowState(value) for value in state_values),
+            workflow_types=tuple(WorkflowType(value) for value in type_values),
+            query=query,
+            updated_after=self._timestamp(
+                self.query_one("#updated-after", Input).value.strip()
+            ),
+            updated_before=self._timestamp(
+                self.query_one("#updated-before", Input).value.strip()
+            ),
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel-run-filter":
+            self.action_cancel()
+            return
+        if event.button.id == "clear-run-filter":
+            self.dismiss(RunFilter())
+            return
+        if event.button.id != "apply-run-filter":
+            return
+        try:
+            filters = self._build_filter()
+        except (TuiDisplayError, ValueError):
+            self.query_one("#run-filter-notice", Static).update(
+                "run filter is invalid"
+            )
+            return
+        self.dismiss(filters)
+
+
 @dataclass(frozen=True, slots=True)
 class ApprovalSubmission:
     request: DangerousActionRequest
@@ -938,6 +1097,7 @@ class DashboardScreen(Screen[None]):
         self._mount_generation = 0
         self._lifecycle_active = False
         self._teardown_started = False
+        self._filters = RunFilter()
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -1062,7 +1222,7 @@ class DashboardScreen(Screen[None]):
         try:
             runs = await asyncio.to_thread(
                 self._controller.list_runs,
-                RunFilter(),
+                self._filters,
                 activities,
             )
         except TuiControllerError:
@@ -1171,6 +1331,30 @@ class DashboardScreen(Screen[None]):
             WorkflowTypeScreen(self._controller, self._supervisor),
             callback=lambda detail: None,
         )
+
+    def action_defects(self) -> None:
+        self.app.push_screen(
+            DefectWizardScreen(self._controller, self._supervisor),
+            callback=lambda detail: None,
+        )
+
+    def action_search(self) -> None:
+        self.app.push_screen(
+            RunFilterScreen(self._filters, search_only=True),
+            callback=self._filter_done,
+        )
+
+    def action_filter(self) -> None:
+        self.app.push_screen(
+            RunFilterScreen(self._filters, search_only=False),
+            callback=self._filter_done,
+        )
+
+    async def _filter_done(self, filters: RunFilter | None) -> None:
+        if filters is None:
+            return
+        self._filters = filters
+        await self.refresh_runs()
 
     def _selected_summary(self) -> RunSummary | None:
         index = self._selected_index()
@@ -1417,6 +1601,10 @@ class DashboardScreen(Screen[None]):
     def show_settings(self) -> None:
         self.action_show_settings()
 
+    @on(Button.Pressed, "#nav-defects")
+    def defects(self) -> None:
+        self.action_defects()
+
     @on(Button.Pressed, "#nav-new-run")
     def new_run(self) -> None:
         self.action_new_run()
@@ -1443,11 +1631,13 @@ __all__ = [
     "CancelModal",
     "DashboardScreen",
     "DefectWizardScreen",
+    "HelpScreen",
     "NavigationPane",
     "PublicationResumeModal",
     "RunDetailPane",
     "RunDetailScreen",
     "RunListPane",
+    "RunFilterScreen",
     "RequirementWizardScreen",
     "RevisionModal",
     "SettingsView",

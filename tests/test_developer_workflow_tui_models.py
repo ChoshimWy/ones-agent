@@ -1208,6 +1208,18 @@ def test_run_filter_matches_state_type_and_case_insensitive_query(tmp_path: Path
     assert RunFilter(query="req-中文").matches(summary)
     assert RunFilter(query=summary.run_id.upper()).matches(summary)
     assert not RunFilter(query="missing").matches(summary)
+    assert RunFilter(updated_after=summary.updated_at).matches(summary)
+    assert RunFilter(updated_before=summary.updated_at).matches(summary)
+    assert not RunFilter(
+        updated_after=summary.updated_at.replace(year=2027)
+    ).matches(summary)
+    with pytest.raises(ValueError, match="timezone-aware"):
+        RunFilter(updated_after=summary.updated_at.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="range"):
+        RunFilter(
+            updated_after=summary.updated_at,
+            updated_before=summary.updated_at.replace(year=2025),
+        )
 
 
 def test_dangerous_action_request_captures_confirmation_facts_and_rejects_stale(

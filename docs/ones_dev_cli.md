@@ -26,7 +26,10 @@ uv run ones-dev tui --config docs/examples/ones-dev.config.json
 - `n`：新建需求或缺陷工作流；缺陷查询的状态值必须是 ONES 工作流状态 ID，多个 ID 用英文逗号分隔，不按状态名称匹配。
 - `r`：恢复当前 run；`v`：修订；`a`：打开审批确认；`x`：打开取消确认。
 - `q`：仅退出界面，不取消、回滚或修改任何工作流状态。
-- `j`/`k` 或方向键移动，`Enter` 打开详情，`Tab`/`Shift+Tab` 切换证据页签，`/` 搜索，`f` 过滤，`?` 查看帮助。
+- `j`/`k` 或方向键移动，`Enter` 打开详情，`Tab`/`Shift+Tab` 切换证据页签。
+- `/` 按 run ID 或 work item ID 搜索；`f` 按状态、工作流类型、work item ID 和 ISO 8601 更新时间范围过滤。筛选界面的 `Apply` 才生效，`Clear` 恢复完整列表，`Escape` 保留原筛选。
+- `?` 从 Dashboard 打开固定的安全帮助页，`Escape` 返回。帮助、搜索和筛选均只读，不读取或显示环境变量、凭据与本地路径。
+- 左侧 `Defects` 直接进入缺陷向导；在点击 `Query defects` 前不会查询 ONES、创建 run 或 worktree。
 
 不同 run 最多并行 `tui_max_concurrency` 个任务，超过上限按提交顺序排队；同一
 run 的 mutation 始终 FIFO 串行，底层 operation lock 和 version CAS 仍是最终门禁。

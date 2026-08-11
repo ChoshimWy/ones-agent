@@ -35,7 +35,10 @@ from src.developer_workflow.tui.screens import (
     ApprovalModal,
     CancelModal,
     DashboardScreen,
+    DefectWizardScreen,
+    HelpScreen,
     PublicationResumeModal,
+    RunFilterScreen,
     RevisionModal,
     SettingsView,
 )
@@ -85,10 +88,12 @@ class FakeController:
     def __init__(self) -> None:
         self.runs = (_summary(1), _summary(2))
         self.shown: list[str] = []
+        self.filters: list[RunFilter] = []
 
     def list_runs(self, filters: RunFilter, activities=None):
-        del filters, activities
-        return self.runs
+        del activities
+        self.filters.append(filters)
+        return tuple(item for item in self.runs if filters.matches(item))
 
     def show(self, run_id: str) -> RunDetail:
         self.shown.append(run_id)
@@ -176,6 +181,75 @@ async def test_mouse_selects_run_and_opens_settings() -> None:
                 await asyncio.sleep(0)
         await pilot.click("#nav-settings")
         assert app.screen.query_one("#settings").display
+
+
+@pytest.mark.asyncio
+async def test_help_is_dashboard_only_and_escape_returns() -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.press("?")
+        assert isinstance(app.screen, HelpScreen)
+        assert len(app.query("#help-screen")) == 1
+        help_text = _plain(app.screen.query_one("#help-content"))
+        for key in ("n", "r", "v", "a", "x", "q", "/", "f"):
+            assert key in help_text
+        assert "read-only" in help_text
+        await pilot.press("escape")
+        assert isinstance(app.screen, DashboardScreen)
+
+        await pilot.press("n")
+        wizard = app.screen
+        await pilot.press("?")
+        assert app.screen is wizard
+
+
+@pytest.mark.asyncio
+async def test_search_and_filter_apply_clear_and_escape_without_mutation() -> None:
+    app = app_factory()
+    controller = app.controller
+    async with app.run_test(size=(60, 32)) as pilot:
+        await pilot.press("/")
+        assert isinstance(app.screen, RunFilterScreen)
+        app.screen.query_one("#work-item-query", Input).value = "BUG-2"
+        await pilot.click("#apply-run-filter")
+        assert isinstance(app.screen, DashboardScreen)
+        assert controller.filters[-1].query == "BUG-2"  # type: ignore[attr-defined]
+        assert len(app.screen._runs) == 1
+
+        await pilot.press("f")
+        assert isinstance(app.screen, RunFilterScreen)
+        app.screen.query_one("#filter-states", Input).value = "WAITING_APPROVAL"
+        app.screen.query_one("#filter-types", Input).value = "defect"
+        app.screen.query_one("#updated-after", Input).value = (
+            "2026-08-11T08:00:00+00:00"
+        )
+        app.screen.query_one("#updated-before", Input).value = (
+            "2026-08-11T10:00:00+00:00"
+        )
+        await pilot.click("#apply-run-filter")
+        applied = controller.filters[-1]  # type: ignore[attr-defined]
+        assert applied.states == (WorkflowState.WAITING_APPROVAL,)
+        assert applied.workflow_types == (WorkflowType.DEFECT,)
+        assert applied.query == "BUG-2"
+
+        await pilot.press("f")
+        app.screen.query_one("#filter-states", Input).value = "BROKEN"
+        await pilot.press("escape")
+        assert controller.filters[-1] == applied  # type: ignore[attr-defined]
+        await pilot.press("f")
+        await pilot.click("#clear-run-filter")
+        assert controller.filters[-1] == RunFilter()  # type: ignore[attr-defined]
+        assert len(app.screen._runs) == 2
+
+
+@pytest.mark.asyncio
+async def test_navigation_defects_opens_defect_wizard_without_starting_work() -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)) as pilot:
+        assert app.supervisor.task_count == 0
+        await pilot.click("#nav-defects")
+        assert isinstance(app.screen, DefectWizardScreen)
+        assert app.supervisor.task_count == 0
 
 
 @pytest.mark.asyncio
