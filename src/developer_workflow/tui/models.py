@@ -60,6 +60,21 @@ def safe_tui_text(
     )
 
 
+def validate_tui_input_text(
+    value: str,
+    *,
+    maximum: int,
+    allow_empty: bool = False,
+) -> str:
+    """Validate plain input text without applying render-layer escaping."""
+
+    return _strict_tui_text(
+        value,
+        maximum=maximum,
+        allow_empty=allow_empty,
+    )
+
+
 def _strict_tui_text(
     value: str,
     *,
@@ -248,27 +263,46 @@ class RunFilter:
             raise ValueError("run filter timestamp range is invalid")
 
     def matches(self, item: RunSummary) -> bool:
-        query = safe_tui_text(
+        return self.matches_facts(
+            state=item.state,
+            workflow_type=item.workflow_type,
+            run_id=item.run_id,
+            work_item_id=item.work_item_id,
+            updated_at=item.updated_at,
+        )
+
+    def matches_facts(
+        self,
+        *,
+        state: WorkflowState,
+        workflow_type: WorkflowType,
+        run_id: str,
+        work_item_id: str,
+        updated_at: datetime,
+    ) -> bool:
+        """Match canonical identity facts before display escaping."""
+
+        query = validate_tui_input_text(
             self.query, maximum=256, allow_empty=True
         ).casefold().strip()
         return (
-            (not self.states or item.state in self.states)
+            (not self.states or state in self.states)
             and (
                 not self.workflow_types
-                or item.workflow_type in self.workflow_types
+                or workflow_type in self.workflow_types
             )
             and (
                 not query
-                or query in item.work_item_id.casefold()
-                or query in item.run_id.casefold()
+                or query in work_item_id.casefold()
+                or query in run_id.casefold()
             )
             and (
                 self.updated_after is None
-                or item.updated_at >= self.updated_after
+                or updated_at >= self.updated_after
             )
             and (
                 self.updated_before is None
-                or item.updated_at <= self.updated_before
+                or updated_at <= self.updated_before
             )
         )
 

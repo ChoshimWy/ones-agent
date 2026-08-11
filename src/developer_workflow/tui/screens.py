@@ -41,7 +41,7 @@ from .models import (
     RunFilter,
     RunSummary,
     TuiDisplayError,
-    safe_tui_text,
+    validate_tui_input_text,
 )
 from .supervisor import RunTaskSupervisor
 
@@ -764,7 +764,7 @@ class RunFilterScreen(Screen[RunFilter | None]):
         return parsed
 
     def _build_filter(self) -> RunFilter:
-        query = safe_tui_text(
+        query = validate_tui_input_text(
             self.query_one("#work-item-query", Input).value,
             maximum=256,
             allow_empty=True,

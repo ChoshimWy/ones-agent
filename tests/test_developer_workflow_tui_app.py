@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from threading import Event
 from types import SimpleNamespace
@@ -89,11 +90,26 @@ class FakeController:
         self.runs = (_summary(1), _summary(2))
         self.shown: list[str] = []
         self.filters: list[RunFilter] = []
+        self.raw_work_items = {
+            item.run_id: item.work_item_id for item in self.runs
+        }
 
     def list_runs(self, filters: RunFilter, activities=None):
         del activities
         self.filters.append(filters)
-        return tuple(item for item in self.runs if filters.matches(item))
+        return tuple(
+            item
+            for item in self.runs
+            if filters.matches_facts(
+                state=item.state,
+                workflow_type=item.workflow_type,
+                run_id=item.run_id,
+                work_item_id=self.raw_work_items.get(
+                    item.run_id, item.work_item_id
+                ),
+                updated_at=item.updated_at,
+            )
+        )
 
     def show(self, run_id: str) -> RunDetail:
         self.shown.append(run_id)
@@ -238,8 +254,46 @@ async def test_search_and_filter_apply_clear_and_escape_without_mutation() -> No
         assert controller.filters[-1] == applied  # type: ignore[attr-defined]
         await pilot.press("f")
         await pilot.click("#clear-run-filter")
-        assert controller.filters[-1] == RunFilter()  # type: ignore[attr-defined]
-        assert len(app.screen._runs) == 2
+        async with asyncio.timeout(2):
+            while not (
+                controller.filters[-1] == RunFilter()  # type: ignore[attr-defined]
+                and len(app.screen._runs) == 2
+            ):
+                await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_search_preserves_literal_rich_brackets_and_backslashes() -> None:
+    app = app_factory()
+    controller = app.controller
+    raw_work_item = r"BUG-[bold]\\literal"
+    summary = replace(
+        controller.runs[1],  # type: ignore[attr-defined]
+        work_item_id=safe_tui_text(raw_work_item),
+    )
+    controller.runs = (summary,)  # type: ignore[attr-defined]
+    controller.raw_work_items = {  # type: ignore[attr-defined]
+        summary.run_id: raw_work_item
+    }
+    literal_query = r"[bold]\\literal"
+
+    async with app.run_test(size=(80, 32)) as pilot:
+        await pilot.press("/")
+        app.screen.query_one("#work-item-query", Input).value = literal_query
+        await pilot.click("#apply-run-filter")
+        assert controller.filters[-1].query == literal_query  # type: ignore[attr-defined]
+        assert len(app.screen._runs) == 1
+        assert raw_work_item in _plain(app.screen.query_one("#run-item-0 Label"))
+
+        await pilot.press("/")
+        assert app.screen.query_one("#work-item-query", Input).value == literal_query
+        await pilot.press("escape", "/")
+        app.screen.query_one("#work-item-query", Input).value = "bad\x1bvalue"
+        await pilot.click("#apply-run-filter")
+        assert isinstance(app.screen, RunFilterScreen)
+        assert _plain(app.screen.query_one("#run-filter-notice")) == (
+            "run filter is invalid"
+        )
 
 
 @pytest.mark.asyncio

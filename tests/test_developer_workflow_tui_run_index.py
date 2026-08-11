@@ -62,7 +62,7 @@ def test_run_index_sorts_filters_and_applies_known_activity(tmp_path: Path) -> N
     store = FileRunStore(tmp_path)
     older_id = "1" * 32
     newer_id = "2" * 32
-    store.create(_run(older_id, work_item_id="REQ-older"))
+    store.create(_run(older_id, work_item_id=r"REQ-[older]\\literal"))
     store.create(_run(newer_id, workflow_type="defect", work_item_id="BUG-newer"))
     _set_updated_at(tmp_path, older_id, datetime(2026, 8, 10, tzinfo=UTC))
     _set_updated_at(tmp_path, newer_id, datetime(2026, 8, 11, tzinfo=UTC))
@@ -88,6 +88,10 @@ def test_run_index_sorts_filters_and_applies_known_activity(tmp_path: Path) -> N
     ) == (newer_id, older_id)
     assert tuple(
         item.run_id for item in index.list(RunFilter(query="older"))
+    ) == (older_id,)
+    assert tuple(
+        item.run_id
+        for item in index.list(RunFilter(query=r"[older]\\literal"))
     ) == (older_id,)
 
 

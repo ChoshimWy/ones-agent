@@ -42,7 +42,13 @@ class RunIndex:
                 if filters.matches(item):
                     corrupted.append(item)
                 continue
-            if filters.matches(item):
+            if filters.matches_facts(
+                state=run.state,
+                workflow_type=run.type,
+                run_id=run.run_id,
+                work_item_id=run.work_item_id,
+                updated_at=run.updated_at,
+            ):
                 valid.append(item)
 
         valid.sort(key=lambda item: item.run_id)

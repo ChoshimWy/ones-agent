@@ -43,6 +43,7 @@ from src.developer_workflow.tui.models import (
     RunSummary,
     TuiDisplayError,
     safe_tui_text,
+    validate_tui_input_text,
 )
 
 
@@ -1208,6 +1209,19 @@ def test_run_filter_matches_state_type_and_case_insensitive_query(tmp_path: Path
     assert RunFilter(query="req-中文").matches(summary)
     assert RunFilter(query=summary.run_id.upper()).matches(summary)
     assert not RunFilter(query="missing").matches(summary)
+    literal_query = "REQ-[中文]\\literal"
+    assert RunFilter(query="[中文]\\LIT").matches_facts(
+        state=summary.state,
+        workflow_type=summary.workflow_type,
+        run_id=summary.run_id,
+        work_item_id=literal_query,
+        updated_at=summary.updated_at,
+    )
+    assert validate_tui_input_text(
+        literal_query, maximum=256
+    ) == literal_query
+    with pytest.raises(TuiDisplayError, match="display value is invalid"):
+        validate_tui_input_text("bad\x1bvalue", maximum=256)
     assert RunFilter(updated_after=summary.updated_at).matches(summary)
     assert RunFilter(updated_before=summary.updated_at).matches(summary)
     assert not RunFilter(
