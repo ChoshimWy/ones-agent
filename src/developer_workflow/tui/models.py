@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
+from rich.markup import escape as escape_markup
+
 from ..approval import approval_fingerprint
 from ..contracts import (
     ApprovalPackage,
@@ -23,6 +25,7 @@ from ..contracts import (
     WorkflowState,
     WorkflowType,
 )
+from ..pr_provider import PullRequestProviderError, parse_repository_identity
 
 
 _INVALID_DISPLAY = "display value is invalid"
@@ -49,7 +52,20 @@ def safe_tui_text(
     maximum: int = 4096,
     allow_empty: bool = False,
 ) -> str:
-    """Return strictly encodable, single-line text without format controls."""
+    """Return strict, single-line text escaped for Rich/Textual display."""
+
+    return escape_markup(
+        _strict_tui_text(value, maximum=maximum, allow_empty=allow_empty)
+    )
+
+
+def _strict_tui_text(
+    value: str,
+    *,
+    maximum: int = 4096,
+    allow_empty: bool = False,
+) -> str:
+    """Validate untrusted text without changing its semantic value."""
 
     if type(value) is not str or maximum < 1:
         raise TuiDisplayError(_INVALID_DISPLAY)
@@ -353,7 +369,7 @@ def _single_repository_views(
         mapping=mapping,
         base_commit=prepared.base_commit,
         head_commit=prepared.head_commit,
-        tree_hash=publication.expected_tree if publication_bound else "",
+        tree_hash="",
         changed_files=changed_files,
         publication=publication if publication_bound else None,
     )
@@ -430,7 +446,7 @@ def _repository_view(
         ),
         pushed=bool(publication and publication.push_completed_at),
         pr_url=(
-            _safe_pr_url(publication.pr_url)
+            _safe_pr_url(publication.pr_url, expected_host=publication.provider_host)
             if publication is not None and publication.pr_url
             else ""
         ),
@@ -454,7 +470,7 @@ def _test_view(result: CommandResult) -> TestView:
 
 
 def _safe_repository_path(value: str) -> str:
-    checked = safe_tui_text(value, maximum=1024)
+    checked = _strict_tui_text(value, maximum=1024)
     parts = checked.split("/")
     if (
         checked.startswith("/")
@@ -464,11 +480,11 @@ def _safe_repository_path(value: str) -> str:
         or parts[0].casefold() == ".git"
     ):
         raise TuiDisplayError(_INVALID_DISPLAY)
-    return checked
+    return escape_markup(checked)
 
 
 def _safe_fingerprint(value: str) -> str:
-    checked = safe_tui_text(value, maximum=64, allow_empty=True)
+    checked = _strict_tui_text(value, maximum=64, allow_empty=True)
     if checked and re.fullmatch(r"[0-9a-f]{64}", checked) is None:
         raise TuiDisplayError(_INVALID_DISPLAY)
     return checked
@@ -524,7 +540,8 @@ def _validate_bound_single_facts(
     prepared = run.prepared_worktree
     snapshot = run.tested_snapshot
     if (
-        mapping is None
+        approval.work_item_id != run.work_item_id
+        or mapping is None
         or prepared is None
         or snapshot is None
         or approval.repository != mapping
@@ -544,11 +561,19 @@ def _validate_bound_single_facts(
     ):
         raise TuiDisplayError(_INVALID_FACTS)
     publication = run.publication
-    if include_publication and publication.approved_fingerprint and (
-        publication.approved_fingerprint != approval.fingerprint
-        or publication.expected_parent != approval.head_commit
-    ):
-        raise TuiDisplayError(_INVALID_FACTS)
+    if include_publication and publication.approved_fingerprint:
+        _validate_publication_intent(
+            publication,
+            run_id=run.run_id,
+            approval_fingerprint=approval.fingerprint,
+            repo_url=approval.repo_url,
+            base_branch=approval.base_branch,
+            head_commit=approval.head_commit,
+            branch=approval.branch,
+            commit_message=approval.commit_message,
+            pr_title=approval.pr_title,
+            pr_body=approval.pr_body,
+        )
 
 
 def _validate_bound_group_facts(
@@ -558,7 +583,11 @@ def _validate_bound_group_facts(
     include_publication: bool,
 ) -> None:
     group = run.repository_group
-    if group is None or approval.repository_group != group:
+    if (
+        approval.work_item_id != run.work_item_id
+        or group is None
+        or approval.repository_group != group
+    ):
         raise TuiDisplayError(_INVALID_FACTS)
     keys = group.topological_keys()
     if (
@@ -601,6 +630,7 @@ def _validate_bound_group_facts(
     if (
         not expected_keys
         or publication.order != keys
+        or publication.comment_marker != _expected_comment_marker(run.run_id)
         or len(actual_keys) != len(set(actual_keys))
         or set(actual_keys) != set(expected_keys)
     ):
@@ -610,11 +640,70 @@ def _validate_bound_group_facts(
         approved = changed_by_key.get(item.repository_key)
         if (
             approved is None
-            or item.approved_fingerprint != approval.fingerprint
-            or item.expected_parent != approved.head_commit
-            or item.expected_tree != approved.tree_hash
         ):
             raise TuiDisplayError(_INVALID_FACTS)
+        _validate_publication_intent(
+            item,
+            run_id=run.run_id,
+            approval_fingerprint=approval.fingerprint,
+            repo_url=approved.mapping.repo_url,
+            base_branch=approved.mapping.base_branch,
+            head_commit=approved.head_commit,
+            branch=approved.branch,
+            commit_message=approved.commit_message,
+            pr_title=approved.pr_title,
+            pr_body=approved.pr_body,
+            repository_key=approved.repository_key,
+            tree_hash=approved.tree_hash,
+        )
+
+
+def _expected_comment_marker(run_id: str) -> str:
+    return f"<!-- ones-dev-run:{run_id} -->"
+
+
+def _validate_publication_intent(
+    publication: PublicationResult | RepositoryPublicationResult,
+    *,
+    run_id: str,
+    approval_fingerprint: str,
+    repo_url: str,
+    base_branch: str,
+    head_commit: str,
+    branch: str,
+    commit_message: str,
+    pr_title: str,
+    pr_body: str,
+    repository_key: str | None = None,
+    tree_hash: str | None = None,
+) -> None:
+    marker = f"ones-dev-run:{run_id}"
+    if repository_key is not None:
+        marker = f"{marker}:{repository_key}"
+    expected = (
+        publication.approved_fingerprint == approval_fingerprint,
+        publication.repo_url == repo_url,
+        publication.provider in {"github", "gitlab"},
+        publication.expected_parent == head_commit,
+        publication.commit_message == commit_message,
+        publication.remote_branch == branch,
+        publication.pr_marker == marker,
+        publication.pr_base == base_branch,
+        publication.pr_head == branch,
+        publication.pr_title == pr_title,
+        publication.pr_body == pr_body,
+        publication.comment_marker == _expected_comment_marker(run_id),
+        tree_hash is None or publication.expected_tree == tree_hash,
+        re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", publication.expected_tree)
+        is not None,
+    )
+    if not all(expected):
+        raise TuiDisplayError(_INVALID_FACTS)
+    try:
+        provider_host = _strict_tui_text(publication.provider_host, maximum=253)
+        parse_repository_identity(publication.repo_url, provider_host)
+    except (PullRequestProviderError, TuiDisplayError):
+        raise TuiDisplayError(_INVALID_FACTS) from None
 
 
 def _approved_tail_matches(
@@ -625,13 +714,14 @@ def _approved_tail_matches(
     return len(results) >= len(approved) and results[-len(approved):] == approved
 
 
-def _safe_pr_url(value: str) -> str:
+def _safe_pr_url(value: str, *, expected_host: str) -> str:
     try:
-        checked = safe_tui_text(value)
+        checked = _strict_tui_text(value)
         parsed = urlsplit(checked)
         if (
             parsed.scheme not in {"http", "https"}
             or not parsed.hostname
+            or parsed.hostname.casefold() != expected_host.casefold()
             or parsed.username is not None
             or parsed.password is not None
         ):
@@ -642,6 +732,6 @@ def _safe_pr_url(value: str) -> str:
             hostname = f"[{hostname}]"
         netloc = f"{hostname}:{port}" if port is not None else hostname
         sanitized = urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
-        return safe_tui_text(sanitized)
+        return _strict_tui_text(sanitized)
     except (TuiDisplayError, ValueError, UnicodeError):
         raise TuiDisplayError(_INVALID_PR_URL) from None

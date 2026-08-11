@@ -6,8 +6,14 @@ from enum import Enum
 from pathlib import Path
 
 import pytest
+from rich.markup import escape as escape_markup
 
-from src.developer_workflow.approval import approval_fingerprint
+from src.contracts import WikiPageSnapshot
+from src.developer_workflow.approval import (
+    approval_fingerprint,
+    issue_approval,
+    validate_for_approval,
+)
 from src.developer_workflow.contracts import (
     ApprovalPackage,
     CommandOutcome,
@@ -74,6 +80,50 @@ def test_safe_tui_text_accepts_normal_chinese_and_emoji_and_controls_empty_polic
         safe_tui_text("")
 
 
+@pytest.mark.parametrize(
+    "value",
+    ["[bold]danger[/bold]", "[link=https://evil.invalid]click[/link]", r"\[bold]"],
+)
+def test_safe_tui_text_escapes_rich_markup_as_plain_text(value: str) -> None:
+    assert safe_tui_text(value) == escape_markup(value)
+
+
+def test_summary_choice_and_repository_path_escape_rich_markup(tmp_path: Path) -> None:
+    work_item = "REQ-[bold]literal[/bold]"
+    summary = RunSummary.from_run(
+        WorkflowRun.new("requirement", work_item), activity=RunActivity.IDLE
+    )
+    candidate = DefectCandidate(
+        uuid="1" * 32,
+        key="BUG-8",
+        number="8",
+        title="[link=https://evil.invalid]literal[/link]",
+        priority="[bold]P1[/bold]",
+        status="Open",
+        status_id="open",
+        updated_at="2026-08-11T04:00:00Z",
+        snapshot_token="hidden",
+    )
+    choice = DefectChoice.from_candidate(candidate)
+    run = _single_run(tmp_path)
+    assert run.tested_snapshot is not None
+    path = "src/[bold]literal[/bold].py"
+    snapshot = run.tested_snapshot.validated_update(changed_files=(path,))
+    unsigned = run.validated_update(
+        approval=None,
+        publication=PublicationResult(),
+        tested_snapshot=snapshot,
+        changed_files=(path,),
+    )
+
+    assert summary.work_item_id == escape_markup(work_item)
+    assert choice.title == escape_markup(candidate.title)
+    assert choice.priority == escape_markup(candidate.priority)
+    assert RunDetail.from_run(unsigned).repositories[0].changed_files == (
+        escape_markup(path),
+    )
+
+
 def _mapping(
     key: str,
     *,
@@ -125,8 +175,43 @@ def _dirty_snapshot(head: str, path: str) -> RepositorySnapshot:
     )
 
 
+def _signed(package: ApprovalPackage) -> ApprovalPackage:
+    validated = validate_for_approval(package)
+    signed = issue_approval(validated, approved_by="alice", approved_at=NOW)
+    assert signed.fingerprint == approval_fingerprint(signed)
+    assert signed.approved_by == "alice"
+    assert signed.approved_at == NOW
+    assert validate_for_approval(signed) == signed
+    return signed
+
+
+def _requirement_facts() -> dict[str, object]:
+    snapshot = WikiPageSnapshot(
+        page_id="PAGE-1",
+        title="Safe requirement",
+        version="v1",
+        updated_at="2026-08-11T04:00:00Z",
+        normalized_content=f"{SENTINEL} private wiki source",
+        content_sha256="b" * 64,
+        source_url="https://ones.example.invalid/wiki/PAGE-1",
+    )
+    return {
+        "work_item_title": "Safe requirement",
+        "work_item_status": "Open",
+        "source_versions": {"work_item": "v1"},
+        "wiki_hashes": {snapshot.page_id: snapshot.content_sha256},
+        "wiki_snapshots": (snapshot,),
+        "coverage": {"criterion": "covered"},
+        "evidence": ("reviewed",),
+        "unrelated_changes_checked": True,
+    }
+
+
 def _publication(
     *,
+    run_id: str,
+    mapping: RepositoryMapping,
+    branch: str,
     fingerprint: str,
     parent: str,
     tree: str,
@@ -136,22 +221,26 @@ def _publication(
 ) -> PublicationResult | RepositoryPublicationResult:
     values = dict(
         approved_fingerprint=fingerprint,
-        repo_url="https://git.example.invalid/team/repo.git",
+        repo_url=mapping.repo_url,
         provider="github",
         provider_host="git.example.invalid",
         expected_parent=parent,
         expected_tree=tree,
         commit_message="feat: safe change",
         commit_hash=commit,
-        remote_branch="codex/safe-change",
+        remote_branch=branch,
         push_completed_at=NOW,
-        pr_marker="marker",
-        pr_base="main",
-        pr_head="codex/safe-change",
+        pr_marker=(
+            f"ones-dev-run:{run_id}:{repository_key}"
+            if repository_key is not None
+            else f"ones-dev-run:{run_id}"
+        ),
+        pr_base=mapping.base_branch,
+        pr_head=branch,
         pr_title="Safe change",
         pr_body="Safe body",
         pr_url=pr_url,
-        comment_marker="comment-marker",
+        comment_marker=f"<!-- ones-dev-run:{run_id} -->",
         error=f"{SENTINEL} provider exception",
     )
     if repository_key is None:
@@ -162,8 +251,10 @@ def _publication(
 def _single_run(tmp_path: Path) -> WorkflowRun:
     mapping = _mapping("repo")
     base, head, tree = "1" * 40, "2" * 40, "3" * 40
+    run = WorkflowRun.new("requirement", "REQ-中文-🚀")
     approval = ApprovalPackage(
         work_item_id="REQ-中文-🚀",
+        **_requirement_facts(),
         repository=mapping,
         repo_url=mapping.repo_url,
         base_branch="main",
@@ -176,17 +267,13 @@ def _single_run(tmp_path: Path) -> WorkflowRun:
         tests=(_test(),),
         review=(f"{SENTINEL} raw AI review",),
         risks=(f"{SENTINEL} risk detail",),
-        unresolved_items=(f"{SENTINEL} unresolved detail",),
-        unrelated_changes_checked=True,
+        unresolved_items=(),
         commit_message="feat: safe change",
         pr_title="Safe change",
         pr_body="Safe body",
     )
-    fingerprint = approval_fingerprint(approval)
-    approval = approval.validated_update(
-        fingerprint=fingerprint, approved_by="alice", approved_at=NOW
-    )
-    return WorkflowRun.new("requirement", "REQ-中文-🚀").validated_update(
+    approval = _signed(approval)
+    return run.validated_update(
         state=WorkflowState.BLOCKED,
         version=7,
         updated_at=NOW,
@@ -201,7 +288,10 @@ def _single_run(tmp_path: Path) -> WorkflowRun:
         review={"summary": f"{SENTINEL} Codex review summary"},
         approval=approval,
         publication=_publication(
-            fingerprint=fingerprint,
+            run_id=run.run_id,
+            mapping=mapping,
+            branch=approval.branch,
+            fingerprint=approval.fingerprint,
             parent=head,
             tree=tree,
             commit="4" * 40,
@@ -260,7 +350,7 @@ def test_single_repository_detail_maps_only_safe_facts(tmp_path: Path) -> None:
     assert (repository.key, repository.role) == ("repo", "primary")
     assert repository.base_commit == "1" * 40
     assert repository.head_commit == "2" * 40
-    assert repository.tree_hash == "3" * 40
+    assert repository.tree_hash == ""
     assert repository.changed_files == ("src/app.py",)
     assert repository.changed_file_count == 1
     assert repository.commit_hash == "4" * 40
@@ -279,7 +369,7 @@ def test_single_repository_detail_maps_only_safe_facts(tmp_path: Path) -> None:
     assert run.approval is not None
     assert detail.fingerprint == run.approval.fingerprint
     assert detail.risk_count == 1
-    assert detail.unresolved_count == 1
+    assert detail.unresolved_count == 0
     assert SENTINEL not in _all_strings(detail)
     for forbidden in ("requirement", "defect", "wiki", "codex", "patch"):
         assert not hasattr(detail, forbidden)
@@ -299,13 +389,14 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
     bases = {"sdk": "1" * 40, "app": "2" * 40}
     heads = {"sdk": "3" * 40, "app": "4" * 40}
     paths = {"sdk": "src/sdk.py", "app": "src/app.py"}
+    run = WorkflowRun.new("requirement", "REQ-2")
     evidence = tuple(
         RepositoryRunEvidence(
             repository_key=item.key,
             mapping=item,
             prepared_worktree=_worktree(tmp_path, item.key, bases[item.key], heads[item.key]),
             tested_snapshot=_dirty_snapshot(heads[item.key], paths[item.key]),
-            test_results=(_test(f"uv run pytest tests/{item.key}"),),
+            test_results=(_test(),),
             changed_files=(paths[item.key],),
         )
         for item in group.repositories
@@ -320,7 +411,7 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
             diff_summary="1 file changed",
             branch=f"codex/{item.key}-change",
             changed_files=(paths[item.key],),
-            tests=(_test(f"uv run pytest tests/{item.key}"),),
+            tests=(_test(),),
             tree_hash=("6" if item.key == "sdk" else "7") * 40,
             commit_message="feat: safe change",
             pr_title="Safe change",
@@ -330,6 +421,7 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
     )
     approval = ApprovalPackage(
         work_item_id="REQ-2",
+        **_requirement_facts(),
         repository_group=group,
         repositories=approvals,
         integration_tests=(_test("uv run pytest tests/integration"),),
@@ -337,14 +429,15 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
         risks=("one", "two"),
         unresolved_items=(),
     )
-    fingerprint = approval_fingerprint(approval)
-    approval = approval.validated_update(
-        fingerprint=fingerprint, approved_by="alice", approved_at=NOW
-    )
+    approval = _signed(approval)
+    mappings = {item.key: item for item in group.repositories}
     publications = tuple(
         _publication(
+            run_id=run.run_id,
+            mapping=mappings[key],
+            branch=f"codex/{key}-change",
             repository_key=key,
-            fingerprint=fingerprint,
+            fingerprint=approval.fingerprint,
             parent=heads[key],
             tree=("6" if key == "sdk" else "7") * 40,
             commit=("9" if key == "sdk" else "a") * 40,
@@ -352,7 +445,7 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
         )
         for key in group.topological_keys()
     )
-    return WorkflowRun.new("requirement", "REQ-2").validated_update(
+    return run.validated_update(
         repository_group=group,
         repository_evidence=evidence,
         integration_test_results=(_test("uv run pytest tests/integration"),),
@@ -360,7 +453,7 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
         group_publication=MultiRepositoryPublicationResult(
             order=group.topological_keys(),
             repositories=publications,
-            comment_marker="comment",
+            comment_marker=f"<!-- ones-dev-run:{run.run_id} -->",
             comment_id="remote-comment-secret-id",
             error=f"{SENTINEL} aggregate provider error",
         ),
@@ -448,19 +541,24 @@ def test_single_repository_uses_validated_snapshot_paths_not_unvalidated_run_pat
 def test_test_view_never_displays_environment_or_credential_bearing_command(
     tmp_path: Path,
 ) -> None:
-    result = _test(f"API_TOKEN={SENTINEL} uv run pytest tests/private.py")
+    result = _test(f"uv run pytest tests/{SENTINEL}-private.py")
     run = _single_run(tmp_path)
     assert run.approval is not None
+    assert run.repository is not None
+    mapping = run.repository.validated_update(test_commands=(result.command,))
     approval = run.approval.validated_update(
-        tests=(result,), fingerprint="", approved_by=None, approved_at=None
+        repository=mapping,
+        tests=(result,),
+        fingerprint="",
+        approved_by=None,
+        approved_at=None,
     )
-    approval = approval.validated_update(
-        fingerprint=approval_fingerprint(approval), approved_by="alice", approved_at=NOW
-    )
+    approval = _signed(approval)
     publication = run.publication.validated_update(
         approved_fingerprint=approval.fingerprint
     )
     run = run.validated_update(
+        repository=mapping,
         test_results=(result,), approval=approval, publication=publication
     )
 
@@ -616,28 +714,182 @@ def test_signed_single_approval_rejects_mismatched_snapshot_and_tests(
         ("base_branch", "release"),
     ],
 )
-def test_signed_single_approval_binds_top_level_repository_identity(
+def test_canonical_forgery_cannot_change_top_level_repository_identity(
     tmp_path: Path, field: str, value: str
 ) -> None:
     run = _single_run(tmp_path)
     assert run.approval is not None
     approval = run.approval.validated_update(
-        **{
-            field: value,
-            "fingerprint": "",
-            "approved_by": None,
-            "approved_at": None,
-        }
+        **{field: value}
     )
-    approval = approval.validated_update(
-        fingerprint=approval_fingerprint(approval), approved_by="alice", approved_at=NOW
-    )
+    approval = approval.validated_update(fingerprint=approval_fingerprint(approval))
     publication = run.publication.validated_update(
         approved_fingerprint=approval.fingerprint
     )
     run = run.validated_update(approval=approval, publication=publication)
 
     with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+
+
+@pytest.mark.parametrize("shape", ["single", "group"])
+def test_signed_approval_from_another_work_item_is_rejected(
+    tmp_path: Path, shape: str
+) -> None:
+    run = _single_run(tmp_path) if shape == "single" else _multi_run(tmp_path)
+    assert run.approval is not None
+    other = _signed(
+        run.approval.validated_update(
+            work_item_id="REQ-OTHER",
+            fingerprint="",
+            approved_by=None,
+            approved_at=None,
+        )
+    )
+    request = DangerousActionRequest.from_run(run, action="approve")
+    if shape == "single":
+        publication = run.publication.validated_update(
+            approved_fingerprint=other.fingerprint
+        )
+        rebound = run.validated_update(approval=other, publication=publication)
+    else:
+        assert run.group_publication is not None
+        publications = tuple(
+            item.validated_update(approved_fingerprint=other.fingerprint)
+            for item in run.group_publication.repositories
+        )
+        rebound = run.validated_update(
+            approval=other,
+            group_publication=run.group_publication.validated_update(
+                repositories=publications
+            ),
+        )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(rebound)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(rebound, action="approve")
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        request.assert_current(rebound)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo_url", "https://git.example.invalid/other/repo.git"),
+        ("provider_host", "other.example.invalid"),
+        ("expected_parent", "e" * 40),
+        ("commit_message", "feat: poisoned intent"),
+        ("remote_branch", "codex/poisoned"),
+        ("pr_base", "release"),
+        ("pr_head", "codex/poisoned"),
+        ("pr_title", "Poisoned title"),
+        ("pr_body", "Poisoned body"),
+        ("pr_marker", "ones-dev-run:wrong"),
+        ("comment_marker", "<!-- ones-dev-run:wrong -->"),
+    ],
+)
+def test_single_publication_rejects_polluted_persisted_intent(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    run = _single_run(tmp_path)
+    poisoned = run.publication.validated_update(**{field: value})
+    run = run.validated_update(publication=poisoned)
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+def test_single_publication_rejects_provider_outside_contract(tmp_path: Path) -> None:
+    run = _single_run(tmp_path)
+    poisoned = run.publication.model_construct(
+        **{**run.publication.__dict__, "provider": "bitbucket"}
+    )
+    run = run.model_construct(**{**run.__dict__, "publication": poisoned})
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+
+
+@pytest.mark.parametrize("provider_host", [None, 7, "bad\nhost"])
+def test_corrupted_publication_host_fails_closed_without_raw_exception(
+    tmp_path: Path, provider_host: object
+) -> None:
+    run = _single_run(tmp_path)
+    poisoned = run.publication.model_construct(
+        **{**run.publication.__dict__, "provider_host": provider_host}
+    )
+    run = run.model_construct(**{**run.__dict__, "publication": poisoned})
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo_url", "https://git.example.invalid/other/sdk.git"),
+        ("provider_host", "other.example.invalid"),
+        ("expected_parent", "e" * 40),
+        ("expected_tree", "f" * 40),
+        ("commit_message", "feat: poisoned intent"),
+        ("remote_branch", "codex/poisoned"),
+        ("pr_base", "release"),
+        ("pr_head", "codex/poisoned"),
+        ("pr_title", "Poisoned title"),
+        ("pr_body", "Poisoned body"),
+        ("pr_marker", "ones-dev-run:wrong:sdk"),
+        ("comment_marker", "<!-- ones-dev-run:wrong -->"),
+    ],
+)
+def test_group_publication_rejects_polluted_repository_intent(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    run = _multi_run(tmp_path)
+    assert run.group_publication is not None
+    publications = list(run.group_publication.repositories)
+    publications[0] = publications[0].validated_update(**{field: value})
+    run = run.validated_update(
+        group_publication=run.group_publication.validated_update(
+            repositories=tuple(publications)
+        )
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+def test_group_publication_rejects_polluted_aggregate_comment_marker(
+    tmp_path: Path,
+) -> None:
+    run = _multi_run(tmp_path)
+    assert run.group_publication is not None
+    run = run.validated_update(
+        group_publication=run.group_publication.validated_update(
+            comment_marker="<!-- ones-dev-run:wrong -->"
+        )
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+
+
+def test_publication_pr_url_host_must_match_persisted_provider_host(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    poisoned = run.publication.validated_update(
+        pr_url="https://other.example.invalid/team/repo/pull/7"
+    )
+    run = run.validated_update(publication=poisoned)
+
+    with pytest.raises(TuiDisplayError, match="^PR URL is invalid$"):
         RunDetail.from_run(run)
 
 
@@ -739,7 +991,7 @@ def test_dangerous_action_request_captures_confirmation_facts_and_rejects_stale(
     assert request.changed_file_count == 1
     assert request.test_count == 1
     assert request.risk_count == 1
-    assert request.unresolved_count == 1
+    assert request.unresolved_count == 0
 
     with pytest.raises(TuiDisplayError, match="^workflow action is stale$"):
         DangerousActionRequest.from_run(
