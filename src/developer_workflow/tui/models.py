@@ -732,6 +732,6 @@ def _safe_pr_url(value: str, *, expected_host: str) -> str:
             hostname = f"[{hostname}]"
         netloc = f"{hostname}:{port}" if port is not None else hostname
         sanitized = urlunsplit((parsed.scheme, netloc, parsed.path or "/", "", ""))
-        return _strict_tui_text(sanitized)
+        return escape_markup(_strict_tui_text(sanitized))
     except (TuiDisplayError, ValueError, UnicodeError):
         raise TuiDisplayError(_INVALID_PR_URL) from None

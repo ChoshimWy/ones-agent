@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from rich.markup import escape as escape_markup
+from rich.text import Text
 
 from src.contracts import WikiPageSnapshot
 from src.developer_workflow.approval import (
@@ -891,6 +892,24 @@ def test_publication_pr_url_host_must_match_persisted_provider_host(
 
     with pytest.raises(TuiDisplayError, match="^PR URL is invalid$"):
         RunDetail.from_run(run)
+
+
+def test_signed_publication_pr_url_path_is_escaped_after_sanitizing(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    raw_display_url = (
+        "https://git.example.invalid/team/repo/pull/[bold]PWN[/bold]"
+    )
+    publication = run.publication.validated_update(
+        pr_url=f"{raw_display_url}?token=SECRET#fragment"
+    )
+    detail = RunDetail.from_run(run.validated_update(publication=publication))
+    displayed = detail.repositories[0].pr_url
+
+    assert displayed == escape_markup(raw_display_url)
+    assert Text.from_markup(displayed).plain == raw_display_url
+    assert "SECRET" not in displayed
 
 
 def test_group_publication_tree_must_match_signed_repository_tree(tmp_path: Path) -> None:
