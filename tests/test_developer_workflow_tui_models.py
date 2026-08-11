@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 from rich.markup import escape as escape_markup
-from rich.text import Text
 
 from src.contracts import WikiPageSnapshot
 from src.developer_workflow.approval import (
@@ -894,22 +893,120 @@ def test_publication_pr_url_host_must_match_persisted_provider_host(
         RunDetail.from_run(run)
 
 
-def test_signed_publication_pr_url_path_is_escaped_after_sanitizing(
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://git.example.invalid/team/other/pull/7",
+        "https://git.example.invalid/team/repo/settings/delete",
+        "https://git.example.invalid/team/repo/-/merge_requests/7",
+        "https://git.example.invalid/team/repo/pull/%37",
+        "https://git.example.invalid/team/repo/../other/pull/7",
+        "https://git.example.invalid/team//repo/pull/7",
+    ],
+)
+def test_signed_publication_pr_url_must_match_provider_repository_path(
+    tmp_path: Path, url: str
+) -> None:
+    run = _single_run(tmp_path)
+    publication = run.publication.validated_update(pr_url=url)
+
+    with pytest.raises(TuiDisplayError) as raised:
+        RunDetail.from_run(run.validated_update(publication=publication))
+
+    assert str(raised.value) == "PR URL is invalid"
+    assert url not in str(raised.value)
+
+
+def test_signed_publication_pr_url_rejects_markup_in_identifier(
     tmp_path: Path,
 ) -> None:
     run = _single_run(tmp_path)
-    raw_display_url = (
-        "https://git.example.invalid/team/repo/pull/[bold]PWN[/bold]"
+    raw_url = "https://git.example.invalid/team/repo/pull/[bold]PWN[/bold]"
+    publication = run.publication.validated_update(
+        pr_url=f"{raw_url}?token=SECRET#fragment"
+    )
+
+    with pytest.raises(TuiDisplayError) as raised:
+        RunDetail.from_run(run.validated_update(publication=publication))
+
+    assert str(raised.value) == "PR URL is invalid"
+    assert "PWN" not in str(raised.value)
+
+
+def test_signed_publication_pr_url_rejects_markup_in_repository_identity(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    assert run.repository is not None
+    repo_url = "https://git.example.invalid/[bold]team[/bold]/repo.git"
+    mapping = run.repository.validated_update(repo_url=repo_url)
+    approval = _signed(
+        run.approval.validated_update(
+            repository=mapping,
+            repo_url=repo_url,
+            fingerprint="",
+            approved_by=None,
+            approved_at=None,
+        )
     )
     publication = run.publication.validated_update(
-        pr_url=f"{raw_display_url}?token=SECRET#fragment"
+        approved_fingerprint=approval.fingerprint,
+        repo_url=repo_url,
+        pr_url="https://git.example.invalid/[bold]team[/bold]/repo/pull/7",
     )
-    detail = RunDetail.from_run(run.validated_update(publication=publication))
-    displayed = detail.repositories[0].pr_url
+    bound = run.validated_update(
+        repository=mapping, approval=approval, publication=publication
+    )
 
-    assert displayed == escape_markup(raw_display_url)
-    assert Text.from_markup(displayed).plain == raw_display_url
-    assert "SECRET" not in displayed
+    with pytest.raises(TuiDisplayError) as raised:
+        RunDetail.from_run(bound)
+
+    assert str(raised.value) == "PR URL is invalid"
+    assert "bold" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("provider", "path"),
+    [
+        ("github", "/team/repo/pull/17"),
+        ("gitlab", "/group/subgroup/repo/-/merge_requests/23"),
+    ],
+)
+def test_signed_publication_accepts_canonical_enterprise_provider_pr_paths(
+    tmp_path: Path, provider: str, path: str
+) -> None:
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    assert run.repository is not None
+    repo_url = (
+        "https://git.example.invalid/group/subgroup/repo.git"
+        if provider == "gitlab"
+        else run.repository.repo_url
+    )
+    mapping = run.repository.validated_update(repo_url=repo_url)
+    approval = _signed(
+        run.approval.validated_update(
+            repository=mapping,
+            repo_url=repo_url,
+            fingerprint="",
+            approved_by=None,
+            approved_at=None,
+        )
+    )
+    publication = run.publication.validated_update(
+        approved_fingerprint=approval.fingerprint,
+        repo_url=repo_url,
+        provider=provider,
+        pr_url=f"https://git.example.invalid{path}?token=SECRET#fragment",
+    )
+    bound = run.validated_update(
+        repository=mapping, approval=approval, publication=publication
+    )
+
+    detail = RunDetail.from_run(bound)
+
+    assert detail.repositories[0].pr_url == f"https://git.example.invalid{path}"
 
 
 def test_group_publication_tree_must_match_signed_repository_tree(tmp_path: Path) -> None:

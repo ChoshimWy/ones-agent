@@ -431,6 +431,20 @@ def _repository_view(
     changed_files: tuple[str, ...],
     publication: PublicationResult | RepositoryPublicationResult | None,
 ) -> RepositoryView:
+    pr_url = ""
+    if publication is not None and publication.pr_url:
+        try:
+            repository_identity = parse_repository_identity(
+                publication.repo_url, publication.provider_host
+            )
+        except (AttributeError, PullRequestProviderError):
+            raise TuiDisplayError(_INVALID_PR_URL) from None
+        pr_url = _safe_pr_url(
+            publication.pr_url,
+            expected_host=publication.provider_host,
+            provider=publication.provider,
+            repository_identity=repository_identity,
+        )
     return RepositoryView(
         key=safe_tui_text(mapping.key, maximum=128),
         role=mapping.role.value,
@@ -445,11 +459,7 @@ def _repository_view(
             else ""
         ),
         pushed=bool(publication and publication.push_completed_at),
-        pr_url=(
-            _safe_pr_url(publication.pr_url, expected_host=publication.provider_host)
-            if publication is not None and publication.pr_url
-            else ""
-        ),
+        pr_url=pr_url,
         error=(
             _PUBLICATION_FAILED
             if publication is not None and publication.error
@@ -714,7 +724,13 @@ def _approved_tail_matches(
     return len(results) >= len(approved) and results[-len(approved):] == approved
 
 
-def _safe_pr_url(value: str, *, expected_host: str) -> str:
+def _safe_pr_url(
+    value: str,
+    *,
+    expected_host: str,
+    provider: str,
+    repository_identity: tuple[str, str],
+) -> str:
     try:
         checked = _strict_tui_text(value)
         parsed = urlsplit(checked)
@@ -724,6 +740,18 @@ def _safe_pr_url(value: str, *, expected_host: str) -> str:
             or parsed.hostname.casefold() != expected_host.casefold()
             or parsed.username is not None
             or parsed.password is not None
+        ):
+            raise ValueError
+        namespace, repository = repository_identity
+        if provider == "github":
+            expected_path = rf"/{re.escape(namespace)}/{re.escape(repository)}/pull/[1-9][0-9]*"
+        elif provider == "gitlab":
+            expected_path = rf"/{re.escape(namespace)}/{re.escape(repository)}/-/merge_requests/[1-9][0-9]*"
+        else:
+            raise ValueError
+        if (
+            any(character in parsed.path for character in "%[]")
+            or re.fullmatch(expected_path, parsed.path) is None
         ):
             raise ValueError
         port = parsed.port
