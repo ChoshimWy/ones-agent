@@ -1,5 +1,45 @@
 # ONES 开发工作流 CLI 运维指南
 
+## 全屏终端界面
+
+使用与非交互 CLI 相同的生产装配启动全屏 Textual 控制台：
+
+```powershell
+uv run ones-dev tui --config docs/examples/ones-dev.config.json
+```
+
+启动会先完整校验生产配置，不提供“缺少凭据时只读降级”模式。配置文件必须提供
+`run_root`、`mirror_root`、`worktree_root`、`sandbox_permission_profile`、
+`repositories` 或 `repository_groups`、`publishing.provider`，以及可选的
+`tui_max_concurrency`（1–8，默认 3）。环境必须提供 ONES 登录与类型配置
+`ONES_BASE_URL`、`ONES_EMAIL`、`ONES_PASSWORD`、`ONES_TEAM_ID`、
+`ONES_ISSUE_TYPE_ID`，PR provider 配置 `ONES_DEV_PROVIDER_TOKEN`、
+`ONES_DEV_PROVIDER_HOST`、`ONES_DEV_PROVIDER_API_URL`，Git 身份
+`ONES_DEV_GIT_AUTHOR_NAME`、`ONES_DEV_GIT_AUTHOR_EMAIL`，以及可用的 Codex
+认证（`CODEX_HOME`、`CODEX_API_KEY`、`CODEX_AUTH_TOKEN` 或
+`OPENAI_API_KEY` 中符合部署策略的一种）。Git 凭据传输仍只接受配置章节列出的
+五个 allowlist 变量。所有值的格式、私有目录约束和可选容量限制以“配置”章节为准；
+凭据只从受控进程环境注入，不写入 JSON，也不会显示在 widget、通知或错误消息中。
+
+常用键：
+
+- `n`：新建需求或缺陷工作流；缺陷查询的状态值必须是 ONES 工作流状态 ID，多个 ID 用英文逗号分隔，不按状态名称匹配。
+- `r`：恢复当前 run；`v`：修订；`a`：打开审批确认；`x`：打开取消确认。
+- `q`：仅退出界面，不取消、回滚或修改任何工作流状态。
+- `j`/`k` 或方向键移动，`Enter` 打开详情，`Tab`/`Shift+Tab` 切换证据页签，`/` 搜索，`f` 过滤，`?` 查看帮助。
+
+不同 run 最多并行 `tui_max_concurrency` 个任务，超过上限按提交顺序排队；同一
+run 的 mutation 始终 FIFO 串行，底层 operation lock 和 version CAS 仍是最终门禁。
+退出不会把后台任务解释为取消；已持久化检查点保留在私有 `run_root`，再次启动后
+只从 `FileRunStore` 恢复。异常退出后可先查看详情，再使用 `r` 从允许的检查点继续。
+
+配置 `source_path` 时，本地 source workspace 始终只读；镜像、修改、测试、commit
+和 push 只发生在隔离的 managed worktree。一个工作项可映射到有向无环的
+`repository_groups`：依赖仓库按拓扑顺序处理，每个有改动的仓库分别创建一个 commit、
+push 和 PR，全部 PR 确认后才向 ONES 写入一条汇总评论；工作流不会自动修改 ONES
+状态。进入 `WAITING_APPROVAL` 前 commit、push、PR 和评论均为零，审批确认时会重新
+加载权威 version 和签名证据，漂移时保持零远端副作用。
+
 ## 多仓库工作流
 
 一个需求或缺陷可以选择一个 `repository_groups` 映射。组内必须且只能有一个
