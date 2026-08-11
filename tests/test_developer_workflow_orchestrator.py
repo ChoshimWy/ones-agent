@@ -59,8 +59,10 @@ class RecordingStore:
         self.run = run.validated_update(version=1)
         return self.run
 
-    def load(self, run_id: str) -> WorkflowRun:
-        self.calls.append(("load", run_id))
+    def load(self, run_id: str, *, read_only: bool = False) -> WorkflowRun:
+        self.calls.append(
+            ("load_read_only", run_id) if read_only else ("load", run_id)
+        )
         assert self.run is not None and self.run.run_id == run_id
         return self.run
 
@@ -94,6 +96,22 @@ class RecordingStore:
     def operation_lock(self, run_id: str, purpose: str):
         self.calls.append(("operation_lock", run_id, purpose))
         return nullcontext()
+
+
+def test_show_supports_explicit_read_only_storage_access() -> None:
+    run = WorkflowRun.new("requirement", "REQ-read-only")
+    store = RecordingStore(run)
+    orchestrator = DeveloperWorkflowOrchestrator(
+        store=store,  # type: ignore[arg-type]
+        requirement_flow=None,  # type: ignore[arg-type]
+        defect_flow=None,  # type: ignore[arg-type]
+        publisher=None,  # type: ignore[arg-type]
+        config=None,  # type: ignore[arg-type]
+        defect_candidates=None,  # type: ignore[arg-type]
+    )
+
+    assert orchestrator.show(run.run_id, read_only=True) is run
+    assert store.calls == [("load_read_only", run.run_id)]
 
 
 class RecordingFlow:

@@ -79,8 +79,9 @@ class DeveloperWorkflowTuiApp(App[None]):
             self.settings,
         )
 
-    def on_mount(self) -> None:
-        self.push_screen(self._dashboard)
+    async def on_mount(self) -> None:
+        await self.push_screen(self._dashboard)
+        await self._dashboard.refresh_runs()
         self._poll_timer = self.set_interval(
             self.poll_interval, self.refresh_runs
         )

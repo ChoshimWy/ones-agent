@@ -245,7 +245,9 @@ class TuiController:
 
     def show(self, run_id: str) -> RunDetail:
         try:
-            return self._detail(self._orchestrator.show(run_id))
+            return self._detail(
+                self._orchestrator.show(run_id, read_only=True)
+            )
         except Exception:
             raise TuiControllerError(_DISPLAY_ERROR) from None
 
@@ -342,7 +344,7 @@ class TuiController:
 
     def resume(self, run_id: str, expected_version: int) -> RunDetail:
         try:
-            run = self._orchestrator.show(run_id)
+            run = self._orchestrator.show(run_id, read_only=True)
         except Exception:
             raise TuiControllerError(_ACTION_ERROR) from None
         if (
@@ -364,7 +366,7 @@ class TuiController:
     ) -> DangerousActionRequest:
         try:
             return DangerousActionRequest.from_run(
-                self._orchestrator.show(run_id), action=action
+                self._orchestrator.show(run_id, read_only=True), action=action
             )
         except Exception:
             raise TuiControllerError(_ACTION_ERROR) from None
@@ -414,7 +416,7 @@ class TuiController:
         if not isinstance(request, DangerousActionRequest) or request.action != action:
             raise TuiControllerError(_ACTION_ERROR)
         try:
-            run = self._orchestrator.show(request.run_id)
+            run = self._orchestrator.show(request.run_id, read_only=True)
         except Exception:
             raise TuiControllerError(_ACTION_UNAVAILABLE) from None
         try:

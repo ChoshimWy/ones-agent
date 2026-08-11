@@ -142,8 +142,10 @@ class DeveloperWorkflowOrchestrator:
             current = self.store.load(created.run_id)
             return self.defect_flow.execute(current)
 
-    def show(self, run_id: str) -> WorkflowRun:
-        return self.store.load(run_id)
+    def show(self, run_id: str, *, read_only: bool = False) -> WorkflowRun:
+        """Load a run, optionally without creating storage lock artifacts."""
+
+        return self.store.load(run_id, read_only=read_only)
 
     def confirm_repository(
         self,

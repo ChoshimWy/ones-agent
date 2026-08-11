@@ -929,6 +929,9 @@ class DashboardScreen(Screen[None]):
         self._refreshing = False
         self._refresh_requested = False
         self._refresh_activities: Mapping[str, RunActivity] | None = None
+        self._refresh_done = asyncio.Event()
+        self._refresh_done.set()
+        self._detail_sequence = 0
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -948,9 +951,8 @@ class DashboardScreen(Screen[None]):
             yield Button("Cancel", id="action-cancel")
         yield Static("", id="notice", markup=False)
 
-    async def on_mount(self) -> None:
+    def on_mount(self) -> None:
         self._set_mode(self.size.width)
-        await self.refresh_runs()
 
     def on_resize(self, event: events.Resize) -> None:
         self._set_mode(event.size.width)
@@ -968,8 +970,10 @@ class DashboardScreen(Screen[None]):
         self._refresh_activities = activities
         if self._refreshing:
             self._refresh_requested = True
+            await self._refresh_done.wait()
             return
         self._refreshing = True
+        self._refresh_done.clear()
         try:
             while True:
                 self._refresh_requested = False
@@ -979,6 +983,7 @@ class DashboardScreen(Screen[None]):
                     break
         finally:
             self._refreshing = False
+            self._refresh_done.set()
 
     async def _refresh_runs(
         self,
@@ -999,12 +1004,18 @@ class DashboardScreen(Screen[None]):
             )
         except TuiControllerError:
             runs = ()
+            self._detail_sequence += 1
             self._runs = runs
+            if not self.is_mounted:
+                return
             await self.query_one(RunListPane).replace_runs(runs)
             self._detail_error = _LIST_UNAVAILABLE
             self.query_one(RunDetailPane).show_error(self._detail_error)
             return
+        self._detail_sequence += 1
         self._runs = runs
+        if not self.is_mounted:
+            return
         await self.query_one(RunListPane).replace_runs(runs)
         if not runs:
             self._detail_error = ""
@@ -1019,22 +1030,30 @@ class DashboardScreen(Screen[None]):
             0,
         )
         self.query_one("#run-list", ListView).index = target
-        self._show_detail(target)
+        await self._show_detail(target)
 
     def _selected_index(self) -> int | None:
         return self.query_one("#run-list", ListView).index
 
-    def _show_detail(self, index: int) -> RunDetail | None:
+    async def _show_detail(self, index: int) -> RunDetail | None:
         summary = self._runs[index]
+        self._detail_sequence += 1
+        sequence = self._detail_sequence
         if summary.corrupted:
             self._detail_error = _STORAGE_CORRUPTED
             self.query_one(RunDetailPane).show_error(self._detail_error)
             return None
         try:
-            detail = self._controller.show(summary.run_id)
+            detail = await asyncio.to_thread(
+                self._controller.show, summary.run_id
+            )
         except TuiControllerError:
+            if not self.is_mounted or sequence != self._detail_sequence:
+                return None
             self._detail_error = _DISPLAY_UNAVAILABLE
             self.query_one(RunDetailPane).show_error(self._detail_error)
+            return None
+        if not self.is_mounted or sequence != self._detail_sequence:
             return None
         self._detail_error = ""
         self.query_one(RunDetailPane).set_detail(detail)
@@ -1046,11 +1065,11 @@ class DashboardScreen(Screen[None]):
     def action_cursor_up(self) -> None:
         self.query_one("#run-list", ListView).action_cursor_up()
 
-    def action_open_run(self) -> None:
+    async def action_open_run(self) -> None:
         index = self._selected_index()
         if index is None or not 0 <= index < len(self._runs):
             return
-        detail = self._show_detail(index)
+        detail = await self._show_detail(index)
         if self.query_one("#dashboard").has_class("one"):
             self.app.push_screen(
                 RunDetailScreen(detail, error=self._detail_error)
@@ -1285,17 +1304,17 @@ class DashboardScreen(Screen[None]):
         await self.refresh_runs()
 
     @on(ListView.Selected, "#run-list")
-    def select_run(self, event: ListView.Selected) -> None:
+    async def select_run(self, event: ListView.Selected) -> None:
         index = event.list_view.index
         if (
             index is not None
             and 0 <= index < len(self._runs)
             and event.item.name == self._runs[index].run_id
         ):
-            self._show_detail(index)
+            await self._show_detail(index)
 
     @on(events.Click, "#run-list ListItem")
-    def click_run(self, event: events.Click) -> None:
+    async def click_run(self, event: events.Click) -> None:
         item_id = event.widget.id
         if item_id is None or not item_id.startswith("run-item-"):
             return
@@ -1305,7 +1324,7 @@ class DashboardScreen(Screen[None]):
             return
         if 0 <= index < len(self._runs):
             self.query_one("#run-list", ListView).index = index
-            self._show_detail(index)
+            await self._show_detail(index)
 
     @on(Button.Pressed, "#nav-runs")
     def show_runs(self) -> None:

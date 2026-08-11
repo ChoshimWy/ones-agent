@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -14,6 +15,8 @@ from src.developer_workflow.contracts import (
 )
 from src.developer_workflow.state_store import FileRunStore
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp, TuiTaskMessage
+from src.developer_workflow.orchestrator import DeveloperWorkflowOrchestrator
+from src.developer_workflow.tui.controller import TuiController
 from src.developer_workflow.tui.models import (
     DangerousActionRequest,
     RunActivity,
@@ -160,6 +163,7 @@ async def test_external_store_update_refreshes_list_and_selected_detail(
     app = _app(controller)
 
     async with app.run_test(size=(120, 32)) as pilot:
+        await app.screen.refresh_runs()
         assert WorkflowState.CREATED.value in _plain(
             app.screen.query_one("#overview-content")
         )
@@ -175,6 +179,88 @@ async def test_external_store_update_refreshes_list_and_selected_detail(
         assert updated.state.value in overview
         assert f"version: {updated.version}" in overview
         assert controller.list_calls >= 2
+
+
+@pytest.mark.asyncio
+async def test_production_poll_and_detail_read_create_no_lock_or_mtime_write(
+    tmp_path: Path,
+) -> None:
+    store = FileRunStore(tmp_path)
+    run = store.create(_run(WorkflowState.CREATED))
+    lock_file = tmp_path / run.run_id / ".lock"
+    lock_file.unlink()
+    run_dir = tmp_path / run.run_id
+    run_file = run_dir / "run.json"
+    before = (run_dir.stat().st_mtime_ns, run_file.stat().st_mtime_ns)
+    orchestrator = DeveloperWorkflowOrchestrator(
+        store=store,
+        requirement_flow=None,  # type: ignore[arg-type]
+        defect_flow=None,  # type: ignore[arg-type]
+        publisher=None,  # type: ignore[arg-type]
+        config=None,  # type: ignore[arg-type]
+        defect_candidates=None,  # type: ignore[arg-type]
+    )
+    controller = TuiController(orchestrator, RunIndex(store))
+    app = DeveloperWorkflowTuiApp(controller, 3, poll_interval=0.02)
+
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.pause(0.08)
+
+    assert not lock_file.exists()
+    assert (run_dir.stat().st_mtime_ns, run_file.stat().st_mtime_ns) == before
+
+
+@pytest.mark.asyncio
+async def test_slow_detail_read_does_not_block_textual_event_loop() -> None:
+    started = Event()
+    release = Event()
+
+    class SlowController:
+        cancel_calls: list[object] = []
+
+        def __init__(self) -> None:
+            self.slow = False
+
+        def list_runs(self, filters: RunFilter, activities=None):
+            del filters, activities
+            return (
+                RunSummary.from_run(
+                    _run(WorkflowState.CREATED), activity=RunActivity.IDLE
+                ),
+            )
+
+        def show(self, run_id: str) -> RunDetail:
+            del run_id
+            if self.slow:
+                started.set()
+                release.wait(0.5)
+            return RunDetail.from_run(_run(WorkflowState.CREATED))
+
+    controller = SlowController()
+    app = DeveloperWorkflowTuiApp(
+        controller,  # type: ignore[arg-type]
+        3,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(120, 32)):
+        ticked = False
+
+        async def tick() -> None:
+            nonlocal ticked
+            await asyncio.sleep(0.01)
+            ticked = True
+
+        controller.slow = True
+        ticker = asyncio.create_task(tick())
+        refresh = asyncio.create_task(app.screen.refresh_runs())
+        try:
+            await asyncio.sleep(0.05)
+            assert started.is_set()
+            assert ticked is True
+            assert not refresh.done()
+        finally:
+            release.set()
+            await asyncio.gather(ticker, refresh)
 
 
 @pytest.mark.asyncio
@@ -282,13 +368,15 @@ async def test_restart_rebuilds_checkpoint_views_only_from_store(
     persisted = _persist(store, state)
 
     first = _app(StoreController(store), poll_interval=10)
-    async with first.run_test(size=(120, 32)):
+    async with first.run_test(size=(120, 32)) as pilot:
+        await first.screen.refresh_runs()
         assert state.value in _plain(first.screen.query_one("#overview-content"))
     assert first.supervisor.closed is True
 
     second_controller = StoreController(FileRunStore(tmp_path))
     second = _app(second_controller, poll_interval=10)
     async with second.run_test(size=(120, 32)) as pilot:
+        await second.screen.refresh_runs()
         overview = _plain(second.screen.query_one("#overview-content"))
         assert state.value in overview
         assert persisted.run_id in {

@@ -68,8 +68,8 @@ class Orchestrator:
         self.calls = []
         self.run = WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1")
 
-    def show(self, run_id):
-        self.calls.append(("show", run_id))
+    def show(self, run_id, *, read_only=False):
+        self.calls.append(("show", run_id, read_only))
         return self.run
 
     def start_defect(self, *args):
@@ -133,6 +133,7 @@ def test_show_projects_persisted_repository_candidates_without_config_access() -
 
     detail = controller.show(orchestrator.run.run_id)
 
+    assert orchestrator.calls[-1] == ("show", orchestrator.run.run_id, True)
     assert tuple(item.key for item in detail.mapping_candidates) == ("primary",)
     assert detail.mapping_candidates[0].repositories[0].test_summary == (
         "1 configured test command"
@@ -602,6 +603,10 @@ def test_sync_adapters_return_only_views_and_forward_expected_versions():
     assert isinstance(controller.resume("r", 4), RunDetail)
     assert ("confirm", "r", "repo", 3) in orchestrator.calls
     assert ("resume", "r", 4) in orchestrator.calls
+    assert not any(
+        call[0] == "show" and call[2] is False
+        for call in orchestrator.calls
+    )
 
 
 def test_cancel_asserts_authoritative_facts_then_forwards_bound_version():
@@ -610,6 +615,10 @@ def test_cancel_asserts_authoritative_facts_then_forwards_bound_version():
     request = controller.prepare_action(orchestrator.run.run_id, "cancel")
     result = controller.cancel(request, "operator")
     assert isinstance(result, RunDetail)
+    assert not any(
+        call[0] == "show" and call[2] is False
+        for call in orchestrator.calls
+    )
     assert ("cancel", orchestrator.run.run_id, "operator", request.version) in orchestrator.calls
 
     drifted = orchestrator.run.validated_update(version=orchestrator.run.version + 1)
@@ -622,7 +631,7 @@ def test_request_authority_and_display_failures_are_unavailable_not_stale(monkey
     orchestrator = Orchestrator()
     controller = TuiController(orchestrator, Index())
     request = controller.prepare_action(orchestrator.run.run_id, "cancel")
-    orchestrator.show = lambda run_id: (_ for _ in ()).throw(
+    orchestrator.show = lambda run_id, *, read_only=False: (_ for _ in ()).throw(
         RuntimeError("TOKEN-INNER")
     )
     with pytest.raises(TuiControllerError, match="^workflow action is unavailable$") as caught:
@@ -630,7 +639,7 @@ def test_request_authority_and_display_failures_are_unavailable_not_stale(monkey
     assert type(caught.value) is TuiControllerError
     assert "TOKEN-INNER" not in str(caught.value)
 
-    orchestrator.show = lambda run_id: orchestrator.run
+    orchestrator.show = lambda run_id, *, read_only=False: orchestrator.run
     monkeypatch.setattr(
         DangerousActionRequest,
         "assert_current",
@@ -711,7 +720,9 @@ def test_read_adapters_sanitize_lower_layer_errors():
         controller.list_runs(RunFilter())
     assert "TOKEN-INNER" not in str(listed.value)
 
-    orchestrator.show = lambda run_id: (_ for _ in ()).throw(OSError("TOKEN-INNER"))
+    orchestrator.show = lambda run_id, *, read_only=False: (
+        _ for _ in ()
+    ).throw(OSError("TOKEN-INNER"))
     with pytest.raises(TuiControllerError) as shown:
         controller.show("run")
     assert "TOKEN-INNER" not in str(shown.value)
