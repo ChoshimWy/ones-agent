@@ -3,13 +3,17 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from textual.widgets import Input, TabbedContent
+from textual.widgets import Button, Input, Static, TabbedContent
 
 from src.developer_workflow import tui
 from src.developer_workflow.contracts import WorkflowRun, WorkflowState, WorkflowType
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
-from src.developer_workflow.tui.controller import TuiControllerError
+from src.developer_workflow.tui.controller import (
+    CandidateSessionView,
+    TuiControllerError,
+)
 from src.developer_workflow.tui.models import (
+    DefectChoice,
     HistoryView,
     PublicationView,
     RepositoryView,
@@ -383,3 +387,217 @@ async def test_all_detail_tabs_render_escaped_values_with_safe_rich_semantics() 
             plain = _plain(app.screen.query_one(f"#{widget_id}"))
             assert raw in plain
             assert "\\[bold]" not in plain
+
+
+def _validating_detail(work_item_id: str, *, run_id: str) -> RunDetail:
+    summary = RunSummary(
+        run_id=run_id,
+        workflow_type=WorkflowType.DEFECT,
+        work_item_id=work_item_id,
+        state=WorkflowState.VALIDATING,
+        version=1,
+        updated_at=NOW,
+        activity=RunActivity.IDLE,
+    )
+    return _detail(summary)
+
+
+class WizardController(FakeController):
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_query: tuple[str, str, str, tuple[str, ...]] | None = None
+        self.mutation_calls: list[tuple[object, ...]] = []
+        self.confirmed_mapping = ""
+        self.fail_query = False
+        self.fail_start = False
+
+    def query_defects(
+        self,
+        project: str,
+        iteration: str,
+        assignee: str,
+        status_ids: tuple[str, ...],
+    ) -> CandidateSessionView:
+        self.last_query = (project, iteration, assignee, status_ids)
+        if self.fail_query:
+            raise TuiControllerError("LEAK-DUPLICATE-UUID-CONTEXT")
+        return CandidateSessionView(
+            session_id="PRIVATE-CANDIDATE-CAPABILITY",
+            items=(DefectChoice("defect-1", "Qt lifecycle defect", "todo-id", "normal"),),
+        )
+
+    def start_defect(self, session_id: str, candidate_id: str) -> RunDetail:
+        self.mutation_calls.append(("start_defect", session_id, candidate_id))
+        if self.fail_start:
+            raise TuiControllerError("LEAK-STALE-CANDIDATE-CONTEXT")
+        return _validating_detail("defect-1", run_id="run-defect-1")
+
+    def start_requirement(self, requirement_id: str) -> RunDetail:
+        self.mutation_calls.append(("start_requirement", requirement_id))
+        return _validating_detail(requirement_id, run_id="run-requirement-1")
+
+    def confirm_repository(
+        self, run_id: str, mapping_key: str, expected_version: int
+    ) -> RunDetail:
+        self.mutation_calls.append(
+            ("confirm_repository", run_id, mapping_key, expected_version)
+        )
+        self.confirmed_mapping = mapping_key
+        return _validating_detail("confirmed", run_id=run_id)
+
+
+def wizard_app_factory(controller: WizardController | None = None) -> DeveloperWorkflowTuiApp:
+    return DeveloperWorkflowTuiApp(
+        controller or WizardController(),  # type: ignore[arg-type]
+        3,
+        provider_type="github",
+        sandbox_configured=True,
+    )
+
+
+async def _open_defect_wizard(pilot) -> None:
+    await pilot.press("n")
+    await pilot.click("#workflow-defect")
+    await pilot.pause()
+
+
+async def _query_defects(pilot) -> None:
+    pilot.app.screen.query_one("#project", Input).value = "project-id"
+    pilot.app.screen.query_one("#iteration", Input).value = "iteration-id"
+    pilot.app.screen.query_one("#assignee", Input).value = "assignee-id"
+    pilot.app.screen.query_one("#status-ids", Input).value = "todo-id,fixing-id"
+    await pilot.click("#query-defects")
+    await pilot.pause()
+
+
+@pytest.mark.asyncio
+async def test_defect_wizard_uses_only_status_ids_and_confirms_mapping() -> None:
+    controller = WizardController()
+    async with wizard_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        assert controller.last_query == (
+            "project-id",
+            "iteration-id",
+            "assignee-id",
+            ("todo-id", "fixing-id"),
+        )
+        rendered = "\n".join(_plain(widget) for widget in pilot.app.screen.query(Static))
+        assert "PRIVATE-CANDIDATE-CAPABILITY" not in rendered
+
+        await pilot.click("#candidate-0")
+        await pilot.pause()
+        assert controller.mutation_calls == [
+            ("start_defect", "PRIVATE-CANDIDATE-CAPABILITY", "defect-1")
+        ]
+        pilot.app.screen.query_one("#mapping-key", Input).value = "app-group"
+        await pilot.click("#review-mapping")
+        await pilot.pause()
+        await pilot.click("#confirm-start")
+        await pilot.pause()
+
+        assert controller.confirmed_mapping == "app-group"
+        assert controller.mutation_calls[-1] == (
+            "confirm_repository",
+            "run-defect-1",
+            "app-group",
+            1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_candidate_query_has_zero_mutation_side_effects() -> None:
+    controller = WizardController()
+    async with wizard_app_factory(controller).run_test() as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        assert controller.mutation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_candidate_snapshot_fails_closed_before_start() -> None:
+    controller = WizardController()
+    controller.fail_query = True
+    async with wizard_app_factory(controller).run_test() as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        notice = _plain(pilot.app.screen.query_one("#wizard-notice"))
+        assert notice == "workflow wizard action failed safely"
+        assert "LEAK-DUPLICATE" not in notice
+        assert not any(
+            (button.id or "").startswith("candidate-")
+            for button in pilot.app.screen.query(Button)
+        )
+        assert controller.mutation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_stale_candidate_fails_closed_without_mapping_confirmation() -> None:
+    controller = WizardController()
+    controller.fail_start = True
+    async with wizard_app_factory(controller).run_test() as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        await pilot.click("#candidate-0")
+        await pilot.pause()
+        notice = _plain(pilot.app.screen.query_one("#wizard-notice"))
+        assert notice == "candidate selection is no longer valid"
+        assert "LEAK-STALE" not in notice
+        assert not pilot.app.screen.query("#mapping-key")
+        assert not any(call[0] == "confirm_repository" for call in controller.mutation_calls)
+
+
+@pytest.mark.asyncio
+async def test_mapping_is_required_and_ambiguous_key_input_fails_closed() -> None:
+    controller = WizardController()
+    async with wizard_app_factory(controller).run_test() as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        await pilot.click("#candidate-0")
+        await pilot.pause()
+        await pilot.click("#review-mapping")
+        await pilot.pause()
+        assert _plain(pilot.app.screen.query_one("#wizard-notice")) == (
+            "one repository mapping key is required"
+        )
+        pilot.app.screen.query_one("#mapping-key", Input).value = "primary,dependency"
+        await pilot.click("#review-mapping")
+        await pilot.pause()
+        assert _plain(pilot.app.screen.query_one("#wizard-notice")) == (
+            "one repository mapping key is required"
+        )
+        assert not any(call[0] == "confirm_repository" for call in controller.mutation_calls)
+
+
+@pytest.mark.asyncio
+async def test_requirement_wizard_reuses_mapping_and_confirmation() -> None:
+    controller = WizardController()
+    async with wizard_app_factory(controller).run_test(size=(60, 24)) as pilot:
+        await pilot.press("n")
+        await pilot.click("#workflow-requirement")
+        await pilot.pause()
+        pilot.app.screen.query_one("#requirement-id", Input).value = "REQ-42"
+        await pilot.click("#start-requirement")
+        await pilot.pause()
+        pilot.app.screen.query_one("#mapping-key", Input).value = "app-group"
+        await pilot.click("#review-mapping")
+        await pilot.pause()
+        await pilot.click("#confirm-start")
+        await pilot.pause()
+
+        assert controller.mutation_calls == [
+            ("start_requirement", "REQ-42"),
+            ("confirm_repository", "run-requirement-1", "app-group", 1),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_wizard_cancel_is_keyboard_reachable_and_has_no_side_effects() -> None:
+    controller = WizardController()
+    async with wizard_app_factory(controller).run_test(size=(60, 24)) as pilot:
+        await pilot.press("n")
+        assert pilot.app.screen.id == "workflow-type-screen"
+        await pilot.press("escape")
+        assert pilot.app.screen.id == "dashboard-screen"
+        assert controller.last_query is None
+        assert controller.mutation_calls == []

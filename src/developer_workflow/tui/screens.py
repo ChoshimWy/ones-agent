@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
 
 from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
+    Input,
     Label,
     ListItem,
     ListView,
@@ -20,8 +23,9 @@ from textual.widgets import (
     TabPane,
 )
 
+from ..contracts import WorkflowState
 from .controller import TuiController, TuiControllerError
-from .models import RepositoryView, RunDetail, RunFilter, RunSummary
+from .models import DefectChoice, RepositoryView, RunDetail, RunFilter, RunSummary
 from .supervisor import RunTaskSupervisor
 
 
@@ -36,6 +40,12 @@ _DETAIL_TABS = (
 _STORAGE_CORRUPTED = "workflow storage is corrupted safely"
 _LIST_UNAVAILABLE = "workflow list is unavailable safely"
 _DISPLAY_UNAVAILABLE = "workflow display is unavailable safely"
+_WIZARD_UNAVAILABLE = "workflow wizard action failed safely"
+_CANDIDATE_STALE = "candidate selection is no longer valid"
+_MAPPING_REQUIRED = "one repository mapping key is required"
+_INPUT_REQUIRED = "required workflow fields are missing"
+_NO_CANDIDATES = "no defect candidates available"
+_SAFE_MAPPING_KEY = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,6 +280,318 @@ class RunDetailScreen(Screen[None]):
     def action_previous_tab(self) -> None:
         self.query_one(RunDetailPane).previous_tab()
 
+
+class _MappingWizardScreen(Screen[RunDetail | None]):
+    """Shared mapping, review, and authoritative confirmation stages."""
+
+    STEP_FILTER = 0
+    STEP_CANDIDATE = 1
+    STEP_MAPPING = 2
+    STEP_CONFIRM = 3
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", priority=True),
+    ]
+
+    def __init__(
+        self,
+        controller: TuiController,
+        supervisor: RunTaskSupervisor,
+        *,
+        screen_id: str,
+    ) -> None:
+        super().__init__(id=screen_id)
+        self._controller = controller
+        self._supervisor = supervisor
+        self._preview: RunDetail | None = None
+        self._mapping_key = ""
+        self._step = self.STEP_FILTER
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="wizard-body"):
+            yield from self._initial_widgets()
+        yield Static("", id="wizard-notice", markup=False)
+        yield Button("Cancel", id="cancel-wizard")
+
+    def _initial_widgets(self) -> tuple[Widget, ...]:
+        raise NotImplementedError
+
+    async def _show_mapping(self, preview: RunDetail) -> None:
+        if preview.summary.state is not WorkflowState.VALIDATING:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        self._preview = preview
+        self._step = self.STEP_MAPPING
+        self._show_notice("")
+        body = self.query_one("#wizard-body", VerticalScroll)
+        await body.remove_children()
+        await body.mount(
+            Label("Repository mapping key"),
+            Input(placeholder="configured mapping or group key", id="mapping-key"),
+            Button("Review", id="review-mapping", variant="primary"),
+        )
+
+    async def _show_confirmation(self) -> None:
+        preview = self._preview
+        if preview is None:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        mapping_key = self.query_one("#mapping-key", Input).value.strip()
+        if (
+            not _SAFE_MAPPING_KEY.fullmatch(mapping_key)
+            or mapping_key in {".", ".."}
+        ):
+            self._show_notice(_MAPPING_REQUIRED)
+            return
+        self._mapping_key = mapping_key
+        self._step = self.STEP_CONFIRM
+        self._show_notice("")
+        body = self.query_one("#wizard-body", VerticalScroll)
+        await body.remove_children()
+        await body.mount(
+            Label("Confirm workflow"),
+            Static(
+                "\n".join(
+                    (
+                        f"work item: {preview.summary.work_item_id}",
+                        f"repository mapping: {mapping_key}",
+                        f"state: {preview.summary.state.value}",
+                    )
+                ),
+                id="workflow-summary",
+                markup=True,
+            ),
+            Button("Confirm", id="confirm-start", variant="success"),
+        )
+
+    async def _confirm(self) -> None:
+        preview = self._preview
+        if preview is None or not self._mapping_key:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        try:
+            detail = await self._supervisor.run_mutation(
+                preview.summary.run_id,
+                "confirm-repository",
+                self._controller.confirm_repository,
+                preview.summary.run_id,
+                self._mapping_key,
+                preview.summary.version,
+            )
+        except Exception:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        self.dismiss(detail)
+
+    def _show_notice(self, message: str) -> None:
+        self.query_one("#wizard-notice", Static).update(message)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    @on(Button.Pressed)
+    async def _handle_mapping_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id
+        if button_id == "cancel-wizard":
+            self.action_cancel()
+        elif button_id == "review-mapping" and self._step == self.STEP_MAPPING:
+            await self._show_confirmation()
+        elif button_id == "confirm-start" and self._step == self.STEP_CONFIRM:
+            await self._confirm()
+
+
+class DefectWizardScreen(_MappingWizardScreen):
+    """Four-stage defect wizard with a read-only candidate query."""
+
+    def __init__(self, controller: TuiController, supervisor: RunTaskSupervisor) -> None:
+        super().__init__(
+            controller,
+            supervisor,
+            screen_id="defect-wizard-screen",
+        )
+        self._candidate_session_id: str | None = None
+        self._candidates: tuple[DefectChoice, ...] = ()
+
+    def _initial_widgets(self) -> tuple[Widget, ...]:
+        return (
+            Label("New defect workflow"),
+            Input(placeholder="ONES project ID", id="project"),
+            Input(placeholder="ONES iteration ID", id="iteration"),
+            Input(placeholder="ONES assignee ID", id="assignee"),
+            Input(
+                placeholder="ONES status IDs, comma-separated",
+                id="status-ids",
+            ),
+            Button("Query defects", id="query-defects", variant="primary"),
+        )
+
+    async def _query(self) -> None:
+        project = self.query_one("#project", Input).value.strip()
+        iteration = self.query_one("#iteration", Input).value.strip()
+        assignee = self.query_one("#assignee", Input).value.strip()
+        status_values = self.query_one("#status-ids", Input).value
+        status_ids = tuple(
+            item.strip() for item in status_values.split(",") if item.strip()
+        )
+        if not project or not iteration or not assignee:
+            self._show_notice(_INPUT_REQUIRED)
+            return
+        if any(not _SAFE_MAPPING_KEY.fullmatch(item) for item in status_ids):
+            self._show_notice(_INPUT_REQUIRED)
+            return
+        try:
+            session = await self._supervisor.run_readonly(
+                "query-defects",
+                self._controller.query_defects,
+                project,
+                iteration,
+                assignee,
+                status_ids,
+            )
+        except Exception:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        if not session.items:
+            self._show_notice(_NO_CANDIDATES)
+            return
+        self._candidate_session_id = session.session_id
+        self._candidates = session.items
+        self._step = self.STEP_CANDIDATE
+        self._show_notice("")
+        body = self.query_one("#wizard-body", VerticalScroll)
+        await body.remove_children()
+        await body.mount(Label("Select one defect"))
+        for index, candidate in enumerate(session.items):
+            await body.mount(
+                Button(
+                    "  ".join(
+                        (
+                            candidate.priority,
+                            candidate.status_id or "status unavailable",
+                            candidate.title,
+                        )
+                    ),
+                    id=f"candidate-{index}",
+                )
+            )
+
+    async def _select_candidate(self, index: int) -> None:
+        session_id = self._candidate_session_id
+        if (
+            self._step != self.STEP_CANDIDATE
+            or session_id is None
+            or not 0 <= index < len(self._candidates)
+        ):
+            self._show_notice(_CANDIDATE_STALE)
+            return
+        candidate_id = self._candidates[index].candidate_id
+        # Make the UI-side capability one-shot before yielding to background work.
+        self._candidate_session_id = None
+        try:
+            preview = await self._supervisor.run_mutation(
+                "new-defect",
+                "start-defect",
+                self._controller.start_defect,
+                session_id,
+                candidate_id,
+            )
+        except Exception:
+            self._show_notice(_CANDIDATE_STALE)
+            return
+        await self._show_mapping(preview)
+
+    @on(Button.Pressed)
+    async def _handle_defect_button(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "query-defects" and self._step == self.STEP_FILTER:
+            await self._query()
+        elif button_id.startswith("candidate-"):
+            try:
+                index = int(button_id.removeprefix("candidate-"))
+            except ValueError:
+                self._show_notice(_CANDIDATE_STALE)
+                return
+            await self._select_candidate(index)
+
+
+class RequirementWizardScreen(_MappingWizardScreen):
+    """Requirement entry followed by the shared mapping confirmation flow."""
+
+    def __init__(self, controller: TuiController, supervisor: RunTaskSupervisor) -> None:
+        super().__init__(
+            controller,
+            supervisor,
+            screen_id="requirement-wizard-screen",
+        )
+
+    def _initial_widgets(self) -> tuple[Widget, ...]:
+        return (
+            Label("New requirement workflow"),
+            Input(placeholder="ONES requirement ID", id="requirement-id"),
+            Button("Continue", id="start-requirement", variant="primary"),
+        )
+
+    async def _start_requirement(self) -> None:
+        requirement_id = self.query_one("#requirement-id", Input).value.strip()
+        if not requirement_id:
+            self._show_notice(_INPUT_REQUIRED)
+            return
+        try:
+            preview = await self._supervisor.run_mutation(
+                "new-requirement",
+                "start-requirement",
+                self._controller.start_requirement,
+                requirement_id,
+            )
+        except Exception:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        await self._show_mapping(preview)
+
+    @on(Button.Pressed, "#start-requirement")
+    async def _handle_requirement_button(self) -> None:
+        if self._step == self.STEP_FILTER:
+            await self._start_requirement()
+
+
+class WorkflowTypeScreen(Screen[RunDetail | None]):
+    """Choose the only two supported workflow creation paths."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, controller: TuiController, supervisor: RunTaskSupervisor) -> None:
+        super().__init__(id="workflow-type-screen")
+        self._controller = controller
+        self._supervisor = supervisor
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("New workflow")
+            yield Button("Defect", id="workflow-defect", variant="primary")
+            yield Button("Requirement", id="workflow-requirement")
+            yield Button("Cancel", id="cancel-workflow-type")
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _wizard_done(self, detail: RunDetail | None) -> None:
+        if detail is not None:
+            self.dismiss(detail)
+
+    @on(Button.Pressed)
+    def _choose(self, event: Button.Pressed) -> None:
+        if event.button.id == "workflow-defect":
+            self.app.push_screen(
+                DefectWizardScreen(self._controller, self._supervisor),
+                callback=self._wizard_done,
+            )
+        elif event.button.id == "workflow-requirement":
+            self.app.push_screen(
+                RequirementWizardScreen(self._controller, self._supervisor),
+                callback=self._wizard_done,
+            )
+        elif event.button.id == "cancel-workflow-type":
+            self.action_cancel()
+
 class DashboardScreen(Screen[None]):
     """Responsive three/two/one-column workflow dashboard."""
 
@@ -283,6 +605,7 @@ class DashboardScreen(Screen[None]):
         Binding("shift+tab", "previous_tab", "Previous tab", show=False, priority=True),
         Binding("s", "show_settings", "Settings", show=False, priority=True),
         Binding("g", "show_runs", "Runs", show=False, priority=True),
+        Binding("n", "new_run", "New run", show=False, priority=True),
     ]
 
     def __init__(
@@ -406,6 +729,12 @@ class DashboardScreen(Screen[None]):
         self.query_one("#settings").display = False
         self.query_one("#workspace").display = True
 
+    def action_new_run(self) -> None:
+        self.app.push_screen(
+            WorkflowTypeScreen(self._controller, self._supervisor),
+            callback=lambda detail: None,
+        )
+
     @on(ListView.Selected, "#run-list")
     def select_run(self, event: ListView.Selected) -> None:
         index = event.list_view.index
@@ -439,12 +768,19 @@ class DashboardScreen(Screen[None]):
     def show_settings(self) -> None:
         self.action_show_settings()
 
+    @on(Button.Pressed, "#nav-new-run")
+    def new_run(self) -> None:
+        self.action_new_run()
+
 
 __all__ = [
     "DashboardScreen",
+    "DefectWizardScreen",
     "NavigationPane",
     "RunDetailPane",
     "RunDetailScreen",
     "RunListPane",
+    "RequirementWizardScreen",
     "SettingsView",
+    "WorkflowTypeScreen",
 ]
