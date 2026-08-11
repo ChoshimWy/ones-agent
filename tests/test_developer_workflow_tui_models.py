@@ -1238,6 +1238,41 @@ def test_dangerous_action_request_captures_confirmation_facts_and_rejects_stale(
         request.assert_current(run.validated_update(version=run.version + 1))
 
 
+def test_single_approval_request_uses_only_fingerprinted_test_tail(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    historical = _test("uv run pytest historical-failure").validated_update(
+        exit_code=1,
+        outcome=CommandOutcome.TEST_FAILED,
+    )
+    run = run.validated_update(test_results=(historical, *run.test_results))
+
+    detail = RunDetail.from_run(run)
+    request = DangerousActionRequest.from_run(run, action="approve")
+
+    assert len(detail.tests) == 2
+    assert detail.repositories[0].test_summary == "2 verified test facts"
+    assert request.test_count == 1
+    assert request.repositories[0].test_summary == "1 verified test fact"
+
+
+def test_multi_approval_request_uses_signed_repository_and_integration_tests(
+    tmp_path: Path,
+) -> None:
+    run = _multi_run(tmp_path)
+
+    detail = RunDetail.from_run(run)
+    request = DangerousActionRequest.from_run(run, action="approve")
+
+    assert len(detail.tests) == 3
+    assert request.test_count == 3
+    assert tuple(item.test_summary for item in request.repositories) == (
+        "1 verified test fact",
+        "1 verified test fact",
+    )
+
+
 def test_dangerous_action_request_captures_unsigned_package_fingerprint(
     tmp_path: Path,
 ) -> None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 import hmac
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal
@@ -287,17 +287,22 @@ class DangerousActionRequest:
         if action == "resume-publication" and not signed:
             raise TuiDisplayError("workflow action is unavailable")
         detail = run_detail_from_run(run)
+        repositories, test_count = _dangerous_test_facts(
+            run,
+            detail,
+            fingerprint_bound=fingerprint_bound,
+        )
         return cls(
             run_id=detail.summary.run_id,
             version=detail.summary.version,
             action=action,
             fingerprint=detail.fingerprint,
             work_item_id=detail.summary.work_item_id,
-            repositories=detail.repositories,
+            repositories=repositories,
             changed_file_count=sum(
                 item.changed_file_count for item in detail.repositories
             ),
-            test_count=len(detail.tests),
+            test_count=test_count,
             risk_count=detail.risk_count,
             unresolved_count=detail.unresolved_count,
             comment_status=(
@@ -314,6 +319,39 @@ class DangerousActionRequest:
         )
         if current != self:
             raise TuiDisplayError("workflow action is stale")
+
+
+def _dangerous_test_facts(
+    run: WorkflowRun,
+    detail: RunDetail,
+    *,
+    fingerprint_bound: bool,
+) -> tuple[tuple[RepositoryView, ...], int]:
+    approval = run.approval
+    if not fingerprint_bound or approval is None:
+        return detail.repositories, len(detail.tests)
+    if run.repository_group is None:
+        count = len(approval.tests)
+        return (
+            tuple(
+                replace(repository, test_summary=_test_fact_summary(count))
+                for repository in detail.repositories
+            ),
+            count,
+        )
+    approved_counts = {
+        item.repository_key: len(item.tests) for item in approval.repositories
+    }
+    repositories = tuple(
+        replace(
+            repository,
+            test_summary=_test_fact_summary(approved_counts[repository.key]),
+        )
+        for repository in detail.repositories
+    )
+    return repositories, sum(approved_counts.values()) + len(
+        approval.integration_tests
+    )
 
 
 def run_detail_from_run(run: WorkflowRun) -> RunDetail:
@@ -586,12 +624,13 @@ def _repository_view(
             if publication is not None and publication.error
             else ""
         ),
-        test_summary=(
-            f"{test_count} verified test "
-            f"{'fact' if test_count == 1 else 'facts'}"
-        ),
+        test_summary=_test_fact_summary(test_count),
         pr_target=safe_tui_text(mapping.base_branch, maximum=256),
     )
+
+
+def _test_fact_summary(count: int) -> str:
+    return f"{count} verified test {'fact' if count == 1 else 'facts'}"
 
 
 def _test_view(result: CommandResult) -> TestView:
