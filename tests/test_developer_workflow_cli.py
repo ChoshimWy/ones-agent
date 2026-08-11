@@ -985,14 +985,18 @@ def test_repository_commands_keep_normal_test_arguments(command: str) -> None:
     assert _mapping().validated_update(test_commands=(command,)).test_commands == (command,)
 
 
-def test_packaging_declares_root_entry_modules_and_workflow_schema() -> None:
+def test_packaging_declares_root_entry_modules_and_workflow_runtime_data() -> None:
     import tomllib
 
     data = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
     setuptools = data["tool"]["setuptools"]
     assert {"server", "main"}.issubset(set(setuptools["py-modules"]))
     assert "schemas/*.json" in setuptools["package-data"]["src.developer_workflow"]
+    assert "tui/*.tcss" in setuptools["package-data"]["src.developer_workflow"]
     assert setuptools["packages"]["find"]["include"] == ["src*", "config*"]
+
+    manifest = Path("MANIFEST.in").read_text(encoding="utf-8")
+    assert "recursive-include src *.py *.json *.tcss" in manifest
 
 
 def test_private_roots_are_created_with_verified_private_access(tmp_path: Path) -> None:
