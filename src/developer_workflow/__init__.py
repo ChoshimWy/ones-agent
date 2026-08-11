@@ -76,6 +76,12 @@ from .repository import (
     WorktreeRepository,
     build_branch_name,
 )
+from .repository_group import (
+    PreparedRepository,
+    RepositoryGroupError,
+    RepositoryGroupWorkspace,
+    repository_branch,
+)
 from .codex_runner import (
     CodexExecutionError,
     CodexOutputError,
@@ -152,6 +158,7 @@ __all__ = [
     "InvalidRunTransitionError",
     "InvalidWorkflowAction",
     "PreparedWorktree",
+    "PreparedRepository",
     "MultiRepositoryPublicationResult",
     "PreflightAnalyzer",
     "PublicationResult",
@@ -162,6 +169,8 @@ __all__ = [
     "PublishingProvider",
     "RepositoryMapping",
     "RepositoryGroupMapping",
+    "RepositoryGroupError",
+    "RepositoryGroupWorkspace",
     "RepositoryPublicationResult",
     "RepositoryRole",
     "RepositoryRunEvidence",
@@ -208,6 +217,7 @@ __all__ = [
     "approval_fingerprint",
     "utc_now",
     "build_branch_name",
+    "repository_branch",
     "extract_acceptance_criteria",
     "issue_approval",
     "validate_for_approval",

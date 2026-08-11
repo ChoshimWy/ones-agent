@@ -148,6 +148,24 @@ def test_repository_group_rejects_cycle_missing_dependency_and_multiple_primarie
             ),
         )
 
+
+def test_repository_group_rejects_duplicate_mirror_names() -> None:
+    with pytest.raises(ValidationError, match="repository names must be unique"):
+        RepositoryGroupMapping(
+            key="duplicate-mirror",
+            project_id="project",
+            iteration_id="iteration",
+            primary_repository="a",
+            repositories=(
+                _group_repository("a", role=RepositoryRole.PRIMARY),
+                _group_repository("b", role=RepositoryRole.DEPENDENCY).validated_update(
+                    repo_name="a"
+                ),
+            ),
+        )
+
+
+def test_repository_group_rejects_missing_dependency_and_multiple_primaries() -> None:
     with pytest.raises(ValidationError, match="unknown repository"):
         RepositoryGroupMapping(
             key="missing",

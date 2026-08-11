@@ -503,11 +503,26 @@ class WorktreeRepository:
             raise RepositoryBoundaryError("mirror path escapes mirror_root")
         return candidate
 
-    def _target_path(self, run_id: str) -> Path:
-        candidate = (self.worktree_root / self._safe_run_id(run_id)).resolve(strict=False)
+    def _target_path(self, run_id: str, repository_key: str | None = None) -> Path:
+        run_root = (self.worktree_root / self._safe_run_id(run_id)).resolve(strict=False)
+        candidate = run_root
+        if repository_key is not None:
+            candidate = (run_root / self._safe_repo_name(repository_key)).resolve(strict=False)
         if not _is_within(candidate, self.worktree_root):
             raise RepositoryBoundaryError("worktree path escapes worktree_root")
         return candidate
+
+    def _prepare_group_parent(self, run_id: str) -> Path:
+        parent = self._target_path(run_id)
+        try:
+            parent.mkdir(exist_ok=True)
+        except OSError as error:
+            raise RepositoryBoundaryError("group worktree parent could not be created") from error
+        if _is_link_or_reparse(parent) or not parent.is_dir():
+            raise RepositoryBoundaryError("group worktree parent is not a real directory")
+        if not _is_within(parent.resolve(strict=True), self.worktree_root):
+            raise RepositoryBoundaryError("group worktree parent escapes worktree_root")
+        return parent.resolve(strict=True)
 
     @staticmethod
     def _normalized_url(value: str) -> tuple[str, str]:
@@ -545,7 +560,38 @@ class WorktreeRepository:
         )
         return "remote", normalized
 
+    def _local_source_facts(
+        self, mapping: RepositoryMapping
+    ) -> tuple[Path, str, bytes, tuple[int, int, int, int]] | None:
+        if mapping.source_path is None:
+            return None
+        try:
+            source = Path(mapping.source_path).resolve(strict=True)
+        except OSError as error:
+            raise RepositoryBoundaryError("local source repository does not exist") from error
+        if _is_link_or_reparse(source) or not source.is_dir():
+            raise RepositoryBoundaryError("local source repository is not a real directory")
+        origin = self._output(
+            ["git", "-C", str(source), "remote", "get-url", "origin"],
+            operation="local source origin validation",
+        ).decode("utf-8", "surrogateescape")
+        if self._normalized_url(origin) != self._normalized_url(mapping.repo_url):
+            raise MirrorOriginMismatch("local source origin does not match mapping")
+        head = self._output(
+            ["git", "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+            operation="local source HEAD validation",
+        ).decode("ascii")
+        status = self._execute(
+            [
+                "git", "-C", str(source), "status", "--porcelain=v1", "-z",
+                "--untracked-files=all",
+            ],
+            operation="local source status validation",
+        ).stdout
+        return source, _canonical_commit_oid(head), status, _path_identity(source)
+
     def _ensure_mirror(self, mapping: RepositoryMapping) -> Path:
+        source_facts = self._local_source_facts(mapping)
         mirror = self._mirror_path(mapping)
         if mirror.exists():
             if _is_link_or_reparse(mirror) or not mirror.is_dir():
@@ -569,10 +615,19 @@ class WorktreeRepository:
             if origin_identity != mapping_identity:
                 raise MirrorOriginMismatch("existing mirror origin does not match mapping")
         else:
+            clone_source = mapping.repo_url if source_facts is None else str(source_facts[0])
             self._execute(
-                ["git", "clone", "--bare", mapping.repo_url, str(mirror)],
+                ["git", "clone", "--bare", clone_source, str(mirror)],
                 operation="mirror clone",
             )
+            if source_facts is not None:
+                self._execute(
+                    [
+                        "git", "--git-dir", str(mirror), "remote", "set-url", "origin",
+                        mapping.repo_url,
+                    ],
+                    operation="mirror authoritative origin configuration",
+                )
         self._execute(
             [
                 "git",
@@ -588,6 +643,8 @@ class WorktreeRepository:
             ["git", "--git-dir", str(mirror), "fetch", "--prune", "origin"],
             operation="mirror fetch",
         )
+        if source_facts is not None and self._local_source_facts(mapping) != source_facts:
+            raise RepositoryIdentityError("local source repository changed during mirror setup")
         return mirror
 
     def _ref_exists(self, mirror: Path, ref: str) -> bool:
@@ -613,10 +670,17 @@ class WorktreeRepository:
         return branch
 
     def prepare(
-        self, run_id: str, mapping: RepositoryMapping, branch: str
+        self,
+        run_id: str,
+        mapping: RepositoryMapping,
+        branch: str,
+        *,
+        repository_key: str | None = None,
     ) -> PreparedWorktree:
         branch = self._validate_work_branch(branch)
-        target = self._target_path(run_id)
+        if repository_key is not None:
+            self._prepare_group_parent(run_id)
+        target = self._target_path(run_id, repository_key)
         mirror = self._ensure_mirror(mapping)
         base_ref = f"refs/remotes/origin/{mapping.base_branch}"
         if not self._ref_exists(mirror, base_ref):
@@ -730,12 +794,17 @@ class WorktreeRepository:
         )
 
     def recover(
-        self, run_id: str, mapping: RepositoryMapping, branch: str
+        self,
+        run_id: str,
+        mapping: RepositoryMapping,
+        branch: str,
+        *,
+        repository_key: str | None = None,
     ) -> PreparedWorktree | None:
         """Recover only an exact, complete worktree left by this deterministic run."""
 
         branch = self._validate_work_branch(branch)
-        target = self._target_path(run_id)
+        target = self._target_path(run_id, repository_key)
         if not target.exists():
             return None
         if _is_link_or_reparse(target) or not target.is_dir():
@@ -807,6 +876,20 @@ class WorktreeRepository:
             head_commit=head,
             mirror_path=mirror,
         )
+
+    def resolve_repository_path(
+        self,
+        prepared: PreparedWorktree,
+        mapping: RepositoryMapping,
+        repository_path: str,
+    ) -> Path:
+        """Resolve one configured repository path without weakening snapshot gates."""
+
+        RepositorySnapshot._validate_repository_path(repository_path)
+        worktree, _ = self._validate_identity(prepared, mapping)
+        if not self._allowed(repository_path, mapping.allowed_paths):
+            raise RepositoryBoundaryError("repository path is outside allowed_paths")
+        return self._validate_changed_path(worktree, repository_path)
 
     def _cleanup_failed_worktree(
         self,

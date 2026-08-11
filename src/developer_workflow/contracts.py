@@ -310,6 +310,9 @@ class RepositoryGroupMapping(WorkflowModel):
         keys = [item.key for item in self.repositories]
         if len(keys) != len(set(keys)):
             raise ValueError("repository keys must be unique within a group")
+        repo_names = [item.repo_name for item in self.repositories]
+        if len(repo_names) != len(set(repo_names)):
+            raise ValueError("repository names must be unique within a group")
         if any(
             item.project_id != self.project_id or item.iteration_id != self.iteration_id
             for item in self.repositories
