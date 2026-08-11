@@ -219,11 +219,15 @@ class TuiController:
         self._max_candidate_sessions = max_candidate_sessions
         self._candidate_sessions: OrderedDict[str, _CandidateSession] = OrderedDict()
         self._candidate_lock = Lock()
+        self._closed = False
         self._async_runtime = _AsyncRuntime()
 
     def close(self) -> None:
         """Stop the controller-owned async runtime without closing shared services."""
 
+        with self._candidate_lock:
+            self._closed = True
+            self._candidate_sessions.clear()
         try:
             self._async_runtime.close()
         except _AsyncRuntimeError:
@@ -252,6 +256,9 @@ class TuiController:
         assignee: str,
         status_ids: tuple[str, ...],
     ) -> CandidateSessionView:
+        with self._candidate_lock:
+            if self._closed:
+                raise TuiControllerError(_QUERY_UNAVAILABLE)
         try:
             candidates = self._async_runtime.submit(
                 self._orchestrator.defect_candidates.list_candidates(
@@ -275,16 +282,18 @@ class TuiController:
             raise TuiControllerError(_CANDIDATE_ERROR) from None
 
         session_id = secrets.token_urlsafe(32)
-        if not candidates:
-            return CandidateSessionView(session_id=session_id, items=())
-        session = _CandidateSession(
-            project=project,
-            iteration=iteration,
-            assignee=assignee,
-            snapshot_token=next(iter(tokens)),
-            candidate_ids=frozenset(item.candidate_id for item in items),
-        )
         with self._candidate_lock:
+            if self._closed:
+                raise TuiControllerError(_QUERY_UNAVAILABLE)
+            if not candidates:
+                return CandidateSessionView(session_id=session_id, items=())
+            session = _CandidateSession(
+                project=project,
+                iteration=iteration,
+                assignee=assignee,
+                snapshot_token=next(iter(tokens)),
+                candidate_ids=frozenset(item.candidate_id for item in items),
+            )
             while session_id in self._candidate_sessions:
                 session_id = secrets.token_urlsafe(32)
             self._candidate_sessions[session_id] = session
@@ -301,17 +310,22 @@ class TuiController:
         ):
             raise TuiControllerError(_CANDIDATE_ERROR)
         with self._candidate_lock:
+            if self._closed:
+                raise TuiControllerError(_QUERY_UNAVAILABLE)
             session = self._candidate_sessions.pop(session_id, None)
-        if session is None or candidate_id not in session.candidate_ids:
-            raise TuiControllerError(_CANDIDATE_ERROR)
+            if session is None or candidate_id not in session.candidate_ids:
+                raise TuiControllerError(_CANDIDATE_ERROR)
+            try:
+                run = self._orchestrator.start_defect(
+                    session.project,
+                    session.iteration,
+                    session.assignee,
+                    session.snapshot_token,
+                    candidate_id,
+                )
+            except Exception:
+                raise TuiControllerError(_CANDIDATE_ERROR) from None
         try:
-            run = self._orchestrator.start_defect(
-                session.project,
-                session.iteration,
-                session.assignee,
-                session.snapshot_token,
-                candidate_id,
-            )
             return self._detail(run)
         except Exception:
             raise TuiControllerError(_CANDIDATE_ERROR) from None

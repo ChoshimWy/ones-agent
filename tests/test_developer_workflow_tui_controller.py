@@ -169,6 +169,149 @@ def test_queries_from_multiple_threads_share_one_stable_event_loop_and_close():
         controller.query_defects("P", "I", "A", ())
 
 
+def test_close_revokes_existing_candidate_session_and_hidden_token():
+    orchestrator = Orchestrator([(candidate(token="TOKEN-CAPABILITY"),)])
+    controller = TuiController(orchestrator, Index())
+    view = controller.query_defects("P", "I", "A", ())
+
+    controller.close()
+
+    assert controller._candidate_sessions == {}
+    assert "TOKEN-CAPABILITY" not in repr(controller._candidate_sessions)
+    with pytest.raises(TuiControllerError):
+        controller.start_defect(view.session_id, "D-1")
+    assert not any(call[0] == "start_defect" for call in orchestrator.calls)
+
+
+def test_inflight_query_cannot_publish_session_after_close_begins():
+    started = threading.Event()
+    release = threading.Event()
+
+    class BarrierCandidates:
+        async def list_candidates(self, *args, **kwargs):
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.001)
+            return (candidate(token="TOKEN-INFLIGHT"),)
+
+    orchestrator = Orchestrator()
+    orchestrator.defect_candidates = BarrierCandidates()
+    controller = TuiController(orchestrator, Index())
+    query_errors = []
+    close_errors = []
+    query_thread = threading.Thread(
+        target=lambda: _capture_query_error(controller, query_errors)
+    )
+    close_thread = threading.Thread(
+        target=lambda: _capture_close_error(controller, close_errors)
+    )
+    query_thread.start()
+    assert started.wait(5)
+    close_thread.start()
+    for _ in range(5000):
+        if controller._async_runtime._closed:
+            break
+        threading.Event().wait(0.001)
+    assert controller._async_runtime._closed
+    release.set()
+    query_thread.join(5)
+    close_thread.join(5)
+
+    assert not query_thread.is_alive() and not close_thread.is_alive()
+    assert close_errors == []
+    assert query_errors and type(query_errors[0]) is TuiControllerError
+    assert str(query_errors[0]) == "candidate query is unavailable"
+    assert controller._candidate_sessions == {}
+    assert "TOKEN-INFLIGHT" not in repr(controller._candidate_sessions)
+    with pytest.raises(TuiControllerError):
+        controller.start_defect("unknown", "D-1")
+    assert not any(call[0] == "start_defect" for call in orchestrator.calls)
+
+
+def test_query_start_and_close_threads_finish_without_deadlock():
+    orchestrator = Orchestrator([(candidate(),), (candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    view = controller.query_defects("P", "I", "A", ())
+    outcomes = []
+
+    def invoke(operation):
+        try:
+            operation()
+            outcomes.append("ok")
+        except TuiControllerError:
+            outcomes.append("rejected")
+
+    threads = [
+        threading.Thread(
+            target=invoke,
+            args=(lambda: controller.query_defects("P", "I", "A", ()),),
+        ),
+        threading.Thread(
+            target=invoke,
+            args=(lambda: controller.start_defect(view.session_id, "D-1"),),
+        ),
+        threading.Thread(target=invoke, args=(controller.close,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(outcomes) == 3
+
+
+def test_close_cannot_return_between_session_pop_and_token_dispatch():
+    orchestrator = Orchestrator([(candidate(token="TOKEN-DISPATCH"),)])
+    controller = TuiController(orchestrator, Index())
+    view = controller.query_defects("P", "I", "A", ())
+    original = controller._candidate_sessions[view.session_id]
+    token_read = threading.Event()
+    release_token = threading.Event()
+    close_returned = threading.Event()
+    order = []
+
+    class BlockingSession:
+        project = original.project
+        iteration = original.iteration
+        assignee = original.assignee
+        candidate_ids = original.candidate_ids
+
+        @property
+        def snapshot_token(self):
+            token_read.set()
+            assert release_token.wait(5)
+            return original.snapshot_token
+
+    controller._candidate_sessions[view.session_id] = BlockingSession()
+    original_start = orchestrator.start_defect
+
+    def record_start(*args):
+        order.append("start")
+        return original_start(*args)
+
+    orchestrator.start_defect = record_start
+    start_thread = threading.Thread(
+        target=lambda: controller.start_defect(view.session_id, "D-1")
+    )
+
+    def close_controller():
+        controller.close()
+        order.append("close")
+        close_returned.set()
+
+    close_thread = threading.Thread(target=close_controller)
+    start_thread.start()
+    assert token_read.wait(5)
+    close_thread.start()
+    returned_before_dispatch = close_returned.wait(0.1)
+    release_token.set()
+    start_thread.join(5)
+    close_thread.join(5)
+
+    assert not returned_before_dispatch
+    assert order == ["start", "close"]
+
+
 def test_query_from_controller_event_loop_is_rejected_without_deadlock():
     orchestrator = Orchestrator()
     controller = TuiController(orchestrator, Index())
@@ -187,7 +330,10 @@ def test_query_from_controller_event_loop_is_rejected_without_deadlock():
 
     orchestrator.defect_candidates = ReentrantCandidates()
     try:
-        assert controller.query_defects("P", "I", "A", ()).items
+        with pytest.raises(
+            TuiControllerError, match="^candidate query is unavailable$"
+        ):
+            controller.query_defects("P", "I", "A", ())
     finally:
         controller.close()
 
@@ -204,18 +350,16 @@ def test_close_waits_for_inflight_query_then_closes_loop_and_thread():
     orchestrator = Orchestrator()
     orchestrator.defect_candidates = SlowCandidates()
     controller = TuiController(orchestrator, Index())
-    results = []
+    errors = []
     worker = threading.Thread(
-        target=lambda: results.append(
-            controller.query_defects("P", "I", "A", ())
-        )
+        target=lambda: _capture_query_error(controller, errors)
     )
     worker.start()
     assert started.wait(5)
     runtime = controller._async_runtime
     controller.close()
     worker.join(5)
-    assert results and results[0].items
+    assert errors and str(errors[0]) == "candidate query is unavailable"
     assert not runtime._thread.is_alive()
     assert runtime._loop.is_closed()
 
@@ -367,6 +511,20 @@ def test_start_defect_consumes_hidden_capability_even_when_orchestrator_fails():
 
     with pytest.raises(TuiControllerError) as caught:
         controller.start_defect(view.session_id, "D-1")
+
+
+def test_start_defect_sanitizes_lower_layer_controller_error():
+    orchestrator = Orchestrator([(candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    view = controller.query_defects("P", "I", "A", ())
+    orchestrator.start_defect = lambda *args: (_ for _ in ()).throw(
+        TuiControllerError("TOKEN-INNER")
+    )
+
+    with pytest.raises(TuiControllerError) as caught:
+        controller.start_defect(view.session_id, "D-1")
+    assert str(caught.value) == "candidate snapshot is invalid"
+    assert "TOKEN-INNER" not in str(caught.value)
     assert "TOKEN-INNER" not in str(caught.value)
     with pytest.raises(TuiControllerError, match="candidate snapshot is invalid"):
         controller.start_defect(view.session_id, "D-1")
