@@ -11,6 +11,7 @@ import pytest
 import src.developer_workflow.tui.controller as controller_module
 from src.developer_workflow.contracts import (
     DefectCandidate,
+    RepositoryMapping,
     WorkflowRun,
     WorkflowState,
     WorkflowType,
@@ -109,6 +110,34 @@ def candidate(candidate_id="D-1", token="SECRET-TOKEN"):
         snapshot_token=token,
         status_id="doing",
     )
+
+
+def test_show_projects_persisted_repository_candidates_without_config_access() -> None:
+    mapping = RepositoryMapping(
+        key="primary",
+        project_id="P",
+        iteration_id="I",
+        repo_url="https://git.example.invalid/team/primary.git",
+        repo_name="primary",
+        test_commands=("uv run pytest",),
+        allowed_paths=("src",),
+    )
+    orchestrator = Orchestrator()
+    orchestrator.run = WorkflowRun.new(
+        WorkflowType.REQUIREMENT, "REQ-1"
+    ).validated_update(
+        state=WorkflowState.VALIDATING,
+        repository_candidates=(mapping,),
+    )
+    controller = TuiController(orchestrator, Index())  # type: ignore[arg-type]
+
+    detail = controller.show(orchestrator.run.run_id)
+
+    assert tuple(item.key for item in detail.mapping_candidates) == ("primary",)
+    assert detail.mapping_candidates[0].repositories[0].test_summary == (
+        "1 configured test command"
+    )
+    assert "git.example.invalid" not in repr(detail.mapping_candidates)
 
 
 def test_query_hides_token_and_forwards_exact_status_ids():

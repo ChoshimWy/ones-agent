@@ -14,6 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 from rich.markup import escape as escape_markup
 
 from ..approval import approval_fingerprint
+from ..command_utils import CommandArgvError, parse_command_argv
 from ..contracts import (
     ApprovalPackage,
     CommandResult,
@@ -170,6 +171,7 @@ class RunDetail:
     fingerprint: str
     risk_count: int
     unresolved_count: int
+    mapping_candidates: tuple[MappingCandidateView, ...] = ()
 
     @classmethod
     def from_run(cls, run: WorkflowRun) -> RunDetail:
@@ -191,6 +193,32 @@ class DefectChoice:
             status_id=safe_tui_text(candidate.status_id, maximum=128, allow_empty=True),
             priority=safe_tui_text(candidate.priority, maximum=128),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class RepositoryCandidateView:
+    """Credential-free facts for one authorized repository candidate."""
+
+    key: str
+    role: str
+    source: str
+    depends_on: tuple[str, ...]
+    lint_summary: str
+    build_summary: str
+    test_summary: str
+    allowed_paths: tuple[str, ...]
+    side_effects: str
+
+
+@dataclass(frozen=True, slots=True)
+class MappingCandidateView:
+    """Frozen single-repository or repository-group selection facts."""
+
+    key: str
+    kind: Literal["repository", "repository-group"]
+    primary_repository: str
+    repositories: tuple[RepositoryCandidateView, ...]
+    integration_test_summary: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,7 +368,83 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
         unresolved_count=(
             len(approval.unresolved_items) if approval is not None else 0
         ),
+        mapping_candidates=_mapping_candidate_views(run),
     )
+
+
+def _mapping_candidate_views(run: WorkflowRun) -> tuple[MappingCandidateView, ...]:
+    if run.state is not WorkflowState.VALIDATING:
+        return ()
+    keys = tuple(item.key for item in run.repository_candidates) + tuple(
+        item.key for item in run.repository_group_candidates
+    )
+    if len(keys) != len(set(keys)):
+        raise TuiDisplayError(_INVALID_FACTS)
+    result = [
+        MappingCandidateView(
+            key=safe_tui_text(mapping.key, maximum=128),
+            kind="repository",
+            primary_repository=safe_tui_text(mapping.key, maximum=128),
+            repositories=(_repository_candidate_view(mapping),),
+            integration_test_summary="0 configured integration test commands",
+        )
+        for mapping in run.repository_candidates
+    ]
+    for group in run.repository_group_candidates:
+        try:
+            by_key = {item.key: item for item in group.repositories}
+            ordered = tuple(by_key[key] for key in group.topological_keys())
+        except Exception:
+            raise TuiDisplayError(_INVALID_FACTS) from None
+        result.append(
+            MappingCandidateView(
+                key=safe_tui_text(group.key, maximum=128),
+                kind="repository-group",
+                primary_repository=safe_tui_text(
+                    group.primary_repository, maximum=128
+                ),
+                repositories=tuple(
+                    _repository_candidate_view(mapping) for mapping in ordered
+                ),
+                integration_test_summary=_command_summary(
+                    group.integration_test_commands, "integration test"
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def _repository_candidate_view(mapping: RepositoryMapping) -> RepositoryCandidateView:
+    return RepositoryCandidateView(
+        key=safe_tui_text(mapping.key, maximum=128),
+        role=mapping.role.value,
+        source=(
+            "local read-only source"
+            if mapping.source_path is not None
+            else "remote mirror"
+        ),
+        depends_on=tuple(
+            safe_tui_text(key, maximum=128) for key in mapping.depends_on
+        ),
+        lint_summary=_command_summary(mapping.lint_commands, "lint"),
+        build_summary=_command_summary(mapping.build_commands, "build"),
+        test_summary=_command_summary(mapping.test_commands, "test"),
+        allowed_paths=tuple(
+            _safe_repository_path(path) for path in mapping.allowed_paths
+        ),
+        side_effects="changes use an isolated managed worktree",
+    )
+
+
+def _command_summary(commands: tuple[str, ...], label: str) -> str:
+    try:
+        for command in commands:
+            parse_command_argv(command)
+    except CommandArgvError:
+        raise TuiDisplayError(_INVALID_FACTS) from None
+    count = len(commands)
+    suffix = "command" if count == 1 else "commands"
+    return f"{count} configured {label} {suffix}"
 
 
 def _single_repository_views(

@@ -25,7 +25,14 @@ from textual.widgets import (
 
 from ..contracts import WorkflowState
 from .controller import TuiController, TuiControllerError
-from .models import DefectChoice, RepositoryView, RunDetail, RunFilter, RunSummary
+from .models import (
+    DefectChoice,
+    MappingCandidateView,
+    RepositoryView,
+    RunDetail,
+    RunFilter,
+    RunSummary,
+)
 from .supervisor import RunTaskSupervisor
 
 
@@ -42,7 +49,8 @@ _LIST_UNAVAILABLE = "workflow list is unavailable safely"
 _DISPLAY_UNAVAILABLE = "workflow display is unavailable safely"
 _WIZARD_UNAVAILABLE = "workflow wizard action failed safely"
 _CANDIDATE_STALE = "candidate selection is no longer valid"
-_MAPPING_REQUIRED = "one repository mapping key is required"
+_MAPPING_REQUIRED = "repository mapping selection is invalid"
+_NO_MAPPINGS = "no authorized repository mappings available"
 _INPUT_REQUIRED = "required workflow fields are missing"
 _NO_CANDIDATES = "no defect candidates available"
 _SAFE_MAPPING_KEY = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
@@ -246,6 +254,32 @@ def _repository_text(item: RepositoryView) -> str:
     )
 
 
+def _mapping_candidate_text(candidate: MappingCandidateView) -> str:
+    topology = " -> ".join(item.key for item in candidate.repositories)
+    lines = [
+        f"{candidate.key}  {candidate.kind}",
+        f"primary: {candidate.primary_repository}",
+        f"topology: {topology}",
+    ]
+    for repository in candidate.repositories:
+        dependencies = ", ".join(repository.depends_on) or "none"
+        allowed_paths = ", ".join(repository.allowed_paths) or "none configured"
+        lines.extend(
+            (
+                f"repository: {repository.key}  role: {repository.role}",
+                f"source: {repository.source}",
+                f"depends on: {dependencies}",
+                repository.lint_summary,
+                repository.build_summary,
+                repository.test_summary,
+                f"allowed paths: {allowed_paths}",
+                f"side effects: {repository.side_effects}",
+            )
+        )
+    lines.append(candidate.integration_test_summary)
+    return "\n".join(lines)
+
+
 class RunDetailScreen(Screen[None]):
     """Independent detail page used by one-column terminals."""
 
@@ -304,6 +338,7 @@ class _MappingWizardScreen(Screen[RunDetail | None]):
         self._supervisor = supervisor
         self._preview: RunDetail | None = None
         self._mapping_key = ""
+        self._mapping_candidates: tuple[MappingCandidateView, ...] = ()
         self._step = self.STEP_FILTER
 
     def compose(self) -> ComposeResult:
@@ -320,47 +355,59 @@ class _MappingWizardScreen(Screen[RunDetail | None]):
             self._show_notice(_WIZARD_UNAVAILABLE)
             return
         self._preview = preview
+        self._mapping_candidates = preview.mapping_candidates
         self._step = self.STEP_MAPPING
-        self._show_notice("")
         body = self.query_one("#wizard-body", VerticalScroll)
         await body.remove_children()
-        await body.mount(
-            Label("Repository mapping key"),
-            Input(placeholder="configured mapping or group key", id="mapping-key"),
-            Button("Review", id="review-mapping", variant="primary"),
-        )
-
-    async def _show_confirmation(self) -> None:
-        preview = self._preview
-        if preview is None:
-            self._show_notice(_WIZARD_UNAVAILABLE)
+        if not self._mapping_candidates:
+            self._show_notice(_NO_MAPPINGS)
+            await body.mount(Label("No authorized repository mappings"))
             return
-        mapping_key = self.query_one("#mapping-key", Input).value.strip()
+        self._show_notice("")
+        await body.mount(Label("Select an authorized repository mapping"))
+        for index, candidate in enumerate(self._mapping_candidates):
+            await body.mount(
+                Button(
+                    f"Select {candidate.key}",
+                    id=f"mapping-{index}",
+                    variant="primary",
+                ),
+                Static(
+                    _mapping_candidate_text(candidate),
+                    id=f"mapping-candidate-{index}",
+                    markup=True,
+                ),
+            )
+
+    async def _show_confirmation(self, index: int) -> None:
+        preview = self._preview
         if (
-            not _SAFE_MAPPING_KEY.fullmatch(mapping_key)
-            or mapping_key in {".", ".."}
+            preview is None
+            or self._step != self.STEP_MAPPING
+            or not 0 <= index < len(self._mapping_candidates)
         ):
             self._show_notice(_MAPPING_REQUIRED)
             return
-        self._mapping_key = mapping_key
+        candidate = self._mapping_candidates[index]
+        self._mapping_key = candidate.key
         self._step = self.STEP_CONFIRM
         self._show_notice("")
         body = self.query_one("#wizard-body", VerticalScroll)
         await body.remove_children()
         await body.mount(
             Label("Confirm workflow"),
+            Button("Confirm", id="confirm-start", variant="success"),
             Static(
                 "\n".join(
                     (
                         f"work item: {preview.summary.work_item_id}",
-                        f"repository mapping: {mapping_key}",
+                        _mapping_candidate_text(candidate),
                         f"state: {preview.summary.state.value}",
                     )
                 ),
                 id="workflow-summary",
                 markup=True,
             ),
-            Button("Confirm", id="confirm-start", variant="success"),
         )
 
     async def _confirm(self) -> None:
@@ -393,8 +440,13 @@ class _MappingWizardScreen(Screen[RunDetail | None]):
         button_id = event.button.id
         if button_id == "cancel-wizard":
             self.action_cancel()
-        elif button_id == "review-mapping" and self._step == self.STEP_MAPPING:
-            await self._show_confirmation()
+        elif button_id is not None and button_id.startswith("mapping-"):
+            try:
+                index = int(button_id.removeprefix("mapping-"))
+            except ValueError:
+                self._show_notice(_MAPPING_REQUIRED)
+                return
+            await self._show_confirmation(index)
         elif button_id == "confirm-start" and self._step == self.STEP_CONFIRM:
             await self._confirm()
 

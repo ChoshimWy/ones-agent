@@ -15,8 +15,10 @@ from src.developer_workflow.tui.controller import (
 from src.developer_workflow.tui.models import (
     DefectChoice,
     HistoryView,
+    MappingCandidateView,
     PublicationView,
     RepositoryView,
+    RepositoryCandidateView,
     RunActivity,
     RunDetail,
     RunFilter,
@@ -389,7 +391,54 @@ async def test_all_detail_tabs_render_escaped_values_with_safe_rich_semantics() 
             assert "\\[bold]" not in plain
 
 
-def _validating_detail(work_item_id: str, *, run_id: str) -> RunDetail:
+def _candidate(
+    key: str = "app-group", *, group: bool = False
+) -> MappingCandidateView:
+    primary = RepositoryCandidateView(
+        key="primary" if group else key,
+        role="primary",
+        source="local read-only source",
+        depends_on=(),
+        lint_summary="1 configured lint command",
+        build_summary="1 configured build command",
+        test_summary="1 configured test command",
+        allowed_paths=("src", "tests"),
+        side_effects="changes use an isolated managed worktree",
+    )
+    repositories = (primary,)
+    if group:
+        repositories += (
+            RepositoryCandidateView(
+                key="dependency",
+                role="dependency",
+                source="remote mirror",
+                depends_on=("primary",),
+                lint_summary="0 configured lint commands",
+                build_summary="1 configured build command",
+                test_summary="1 configured test command",
+                allowed_paths=("lib",),
+                side_effects="changes use an isolated managed worktree",
+            ),
+        )
+    return MappingCandidateView(
+        key=key,
+        kind="repository-group" if group else "repository",
+        primary_repository=primary.key,
+        repositories=repositories,
+        integration_test_summary=(
+            "1 configured integration test command"
+            if group
+            else "0 configured integration test commands"
+        ),
+    )
+
+
+def _validating_detail(
+    work_item_id: str,
+    *,
+    run_id: str,
+    candidates: tuple[MappingCandidateView, ...] | None = None,
+) -> RunDetail:
     summary = RunSummary(
         run_id=run_id,
         workflow_type=WorkflowType.DEFECT,
@@ -399,7 +448,20 @@ def _validating_detail(work_item_id: str, *, run_id: str) -> RunDetail:
         updated_at=NOW,
         activity=RunActivity.IDLE,
     )
-    return _detail(summary)
+    detail = _detail(summary)
+    return RunDetail(
+        summary=detail.summary,
+        repositories=detail.repositories,
+        tests=detail.tests,
+        review=detail.review,
+        publication=detail.publication,
+        history=detail.history,
+        blocked_reason=detail.blocked_reason,
+        fingerprint=detail.fingerprint,
+        risk_count=detail.risk_count,
+        unresolved_count=detail.unresolved_count,
+        mapping_candidates=(_candidate(),) if candidates is None else candidates,
+    )
 
 
 class WizardController(FakeController):
@@ -410,6 +472,8 @@ class WizardController(FakeController):
         self.confirmed_mapping = ""
         self.fail_query = False
         self.fail_start = False
+        self.fail_confirm = False
+        self.mapping_candidates: tuple[MappingCandidateView, ...] = (_candidate(),)
 
     def query_defects(
         self,
@@ -430,11 +494,19 @@ class WizardController(FakeController):
         self.mutation_calls.append(("start_defect", session_id, candidate_id))
         if self.fail_start:
             raise TuiControllerError("LEAK-STALE-CANDIDATE-CONTEXT")
-        return _validating_detail("defect-1", run_id="run-defect-1")
+        return _validating_detail(
+            "defect-1",
+            run_id="run-defect-1",
+            candidates=self.mapping_candidates,
+        )
 
     def start_requirement(self, requirement_id: str) -> RunDetail:
         self.mutation_calls.append(("start_requirement", requirement_id))
-        return _validating_detail(requirement_id, run_id="run-requirement-1")
+        return _validating_detail(
+            requirement_id,
+            run_id="run-requirement-1",
+            candidates=self.mapping_candidates,
+        )
 
     def confirm_repository(
         self, run_id: str, mapping_key: str, expected_version: int
@@ -442,6 +514,8 @@ class WizardController(FakeController):
         self.mutation_calls.append(
             ("confirm_repository", run_id, mapping_key, expected_version)
         )
+        if self.fail_confirm:
+            raise TuiControllerError("LEAK-CONFIG-DRIFT-CONTEXT")
         self.confirmed_mapping = mapping_key
         return _validating_detail("confirmed", run_id=run_id)
 
@@ -490,8 +564,8 @@ async def test_defect_wizard_uses_only_status_ids_and_confirms_mapping() -> None
         assert controller.mutation_calls == [
             ("start_defect", "PRIVATE-CANDIDATE-CAPABILITY", "defect-1")
         ]
-        pilot.app.screen.query_one("#mapping-key", Input).value = "app-group"
-        await pilot.click("#review-mapping")
+        assert not pilot.app.screen.query("#mapping-key")
+        await pilot.click("#mapping-0")
         await pilot.pause()
         await pilot.click("#confirm-start")
         await pilot.pause()
@@ -548,30 +622,62 @@ async def test_stale_candidate_fails_closed_without_mapping_confirmation() -> No
 
 
 @pytest.mark.asyncio
-async def test_mapping_is_required_and_ambiguous_key_input_fails_closed() -> None:
+async def test_no_authorized_mapping_candidate_fails_closed() -> None:
+    controller = WizardController()
+    controller.mapping_candidates = ()
+    async with wizard_app_factory(controller).run_test() as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        await pilot.click("#candidate-0")
+        await pilot.pause()
+        assert _plain(pilot.app.screen.query_one("#wizard-notice")) == (
+            "no authorized repository mappings available"
+        )
+        assert not pilot.app.screen.query("#mapping-key")
+        assert not any(
+            (button.id or "").startswith("mapping-")
+            for button in pilot.app.screen.query(Button)
+        )
+        assert not any(call[0] == "confirm_repository" for call in controller.mutation_calls)
+
+
+@pytest.mark.asyncio
+async def test_unlisted_mapping_and_authoritative_drift_fail_closed() -> None:
     controller = WizardController()
     async with wizard_app_factory(controller).run_test() as pilot:
         await _open_defect_wizard(pilot)
         await _query_defects(pilot)
         await pilot.click("#candidate-0")
         await pilot.pause()
-        await pilot.click("#review-mapping")
-        await pilot.pause()
-        assert _plain(pilot.app.screen.query_one("#wizard-notice")) == (
-            "one repository mapping key is required"
+        screen = pilot.app.screen
+        await screen._show_confirmation(99)  # type: ignore[attr-defined]
+        assert _plain(screen.query_one("#wizard-notice")) == (
+            "repository mapping selection is invalid"
         )
-        pilot.app.screen.query_one("#mapping-key", Input).value = "primary,dependency"
-        await pilot.click("#review-mapping")
-        await pilot.pause()
-        assert _plain(pilot.app.screen.query_one("#wizard-notice")) == (
-            "one repository mapping key is required"
+        assert not any(
+            call[0] == "confirm_repository" for call in controller.mutation_calls
         )
-        assert not any(call[0] == "confirm_repository" for call in controller.mutation_calls)
+
+        await pilot.click("#mapping-0")
+        await pilot.pause()
+        controller.fail_confirm = True
+        await pilot.click("#confirm-start")
+        await pilot.pause()
+        notice = _plain(pilot.app.screen.query_one("#wizard-notice"))
+        assert notice == "workflow wizard action failed safely"
+        assert "LEAK-CONFIG-DRIFT" not in notice
+        assert controller.mutation_calls[-1] == (
+            "confirm_repository",
+            "run-defect-1",
+            "app-group",
+            1,
+        )
 
 
 @pytest.mark.asyncio
 async def test_requirement_wizard_reuses_mapping_and_confirmation() -> None:
     controller = WizardController()
+    controller.mapping_candidates = (_candidate("group-app", group=True),)
     async with wizard_app_factory(controller).run_test(size=(60, 24)) as pilot:
         await pilot.press("n")
         await pilot.click("#workflow-requirement")
@@ -579,15 +685,21 @@ async def test_requirement_wizard_reuses_mapping_and_confirmation() -> None:
         pilot.app.screen.query_one("#requirement-id", Input).value = "REQ-42"
         await pilot.click("#start-requirement")
         await pilot.pause()
-        pilot.app.screen.query_one("#mapping-key", Input).value = "app-group"
-        await pilot.click("#review-mapping")
+        summary = _plain(pilot.app.screen.query_one("#mapping-candidate-0"))
+        assert "repository-group" in summary
+        assert "primary -> dependency" in summary
+        assert "local read-only source" in summary
+        assert "1 configured lint command" in summary
+        assert "1 configured integration test command" in summary
+        assert "changes use an isolated managed worktree" in summary
+        await pilot.click("#mapping-0")
         await pilot.pause()
         await pilot.click("#confirm-start")
         await pilot.pause()
 
         assert controller.mutation_calls == [
             ("start_requirement", "REQ-42"),
-            ("confirm_repository", "run-requirement-1", "app-group", 1),
+            ("confirm_repository", "run-requirement-1", "group-app", 1),
         ]
 
 

@@ -143,6 +143,100 @@ def _mapping(
     )
 
 
+def test_validating_run_exposes_only_authorized_safe_mapping_candidates(
+    tmp_path: Path,
+) -> None:
+    primary = _mapping("primary")
+    dependency = _mapping(
+        "dependency",
+        role=RepositoryRole.DEPENDENCY,
+        depends_on=("primary",),
+    ).model_copy(
+        update={
+            "source_path": tmp_path / SENTINEL / "dependency",
+            "lint_commands": ("uv run ruff check .",),
+            "build_commands": ("uv run python -m compileall src",),
+        }
+    )
+    group = RepositoryGroupMapping(
+        key="app-group",
+        project_id="P",
+        iteration_id="I",
+        primary_repository="primary",
+        repositories=(dependency, primary),
+        integration_test_commands=("uv run pytest tests/integration",),
+    )
+    run = WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1").validated_update(
+        state=WorkflowState.VALIDATING,
+        repository_candidates=(primary,),
+        repository_group_candidates=(group,),
+    )
+
+    candidates = RunDetail.from_run(run).mapping_candidates
+
+    assert tuple(item.key for item in candidates) == ("primary", "app-group")
+    assert candidates[0].kind == "repository"
+    assert candidates[0].primary_repository == "primary"
+    assert candidates[1].kind == "repository-group"
+    assert candidates[1].primary_repository == "primary"
+    assert tuple(item.key for item in candidates[1].repositories) == (
+        "primary",
+        "dependency",
+    )
+    dependency_view = candidates[1].repositories[1]
+    assert dependency_view.source == "local read-only source"
+    assert dependency_view.depends_on == ("primary",)
+    assert dependency_view.lint_summary == "1 configured lint command"
+    assert dependency_view.build_summary == "1 configured build command"
+    assert dependency_view.test_summary == "1 configured test command"
+    assert dependency_view.allowed_paths == ("src", "tests")
+    assert dependency_view.side_effects == "changes use an isolated managed worktree"
+    assert candidates[1].integration_test_summary == (
+        "1 configured integration test command"
+    )
+    rendered = repr(candidates)
+    assert SENTINEL not in rendered
+    assert "git.example.invalid" not in rendered
+    assert "uv run" not in rendered
+
+
+def test_duplicate_mapping_candidate_keys_fail_closed() -> None:
+    mapping = _mapping("same-key")
+    group = RepositoryGroupMapping(
+        key="same-key",
+        project_id="P",
+        iteration_id="I",
+        primary_repository="same-key",
+        repositories=(mapping,),
+    )
+    run = WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1").validated_update(
+        state=WorkflowState.VALIDATING,
+        repository_candidates=(mapping,),
+        repository_group_candidates=(group,),
+    )
+
+    with pytest.raises(TuiDisplayError, match="workflow display facts are invalid"):
+        RunDetail.from_run(run)
+
+
+def test_mapping_candidate_rejects_credential_bearing_command_facts() -> None:
+    mapping_data = _mapping("primary").model_dump()
+    mapping_data["test_commands"] = ("curl --oauth2-bearer=LEAK-ME-TOKEN",)
+    mapping = RepositoryMapping.model_construct(**mapping_data)
+    base_run = WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1")
+    run_data = {
+        name: getattr(base_run, name) for name in type(base_run).model_fields
+    }
+    run_data.update(
+        state=WorkflowState.VALIDATING,
+        repository_candidates=(mapping,),
+    )
+    run = WorkflowRun.model_construct(**run_data)
+
+    with pytest.raises(TuiDisplayError, match="workflow display facts are invalid"):
+        RunDetail.from_run(run)
+
+
 def _worktree(tmp_path: Path, key: str, base: str, head: str) -> PreparedWorktree:
     return PreparedWorktree(
         path=(tmp_path / "worktrees" / key).resolve(),
