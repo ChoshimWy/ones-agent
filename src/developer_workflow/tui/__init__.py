@@ -23,12 +23,19 @@ from .models import (
     run_detail_from_run,
     safe_tui_text,
 )
+from .run_index import RunIndex
 from .supervisor import (
     RunTaskSupervisor,
     SupervisorClosedError,
     SupervisorLoopError,
     TaskEvent,
 )
+
+
+def run_tui(controller: TuiController, max_concurrency: int) -> None:
+    """Run the full-screen terminal application for an assembled controller."""
+
+    DeveloperWorkflowTuiApp(controller, max_concurrency).run()
 
 __all__ = [
     "CandidateSessionView",
@@ -41,6 +48,7 @@ __all__ = [
     "RunActivity",
     "RunDetail",
     "RunFilter",
+    "RunIndex",
     "RunSummary",
     "RunTaskSupervisor",
     "SupervisorClosedError",
@@ -52,5 +60,6 @@ __all__ = [
     "TuiDisplayError",
     "TaskEvent",
     "run_detail_from_run",
+    "run_tui",
     "safe_tui_text",
 ]

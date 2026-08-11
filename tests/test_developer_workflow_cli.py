@@ -309,6 +309,36 @@ def test_tui_parser_accepts_custom_config_path() -> None:
     assert args.config == "custom.json"
 
 
+def test_tui_help_has_no_configuration_factory_or_runner_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.cli import main
+
+    calls: list[object] = []
+    monkeypatch.setattr(
+        DeveloperWorkflowConfig,
+        "load",
+        lambda path: calls.append(("config", path)),
+    )
+    output = Terminal(tty=False)
+
+    code = main(
+        ["tui", "--help"],
+        factory=lambda config: calls.append(  # type: ignore[arg-type,func-returns-value]
+            ("factory", config)
+        ),
+        tui_runner=lambda controller, limit: calls.append(
+            ("runner", controller, limit)
+        ),
+        stdout=output,
+        stderr=Terminal(tty=False),
+    )
+
+    assert code == 0
+    assert "--config" in output.getvalue()
+    assert calls == []
+
+
 class DefectListClient:
     def __init__(self, candidates: tuple[DefectCandidate, ...] | None = None) -> None:
         self.candidates = candidates if candidates is not None else Candidates().list_candidates

@@ -39,6 +39,10 @@ class DefectListFactory(Protocol):
     def __call__(self, limit: int, page_size: int) -> DefectListClient: ...
 
 
+class TuiRunner(Protocol):
+    def __call__(self, controller: object, max_concurrency: int) -> None: ...
+
+
 class _ParserExit(Exception):
     def __init__(self, status: int) -> None:
         self.status = status
@@ -675,11 +679,27 @@ def build_production_defect_list_client(
     return _ProductionDefectListClient(gateway, candidates)
 
 
+def _execute_tui(
+    config: DeveloperWorkflowConfig,
+    factory: OrchestratorFactory,
+    tui_runner: TuiRunner,
+) -> int:
+    """Assemble the TUI from the same validated production workflow graph."""
+
+    from .tui import RunIndex, TuiController
+
+    orchestrator = factory(config)
+    controller = TuiController(orchestrator, RunIndex(orchestrator.store))
+    tui_runner(controller, config.tui_max_concurrency)
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     factory: OrchestratorFactory = build_production_orchestrator,
     defect_list_factory: DefectListFactory = build_production_defect_list_client,
+    tui_runner: TuiRunner | None = None,
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
@@ -698,6 +718,12 @@ def main(
                 args, defect_list_factory, stdout=stdout, stderr=stderr
             )
         config = DeveloperWorkflowConfig.load(args.config)
+        if args.command == "tui":
+            if tui_runner is None:
+                from .tui import run_tui
+
+                tui_runner = run_tui
+            return _execute_tui(config, factory, tui_runner)
         orchestrator = factory(config)
         return _execute(
             args, orchestrator, stdin=stdin, stdout=stdout, stderr=stderr
