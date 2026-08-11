@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import re
+from typing import Literal
+import unicodedata
 
 from rich.text import Text
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -24,8 +26,9 @@ from textual.widgets import (
 )
 
 from ..contracts import WorkflowState
-from .controller import TuiController, TuiControllerError
+from .controller import StaleTuiActionError, TuiController, TuiControllerError
 from .models import (
+    DangerousActionRequest,
     DefectChoice,
     MappingCandidateView,
     RepositoryView,
@@ -53,6 +56,10 @@ _MAPPING_REQUIRED = "repository mapping selection is invalid"
 _NO_MAPPINGS = "no authorized repository mappings available"
 _INPUT_REQUIRED = "required workflow fields are missing"
 _NO_CANDIDATES = "no defect candidates available"
+_ACTION_UNAVAILABLE = "workflow action is unavailable"
+_ACTION_FAILED = "workflow action failed safely"
+_ACTION_STALE = "workflow changed; review again"
+_ACTION_INPUT_REQUIRED = "required action fields are missing"
 _SAFE_MAPPING_KEY = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 
 
@@ -172,6 +179,12 @@ class RunDetailPane(Vertical):
                     f"risks: {detail.risk_count}",
                     f"unresolved: {detail.unresolved_count}",
                     f"blocked: {detail.blocked_reason or 'no'}",
+                    "resume state: "
+                    + (
+                        detail.resume_state.value
+                        if detail.resume_state is not None
+                        else "not available"
+                    ),
                 )
             )
         )
@@ -644,6 +657,239 @@ class WorkflowTypeScreen(Screen[RunDetail | None]):
         elif event.button.id == "cancel-workflow-type":
             self.action_cancel()
 
+
+@dataclass(frozen=True, slots=True)
+class ApprovalSubmission:
+    request: DangerousActionRequest
+    actor: str
+
+
+@dataclass(frozen=True, slots=True)
+class RevisionSubmission:
+    request: DangerousActionRequest
+    feedback: str
+    scope: Literal["implementation", "repair"]
+
+
+@dataclass(frozen=True, slots=True)
+class CancelSubmission:
+    request: DangerousActionRequest
+    actor: str
+
+
+class _DangerousActionModal(ModalScreen[object | None]):
+    """Explicit-confirmation shell; plain Enter is deliberately inert."""
+
+    BINDINGS = [
+        Binding("escape", "back", "Back", priority=True),
+        Binding("enter", "ignore_enter", "", show=False, priority=True),
+        Binding("ctrl+enter", "confirm", "Confirm", priority=True),
+    ]
+
+    def __init__(self, request: DangerousActionRequest, *, screen_id: str) -> None:
+        super().__init__(id=screen_id)
+        self.request = request
+
+    def action_back(self) -> None:
+        self.dismiss(None)
+
+    def action_ignore_enter(self) -> None:
+        return
+
+    def action_confirm(self) -> None:
+        self._confirm()
+
+    def _confirm(self) -> None:
+        raise NotImplementedError
+
+    def _notice(self, message: str) -> None:
+        self.query_one("#modal-notice", Static).update(message)
+
+
+def _valid_action_text(value: str, *, maximum: int) -> str | None:
+    value = value.strip()
+    if not value or len(value) > maximum:
+        return None
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return None
+    if any(
+        ord(character) < 32
+        or 127 <= ord(character) <= 159
+        or unicodedata.category(character) in {"Cf", "Cs", "Zl", "Zp"}
+        for character in value
+    ):
+        return None
+    return value
+
+
+def _repository_action_facts(repository: RepositoryView) -> tuple[Widget, ...]:
+    return (
+        Label(f"{repository.key}  {repository.role}"),
+        Static(f"base: {repository.base_commit or 'not available'}"),
+        Static(f"head: {repository.head_commit or 'not available'}"),
+        Static(repository.tree_hash or "not available", classes="tree-hash"),
+        Static(repository.test_summary),
+        Static(f"PR target: {repository.pr_target or 'not available'}"),
+        Static(f"commit: {repository.commit_hash or 'not created'}"),
+        Static(f"push: {'completed' if repository.pushed else 'not completed'}"),
+        Static(f"PR: {repository.pr_url or 'not created'}"),
+        Static(f"error: {repository.error or 'none'}"),
+    )
+
+
+class ApprovalModal(_DangerousActionModal):
+    """Review signed approval facts before allowing an explicit approval."""
+
+    def __init__(self, request: DangerousActionRequest) -> None:
+        super().__init__(request, screen_id="approval-modal")
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Approve workflow")
+            yield Static(self.request.fingerprint, id="fingerprint")
+            yield Static(
+                "\n".join(
+                    (
+                        f"work item: {self.request.work_item_id}",
+                        f"repositories: {len(self.request.repositories)}",
+                        f"changed files: {self.request.changed_file_count}",
+                        f"tests: {self.request.test_count}",
+                        f"risks: {self.request.risk_count}",
+                        f"unresolved: {self.request.unresolved_count}",
+                    )
+                )
+            )
+            for repository in self.request.repositories:
+                yield from _repository_action_facts(repository)
+            yield Static(f"comment: {self.request.comment_status}")
+            yield Static(
+                f"publication error: {self.request.publication_error or 'none'}"
+            )
+            yield Input(placeholder="Approver actor", id="actor")
+        yield Static("", id="modal-notice", markup=False)
+        yield Button("Approve", id="confirm-approve", variant="warning")
+        yield Button("Back", id="cancel-action")
+
+    def _confirm(self) -> None:
+        actor = _valid_action_text(
+            self.query_one("#actor", Input).value, maximum=128
+        )
+        if actor is None:
+            self._notice(_ACTION_INPUT_REQUIRED)
+            return
+        self.dismiss(ApprovalSubmission(self.request, actor))
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-approve":
+            self._confirm()
+        elif event.button.id == "cancel-action":
+            self.action_back()
+
+
+class RevisionModal(_DangerousActionModal):
+    """Collect bounded revision feedback and an explicit workflow scope."""
+
+    def __init__(self, request: DangerousActionRequest) -> None:
+        super().__init__(request, screen_id="revision-modal")
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Revise workflow")
+            yield Static(f"work item: {self.request.work_item_id}")
+            yield Input(placeholder="Revision feedback", id="feedback")
+            yield Input(placeholder="implementation or repair", id="scope")
+        yield Static("", id="modal-notice", markup=False)
+        yield Button("Revise", id="confirm-revise", variant="warning")
+        yield Button("Back", id="cancel-action")
+
+    def _confirm(self) -> None:
+        feedback = _valid_action_text(
+            self.query_one("#feedback", Input).value, maximum=4096
+        )
+        scope = self.query_one("#scope", Input).value.strip()
+        if feedback is None or scope not in {"implementation", "repair"}:
+            self._notice(_ACTION_INPUT_REQUIRED)
+            return
+        self.dismiss(RevisionSubmission(self.request, feedback, scope))
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-revise":
+            self._confirm()
+        elif event.button.id == "cancel-action":
+            self.action_back()
+
+
+class CancelModal(_DangerousActionModal):
+    """Require an actor before cancelling an authoritative run version."""
+
+    def __init__(self, request: DangerousActionRequest) -> None:
+        super().__init__(request, screen_id="cancel-modal")
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Cancel workflow")
+            yield Static(f"work item: {self.request.work_item_id}")
+            yield Input(placeholder="Cancellation actor", id="actor")
+        yield Static("", id="modal-notice", markup=False)
+        yield Button("Cancel workflow", id="confirm-cancel", variant="error")
+        yield Button("Back", id="cancel-action")
+
+    def _confirm(self) -> None:
+        actor = _valid_action_text(
+            self.query_one("#actor", Input).value, maximum=128
+        )
+        if actor is None:
+            self._notice(_ACTION_INPUT_REQUIRED)
+            return
+        self.dismiss(CancelSubmission(self.request, actor))
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-cancel":
+            self._confirm()
+        elif event.button.id == "cancel-action":
+            self.action_back()
+
+
+class PublicationResumeModal(_DangerousActionModal):
+    """Show persisted per-repository publication checkpoints before retry."""
+
+    def __init__(self, request: DangerousActionRequest) -> None:
+        super().__init__(request, screen_id="publication-resume-modal")
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Resume publication")
+            yield Static(self.request.fingerprint, id="fingerprint")
+            for repository in self.request.repositories:
+                yield from _repository_action_facts(repository)
+            yield Static(f"comment: {self.request.comment_status}")
+            yield Static(
+                f"publication error: {self.request.publication_error or 'none'}"
+            )
+        yield Static("", id="modal-notice", markup=False)
+        yield Button(
+            "Resume publication",
+            id="confirm-resume-publication",
+            variant="warning",
+        )
+        yield Button("Back", id="cancel-action")
+
+    def _confirm(self) -> None:
+        self.dismiss(self.request)
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "confirm-resume-publication":
+            self._confirm()
+        elif event.button.id == "cancel-action":
+            self.action_back()
+
+
 class DashboardScreen(Screen[None]):
     """Responsive three/two/one-column workflow dashboard."""
 
@@ -658,6 +904,10 @@ class DashboardScreen(Screen[None]):
         Binding("s", "show_settings", "Settings", show=False, priority=True),
         Binding("g", "show_runs", "Runs", show=False, priority=True),
         Binding("n", "new_run", "New run", show=False, priority=True),
+        Binding("r", "resume", "Resume", show=False, priority=True),
+        Binding("v", "revise", "Revise", show=False, priority=True),
+        Binding("a", "approve", "Approve", show=False, priority=True),
+        Binding("x", "cancel_run", "Cancel", show=False, priority=True),
     ]
 
     def __init__(
@@ -684,6 +934,12 @@ class DashboardScreen(Screen[None]):
                 id="settings",
                 markup=False,
             )
+        with Horizontal(id="action-bar"):
+            yield Button("Resume", id="action-resume")
+            yield Button("Revise", id="action-revise")
+            yield Button("Approve", id="action-approve")
+            yield Button("Cancel", id="action-cancel")
+        yield Static("", id="notice", markup=False)
 
     async def on_mount(self) -> None:
         self._set_mode(self.size.width)
@@ -787,6 +1043,214 @@ class DashboardScreen(Screen[None]):
             callback=lambda detail: None,
         )
 
+    def _selected_summary(self) -> RunSummary | None:
+        index = self._selected_index()
+        if index is None or not 0 <= index < len(self._runs):
+            return None
+        summary = self._runs[index]
+        return None if summary.corrupted else summary
+
+    def _show_action_notice(self, message: str) -> None:
+        self.query_one("#notice", Static).update(message)
+
+    async def _prepare_action(
+        self, action: str
+    ) -> DangerousActionRequest | None:
+        summary = self._selected_summary()
+        if summary is None:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return None
+        try:
+            return await self._supervisor.run_readonly(
+                f"prepare-{action}",
+                self._controller.prepare_action,
+                summary.run_id,
+                action,
+            )
+        except Exception:
+            self._show_action_notice(_ACTION_FAILED)
+            return None
+
+    @staticmethod
+    def _terminal(summary: RunSummary) -> bool:
+        return summary.state in {
+            WorkflowState.COMPLETED,
+            WorkflowState.CANCELLED,
+            WorkflowState.FAILED,
+        }
+
+    async def action_approve(self) -> None:
+        summary = self._selected_summary()
+        if summary is None or summary.state is not WorkflowState.WAITING_APPROVAL:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        request = await self._prepare_action("approve")
+        if request is not None and request.state is WorkflowState.WAITING_APPROVAL:
+            self.app.push_screen(ApprovalModal(request), callback=self._approval_done)
+        elif request is not None:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+
+    async def action_revise(self) -> None:
+        summary = self._selected_summary()
+        if summary is None or summary.state not in {
+            WorkflowState.WAITING_APPROVAL,
+            WorkflowState.BLOCKED,
+        }:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        request = await self._prepare_action("revise")
+        allowed = request is not None and (
+            request.state is WorkflowState.WAITING_APPROVAL
+            or (
+                request.state is WorkflowState.BLOCKED
+                and request.resume_state
+                in {
+                    WorkflowState.IMPLEMENTING,
+                    WorkflowState.TESTING,
+                    WorkflowState.AI_REVIEW,
+                    WorkflowState.WAITING_APPROVAL,
+                }
+            )
+        )
+        if allowed:
+            assert request is not None
+            self.app.push_screen(RevisionModal(request), callback=self._revision_done)
+        elif request is not None:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+
+    async def action_cancel_run(self) -> None:
+        summary = self._selected_summary()
+        if summary is None or self._terminal(summary):
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        request = await self._prepare_action("cancel")
+        if request is not None and request.state not in {
+            WorkflowState.COMPLETED,
+            WorkflowState.CANCELLED,
+            WorkflowState.FAILED,
+        }:
+            self.app.push_screen(CancelModal(request), callback=self._cancel_done)
+        elif request is not None:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+
+    async def action_resume(self) -> None:
+        summary = self._selected_summary()
+        if (
+            summary is None
+            or self._terminal(summary)
+            or summary.state is WorkflowState.WAITING_APPROVAL
+        ):
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        try:
+            detail = await self._supervisor.run_readonly(
+                "review-resume", self._controller.show, summary.run_id
+            )
+        except Exception:
+            self._show_action_notice(_ACTION_FAILED)
+            return
+        publication_resume = (
+            detail.summary.state
+            in {WorkflowState.PARTIAL_SUCCESS, WorkflowState.PUBLISHING}
+            or (
+                detail.summary.state is WorkflowState.BLOCKED
+                and detail.resume_state is WorkflowState.PUBLISHING
+            )
+        )
+        if publication_resume:
+            request = await self._prepare_action("resume-publication")
+            valid_publication_request = request is not None and (
+                request.state
+                in {WorkflowState.PARTIAL_SUCCESS, WorkflowState.PUBLISHING}
+                or (
+                    request.state is WorkflowState.BLOCKED
+                    and request.resume_state is WorkflowState.PUBLISHING
+                )
+            )
+            if valid_publication_request:
+                assert request is not None
+                self.app.push_screen(
+                    PublicationResumeModal(request),
+                    callback=self._publication_resume_done,
+                )
+            elif request is not None:
+                self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        try:
+            await self._supervisor.run_mutation(
+                detail.summary.run_id,
+                "resume",
+                self._controller.resume,
+                detail.summary.run_id,
+                detail.summary.version,
+            )
+        except StaleTuiActionError:
+            self._show_action_notice(_ACTION_STALE)
+        except Exception:
+            self._show_action_notice(_ACTION_FAILED)
+        await self.refresh_runs()
+
+    async def _approval_done(self, submission: object | None) -> None:
+        if not isinstance(submission, ApprovalSubmission):
+            return
+        await self._run_dangerous(
+            submission.request,
+            "approve",
+            self._controller.approve,
+            submission.request,
+            submission.actor,
+        )
+
+    async def _revision_done(self, submission: object | None) -> None:
+        if not isinstance(submission, RevisionSubmission):
+            return
+        await self._run_dangerous(
+            submission.request,
+            "revise",
+            self._controller.revise,
+            submission.request,
+            submission.feedback,
+            submission.scope,
+        )
+
+    async def _cancel_done(self, submission: object | None) -> None:
+        if not isinstance(submission, CancelSubmission):
+            return
+        await self._run_dangerous(
+            submission.request,
+            "cancel",
+            self._controller.cancel,
+            submission.request,
+            submission.actor,
+        )
+
+    async def _publication_resume_done(self, submission: object | None) -> None:
+        if not isinstance(submission, DangerousActionRequest):
+            return
+        await self._run_dangerous(
+            submission,
+            "resume-publication",
+            self._controller.resume_publication,
+            submission,
+        )
+
+    async def _run_dangerous(
+        self,
+        request: DangerousActionRequest,
+        action: str,
+        call,
+        *args: object,
+    ) -> None:
+        try:
+            await self._supervisor.run_mutation(
+                request.run_id, action, call, *args
+            )
+        except StaleTuiActionError:
+            self._show_action_notice(_ACTION_STALE)
+        except Exception:
+            self._show_action_notice(_ACTION_FAILED)
+        await self.refresh_runs()
+
     @on(ListView.Selected, "#run-list")
     def select_run(self, event: ListView.Selected) -> None:
         index = event.list_view.index
@@ -824,15 +1288,35 @@ class DashboardScreen(Screen[None]):
     def new_run(self) -> None:
         self.action_new_run()
 
+    @on(Button.Pressed, "#action-resume")
+    async def resume_button(self) -> None:
+        await self.action_resume()
+
+    @on(Button.Pressed, "#action-revise")
+    async def revise_button(self) -> None:
+        await self.action_revise()
+
+    @on(Button.Pressed, "#action-approve")
+    async def approve_button(self) -> None:
+        await self.action_approve()
+
+    @on(Button.Pressed, "#action-cancel")
+    async def cancel_button(self) -> None:
+        await self.action_cancel_run()
+
 
 __all__ = [
+    "ApprovalModal",
+    "CancelModal",
     "DashboardScreen",
     "DefectWizardScreen",
     "NavigationPane",
+    "PublicationResumeModal",
     "RunDetailPane",
     "RunDetailScreen",
     "RunListPane",
     "RequirementWizardScreen",
+    "RevisionModal",
     "SettingsView",
     "WorkflowTypeScreen",
 ]

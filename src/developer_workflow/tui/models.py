@@ -136,6 +136,8 @@ class RepositoryView:
     pushed: bool
     pr_url: str
     error: str
+    test_summary: str = "0 verified test facts"
+    pr_target: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +174,7 @@ class RunDetail:
     risk_count: int
     unresolved_count: int
     mapping_candidates: tuple[MappingCandidateView, ...] = ()
+    resume_state: WorkflowState | None = None
 
     @classmethod
     def from_run(cls, run: WorkflowRun) -> RunDetail:
@@ -257,6 +260,10 @@ class DangerousActionRequest:
     test_count: int
     risk_count: int
     unresolved_count: int
+    comment_status: str = "not delivered"
+    publication_error: str = ""
+    state: WorkflowState = WorkflowState.CREATED
+    resume_state: WorkflowState | None = None
 
     def __post_init__(self) -> None:
         if self.action not in _ACTIONS:
@@ -293,6 +300,12 @@ class DangerousActionRequest:
             test_count=len(detail.tests),
             risk_count=detail.risk_count,
             unresolved_count=detail.unresolved_count,
+            comment_status=(
+                "delivered" if detail.publication.comment_id else "not delivered"
+            ),
+            publication_error=detail.publication.error,
+            state=detail.summary.state,
+            resume_state=detail.resume_state,
         )
 
     def assert_current(self, run: WorkflowRun) -> None:
@@ -369,6 +382,7 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
             len(approval.unresolved_items) if approval is not None else 0
         ),
         mapping_candidates=_mapping_candidate_views(run),
+        resume_state=run.resume_state,
     )
 
 
@@ -476,6 +490,7 @@ def _single_repository_views(
         tree_hash="",
         changed_files=changed_files,
         publication=publication if publication_bound else None,
+        test_count=len(run.test_results),
     )
     return (repository,), tuple(_test_view(item) for item in run.test_results)
 
@@ -519,6 +534,7 @@ def _group_views(
                 tree_hash=signed_evidence.tree_hash if signed_evidence else "",
                 changed_files=changed_files,
                 publication=publication,
+                test_count=len(evidence.test_results),
             )
         )
         test_views.extend(_test_view(item) for item in evidence.test_results)
@@ -534,6 +550,7 @@ def _repository_view(
     tree_hash: str,
     changed_files: tuple[str, ...],
     publication: PublicationResult | RepositoryPublicationResult | None,
+    test_count: int,
 ) -> RepositoryView:
     pr_url = ""
     if publication is not None and publication.pr_url:
@@ -569,6 +586,11 @@ def _repository_view(
             if publication is not None and publication.error
             else ""
         ),
+        test_summary=(
+            f"{test_count} verified test "
+            f"{'fact' if test_count == 1 else 'facts'}"
+        ),
+        pr_target=safe_tui_text(mapping.base_branch, maximum=256),
     )
 
 

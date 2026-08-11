@@ -469,6 +469,23 @@ def test_single_repository_detail_maps_only_safe_facts(tmp_path: Path) -> None:
         assert not hasattr(detail, forbidden)
 
 
+def test_action_detail_exposes_only_safe_resume_and_per_repository_review_facts(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path).validated_update(
+        resume_state=WorkflowState.PUBLISHING
+    )
+
+    detail = RunDetail.from_run(run)
+
+    assert detail.resume_state is WorkflowState.PUBLISHING
+    assert detail.repositories[0].test_summary == "1 verified test fact"
+    assert detail.repositories[0].pr_target == "main"
+    request = DangerousActionRequest.from_run(run, action="resume-publication")
+    assert request.state is WorkflowState.BLOCKED
+    assert request.resume_state is WorkflowState.PUBLISHING
+
+
 def _multi_run(tmp_path: Path) -> WorkflowRun:
     sdk = _mapping("sdk", role=RepositoryRole.DEPENDENCY)
     app = _mapping("app", depends_on=("sdk",))
@@ -590,12 +607,21 @@ def test_multi_repository_detail_correlates_signed_and_publication_facts_by_key(
     assert by_key["app"].commit_hash == "a" * 40
     assert by_key["sdk"].pr_url.endswith("/sdk/pull/1")
     assert by_key["app"].pr_url.endswith("/app/pull/2")
+    assert by_key["sdk"].test_summary == "1 verified test fact"
+    assert by_key["app"].test_summary == "1 verified test fact"
+    assert by_key["sdk"].pr_target == "main"
+    assert by_key["app"].pr_target == "main"
     assert len(detail.tests) == 3
     assert detail.tests[-1].command == "test command"
     assert detail.publication.comment_id == "delivered"
     assert detail.publication.error == "publication failed safely"
     assert detail.risk_count == 2
     assert SENTINEL not in _all_strings(detail)
+
+    request = DangerousActionRequest.from_run(run, action="resume-publication")
+    assert request.comment_status == "delivered"
+    assert request.publication_error == "publication failed safely"
+    assert SENTINEL not in _all_strings(request)
 
 
 @pytest.mark.parametrize(

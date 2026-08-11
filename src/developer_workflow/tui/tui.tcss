@@ -4,7 +4,34 @@ Screen {
 
 #dashboard {
     width: 100%;
-    height: 100%;
+    height: 1fr;
+}
+
+#action-bar {
+    height: 3;
+}
+
+#action-bar Button {
+    width: 1fr;
+}
+
+#notice,
+#modal-notice {
+    height: 1;
+}
+
+ApprovalModal,
+RevisionModal,
+CancelModal,
+PublicationResumeModal {
+    layout: vertical;
+}
+
+ApprovalModal > VerticalScroll,
+RevisionModal > VerticalScroll,
+CancelModal > VerticalScroll,
+PublicationResumeModal > VerticalScroll {
+    height: 1fr;
 }
 
 #navigation {

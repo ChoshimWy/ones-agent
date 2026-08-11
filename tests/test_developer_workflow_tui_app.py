@@ -10,9 +10,11 @@ from src.developer_workflow.contracts import WorkflowRun, WorkflowState, Workflo
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
 from src.developer_workflow.tui.controller import (
     CandidateSessionView,
+    StaleTuiActionError,
     TuiControllerError,
 )
 from src.developer_workflow.tui.models import (
+    DangerousActionRequest,
     DefectChoice,
     HistoryView,
     MappingCandidateView,
@@ -26,7 +28,14 @@ from src.developer_workflow.tui.models import (
     TestView as TuiTestView,
     safe_tui_text,
 )
-from src.developer_workflow.tui.screens import DashboardScreen, SettingsView
+from src.developer_workflow.tui.screens import (
+    ApprovalModal,
+    CancelModal,
+    DashboardScreen,
+    PublicationResumeModal,
+    RevisionModal,
+    SettingsView,
+)
 
 
 NOW = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
@@ -713,3 +722,360 @@ async def test_wizard_cancel_is_keyboard_reachable_and_has_no_side_effects() -> 
         assert pilot.app.screen.id == "dashboard-screen"
         assert controller.last_query is None
         assert controller.mutation_calls == []
+
+
+def _action_repository(key: str, role: str, suffix: str) -> RepositoryView:
+    return RepositoryView(
+        key=key,
+        role=role,
+        base_commit=suffix * 40,
+        head_commit=suffix.upper() * 40,
+        tree_hash=suffix * 64,
+        changed_files=(f"src/{key}.py",),
+        changed_file_count=1,
+        commit_hash="",
+        pushed=False,
+        pr_url="",
+        error="",
+        test_summary="1 verified test fact",
+        pr_target="main",
+    )
+
+
+class ActionController(FakeController):
+    def __init__(
+        self,
+        state: WorkflowState = WorkflowState.WAITING_APPROVAL,
+        *,
+        resume_state: WorkflowState | None = None,
+    ) -> None:
+        super().__init__()
+        self.state = state
+        self.resume_state = resume_state
+        self.version = 7
+        self.action_calls: list[tuple[object, ...]] = []
+        self.remote_effects: list[str] = []
+        self.repositories = (
+            _action_repository("primary", "primary", "a"),
+            _action_repository("dependency", "dependency", "b"),
+        )
+
+    def _summary(self) -> RunSummary:
+        return RunSummary(
+            run_id="run-action",
+            workflow_type=WorkflowType.DEFECT,
+            work_item_id="BUG-42",
+            state=self.state,
+            version=self.version,
+            updated_at=NOW,
+            activity=RunActivity.IDLE,
+        )
+
+    def _detail(self) -> RunDetail:
+        return RunDetail(
+            summary=self._summary(),
+            repositories=self.repositories,
+            tests=(TuiTestView("test command", "passed", 0),) * 2,
+            review=("review recorded",),
+            publication=PublicationView(
+                repositories=self.repositories,
+                comment_id="",
+                error=(
+                    "publication failed safely"
+                    if self.state is WorkflowState.PARTIAL_SUCCESS
+                    else ""
+                ),
+            ),
+            history=(),
+            blocked_reason=(
+                "workflow blocked safely"
+                if self.state is WorkflowState.BLOCKED
+                else ""
+            ),
+            fingerprint="f" * 64,
+            risk_count=2,
+            unresolved_count=1,
+            resume_state=self.resume_state,
+        )
+
+    def list_runs(self, filters: RunFilter, activities=None):
+        del filters, activities
+        return (self._summary(),)
+
+    def show(self, run_id: str) -> RunDetail:
+        assert run_id == "run-action"
+        return self._detail()
+
+    def prepare_action(self, run_id: str, action: str) -> DangerousActionRequest:
+        assert run_id == "run-action"
+        detail = self._detail()
+        return DangerousActionRequest(
+            run_id=run_id,
+            version=detail.summary.version,
+            action=action,
+            fingerprint=detail.fingerprint,
+            work_item_id=detail.summary.work_item_id,
+            repositories=detail.repositories,
+            changed_file_count=2,
+            test_count=2,
+            risk_count=detail.risk_count,
+            unresolved_count=detail.unresolved_count,
+            comment_status="not delivered",
+            publication_error=detail.publication.error,
+            state=detail.summary.state,
+            resume_state=detail.resume_state,
+        )
+
+    def _current(self, version: int) -> None:
+        if version != self.version:
+            raise StaleTuiActionError("LEAK-STALE-BODY")
+
+    def approve(self, request: DangerousActionRequest, actor: str) -> RunDetail:
+        self._current(request.version)
+        self.action_calls.append(("approve", request.version, actor))
+        self.remote_effects.extend(("commit", "push", "pr", "comment"))
+        return self._detail()
+
+    def revise(
+        self, request: DangerousActionRequest, feedback: str, scope: str | None
+    ) -> RunDetail:
+        self._current(request.version)
+        self.action_calls.append(("revise", request.version, feedback, scope))
+        return self._detail()
+
+    def cancel(self, request: DangerousActionRequest, actor: str) -> RunDetail:
+        self._current(request.version)
+        self.action_calls.append(("cancel", request.version, actor))
+        return self._detail()
+
+    def resume_publication(self, request: DangerousActionRequest) -> RunDetail:
+        self._current(request.version)
+        self.action_calls.append(("resume-publication", request.version))
+        return self._detail()
+
+    def resume(self, run_id: str, expected_version: int) -> RunDetail:
+        self._current(expected_version)
+        self.action_calls.append(("resume", run_id, expected_version))
+        return self._detail()
+
+    def advance_authoritative_version(self) -> None:
+        self.version += 1
+
+
+def action_app_factory(controller: ActionController) -> DeveloperWorkflowTuiApp:
+    return DeveloperWorkflowTuiApp(controller, 3)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_approval_modal_renders_complete_signed_multi_repository_facts() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        await pilot.press("a")
+        assert isinstance(pilot.app.screen, ApprovalModal)
+        assert _plain(pilot.app.screen.query_one("#fingerprint")) == "f" * 64
+        rendered = "\n".join(_plain(item) for item in pilot.app.screen.query(Static))
+        assert "work item: BUG-42" in rendered
+        assert "repositories: 2" in rendered
+        assert "changed files: 2" in rendered
+        assert "tests: 2" in rendered
+        assert "risks: 2" in rendered
+        assert "unresolved: 1" in rendered
+        assert [
+            _plain(item) for item in pilot.app.screen.query(".tree-hash")
+        ] == ["a" * 64, "b" * 64]
+        assert "base: " + "a" * 40 in rendered
+        assert "head: " + "A" * 40 in rendered
+        assert "1 verified test fact" in rendered
+        assert "PR target: main" in rendered
+        assert "commit: not created" in rendered
+        assert "push: not completed" in rendered
+        assert "PR: not created" in rendered
+        assert "comment: not delivered" in rendered
+        assert controller.remote_effects == []
+
+
+@pytest.mark.asyncio
+async def test_plain_enter_never_confirms_dangerous_actions_and_escape_returns() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("x")
+        assert isinstance(pilot.app.screen, CancelModal)
+        pilot.app.screen.query_one("#actor", Input).value = "operator"
+        await pilot.press("enter")
+        assert controller.action_calls == []
+        await pilot.press("escape")
+        assert pilot.app.screen.id == "dashboard-screen"
+
+
+@pytest.mark.asyncio
+async def test_actor_input_rejects_bidi_controls_with_a_fixed_error() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("x")
+        pilot.app.screen.query_one("#actor", Input).value = "operator\u202esecret"
+        await pilot.press("ctrl+enter")
+        notice = _plain(pilot.app.screen.query_one("#modal-notice"))
+        assert notice == "required action fields are missing"
+        assert "secret" not in notice
+        assert controller.action_calls == []
+
+
+@pytest.mark.asyncio
+async def test_approval_stale_confirmation_is_fixed_and_has_zero_effects() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("a")
+        controller.advance_authoritative_version()
+        pilot.app.screen.query_one("#actor", Input).value = "operator"
+        await pilot.click("#confirm-approve")
+        await pilot.pause(0.1)
+        assert pilot.app.screen.id == "dashboard-screen"
+        assert _plain(pilot.app.screen.query_one("#notice")) == (
+            "workflow changed; review again"
+        )
+        assert controller.action_calls == []
+        assert controller.remote_effects == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["revise", "cancel", "resume-publication"])
+async def test_every_dangerous_action_fails_closed_after_authoritative_drift(
+    action: str,
+) -> None:
+    controller = ActionController(
+        WorkflowState.PARTIAL_SUCCESS
+        if action == "resume-publication"
+        else WorkflowState.WAITING_APPROVAL
+    )
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press(
+            {"revise": "v", "cancel": "x", "resume-publication": "r"}[action]
+        )
+        controller.advance_authoritative_version()
+        if action == "revise":
+            pilot.app.screen.query_one("#feedback", Input).value = "fix lifecycle"
+            pilot.app.screen.query_one("#scope", Input).value = "repair"
+        elif action == "cancel":
+            pilot.app.screen.query_one("#actor", Input).value = "operator"
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        assert pilot.app.screen.id == "dashboard-screen"
+        assert _plain(pilot.app.screen.query_one("#notice")) == (
+            "workflow changed; review again"
+        )
+        assert controller.action_calls == []
+        assert controller.remote_effects == []
+
+
+@pytest.mark.asyncio
+async def test_approval_requires_actor_and_mouse_confirmation() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("a")
+        await pilot.click("#confirm-approve")
+        assert _plain(pilot.app.screen.query_one("#modal-notice")) == (
+            "required action fields are missing"
+        )
+        await pilot.press("escape", "a")
+        pilot.app.screen.query_one("#actor", Input).value = "operator"
+        await pilot.click("#confirm-approve")
+        await pilot.pause(0.1)
+        assert controller.action_calls == [("approve", 7, "operator")]
+
+
+@pytest.mark.asyncio
+async def test_revision_and_cancel_validate_inputs_and_use_supervisor_controller_path() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("v")
+        assert isinstance(pilot.app.screen, RevisionModal)
+        pilot.app.screen.query_one("#feedback", Input).value = "fix lifecycle"
+        pilot.app.screen.query_one("#scope", Input).value = "repair"
+        await pilot.click("#confirm-revise")
+        await pilot.pause()
+        assert controller.action_calls == [("revise", 7, "fix lifecycle", "repair")]
+
+        await pilot.press("x")
+        pilot.app.screen.query_one("#actor", Input).value = "operator"
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        assert controller.action_calls[-1] == ("cancel", 7, "operator")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_state", [None, WorkflowState.PUBLISHING])
+async def test_blocked_publication_or_unknown_checkpoint_cannot_be_revised(
+    resume_state: WorkflowState | None,
+) -> None:
+    controller = ActionController(
+        WorkflowState.BLOCKED, resume_state=resume_state
+    )
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("v")
+        assert pilot.app.screen.id == "dashboard-screen"
+        assert _plain(pilot.app.screen.query_one("#notice")) == (
+            "workflow action is unavailable"
+        )
+        assert controller.action_calls == []
+
+
+@pytest.mark.asyncio
+async def test_ordinary_resume_has_no_modal_and_passes_expected_version() -> None:
+    controller = ActionController(
+        WorkflowState.BLOCKED, resume_state=WorkflowState.IMPLEMENTING
+    )
+    async with action_app_factory(controller).run_test() as pilot:
+        assert "resume state: IMPLEMENTING" in _plain(
+            pilot.app.screen.query_one("#overview-content")
+        )
+        await pilot.press("r")
+        await pilot.pause()
+        assert pilot.app.screen.id == "dashboard-screen"
+        assert controller.action_calls == [("resume", "run-action", 7)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("state", "resume_state"),
+    [
+        (WorkflowState.PARTIAL_SUCCESS, None),
+        (WorkflowState.PUBLISHING, None),
+        (WorkflowState.BLOCKED, WorkflowState.PUBLISHING),
+    ],
+)
+async def test_publication_resume_uses_dedicated_modal_with_per_repository_facts(
+    state: WorkflowState, resume_state: WorkflowState | None
+) -> None:
+    controller = ActionController(state, resume_state=resume_state)
+    async with action_app_factory(controller).run_test(size=(60, 26)) as pilot:
+        await pilot.click("#action-resume")
+        await pilot.pause(0.1)
+        assert isinstance(pilot.app.screen, PublicationResumeModal)
+        rendered = "\n".join(_plain(item) for item in pilot.app.screen.query(Static))
+        assert "primary" in rendered and "dependency" in rendered
+        assert "commit: not created" in rendered
+        assert "push: not completed" in rendered
+        assert "PR: not created" in rendered
+        assert "publication failed safely" in rendered or state is not WorkflowState.PARTIAL_SUCCESS
+        await pilot.press("enter")
+        assert controller.action_calls == []
+        await pilot.press("ctrl+enter")
+        await pilot.pause()
+        assert controller.action_calls == [("resume-publication", 7)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "state",
+    [WorkflowState.COMPLETED, WorkflowState.CANCELLED, WorkflowState.FAILED],
+)
+async def test_terminal_states_reject_all_mutating_actions(state: WorkflowState) -> None:
+    controller = ActionController(state)
+    async with action_app_factory(controller).run_test() as pilot:
+        for key in ("r", "v", "a", "x"):
+            await pilot.press(key)
+        assert pilot.app.screen.id == "dashboard-screen"
+        assert _plain(pilot.app.screen.query_one("#notice")) == (
+            "workflow action is unavailable"
+        )
+        assert controller.action_calls == []
