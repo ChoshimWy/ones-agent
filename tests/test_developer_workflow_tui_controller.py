@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import fields
 from contextlib import contextmanager
+import asyncio
 from types import SimpleNamespace
 import threading
 
 import pytest
 
+import src.developer_workflow.tui.controller as controller_module
 from src.developer_workflow.contracts import (
     DefectCandidate,
     WorkflowRun,
@@ -24,7 +26,12 @@ from src.developer_workflow.tui.controller import (
     TuiController,
     TuiControllerError,
 )
-from src.developer_workflow.tui.models import DangerousActionRequest, RunDetail, RunFilter
+from src.developer_workflow.tui.models import (
+    DangerousActionRequest,
+    RunDetail,
+    RunFilter,
+    TuiDisplayError,
+)
 from src.developer_workflow.tui.run_index import RunIndex
 
 
@@ -39,6 +46,19 @@ class Candidates:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+class LoopRecordingCandidates:
+    def __init__(self):
+        self.loops = []
+        self.status_ids = []
+
+    async def list_candidates(self, project, iteration, assignee, *, status_ids=None):
+        assert status_ids != ()
+        self.loops.append(asyncio.get_running_loop())
+        self.status_ids.append(status_ids)
+        await asyncio.sleep(0.01)
+        return (candidate(),)
 
 
 class Orchestrator:
@@ -102,6 +122,223 @@ def test_query_hides_token_and_forwards_exact_status_ids():
     assert "SECRET-TOKEN" not in repr(view)
     assert all(field.name != "snapshot_token" for field in fields(view))
     assert view.items[0].candidate_id == "D-1"
+
+
+def test_query_passes_none_for_empty_status_ids():
+    candidates = LoopRecordingCandidates()
+    orchestrator = Orchestrator()
+    orchestrator.defect_candidates = candidates
+    controller = TuiController(orchestrator, Index())
+    try:
+        controller.query_defects("P", "I", "A", ())
+        controller.query_defects("P", "I", "A", ("todo",))
+        assert candidates.status_ids == [None, ("todo",)]
+        assert candidates.loops[0] is candidates.loops[1]
+    finally:
+        controller.close()
+
+
+def test_queries_from_multiple_threads_share_one_stable_event_loop_and_close():
+    candidates = LoopRecordingCandidates()
+    orchestrator = Orchestrator()
+    orchestrator.defect_candidates = candidates
+    controller = TuiController(orchestrator, Index())
+    errors = []
+
+    def query():
+        try:
+            controller.query_defects("P", "I", "A", ())
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=query) for _ in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+    assert errors == []
+    assert len(candidates.loops) == 4
+    assert len({id(loop) for loop in candidates.loops}) == 1
+    runtime_thread = controller._async_runtime._thread
+    runtime_loop = controller._async_runtime._loop
+    controller.close()
+    controller.close()
+    assert not runtime_thread.is_alive()
+    assert runtime_loop.is_closed()
+    with pytest.raises(TuiControllerError, match="^candidate query is unavailable$"):
+        controller.query_defects("P", "I", "A", ())
+
+
+def test_query_from_controller_event_loop_is_rejected_without_deadlock():
+    orchestrator = Orchestrator()
+    controller = TuiController(orchestrator, Index())
+
+    class ReentrantCandidates:
+        async def list_candidates(self, *args, **kwargs):
+            with pytest.raises(
+                TuiControllerError, match="^candidate query is unavailable$"
+            ):
+                controller.query_defects("P", "I", "A", ())
+            with pytest.raises(
+                TuiControllerError, match="^candidate query is unavailable$"
+            ):
+                controller.close()
+            return (candidate(),)
+
+    orchestrator.defect_candidates = ReentrantCandidates()
+    try:
+        assert controller.query_defects("P", "I", "A", ()).items
+    finally:
+        controller.close()
+
+
+def test_close_waits_for_inflight_query_then_closes_loop_and_thread():
+    started = threading.Event()
+
+    class SlowCandidates:
+        async def list_candidates(self, *args, **kwargs):
+            started.set()
+            await asyncio.sleep(0.05)
+            return (candidate(),)
+
+    orchestrator = Orchestrator()
+    orchestrator.defect_candidates = SlowCandidates()
+    controller = TuiController(orchestrator, Index())
+    results = []
+    worker = threading.Thread(
+        target=lambda: results.append(
+            controller.query_defects("P", "I", "A", ())
+        )
+    )
+    worker.start()
+    assert started.wait(5)
+    runtime = controller._async_runtime
+    controller.close()
+    worker.join(5)
+    assert results and results[0].items
+    assert not runtime._thread.is_alive()
+    assert runtime._loop.is_closed()
+
+
+def test_close_racing_loop_start_does_not_miss_stop(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+    original_new_event_loop = asyncio.new_event_loop
+
+    def delayed_new_event_loop():
+        entered.set()
+        assert release.wait(5)
+        return original_new_event_loop()
+
+    monkeypatch.setattr(asyncio, "new_event_loop", delayed_new_event_loop)
+    orchestrator = Orchestrator([(candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    query_errors = []
+    close_errors = []
+    query_thread = threading.Thread(
+        target=lambda: _capture_query_error(controller, query_errors)
+    )
+    query_thread.start()
+    assert entered.wait(5)
+    close_thread = threading.Thread(
+        target=lambda: _capture_close_error(controller, close_errors)
+    )
+    close_thread.start()
+    release.set()
+    close_thread.join(0.5)
+    missed_stop = close_thread.is_alive()
+    if missed_stop:
+        assert controller._async_runtime._ready.wait(5)
+        controller._async_runtime._loop.call_soon_threadsafe(
+            controller._async_runtime._loop.stop
+        )
+    close_thread.join(5)
+    query_thread.join(5)
+    assert not missed_stop
+    assert close_errors == []
+    assert query_errors and isinstance(query_errors[0], TuiControllerError)
+
+
+def test_runtime_construction_and_unexpected_stop_fail_with_fixed_error(monkeypatch):
+    orchestrator = Orchestrator([(candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    monkeypatch.setattr(
+        asyncio,
+        "new_event_loop",
+        lambda: (_ for _ in ()).throw(RuntimeError("TOKEN-INNER")),
+    )
+    with pytest.raises(TuiControllerError, match="^candidate query is unavailable$") as failed:
+        controller.query_defects("P", "I", "A", ())
+    assert "TOKEN-INNER" not in str(failed.value)
+    failed_thread = controller._async_runtime._thread
+    monkeypatch.undo()
+    with pytest.raises(TuiControllerError, match="^candidate query is unavailable$"):
+        controller.query_defects("P", "I", "A", ())
+    assert controller._async_runtime._thread is failed_thread
+    assert not failed_thread.is_alive()
+    controller.close()
+
+    orchestrator = Orchestrator([(candidate(),), (candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    controller.query_defects("P", "I", "A", ())
+    runtime = controller._async_runtime
+    runtime._loop.call_soon_threadsafe(runtime._loop.stop)
+    assert runtime._stopped.wait(5)
+    with pytest.raises(TuiControllerError, match="^candidate query is unavailable$"):
+        controller.query_defects("P", "I", "A", ())
+    controller.close()
+
+
+def test_loop_stop_before_task_creation_releases_waiter_without_coroutine_leak():
+    orchestrator = Orchestrator([(candidate(),), (candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    controller.query_defects("P", "I", "A", ())
+    runtime = controller._async_runtime
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+
+    def stop_before_next_ready_batch():
+        callback_entered.set()
+        assert release_callback.wait(5)
+        runtime._loop.stop()
+
+    runtime._loop.call_soon_threadsafe(stop_before_next_ready_batch)
+    assert callback_entered.wait(5)
+    errors = []
+    worker = threading.Thread(
+        target=lambda: _capture_query_error(controller, errors)
+    )
+    worker.start()
+    release_callback.set()
+    assert runtime._stopped.wait(5)
+    worker.join(0.5)
+    stranded = worker.is_alive()
+    if stranded:
+        controller.close()
+        worker.join(5)
+    assert not stranded
+    assert errors and type(errors[0]) is TuiControllerError
+    assert str(errors[0]) == "candidate query is unavailable"
+    assert runtime._futures == set()
+    controller.close()
+
+
+def test_thread_start_failure_is_fixed_and_close_remains_idempotent(monkeypatch):
+    class FailedThread:
+        def start(self):
+            raise RuntimeError("TOKEN-INNER")
+
+    monkeypatch.setattr(controller_module, "Thread", lambda **kwargs: FailedThread())
+    controller = TuiController(Orchestrator([(candidate(),)]), Index())
+    with pytest.raises(TuiControllerError, match="^candidate query is unavailable$") as failed:
+        controller.query_defects("P", "I", "A", ())
+    assert "TOKEN-INNER" not in str(failed.value)
+    monkeypatch.undo()
+    with pytest.raises(TuiControllerError, match="^candidate query is unavailable$"):
+        controller.query_defects("P", "I", "A", ())
+    assert controller._async_runtime._thread is None
+    controller.close()
+    controller.close()
 
 
 def test_query_rejects_mixed_tokens_and_does_not_create_empty_or_failed_sessions():
@@ -196,6 +433,32 @@ def test_cancel_asserts_authoritative_facts_then_forwards_bound_version():
     orchestrator.run = drifted
     with pytest.raises(StaleTuiActionError, match="^workflow changed; review again$"):
         controller.cancel(request, "SECRET-ACTOR")
+
+
+def test_request_authority_and_display_failures_are_unavailable_not_stale(monkeypatch):
+    orchestrator = Orchestrator()
+    controller = TuiController(orchestrator, Index())
+    request = controller.prepare_action(orchestrator.run.run_id, "cancel")
+    orchestrator.show = lambda run_id: (_ for _ in ()).throw(
+        RuntimeError("TOKEN-INNER")
+    )
+    with pytest.raises(TuiControllerError, match="^workflow action is unavailable$") as caught:
+        controller.cancel(request, "actor")
+    assert type(caught.value) is TuiControllerError
+    assert "TOKEN-INNER" not in str(caught.value)
+
+    orchestrator.show = lambda run_id: orchestrator.run
+    monkeypatch.setattr(
+        DangerousActionRequest,
+        "assert_current",
+        lambda self, run: (_ for _ in ()).throw(
+            TuiDisplayError("workflow display TOKEN-INNER")
+        ),
+    )
+    with pytest.raises(TuiControllerError, match="^workflow action is unavailable$") as display:
+        controller.cancel(request, "actor")
+    assert type(display.value) is TuiControllerError
+    assert "TOKEN-INNER" not in str(display.value)
 
 
 def test_constructor_requires_strict_positive_capacity():
@@ -295,5 +558,19 @@ def test_atomic_stale_from_regular_versioned_commands_has_stale_type():
 def _capture_stale(controller, request, errors):
     try:
         controller.cancel(request, "operator")
+    except Exception as exc:
+        errors.append(exc)
+
+
+def _capture_query_error(controller, errors):
+    try:
+        controller.query_defects("P", "I", "A", ())
+    except Exception as exc:
+        errors.append(exc)
+
+
+def _capture_close_error(controller, errors):
+    try:
+        controller.close()
     except Exception as exc:
         errors.append(exc)
