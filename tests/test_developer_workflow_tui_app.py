@@ -6,8 +6,9 @@ import pytest
 from textual.widgets import Input, TabbedContent
 
 from src.developer_workflow import tui
-from src.developer_workflow.contracts import WorkflowState, WorkflowType
+from src.developer_workflow.contracts import WorkflowRun, WorkflowState, WorkflowType
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+from src.developer_workflow.tui.controller import TuiControllerError
 from src.developer_workflow.tui.models import (
     HistoryView,
     PublicationView,
@@ -17,11 +18,18 @@ from src.developer_workflow.tui.models import (
     RunFilter,
     RunSummary,
     TestView as TuiTestView,
+    safe_tui_text,
 )
 from src.developer_workflow.tui.screens import DashboardScreen, SettingsView
 
 
 NOW = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
+
+
+def _plain(widget) -> str:
+    rendered = widget.render()
+    renderable = getattr(rendered, "_renderable", rendered)
+    return renderable.plain if hasattr(renderable, "plain") else str(renderable)
 
 
 def test_tui_package_exports_application_entry() -> None:
@@ -262,3 +270,116 @@ async def test_refresh_replaces_list_atomically_and_preserves_selected_run() -> 
         assert len(screen.query("#run-list ListItem")) == 0
         overview = screen.query_one("#overview-content")
         assert str(overview.renderable) == "No run selected"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width", [60, 120])
+async def test_corrupted_run_never_calls_show_and_uses_fixed_error_view(
+    width: int,
+) -> None:
+    controller = FakeController()
+    controller.runs = (RunSummary.corrupted_entry("a" * 32),)
+
+    def forbidden_show(run_id: str) -> RunDetail:
+        raise AssertionError(f"show must not be called: {run_id}")
+
+    controller.show = forbidden_show  # type: ignore[method-assign]
+    app = DeveloperWorkflowTuiApp(controller, 3)  # type: ignore[arg-type]
+    async with app.run_test(size=(width, 32)) as pilot:
+        assert _plain(app.screen.query_one("#overview-content")) == (
+            "workflow storage is corrupted safely"
+        )
+        await pilot.press("enter")
+        assert _plain(app.screen.query_one("#overview-content")) == (
+            "workflow storage is corrupted safely"
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["list", "show"])
+async def test_expected_controller_errors_render_fixed_safe_views(failure: str) -> None:
+    controller = FakeController()
+    if failure == "list":
+        controller.list_runs = (  # type: ignore[method-assign]
+            lambda filters, activities=None: (_ for _ in ()).throw(
+                TuiControllerError("LEAK-ME controller list body")
+            )
+        )
+        expected = "workflow list is unavailable safely"
+    else:
+        controller.show = (  # type: ignore[method-assign]
+            lambda run_id: (_ for _ in ()).throw(
+                TuiControllerError("LEAK-ME controller show body")
+            )
+        )
+        expected = "workflow display is unavailable safely"
+    app = DeveloperWorkflowTuiApp(controller, 3)  # type: ignore[arg-type]
+    async with app.run_test(size=(120, 32)):
+        text = _plain(app.screen.query_one("#overview-content"))
+        assert text == expected
+        assert "LEAK-ME" not in text
+
+
+@pytest.mark.asyncio
+async def test_factory_escaped_markup_renders_as_literal_without_backslashes() -> None:
+    raw = "[bold]literal[/bold]"
+    run = WorkflowRun.new("requirement", raw)
+    detail = RunDetail.from_run(run)
+    controller = FakeController()
+    controller.runs = (detail.summary,)
+    controller.show = lambda run_id: detail  # type: ignore[method-assign]
+    app = DeveloperWorkflowTuiApp(controller, 3)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(120, 32)):
+        overview = app.screen.query_one("#overview-content")
+        assert _plain(overview).splitlines()[0] == raw
+        assert "\\[bold]" not in _plain(overview)
+
+
+@pytest.mark.asyncio
+async def test_all_detail_tabs_render_escaped_values_with_safe_rich_semantics() -> None:
+    raw = "[bold]literal[/bold]"
+    escaped = safe_tui_text(raw)
+    summary = _summary(1)
+    repository = RepositoryView(
+        key=escaped,
+        role=escaped,
+        base_commit=escaped,
+        head_commit=escaped,
+        tree_hash=escaped,
+        changed_files=(escaped,),
+        changed_file_count=1,
+        commit_hash=escaped,
+        pushed=False,
+        pr_url=escaped,
+        error=escaped,
+    )
+    detail = RunDetail(
+        summary=summary,
+        repositories=(repository,),
+        tests=(TuiTestView(escaped, escaped, 0),),
+        review=(escaped,),
+        publication=PublicationView((repository,), "", escaped),
+        history=(HistoryView(escaped, escaped, NOW),),
+        blocked_reason=escaped,
+        fingerprint="",
+        risk_count=0,
+        unresolved_count=0,
+    )
+    controller = FakeController()
+    controller.runs = (summary,)
+    controller.show = lambda run_id: detail  # type: ignore[method-assign]
+    app = DeveloperWorkflowTuiApp(controller, 3)  # type: ignore[arg-type]
+
+    async with app.run_test(size=(120, 32)):
+        for widget_id in (
+            "overview-content",
+            "repositories-content",
+            "tests-content",
+            "review-content",
+            "publication-content",
+            "history-content",
+        ):
+            plain = _plain(app.screen.query_one(f"#{widget_id}"))
+            assert raw in plain
+            assert "\\[bold]" not in plain

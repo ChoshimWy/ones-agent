@@ -20,7 +20,7 @@ from textual.widgets import (
     TabPane,
 )
 
-from .controller import TuiController
+from .controller import TuiController, TuiControllerError
 from .models import RepositoryView, RunDetail, RunFilter, RunSummary
 from .supervisor import RunTaskSupervisor
 
@@ -33,6 +33,9 @@ _DETAIL_TABS = (
     "publication",
     "history",
 )
+_STORAGE_CORRUPTED = "workflow storage is corrupted safely"
+_LIST_UNAVAILABLE = "workflow list is unavailable safely"
+_DISPLAY_UNAVAILABLE = "workflow display is unavailable safely"
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,25 +122,25 @@ class RunDetailPane(Vertical):
         yield Label("Run detail", classes="pane-title")
         with TabbedContent(initial="overview", id="detail-tabs"):
             with TabPane("Overview", id="overview"):
-                yield Static("No run selected", id="overview-content", markup=False)
+                yield Static("No run selected", id="overview-content", markup=True)
             with TabPane("Repositories", id="repositories"):
                 yield Static(
                     "No repository evidence",
                     id="repositories-content",
-                    markup=False,
+                    markup=True,
                 )
             with TabPane("Tests", id="tests"):
-                yield Static("No test evidence", id="tests-content", markup=False)
+                yield Static("No test evidence", id="tests-content", markup=True)
             with TabPane("Review", id="review"):
-                yield Static("No review evidence", id="review-content", markup=False)
+                yield Static("No review evidence", id="review-content", markup=True)
             with TabPane("Publication", id="publication"):
                 yield Static(
                     "No publication evidence",
                     id="publication-content",
-                    markup=False,
+                    markup=True,
                 )
             with TabPane("History", id="history"):
-                yield Static("No history", id="history-content", markup=False)
+                yield Static("No history", id="history-content", markup=True)
 
     def set_detail(self, detail: RunDetail) -> None:
         summary = detail.summary
@@ -201,6 +204,10 @@ class RunDetailPane(Vertical):
         )
         self.query_one("#history-content", Static).update("No history")
 
+    def show_error(self, message: str) -> None:
+        self.clear_detail()
+        self.query_one("#overview-content", Static).update(message)
+
     def next_tab(self) -> None:
         tabs = self.query_one("#detail-tabs", TabbedContent)
         index = _DETAIL_TABS.index(tabs.active)
@@ -239,15 +246,20 @@ class RunDetailScreen(Screen[None]):
         Binding("shift+tab", "previous_tab", "Previous tab", show=False, priority=True),
     ]
 
-    def __init__(self, detail: RunDetail) -> None:
+    def __init__(self, detail: RunDetail | None, *, error: str = "") -> None:
         super().__init__(id="run-detail-screen")
         self._detail = detail
+        self._error = error
 
     def compose(self) -> ComposeResult:
         yield RunDetailPane(id="run-detail")
 
     def on_mount(self) -> None:
-        self.query_one(RunDetailPane).set_detail(self._detail)
+        pane = self.query_one(RunDetailPane)
+        if self._detail is not None:
+            pane.set_detail(self._detail)
+        else:
+            pane.show_error(self._error or _DISPLAY_UNAVAILABLE)
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -284,6 +296,7 @@ class DashboardScreen(Screen[None]):
         self._supervisor = supervisor
         self._settings = settings
         self._runs: tuple[RunSummary, ...] = ()
+        self._detail_error = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -318,10 +331,19 @@ class DashboardScreen(Screen[None]):
             and 0 <= selected_index < len(self._runs)
             else None
         )
-        runs = self._controller.list_runs(RunFilter())
+        try:
+            runs = self._controller.list_runs(RunFilter())
+        except TuiControllerError:
+            runs = ()
+            await self.query_one(RunListPane).replace_runs(runs)
+            self._runs = runs
+            self._detail_error = _LIST_UNAVAILABLE
+            self.query_one(RunDetailPane).show_error(self._detail_error)
+            return
         await self.query_one(RunListPane).replace_runs(runs)
         self._runs = runs
         if not runs:
+            self._detail_error = ""
             self.query_one(RunDetailPane).clear_detail()
             return
         target = next(
@@ -338,8 +360,19 @@ class DashboardScreen(Screen[None]):
     def _selected_index(self) -> int | None:
         return self.query_one("#run-list", ListView).index
 
-    def _show_detail(self, index: int) -> RunDetail:
-        detail = self._controller.show(self._runs[index].run_id)
+    def _show_detail(self, index: int) -> RunDetail | None:
+        summary = self._runs[index]
+        if summary.corrupted:
+            self._detail_error = _STORAGE_CORRUPTED
+            self.query_one(RunDetailPane).show_error(self._detail_error)
+            return None
+        try:
+            detail = self._controller.show(summary.run_id)
+        except TuiControllerError:
+            self._detail_error = _DISPLAY_UNAVAILABLE
+            self.query_one(RunDetailPane).show_error(self._detail_error)
+            return None
+        self._detail_error = ""
         self.query_one(RunDetailPane).set_detail(detail)
         return detail
 
@@ -355,7 +388,9 @@ class DashboardScreen(Screen[None]):
             return
         detail = self._show_detail(index)
         if self.query_one("#dashboard").has_class("one"):
-            self.app.push_screen(RunDetailScreen(detail))
+            self.app.push_screen(
+                RunDetailScreen(detail, error=self._detail_error)
+            )
 
     def action_next_tab(self) -> None:
         self.query_one(RunDetailPane).next_tab()
