@@ -230,7 +230,9 @@ class DangerousActionRequest:
             raise TuiDisplayError("workflow action is invalid")
         if expected_version is not None and expected_version != run.version:
             raise TuiDisplayError("workflow action is stale")
-        _, signed = _approval_status(run.approval)
+        _, fingerprint_bound, signed = _approval_status(run.approval)
+        if action == "approve" and not fingerprint_bound:
+            raise TuiDisplayError("workflow action is unavailable")
         if action == "resume-publication" and not signed:
             raise TuiDisplayError("workflow action is unavailable")
         detail = run_detail_from_run(run)
@@ -259,16 +261,18 @@ class DangerousActionRequest:
 
 def run_detail_from_run(run: WorkflowRun) -> RunDetail:
     approval = run.approval
-    fingerprint, signed = _approval_status(approval)
-    if signed and approval is not None:
+    fingerprint, fingerprint_bound, signed = _approval_status(approval)
+    if fingerprint_bound and approval is not None:
         if run.repository_group is not None:
-            _validate_signed_group_facts(run, approval)
+            _validate_bound_group_facts(run, approval, include_publication=signed)
         else:
-            _validate_signed_single_facts(run, approval)
+            _validate_bound_single_facts(run, approval, include_publication=signed)
     repositories: tuple[RepositoryView, ...]
     tests: tuple[TestView, ...]
     if run.repository_group is not None:
-        repositories, tests = _group_views(run, signed=signed)
+        repositories, tests = _group_views(
+            run, fingerprint_bound=fingerprint_bound, signed=signed
+        )
     else:
         repositories, tests = _single_repository_views(run, signed=signed)
 
@@ -357,14 +361,14 @@ def _single_repository_views(
 
 
 def _group_views(
-    run: WorkflowRun, *, signed: bool
+    run: WorkflowRun, *, fingerprint_bound: bool, signed: bool
 ) -> tuple[tuple[RepositoryView, ...], tuple[TestView, ...]]:
     approval = run.approval
     approvals = {
         item.repository_key: item
         for item in (
             approval.repositories
-            if signed and approval is not None
+            if fingerprint_bound and approval is not None
             else ()
         )
     }
@@ -470,9 +474,11 @@ def _safe_fingerprint(value: str) -> str:
     return checked
 
 
-def _approval_status(approval: ApprovalPackage | None) -> tuple[str, bool]:
+def _approval_status(
+    approval: ApprovalPackage | None,
+) -> tuple[str, bool, bool]:
     if approval is None:
-        return "", False
+        return "", False, False
     fingerprint = _safe_fingerprint(approval.fingerprint)
     if fingerprint:
         try:
@@ -481,12 +487,38 @@ def _approval_status(approval: ApprovalPackage | None) -> tuple[str, bool]:
             raise TuiDisplayError(_INVALID_FACTS) from None
         if not hmac.compare_digest(fingerprint, actual):
             raise TuiDisplayError(_INVALID_FACTS)
-    signed = bool(fingerprint and approval.approved_by and approval.approved_at)
-    return fingerprint, signed
+    fingerprint_bound = bool(fingerprint)
+    signed = fingerprint_bound and _has_valid_approval_metadata(approval)
+    return fingerprint, fingerprint_bound, signed
 
 
-def _validate_signed_single_facts(
-    run: WorkflowRun, approval: ApprovalPackage
+def _has_valid_approval_metadata(approval: ApprovalPackage) -> bool:
+    actor = approval.approved_by
+    approved_at = approval.approved_at
+    if (
+        type(actor) is not str
+        or not actor.strip()
+        or type(approved_at) is not datetime
+        or approved_at.tzinfo is None
+        or approved_at.utcoffset() is None
+        or any(
+            ord(character) <= 0x1F or 0x7F <= ord(character) <= 0x9F
+            for character in actor
+        )
+    ):
+        return False
+    try:
+        actor.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return False
+    return True
+
+
+def _validate_bound_single_facts(
+    run: WorkflowRun,
+    approval: ApprovalPackage,
+    *,
+    include_publication: bool,
 ) -> None:
     mapping = run.repository
     prepared = run.prepared_worktree
@@ -512,15 +544,18 @@ def _validate_signed_single_facts(
     ):
         raise TuiDisplayError(_INVALID_FACTS)
     publication = run.publication
-    if publication.approved_fingerprint and (
+    if include_publication and publication.approved_fingerprint and (
         publication.approved_fingerprint != approval.fingerprint
         or publication.expected_parent != approval.head_commit
     ):
         raise TuiDisplayError(_INVALID_FACTS)
 
 
-def _validate_signed_group_facts(
-    run: WorkflowRun, approval: ApprovalPackage
+def _validate_bound_group_facts(
+    run: WorkflowRun,
+    approval: ApprovalPackage,
+    *,
+    include_publication: bool,
 ) -> None:
     group = run.repository_group
     if group is None or approval.repository_group != group:
@@ -554,7 +589,7 @@ def _validate_signed_group_facts(
         ):
             raise TuiDisplayError(_INVALID_FACTS)
     publication = run.group_publication
-    if publication is None:
+    if publication is None or not include_publication:
         return
     changed = tuple(
         item for item in approval.repositories if item.changed_files

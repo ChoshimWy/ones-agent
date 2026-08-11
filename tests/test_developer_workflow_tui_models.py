@@ -481,7 +481,10 @@ def test_unsigned_group_approval_cannot_authorize_publication_facts(
     detail = RunDetail.from_run(run)
 
     assert detail.fingerprint == unsigned.fingerprint
-    assert all(repository.tree_hash == "" for repository in detail.repositories)
+    assert [repository.tree_hash for repository in detail.repositories] == [
+        "6" * 40,
+        "7" * 40,
+    ]
     assert all(repository.commit_hash == "" for repository in detail.repositories)
     assert all(not repository.pushed for repository in detail.repositories)
     assert all(repository.pr_url == "" for repository in detail.repositories)
@@ -761,22 +764,110 @@ def test_dangerous_action_request_captures_unsigned_package_fingerprint(
     assert request.fingerprint == run.approval.fingerprint
 
 
-def test_unsigned_package_allows_approve_but_rejects_resume_publication(
+def test_fingerprinted_unsigned_package_allows_approve_but_rejects_resume_publication(
     tmp_path: Path,
 ) -> None:
     run = _single_run(tmp_path)
     assert run.approval is not None
     unsigned = run.approval.validated_update(
-        fingerprint="", approved_by=None, approved_at=None
+        approved_by=None, approved_at=None
     )
     run = run.validated_update(approval=unsigned, publication=PublicationResult())
 
     request = DangerousActionRequest.from_run(run, action="approve")
 
     assert request.action == "approve"
-    assert request.fingerprint == ""
+    assert request.fingerprint == unsigned.fingerprint
     with pytest.raises(TuiDisplayError, match="^workflow action is unavailable$"):
         DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+def test_invalid_approval_actor_cannot_authorize_publication(tmp_path: Path) -> None:
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    invalid_actor = run.approval.validated_update(approved_by="alice\nforged")
+    run = run.validated_update(approval=invalid_actor)
+
+    detail = RunDetail.from_run(run)
+
+    assert detail.repositories[0].commit_hash == ""
+    assert not detail.repositories[0].pushed
+    assert detail.repositories[0].pr_url == ""
+    assert detail.publication.comment_id == ""
+    with pytest.raises(TuiDisplayError, match="^workflow action is unavailable$"):
+        DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+@pytest.mark.parametrize("approval_shape", ["missing", "empty-fingerprint"])
+def test_approve_requires_fingerprint_bound_approval_package(
+    tmp_path: Path, approval_shape: str
+) -> None:
+    run = _single_run(tmp_path)
+    if approval_shape == "missing":
+        run = run.validated_update(approval=None, publication=PublicationResult())
+    else:
+        assert run.approval is not None
+        empty = run.approval.validated_update(
+            fingerprint="", approved_by=None, approved_at=None
+        )
+        run = run.validated_update(approval=empty, publication=PublicationResult())
+
+    with pytest.raises(TuiDisplayError, match="^workflow action is unavailable$"):
+        DangerousActionRequest.from_run(run, action="approve")
+
+
+def test_fingerprinted_unsigned_single_drift_rejects_approve_and_stale_check(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    unsigned = run.approval.validated_update(approved_by=None, approved_at=None)
+    run = run.validated_update(approval=unsigned, publication=PublicationResult())
+    request = DangerousActionRequest.from_run(run, action="approve")
+    assert run.tested_snapshot is not None
+    snapshot = run.tested_snapshot.validated_update(
+        changed_files=("src/drift.py",)
+    )
+    drifted = run.validated_update(
+        tested_snapshot=snapshot, changed_files=snapshot.changed_files
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(drifted)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(drifted, action="approve")
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        request.assert_current(drifted)
+
+
+def test_fingerprinted_unsigned_group_drift_rejects_approve_and_stale_check(
+    tmp_path: Path,
+) -> None:
+    run = _multi_run(tmp_path)
+    assert run.approval is not None
+    unsigned = run.approval.validated_update(approved_by=None, approved_at=None)
+    run = run.validated_update(
+        approval=unsigned, group_publication=None
+    )
+    request = DangerousActionRequest.from_run(run, action="approve")
+    evidence = run.repository_evidence[0]
+    assert evidence.tested_snapshot is not None
+    snapshot = evidence.tested_snapshot.validated_update(
+        changed_files=("src/drift.py",)
+    )
+    changed = evidence.validated_update(
+        tested_snapshot=snapshot, changed_files=snapshot.changed_files
+    )
+    drifted = run.validated_update(
+        repository_evidence=(changed, *run.repository_evidence[1:])
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(drifted)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(drifted, action="approve")
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        request.assert_current(drifted)
 
 
 def test_canonical_but_forged_fingerprint_rejects_request_and_stale_check(
