@@ -139,6 +139,103 @@ async def test_readonly_calls_run_concurrently_but_obey_global_limit() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("second_run", ["run-a", "run-b"])
+async def test_cancelled_started_call_holds_run_and_global_gate_until_thread_ends(
+    second_run: str,
+) -> None:
+    first_started = threading.Event()
+    second_started = threading.Event()
+    release_first = threading.Event()
+    release_second = threading.Event()
+    events: list[TaskEvent] = []
+    supervisor = RunTaskSupervisor(max_concurrency=1, sink=events.append)
+
+    def first_call() -> str:
+        first_started.set()
+        assert release_first.wait(2)
+        return "first"
+
+    def second_call() -> str:
+        second_started.set()
+        assert release_second.wait(2)
+        return "second"
+
+    first = supervisor.submit("run-a", "resume", first_call)
+    second = supervisor.submit(second_run, "approve", second_call)
+    await _wait_thread_event(first_started)
+    first.cancel()
+    await asyncio.sleep(0)
+    assert not first.done()
+    first.cancel()
+    await asyncio.sleep(0)
+
+    assert not await asyncio.to_thread(second_started.wait, 0.1)
+    assert not first.done()
+    release_first.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert [
+        event.message for event in events if event.action == "resume"
+    ] == [
+        "workflow action queued",
+        "workflow action started",
+        "workflow action completed",
+    ]
+    await _wait_thread_event(second_started)
+    release_second.set()
+    assert await second == "second"
+    await supervisor.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_started_failure_is_fixed_and_never_unhandled() -> None:
+    call_started = threading.Event()
+    call_finished = threading.Event()
+    release = threading.Event()
+    next_started = threading.Event()
+    events: list[TaskEvent] = []
+    loop_errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda unused_loop, context: loop_errors.append(context))
+    supervisor = RunTaskSupervisor(max_concurrency=1, sink=events.append)
+
+    def failing_call() -> None:
+        call_started.set()
+        assert release.wait(2)
+        call_finished.set()
+        raise RuntimeError("TOKEN-INNER")
+
+    try:
+        first = supervisor.submit("run-a", "resume", failing_call)
+        second = supervisor.submit(
+            "run-b", "approve", lambda: next_started.set()
+        )
+        await _wait_thread_event(call_started)
+        first.cancel()
+        assert not await asyncio.to_thread(next_started.wait, 0.1)
+        release.set()
+        await _wait_thread_event(call_finished)
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        await second
+        await asyncio.sleep(0)
+        assert loop_errors == []
+        assert [event.message for event in events] == [
+            "workflow action queued",
+            "workflow action queued",
+            "workflow action started",
+            "workflow action failed safely",
+            "workflow action started",
+            "workflow action completed",
+        ]
+        assert "TOKEN" not in repr(events)
+    finally:
+        await supervisor.close()
+        loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
 async def test_events_are_fixed_and_sink_failures_do_not_change_results() -> None:
     events: list[TaskEvent] = []
 
@@ -222,15 +319,17 @@ async def test_close_cancels_waiters_detaches_running_work_and_is_idempotent() -
         await supervisor.close()
         assert time.monotonic() - started < 0.2
         assert queued.cancelled()
-        assert running.cancelled()
-        assert supervisor.task_count == 0
-        assert supervisor.run_lock_count == 0
+        assert not running.done()
+        assert supervisor.task_count == 1
+        assert supervisor.run_lock_count == 1
         assert not business_cancel_called.is_set()
         assert events[-1].message == "workflow action cancelled"
         assert supervisor.closed
         await supervisor.close()
         release.set()
         await _wait_thread_event(running_finished)
+        with pytest.raises(asyncio.CancelledError):
+            await running
         await asyncio.sleep(0.05)
         assert supervisor.task_count == 0
         assert loop_errors == []

@@ -194,20 +194,21 @@ class RunTaskSupervisor:
         return await task
 
     async def close(self) -> None:
-        """Reject new work and detach running thread operations immediately."""
+        """Reject new work without waiting for started thread operations."""
 
         self._require_loop()
         if self._closed:
             return
         self._closed = True
-        tasks = tuple(self._tasks)
+        waiting_tasks = tuple(
+            task for task, state in self._tasks.items() if not state.started
+        )
         for task, state in tuple(self._tasks.items()):
             if not state.started and state.run_id is not None:
                 self._notify_cancelled(state)
             task.cancel()
-        # Wrapper tasks cancel promptly because thread work is shielded and detached.
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if waiting_tasks:
+            await asyncio.gather(*waiting_tasks, return_exceptions=True)
 
     async def _execute_mutation(
         self,
@@ -222,14 +223,19 @@ class RunTaskSupervisor:
                     assert state.run_id is not None
                     self._emit(TaskEvent.started(state.run_id, state.action))
                     try:
-                        result = await self._invoke(call)
-                    except asyncio.CancelledError:
-                        raise
+                        cancelled, result, error = await self._invoke(call)
                     except BaseException:
                         self._emit(TaskEvent.failed(state.run_id, state.action))
                         raise
-                    self._emit(TaskEvent.completed(state.run_id, state.action))
-                    return result
+                    if error is None:
+                        self._emit(TaskEvent.completed(state.run_id, state.action))
+                    else:
+                        self._emit(TaskEvent.failed(state.run_id, state.action))
+                    if cancelled:
+                        raise asyncio.CancelledError
+                    if error is not None:
+                        raise error
+                    return cast(T, result)
         except asyncio.CancelledError:
             if not state.started:
                 self._notify_cancelled(state)
@@ -243,15 +249,38 @@ class RunTaskSupervisor:
     ) -> T:
         async with self._semaphore:
             state.started = True
-            return await self._invoke(lambda: call(*args))
+            cancelled, result, error = await self._invoke(lambda: call(*args))
+            if cancelled:
+                raise asyncio.CancelledError
+            if error is not None:
+                raise error
+            return cast(T, result)
 
-    async def _invoke(self, call: Callable[[], T]) -> T:
+    async def _invoke(
+        self, call: Callable[[], T]
+    ) -> tuple[bool, T | None, BaseException | None]:
         thread_task = self._loop.create_task(asyncio.to_thread(call))
+        cancelled = False
+        while not thread_task.done():
+            try:
+                await asyncio.shield(thread_task)
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if (
+                    thread_task.done()
+                    and current is not None
+                    and not current.cancelling()
+                ):
+                    break
+                cancelled = True
+            except BaseException:
+                # The thread task now owns the original failure; retrieve it below.
+                pass
         try:
-            return await asyncio.shield(thread_task)
-        except asyncio.CancelledError:
-            thread_task.add_done_callback(self._consume_task)
-            raise
+            result = thread_task.result()
+        except BaseException as error:
+            return cancelled, None, error
+        return cancelled, result, None
 
     def _register(
         self, task: asyncio.Task[object], state: _TaskState
