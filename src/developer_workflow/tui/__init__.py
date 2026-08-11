@@ -1,5 +1,12 @@
 """Stable display-model API for the developer workflow terminal UI."""
 
+from .controller import (
+    CandidateSessionView,
+    StaleTuiActionError,
+    TuiController,
+    TuiControllerError,
+)
+
 from .models import (
     DangerousActionRequest,
     DefectChoice,
@@ -17,6 +24,7 @@ from .models import (
 )
 
 __all__ = [
+    "CandidateSessionView",
     "DangerousActionRequest",
     "DefectChoice",
     "HistoryView",
@@ -27,6 +35,9 @@ __all__ = [
     "RunFilter",
     "RunSummary",
     "TestView",
+    "StaleTuiActionError",
+    "TuiController",
+    "TuiControllerError",
     "TuiDisplayError",
     "run_detail_from_run",
     "safe_tui_text",

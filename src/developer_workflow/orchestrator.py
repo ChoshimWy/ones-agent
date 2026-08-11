@@ -38,6 +38,14 @@ _BIDI_CONTROL_CHARACTERS = {
 _INVALID_REVISION_SCOPE = (
     "revision scope is invalid; start a new defect run to rebuild evidence"
 )
+_STALE_WORKFLOW = "workflow changed; review again"
+
+
+def _require_expected_version(run: WorkflowRun, expected_version: int | None) -> None:
+    if expected_version is not None and (
+        type(expected_version) is not int or run.version != expected_version
+    ):
+        raise InvalidWorkflowAction(_STALE_WORKFLOW)
 
 
 def _validated_text(value: str, *, kind: str, max_length: int) -> str:
@@ -137,9 +145,16 @@ class DeveloperWorkflowOrchestrator:
     def show(self, run_id: str) -> WorkflowRun:
         return self.store.load(run_id)
 
-    def confirm_repository(self, run_id: str, mapping_key: str) -> WorkflowRun:
+    def confirm_repository(
+        self,
+        run_id: str,
+        mapping_key: str,
+        *,
+        expected_version: int | None = None,
+    ) -> WorkflowRun:
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
             if run.state is not WorkflowState.VALIDATING:
                 raise InvalidWorkflowAction("repository confirmation requires VALIDATING")
             persisted_group = next(
@@ -191,9 +206,12 @@ class DeveloperWorkflowOrchestrator:
             )
             return self._flow_for(saved).execute(saved)
 
-    def resume(self, run_id: str) -> WorkflowRun:
+    def resume(
+        self, run_id: str, *, expected_version: int | None = None
+    ) -> WorkflowRun:
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
             if run.state is WorkflowState.PARTIAL_SUCCESS:
                 return (
                     self.publisher.publish(run)
@@ -223,11 +241,13 @@ class DeveloperWorkflowOrchestrator:
         feedback: str,
         *,
         scope: Literal["implementation", "repair"] | None = None,
+        expected_version: int | None = None,
     ) -> WorkflowRun:
         scope = _validated_revision_scope(scope)
         feedback = _validated_text(feedback, kind="revision feedback", max_length=4096)
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
             expected_scope = (
                 "implementation"
                 if run.workflow_type is WorkflowType.REQUIREMENT
@@ -286,12 +306,19 @@ class DeveloperWorkflowOrchestrator:
             saved = self.store.save(revised, expected_version=blocked.version)
             return self._flow_for(saved).execute(saved)
 
-    def approve(self, run_id: str, approved_by: str) -> WorkflowRun:
+    def approve(
+        self,
+        run_id: str,
+        approved_by: str,
+        *,
+        expected_version: int | None = None,
+    ) -> WorkflowRun:
         approved_by = _validated_text(
             approved_by, kind="approver identity", max_length=128
         )
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
             if run.state is not WorkflowState.WAITING_APPROVAL:
                 raise InvalidWorkflowAction("approve requires WAITING_APPROVAL")
             if run.approval is None:
@@ -302,10 +329,17 @@ class DeveloperWorkflowOrchestrator:
             )
             return self.publisher.publish(saved)
 
-    def cancel(self, run_id: str, actor: str) -> WorkflowRun:
+    def cancel(
+        self,
+        run_id: str,
+        actor: str,
+        *,
+        expected_version: int | None = None,
+    ) -> WorkflowRun:
         actor = _validated_text(actor, kind="cancellation actor", max_length=128)
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
             return self.store.transition(
                 run_id,
                 run.version,

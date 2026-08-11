@@ -226,6 +226,40 @@ def _orchestrator(
     )
 
 
+@pytest.mark.parametrize("method,args", [
+    ("resume", ()),
+    ("confirm_repository", ("repo",)),
+    ("revise", ("feedback",)),
+    ("approve", ("operator",)),
+    ("cancel", ("operator",)),
+])
+def test_expected_version_is_checked_after_lock_and_load_before_side_effects(
+    tmp_path: Path, method: str, args: tuple[str, ...]
+) -> None:
+    run = WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1").validated_update(
+        version=7, state=WorkflowState.WAITING_APPROVAL
+    )
+    orchestrator, store, requirement, defect, publisher = _orchestrator(tmp_path, run)
+
+    with pytest.raises(InvalidWorkflowAction, match="^workflow changed; review again$"):
+        getattr(orchestrator, method)(run.run_id, *args, expected_version=6)
+
+    assert store.calls == [
+        ("operation_lock", run.run_id, "orchestrate"),
+        ("load", run.run_id),
+    ]
+    assert requirement.calls == defect.calls == []
+    assert publisher.publish_calls == publisher.retry_calls == []
+
+
+def test_expected_version_rejects_bool_even_when_equal(tmp_path: Path) -> None:
+    run = WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1").validated_update(version=1)
+    orchestrator, store, *_ = _orchestrator(tmp_path, run)
+    with pytest.raises(InvalidWorkflowAction, match="^workflow changed; review again$"):
+        orchestrator.resume(run.run_id, expected_version=True)
+    assert store.calls[-1] == ("load", run.run_id)
+
+
 def _defect(defect_id: str = "1" * 32) -> DefectRecord:
     return DefectRecord(
         defect_id=defect_id,
