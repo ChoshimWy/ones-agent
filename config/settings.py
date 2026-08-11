@@ -6,6 +6,23 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+DEFAULT_DEFECT_STATUS_IDS = [
+    "JAZYLueG",
+    "VMxom1Jo",
+    "WwhszYN8",
+    "CKA6U955",
+]
+
+
+def _parse_status_ids(raw: str) -> list[str]:
+    status_ids: list[str] = []
+    for part in raw.split(","):
+        status_id = part.strip(" []'\"")
+        if status_id and status_id not in status_ids:
+            status_ids.append(status_id)
+    return status_ids
+
+
 class OnesSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="ONES_", env_file=".env", extra="ignore")
 
@@ -16,6 +33,17 @@ class OnesSettings(BaseSettings):
     project_id: str = ""
     issue_type_id: str = ""
     api_token: str = ""
+    defect_status_ids: str = ""
+    comment_list_path_template: str | None = None
+    comment_timeout_seconds: float = Field(default=30.0, gt=0)
+    comment_max_pages: int = Field(default=50, gt=0)
+    comment_max_comments: int = Field(default=10_000, gt=0)
+    comment_max_payload_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+
+    def defect_status_id_list(self) -> list[str]:
+        if self.defect_status_ids:
+            return _parse_status_ids(self.defect_status_ids)
+        return list(DEFAULT_DEFECT_STATUS_IDS)
 
 
 class GitSettings(BaseSettings):
@@ -83,6 +111,7 @@ class Settings:
                 "base_url": self.ones.base_url,
                 "team_id": self.ones.team_id,
                 "project_id": self.ones.project_id,
+                "defect_status_ids": self.ones.defect_status_id_list(),
                 "has_credentials": bool(self.ones.email and self.ones.password),
             },
             "git": {

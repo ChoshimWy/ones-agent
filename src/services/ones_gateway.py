@@ -7,10 +7,37 @@ behind an adapter boundary.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Iterable
+from datetime import UTC, datetime
+import hashlib
+import json
+import math
+import re
+import time
+from typing import TYPE_CHECKING, Callable, Iterable
+from urllib.parse import unquote, urlsplit
 
-from src.contracts import DefectRecord, IdentityRef, IssueTypeRef, PriorityRef, ProjectRef, StatusRef
+import httpx
+import requests
+import structlog
+
+from src.contracts import (
+    DefectRecord,
+    IdentityRef,
+    IssueTypeRef,
+    PriorityRef,
+    ProjectRef,
+    RequirementRecord,
+    StatusRef,
+    WikiPageRef,
+    WikiPageSnapshot,
+    WorkflowStatusRef,
+)
+from src.integrations.ones_common import quote_wiki_segment, validate_wiki_segment
+
+
+log = structlog.get_logger()
 
 if TYPE_CHECKING:
     from config.settings import OnesSettings
@@ -20,6 +47,8 @@ if TYPE_CHECKING:
 
 _DEFAULT_DEFECT_LIMIT = 1000
 _CURRENT_USER_TOKEN = "$currentUser"
+_OPEN_STATUS_CATEGORIES = frozenset({"open", "todo", "to_do", "doing", "in_progress", "pending"})
+_CLOSED_STATUS_CATEGORIES = frozenset({"done", "completed", "cancelled", "discarded", "closed"})
 
 
 class OnesGatewayError(Exception):
@@ -48,6 +77,7 @@ class _DefectQuery:
     issue_type_id: str | None
     sprint_id: str | None
     assignee: str | None
+    status_ids: tuple[str, ...]
     mine: bool
     limit: int
     page_size: int
@@ -64,6 +94,7 @@ class OnesGateway:
     settings: OnesSettings | None = None
     async_client: OnesAsyncClient | None = None
     sync_client: OnesClient | None = None
+    retry_backoff: Callable[[int], float] = field(default=lambda attempt: 0.1 * (2 ** (attempt - 1)), repr=False)
     _managed_async_client: OnesAsyncClient | None = field(default=None, init=False, repr=False)
     _managed_sync_client: OnesClient | None = field(default=None, init=False, repr=False)
 
@@ -77,6 +108,250 @@ class OnesGateway:
     async def list_projects(self, include_archived: bool = False) -> list[dict]:
         return await self._call_async("fetch_projects", include_archived=include_archived)
 
+    def parse_wiki_url(self, url: str) -> WikiPageRef:
+        settings = self.settings
+        if settings is None:
+            from config.settings import OnesSettings
+            settings = OnesSettings()
+        base = urlsplit(settings.base_url.rstrip("/"))
+        candidate = urlsplit(str(url).strip())
+        if self._origin(candidate) != self._origin(base):
+            raise ValueError("Wiki URL must use the configured ONES origin")
+
+        base_path = base.path.rstrip("/")
+        expected_path = f"{base_path}/wiki/"
+        if candidate.path.rstrip("/") != expected_path.rstrip("/") or candidate.query:
+            raise ValueError("Wiki URL must use the authorized ONES Wiki page path")
+        fragment_path = candidate.fragment
+        decoded = unquote(fragment_path)
+        if decoded != fragment_path or ".." in decoded.split("/"):
+            raise ValueError("Wiki URL contains an unsafe encoded or traversal path")
+        match = re.fullmatch(r"/?team/([^/?#]+)/space/([^/?#]+)/page/([^/?#]+)", decoded)
+        if match is None or any(not value.strip() for value in match.groups()):
+            raise ValueError("Wiki URL is missing team, space, or page identity")
+        team_id, space_id, page_id = match.groups()
+        team_id = validate_wiki_segment(team_id, label="team")
+        space_id = validate_wiki_segment(space_id, label="space")
+        page_id = validate_wiki_segment(page_id, label="page")
+        if team_id != settings.team_id:
+            raise ValueError("Wiki URL team does not match the configured ONES team")
+        canonical_origin = self._canonical_origin(base)
+        source_url = (
+            f"{canonical_origin}{base_path}/wiki/#/team/{quote_wiki_segment(team_id, label='team')}"
+            f"/space/{quote_wiki_segment(space_id, label='space')}/page/{quote_wiki_segment(page_id, label='page')}"
+        )
+        return WikiPageRef(team_id=team_id, space_id=space_id, page_id=page_id, source_url=source_url)
+
+    async def get_wiki_snapshot(self, url: str) -> WikiPageSnapshot:
+        ref = self.parse_wiki_url(url)
+        return await self.get_wiki_snapshot_by_ids(ref.space_id, ref.page_id, source_url=ref.source_url)
+
+    async def get_wiki_snapshot_by_ids(
+        self,
+        space_id: str,
+        page_id: str,
+        *,
+        source_url: str | None = None,
+    ) -> WikiPageSnapshot:
+        settings = self.settings
+        if settings is None:
+            from config.settings import OnesSettings
+            settings = OnesSettings()
+        validate_wiki_segment(settings.team_id, label="team")
+        space_id = validate_wiki_segment(space_id, label="space")
+        page_id = validate_wiki_segment(page_id, label="page")
+        body = await self._call_wiki_async("fetch_wiki_page", space_id, page_id)
+        detail = await self._call_wiki_async("fetch_wiki_page_info", page_id)
+        return self._build_wiki_snapshot(space_id, page_id, body, detail, source_url=source_url)
+
+    def get_wiki_snapshot_sync(self, url: str) -> WikiPageSnapshot:
+        ref = self.parse_wiki_url(url)
+        return self.get_wiki_snapshot_by_ids_sync(ref.space_id, ref.page_id, source_url=ref.source_url)
+
+    def get_wiki_snapshot_by_ids_sync(
+        self,
+        space_id: str,
+        page_id: str,
+        *,
+        source_url: str | None = None,
+    ) -> WikiPageSnapshot:
+        settings = self.settings
+        if settings is None:
+            from config.settings import OnesSettings
+            settings = OnesSettings()
+        validate_wiki_segment(settings.team_id, label="team")
+        space_id = validate_wiki_segment(space_id, label="space")
+        page_id = validate_wiki_segment(page_id, label="page")
+        body = self._call_wiki_sync("fetch_wiki_page", space_id, page_id)
+        detail = self._call_wiki_sync("fetch_wiki_page_info", page_id)
+        return self._build_wiki_snapshot(space_id, page_id, body, detail, source_url=source_url)
+
+    async def get_normalized_requirement(self, issue_id: str) -> RequirementRecord:
+        detail = await self._call_async("fetch_issue_detail", issue_id)
+        return self.normalize_requirement(self._resolve_issue_detail(detail, issue_id))
+
+    def get_normalized_requirement_sync(self, issue_id: str) -> RequirementRecord:
+        detail = self._call_sync("fetch_issue_detail", issue_id)
+        return self.normalize_requirement(self._resolve_issue_detail(detail, issue_id))
+
+    async def list_comments(self, item_id: str, *, page_size: int = 200) -> list[dict[str, str]]:
+        payload = await self._call_async("list_comments", self._comment_item_id(item_id), page_size=page_size)
+        return self._normalize_comments(payload)
+
+    def list_comments_sync(self, item_id: str, *, page_size: int = 200) -> list[dict[str, str]]:
+        payload = self._call_sync("list_comments", self._comment_item_id(item_id), page_size=page_size)
+        return self._normalize_comments(payload)
+
+    async def add_comment(self, item_id: str, text: str) -> dict[str, str]:
+        item_id = self._comment_item_id(item_id)
+        text = self._comment_text(text)
+        payload = await self._call_async("add_comment", item_id, text)
+        return self._normalize_created_comment(payload, text)
+
+    def add_comment_sync(self, item_id: str, text: str) -> dict[str, str]:
+        item_id = self._comment_item_id(item_id)
+        text = self._comment_text(text)
+        payload = self._call_sync("add_comment", item_id, text)
+        return self._normalize_created_comment(payload, text)
+
+    @classmethod
+    def _comment_item_id(cls, value: str) -> str:
+        if type(value) is not str or not value.strip():
+            raise OnesGatewayPayloadError("ONES comment item id is invalid")
+        value = cls._ensure_utf8(value.strip(), context="comment item id")
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            raise OnesGatewayPayloadError("ONES comment item id is invalid")
+        return value
+
+    @classmethod
+    def _comment_text(cls, value: str) -> str:
+        if type(value) is not str or not value.strip():
+            raise OnesGatewayPayloadError("ONES comment text is invalid")
+        value = cls._ensure_utf8(value, context="comment text")
+        if any(ord(character) < 32 and character not in "\n\t" for character in value):
+            raise OnesGatewayPayloadError("ONES comment text is invalid")
+        return value
+
+    @classmethod
+    def _normalize_comments(cls, payload: object) -> list[dict[str, str]]:
+        if not isinstance(payload, list):
+            raise OnesGatewayPayloadError("Malformed ONES comments payload: expected list")
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise OnesGatewayPayloadError("Malformed ONES comment: expected mapping")
+            identity = entry.get("id", entry.get("uuid"))
+            text = entry.get("text", entry.get("message", entry.get("content")))
+            if type(identity) is not str or not identity.strip() or type(text) is not str:
+                raise OnesGatewayPayloadError("Malformed ONES comment fields")
+            identity = cls._ensure_utf8(identity.strip(), context="comment id")
+            text = cls._ensure_utf8(text, context="comment text")
+            if any(ord(character) < 32 or ord(character) == 127 for character in identity):
+                raise OnesGatewayPayloadError("Malformed ONES comment identity")
+            if any(ord(character) < 32 and character not in "\n\t" for character in text):
+                raise OnesGatewayPayloadError("Malformed ONES comment text")
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result.append({"id": identity, "text": text})
+        return result
+
+    @classmethod
+    def _normalize_created_comment(cls, payload: object, text: str) -> dict[str, str]:
+        if not isinstance(payload, dict):
+            raise OnesGatewayPayloadError("Malformed ONES add comment payload")
+        identity = payload.get("id", payload.get("uuid", payload.get("key")))
+        if type(identity) is not str or not identity.strip():
+            raise OnesGatewayPayloadError("Malformed ONES add comment identity")
+        identity = cls._ensure_utf8(identity.strip(), context="comment id")
+        if any(ord(character) < 32 or ord(character) == 127 for character in identity):
+            raise OnesGatewayPayloadError("Malformed ONES add comment identity")
+        returned_text = payload.get("text", payload.get("message", payload.get("content", text)))
+        if type(returned_text) is not str or returned_text != text:
+            raise OnesGatewayPayloadError("Malformed ONES add comment text")
+        return {"id": identity, "text": text}
+
+    async def list_defect_statuses(
+        self,
+        project_id: str,
+        issue_type_id: str,
+    ) -> list[WorkflowStatusRef]:
+        configs = await self._call_async("fetch_task_status_configs", [project_id])
+        definitions = await self._call_async("fetch_task_status_definitions")
+        return self._build_workflow_statuses(configs, definitions, project_id, issue_type_id)
+
+    async def list_open_defects(
+        self,
+        project_id: str,
+        issue_type_id: str,
+        sprint_id: str | None,
+        assignee: str | None,
+        *,
+        limit: int = 5000,
+        page_size: int = 200,
+    ) -> list[DefectRecord]:
+        statuses = await self.list_defect_statuses(project_id, issue_type_id)
+        if not statuses:
+            raise OnesGatewayPayloadError("ONES defect workflow has no statuses")
+
+        open_status_ids: list[str] = []
+        for status in statuses:
+            category = str(status.category or "").strip().lower()
+            if not category:
+                raise OnesGatewayPayloadError(f"ONES workflow status {status.id or '<empty>'} has no category")
+            if category in _OPEN_STATUS_CATEGORIES:
+                open_status_ids.append(status.id)
+            elif category not in _CLOSED_STATUS_CATEGORIES:
+                raise OnesGatewayPayloadError(
+                    f"ONES workflow status {status.id or '<empty>'} has unknown category: {category}",
+                )
+
+        if not open_status_ids:
+            return []
+
+        return await self.list_normalized_defects(
+            project_id=project_id,
+            issue_type_id=issue_type_id,
+            sprint_id=sprint_id,
+            assignee=assignee,
+            status_ids=open_status_ids,
+            limit=limit,
+            page_size=page_size,
+        )
+
+    def list_defect_statuses_sync(
+        self,
+        project_id: str,
+        issue_type_id: str,
+    ) -> list[WorkflowStatusRef]:
+        configs = self._call_sync("fetch_task_status_configs", [project_id])
+        definitions = self._call_sync("fetch_task_status_definitions")
+        return self._build_workflow_statuses(configs, definitions, project_id, issue_type_id)
+
+    @classmethod
+    def _build_workflow_statuses(
+        cls,
+        configs: list[dict],
+        definitions: list[dict],
+        project_id: str,
+        issue_type_id: str,
+    ) -> list[WorkflowStatusRef]:
+        definitions_by_id = {
+            str(item.get("uuid") or ""): item
+            for item in definitions
+            if isinstance(item, dict) and item.get("uuid")
+        }
+        selected = [
+            item
+            for item in configs
+            if isinstance(item, dict)
+            and item.get("project_uuid") == project_id
+            and item.get("issue_type_uuid") == issue_type_id
+        ]
+        selected.sort(key=lambda item: int(item.get("position", 0)))
+        return [cls._normalize_workflow_status(item, definitions_by_id) for item in selected]
+
     async def list_defects(
         self,
         *,
@@ -86,6 +361,7 @@ class OnesGateway:
         sprint_id: str | None = None,
         assignee: str | None = None,
         assign: str | None = None,
+        status_ids: Iterable[str] | None = None,
         current_user: bool | None = None,
         mine: bool = False,
         limit: int = _DEFAULT_DEFECT_LIMIT,
@@ -98,6 +374,7 @@ class OnesGateway:
             sprint_id=sprint_id,
             assignee=assignee,
             assign=assign,
+            status_ids=status_ids,
             current_user=current_user,
             mine=mine,
             limit=limit,
@@ -135,6 +412,7 @@ class OnesGateway:
         sprint_id: str | None = None,
         assignee: str | None = None,
         assign: str | None = None,
+        status_ids: Iterable[str] | None = None,
         current_user: bool | None = None,
         mine: bool = False,
         limit: int = _DEFAULT_DEFECT_LIMIT,
@@ -147,6 +425,7 @@ class OnesGateway:
             sprint_id=sprint_id,
             assignee=assignee,
             assign=assign,
+            status_ids=status_ids,
             current_user=current_user,
             mine=mine,
             limit=limit,
@@ -155,7 +434,10 @@ class OnesGateway:
         if self._uses_scoped_fetch(query):
             defect = await self._find_defect_async(issue_id, query)
             if defect:
-                return self._validate_issue_payload(defect, issue_id, context="scoped defect detail")
+                matched = self._validate_issue_payload(defect, issue_id, context="scoped defect lookup")
+                detail_id = str(matched.get("key") or matched["uuid"])
+                detail = await self._call_async("fetch_issue_detail", detail_id)
+                return self._resolve_issue_detail(detail, issue_id)
 
         detail = await self._call_async("fetch_issue_detail", issue_id)
         return self._resolve_issue_detail(detail, issue_id)
@@ -179,6 +461,7 @@ class OnesGateway:
         sprint_id: str | None = None,
         assignee: str | None = None,
         assign: str | None = None,
+        status_ids: Iterable[str] | None = None,
         current_user: bool | None = None,
         mine: bool = False,
         limit: int = _DEFAULT_DEFECT_LIMIT,
@@ -191,6 +474,7 @@ class OnesGateway:
             sprint_id=sprint_id,
             assignee=assignee,
             assign=assign,
+            status_ids=status_ids,
             current_user=current_user,
             mine=mine,
             limit=limit,
@@ -217,6 +501,7 @@ class OnesGateway:
         sprint_id: str | None = None,
         assignee: str | None = None,
         assign: str | None = None,
+        status_ids: Iterable[str] | None = None,
         current_user: bool | None = None,
         mine: bool = False,
         limit: int = _DEFAULT_DEFECT_LIMIT,
@@ -229,6 +514,7 @@ class OnesGateway:
             sprint_id=sprint_id,
             assignee=assignee,
             assign=assign,
+            status_ids=status_ids,
             current_user=current_user,
             mine=mine,
             limit=limit,
@@ -266,6 +552,7 @@ class OnesGateway:
         sprint_id: str | None = None,
         assignee: str | None = None,
         assign: str | None = None,
+        status_ids: Iterable[str] | None = None,
         current_user: bool | None = None,
         mine: bool = False,
         limit: int = _DEFAULT_DEFECT_LIMIT,
@@ -278,6 +565,7 @@ class OnesGateway:
             sprint_id=sprint_id,
             assignee=assignee,
             assign=assign,
+            status_ids=status_ids,
             current_user=current_user,
             mine=mine,
             limit=limit,
@@ -286,7 +574,10 @@ class OnesGateway:
         if self._uses_scoped_fetch(query):
             defect = self._find_defect_sync(issue_id, query)
             if defect:
-                return self._validate_issue_payload(defect, issue_id, context="scoped defect detail")
+                matched = self._validate_issue_payload(defect, issue_id, context="scoped defect lookup")
+                detail_id = str(matched.get("key") or matched["uuid"])
+                detail = self._call_sync("fetch_issue_detail", detail_id)
+                return self._resolve_issue_detail(detail, issue_id)
 
         detail = self._call_sync("fetch_issue_detail", issue_id)
         return self._resolve_issue_detail(detail, issue_id)
@@ -298,10 +589,19 @@ class OnesGateway:
         projects = self.list_projects_sync(include_archived=include_archived)
         return self.normalize_projects(projects)
 
+    def list_team_members_sync(self, uuids: list[str] | None = None) -> list[dict]:
+        return self._call_sync("fetch_team_members", uuids=uuids)
+
+    def list_role_members_sync(self, project_id: str) -> list[dict]:
+        return self._call_sync("fetch_role_members", project_id)
+
     async def close(self) -> None:
         if self._managed_async_client is not None:
             await self._managed_async_client.close()
             self._managed_async_client = None
+        if self._managed_sync_client is not None:
+            self._managed_sync_client.close()
+            self._managed_sync_client = None
 
     async def _list_defects_async(self, query: _DefectQuery) -> list[dict]:
         client = await self._get_async_client()
@@ -321,6 +621,34 @@ class OnesGateway:
 
     def normalize_defects(self, defects: list[dict]) -> list[DefectRecord]:
         return [self.normalize_defect(defect) for defect in defects]
+
+    @staticmethod
+    def _normalize_workflow_status(
+        config: dict,
+        definitions_by_id: dict[str, dict],
+    ) -> WorkflowStatusRef:
+        status_id = str(config.get("status_uuid") or "").strip()
+        definition = definitions_by_id.get(status_id)
+        if not status_id or definition is None:
+            raise OnesGatewayPayloadError(
+                f"Malformed ONES workflow status: missing definition for {status_id or '<empty>'}",
+            )
+        name = str(definition.get("name") or "").strip()
+        category = str(definition.get("category") or "").strip()
+        if not name or not category:
+            raise OnesGatewayPayloadError(
+                f"Malformed ONES workflow status definition: {status_id}",
+            )
+        return WorkflowStatusRef(
+            id=status_id,
+            name=name,
+            category=category,
+            position=int(config.get("position", 0)),
+            default=bool(config.get("default", False)),
+            built_in=bool(definition.get("built_in", False)),
+            detail_type=str(definition.get("detail_type") or ""),
+            name_pinyin=str(definition.get("name_pinyin") or ""),
+        )
 
     def normalize_projects(self, projects: list[dict]) -> list[ProjectRef]:
         return [self.normalize_project(project) for project in projects]
@@ -376,6 +704,378 @@ class OnesGateway:
             raw=defect,
         )
 
+    def normalize_requirement(self, detail: dict) -> RequirementRecord:
+        detail = self._require_mapping(detail, context="requirement payload")
+        requirement_id = self._required_scalar(detail.get("uuid"), context="requirement uuid")
+        title = self._first_string_value(detail, keys=("name", "title"), context="requirement title")
+        project = self._require_nested_mapping(detail, "project", context=f"requirement payload {requirement_id}")
+        iteration = self._optional_mapping(detail, "sprint", context=f"requirement payload {requirement_id}")
+        assignee = self._optional_mapping(detail, "assign", context=f"requirement payload {requirement_id}")
+        status = self._require_nested_mapping(detail, "status", context=f"requirement payload {requirement_id}")
+        project_id = self._required_scalar(project.get("uuid"), context="requirement project uuid")
+        status_id = self._required_scalar(status.get("uuid"), context="requirement status uuid")
+        iteration_id = ""
+        if detail.get("sprint") is not None:
+            iteration_id = self._required_scalar(iteration.get("uuid"), context="requirement sprint uuid")
+        assignee_id = ""
+        if detail.get("assign") is not None:
+            assignee_id = self._required_scalar(assignee.get("uuid"), context="requirement assignee uuid")
+        number = self._optional_scalar(detail.get("number"), context="requirement number")
+        description = self._normalize_requirement_description(detail.get("description"))
+        related = detail.get("relatedWikiPages")
+        if related is None:
+            related = []
+        if not isinstance(related, list):
+            raise OnesGatewayPayloadError("Malformed ONES requirement payload: relatedWikiPages must be a list")
+        if any(not isinstance(item, dict) for item in related):
+            raise OnesGatewayPayloadError("Malformed ONES requirement payload: relatedWikiPages entries must be mappings")
+        related_by_page: dict[str, dict] = {}
+        for item in related:
+            raw_page_id = item.get("uuid") if item.get("uuid") is not None else item.get("page_id")
+            page_identity = self._optional_scalar(raw_page_id, context="related Wiki page uuid")
+            if page_identity:
+                related_by_page[page_identity] = item
+        wiki_refs: list[WikiPageRef] = []
+        seen: set[tuple[str, str]] = set()
+        for raw_url in re.findall(r"https?://[^\s<>'\"]+", description):
+            try:
+                ref = self.parse_wiki_url(raw_url.rstrip(".,;:)"))
+            except ValueError:
+                continue
+            key = (ref.space_id, ref.page_id)
+            if key in seen:
+                continue
+            seen.add(key)
+            related_item = related_by_page.get(ref.page_id, {})
+            ref.title = self._optional_display_value(related_item, keys=("title", "name"), context="related Wiki title")
+            wiki_refs.append(ref)
+        for item in related:
+            if not isinstance(item, dict):
+                continue
+            raw_urls = [self._optional_string(item.get(field_name), context=f"related Wiki {field_name}") for field_name in ("url", "source_url", "link", "web_url")]
+            for raw_url in raw_urls:
+                if not raw_url:
+                    continue
+                try:
+                    ref = self.parse_wiki_url(raw_url)
+                except ValueError:
+                    continue
+                key = (ref.space_id, ref.page_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                ref.title = self._optional_display_value(item, keys=("title", "name"), context="related Wiki title")
+                wiki_refs.append(ref)
+
+        return RequirementRecord(
+            requirement_id=requirement_id,
+            number=number,
+            title=title,
+            project=ProjectRef(id=project_id, name=self._optional_display_value(project, keys=("name",), context="requirement project name")),
+            iteration=ProjectRef(id=iteration_id, name=self._optional_display_value(iteration, keys=("name",), context="requirement sprint name")),
+            assignee=(
+                IdentityRef(
+                    id=assignee_id,
+                    name=self._optional_display_value(assignee, keys=("name",), context="requirement assignee name"),
+                    avatar=self._optional_display_value(assignee, keys=("avatar",), context="requirement assignee avatar"),
+                )
+                if assignee_id
+                else None
+            ),
+            status=StatusRef(
+                id=status_id,
+                name=self._optional_display_value(status, keys=("name",), context="requirement status name"),
+                category=self._optional_display_value(status, keys=("category",), context="requirement status category"),
+            ),
+            description=description,
+            wiki_refs=wiki_refs,
+            source="ones",
+        )
+
+    async def _call_wiki_async(self, method_name: str, *args) -> dict:
+        init_error: OnesGatewayError | None = None
+        try:
+            client = await self._get_async_client()
+        except Exception as exc:
+            init_error = self._map_wiki_exception(exc, context=f"async ONES {method_name}")
+        if init_error is not None:
+            raise init_error from None
+        method = getattr(client, method_name)
+        for attempt in range(1, 4):
+            safe_error: OnesGatewayError | None = None
+            retryable = False
+            try:
+                payload = await method(*args)
+                return self._require_mapping(payload, context=method_name)
+            except Exception as exc:
+                safe_error = self._map_wiki_exception(exc, context=f"async ONES {method_name}")
+                retryable = self._is_retryable(exc)
+            if attempt == 3 or not retryable:
+                raise safe_error from None
+            if safe_error is not None:
+                delay = max(0.0, float(self.retry_backoff(attempt)))
+                if delay:
+                    await asyncio.sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _call_wiki_sync(self, method_name: str, *args) -> dict:
+        init_error: OnesGatewayError | None = None
+        try:
+            client = self._get_sync_client()
+        except Exception as exc:
+            init_error = self._map_wiki_exception(exc, context=f"sync ONES {method_name}")
+        if init_error is not None:
+            raise init_error from None
+        method = getattr(client, method_name)
+        for attempt in range(1, 4):
+            safe_error: OnesGatewayError | None = None
+            retryable = False
+            try:
+                payload = method(*args)
+                return self._require_mapping(payload, context=method_name)
+            except Exception as exc:
+                safe_error = self._map_wiki_exception(exc, context=f"sync ONES {method_name}")
+                retryable = self._is_retryable(exc)
+            if attempt == 3 or not retryable:
+                raise safe_error from None
+            if safe_error is not None:
+                delay = max(0.0, float(self.retry_backoff(attempt)))
+                if delay:
+                    time.sleep(delay)
+        raise AssertionError("unreachable")
+
+    def _build_wiki_snapshot(
+        self,
+        space_id: str,
+        page_id: str,
+        body: dict,
+        detail: dict,
+        *,
+        source_url: str | None,
+    ) -> WikiPageSnapshot:
+        body = self._require_mapping(body, context="Wiki page body")
+        detail = self._require_mapping(detail, context="Wiki page detail")
+        nested_page = self._envelope_mapping(body, "page", context="Wiki page body")
+        nested_data = self._envelope_mapping(body, "data", context="Wiki page body")
+        detail_page = self._envelope_mapping(detail, "page", context="Wiki page detail")
+        detail_data = self._envelope_mapping(detail, "data", context="Wiki page detail")
+        content = self._first_present(body, nested_page, nested_data, key="content")
+        if content is None:
+            raise OnesGatewayPayloadError("Malformed ONES Wiki page body: missing content")
+        normalized = self._normalize_wiki_content(content)
+        if not normalized:
+            raise OnesGatewayPayloadError("Malformed ONES Wiki page body: empty content")
+        settings = self.settings
+        if settings is None:
+            from config.settings import OnesSettings
+            settings = OnesSettings()
+        if source_url is None:
+            base = urlsplit(settings.base_url.rstrip("/"))
+            source_url = (
+                f"{self._canonical_origin(base)}{base.path.rstrip('/')}/wiki/#/team/{settings.team_id}"
+                f"/space/{space_id}/page/{page_id}"
+            )
+        metadata_payloads = (detail, detail_page, detail_data, nested_page, nested_data, body)
+        title = self._first_string_value(*metadata_payloads, keys=("title", "name"), context="Wiki title")
+        version = self._first_scalar_value(
+            *metadata_payloads, keys=("version", "revision"), context="Wiki version",
+        )
+        updated_at_raw = self._first_raw_value(
+            *metadata_payloads,
+            keys=("updated_at", "updateTime", "serverUpdateStamp", "CreatedTime"),
+            context="Wiki updated_at",
+        )
+        updated_at = self._normalize_wiki_timestamp(updated_at_raw)
+        return WikiPageSnapshot(
+            team_id=settings.team_id,
+            space_id=space_id,
+            page_id=page_id,
+            title=title,
+            version=version,
+            updated_at=updated_at,
+            normalized_content=normalized,
+            content_sha256=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+            source_url=source_url,
+        )
+
+    @staticmethod
+    def _normalize_wiki_content(content: object) -> str:
+        if isinstance(content, str):
+            lines = content.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            normalized = "\n".join(line.rstrip() for line in lines).rstrip("\n")
+            result = f"{normalized}\n" if normalized else ""
+            return OnesGateway._ensure_utf8(result, context="Wiki content")
+        if not isinstance(content, (dict, list)):
+            raise OnesGatewayPayloadError("Malformed ONES Wiki content: expected text or structured JSON")
+        serialization_failed = False
+        try:
+            normalized = json.dumps(
+                content,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            serialization_failed = True
+        if serialization_failed:
+            raise OnesGatewayPayloadError("Malformed ONES Wiki content: not JSON serializable") from None
+        return OnesGateway._ensure_utf8(normalized, context="Wiki content")
+
+    @staticmethod
+    def _optional_mapping(payload: dict, key: str, *, context: str) -> dict:
+        value = payload.get(key)
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: invalid '{key}'")
+        return value
+
+    @staticmethod
+    def _envelope_mapping(payload: dict, key: str, *, context: str) -> dict:
+        if key not in payload:
+            return {}
+        value = payload[key]
+        if not isinstance(value, dict):
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: invalid '{key}' envelope")
+        return value
+
+    @staticmethod
+    def _first_present(*payloads: dict, key: str) -> object | None:
+        for payload in payloads:
+            if key in payload:
+                return payload[key]
+        return None
+
+    @staticmethod
+    def _first_string_value(*payloads: dict, keys: tuple[str, ...], context: str) -> str:
+        for payload in payloads:
+            for key in keys:
+                if key not in payload or payload[key] is None:
+                    continue
+                value = payload[key]
+                if not isinstance(value, str):
+                    raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: expected string")
+                normalized = value.strip()
+                if normalized:
+                    return OnesGateway._ensure_utf8(normalized, context=context)
+        raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: missing non-empty string")
+
+    @staticmethod
+    def _first_scalar_value(*payloads: dict, keys: tuple[str, ...], context: str) -> str:
+        for payload in payloads:
+            for key in keys:
+                if key not in payload or payload[key] is None:
+                    continue
+                value = OnesGateway._required_scalar(payload[key], context=context)
+                if value:
+                    return value
+        raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: missing non-empty scalar")
+
+    @staticmethod
+    def _first_raw_value(*payloads: dict, keys: tuple[str, ...], context: str) -> object:
+        for payload in payloads:
+            for key in keys:
+                if key in payload and payload[key] is not None:
+                    return payload[key]
+        raise OnesGatewayPayloadError(
+            f"Malformed ONES payload for {context}: missing non-empty scalar"
+        )
+
+    @staticmethod
+    def _normalize_wiki_timestamp(value: object) -> str:
+        lower = datetime(2000, 1, 1, tzinfo=UTC)
+        upper = datetime(3000, 1, 1, tzinfo=UTC)
+        parsed: datetime
+        if type(value) is int:
+            seconds = value / 1000 if value >= 100_000_000_000 else value
+            try:
+                parsed = datetime.fromtimestamp(seconds, tz=UTC)
+            except (OverflowError, OSError, ValueError):
+                raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at") from None
+        elif type(value) is str and value and value == value.strip():
+            candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+            try:
+                parsed = datetime.fromisoformat(candidate)
+            except ValueError:
+                raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at") from None
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at")
+            parsed = parsed.astimezone(UTC)
+        else:
+            raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at")
+        if parsed < lower or parsed >= upper:
+            raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at")
+        return parsed.isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _required_scalar(value: object, *, context: str) -> str:
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: expected scalar")
+        if isinstance(value, float) and not math.isfinite(value):
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: expected finite scalar")
+        normalized = str(value).strip()
+        if not normalized:
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: empty scalar")
+        return OnesGateway._ensure_utf8(normalized, context=context)
+
+    @staticmethod
+    def _optional_scalar(value: object, *, context: str) -> str:
+        if value is None:
+            return ""
+        return OnesGateway._required_scalar(value, context=context)
+
+    @staticmethod
+    def _optional_string(value: object, *, context: str) -> str:
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: expected string")
+        return OnesGateway._ensure_utf8(value.strip(), context=context)
+
+    @staticmethod
+    def _optional_display_value(payload: dict, *, keys: tuple[str, ...], context: str) -> str:
+        for key in keys:
+            if key in payload and payload[key] is not None:
+                return OnesGateway._optional_scalar(payload[key], context=context)
+        return ""
+
+    @staticmethod
+    def _normalize_requirement_description(value: object) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            lines = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            normalized = "\n".join(line.rstrip() for line in lines).rstrip("\n")
+            return OnesGateway._ensure_utf8(normalized, context="requirement description")
+        if not isinstance(value, (dict, list)):
+            raise OnesGatewayPayloadError("Malformed ONES requirement description: expected text or structured JSON")
+        serialization_failed = False
+        try:
+            normalized = json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError):
+            serialization_failed = True
+        if serialization_failed:
+            raise OnesGatewayPayloadError("Malformed ONES requirement description: not JSON serializable") from None
+        return OnesGateway._ensure_utf8(normalized, context="requirement description")
+
+    @staticmethod
+    def _ensure_utf8(value: str, *, context: str) -> str:
+        encoding_failed = False
+        try:
+            value.encode("utf-8")
+        except UnicodeEncodeError:
+            encoding_failed = True
+        if encoding_failed:
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}: invalid UTF-8 text") from None
+        return value
+
     async def _call_async(self, method_name: str, *args, **kwargs):
         try:
             client = await self._get_async_client()
@@ -402,12 +1102,11 @@ class OnesGateway:
         remaining = query.limit
 
         for project_id in project_ids:
-            fetch_limit = min(remaining, query.page_size)
             fetched = await self._fetch_defects_async(
                 client,
                 query,
                 project_id=project_id,
-                limit=fetch_limit,
+                limit=remaining,
             )
             self._extend_unique_defects(defects, fetched, seen_issue_ids)
             remaining = query.limit - len(defects)
@@ -426,12 +1125,11 @@ class OnesGateway:
         remaining = query.limit
 
         for project_id in project_ids:
-            fetch_limit = min(remaining, query.page_size)
             fetched = self._fetch_defects_sync(
                 client,
                 query,
                 project_id=project_id,
-                limit=fetch_limit,
+                limit=remaining,
             )
             self._extend_unique_defects(defects, fetched, seen_issue_ids)
             remaining = query.limit - len(defects)
@@ -452,6 +1150,7 @@ class OnesGateway:
             "project_id": project_id,
             "issue_type_id": query.issue_type_id,
             "limit": limit,
+            "page_size": query.page_size,
         }
         if query.sprint_id:
             kwargs["sprint_id"] = query.sprint_id
@@ -463,6 +1162,8 @@ class OnesGateway:
 
         if query.assignee:
             kwargs["assign"] = query.assignee
+        if query.status_ids:
+            kwargs["status_in"] = list(query.status_ids)
         try:
             return await client.fetch_defects(**kwargs)
         except Exception as exc:
@@ -480,6 +1181,7 @@ class OnesGateway:
             "project_id": project_id,
             "issue_type_id": query.issue_type_id,
             "limit": limit,
+            "page_size": query.page_size,
         }
         if query.sprint_id:
             kwargs["sprint_id"] = query.sprint_id
@@ -491,6 +1193,8 @@ class OnesGateway:
 
         if query.assignee:
             kwargs["assign"] = query.assignee
+        if query.status_ids:
+            kwargs["status_in"] = list(query.status_ids)
         try:
             return client.fetch_defects(**kwargs)
         except Exception as exc:
@@ -501,14 +1205,24 @@ class OnesGateway:
             return self.async_client
 
         try:
+            log.info(
+                "ones_gateway_async_client_init",
+                has_settings=bool(self.settings),
+                managed_client_cached=self._managed_async_client is not None,
+            )
             from config.settings import OnesSettings
             from src.integrations.ones_api import OnesAsyncClient
 
             if self._managed_async_client is None:
-                self._managed_async_client = OnesAsyncClient(self.settings or OnesSettings())
+                managed_settings = self.settings or OnesSettings()
+                self._managed_async_client = OnesAsyncClient(managed_settings)
                 await self._managed_async_client._get_client()
             return self._managed_async_client
         except Exception as exc:
+            log.error(
+                "ones_gateway_async_client_init_failed",
+                context="async ONES client initialization",
+            )
             raise self._map_exception(exc, context="async ONES client initialization") from exc
 
     def _get_sync_client(self) -> OnesClient:
@@ -516,12 +1230,34 @@ class OnesGateway:
             return self.sync_client
 
         try:
+            log.info(
+                "ones_gateway_sync_client_init",
+                managed_client_cached=self._managed_sync_client is not None,
+            )
             from src.integrations.ones import OnesClient
 
             if self._managed_sync_client is None:
-                self._managed_sync_client = OnesClient()
+                from config.settings import OnesSettings
+                managed_settings = self.settings or OnesSettings()
+                self._managed_sync_client = OnesClient(
+                    base_url=managed_settings.base_url,
+                    email=managed_settings.email,
+                    password=managed_settings.password,
+                    team_id=managed_settings.team_id,
+                    project_id=managed_settings.project_id,
+                    issue_type_id=managed_settings.issue_type_id,
+                    comment_list_path_template=managed_settings.comment_list_path_template,
+                    comment_timeout_seconds=managed_settings.comment_timeout_seconds,
+                    comment_max_pages=managed_settings.comment_max_pages,
+                    comment_max_comments=managed_settings.comment_max_comments,
+                    comment_max_payload_bytes=managed_settings.comment_max_payload_bytes,
+                )
             return self._managed_sync_client
         except Exception as exc:
+            log.error(
+                "ones_gateway_sync_client_init_failed",
+                context="sync ONES client initialization",
+            )
             raise self._map_exception(exc, context="sync ONES client initialization") from exc
 
     @staticmethod
@@ -533,6 +1269,7 @@ class OnesGateway:
         sprint_id: str | None,
         assignee: str | None,
         assign: str | None,
+        status_ids: Iterable[str] | None,
         current_user: bool | None,
         mine: bool,
         limit: int,
@@ -540,6 +1277,7 @@ class OnesGateway:
     ) -> _DefectQuery:
         normalized_project_ids = OnesGateway._normalize_project_ids(project_id, project_ids)
         normalized_assignee = assignee if assignee is not None else assign
+        normalized_status_ids = tuple(str(value).strip() for value in (status_ids or []) if str(value).strip())
         use_current_user = bool(current_user) or mine or normalized_assignee == _CURRENT_USER_TOKEN
         if use_current_user:
             normalized_assignee = None
@@ -556,6 +1294,7 @@ class OnesGateway:
             issue_type_id=issue_type_id or None,
             sprint_id=sprint_id or None,
             assignee=normalized_assignee or None,
+            status_ids=normalized_status_ids,
             mine=use_current_user,
             limit=normalized_limit,
             page_size=normalized_page_size,
@@ -610,12 +1349,11 @@ class OnesGateway:
                 raise OnesGatewayPayloadError(
                     f"Malformed ONES payload in defect lookup: expected mapping entries while resolving {issue_id}",
                 )
-            current_issue_id = defect.get("uuid")
-            if current_issue_id is None:
+            if defect.get("uuid") is None:
                 raise OnesGatewayPayloadError(
                     f"Malformed ONES payload in defect lookup: missing 'uuid' while resolving {issue_id}",
                 )
-            if current_issue_id == issue_id:
+            if OnesGateway._matches_issue(defect, issue_id):
                 return defect
 
         return {}
@@ -625,18 +1363,24 @@ class OnesGateway:
         if not detail:
             raise OnesGatewayNotFoundError(f"ONES issue not found: {issue_id}")
 
-        validated = OnesGateway._validate_issue_payload(detail, issue_id, context="issue detail")
-        if validated.get("uuid") != issue_id:
-            raise OnesGatewayNotFoundError(f"ONES issue not found: {issue_id}")
-        return validated
+        return OnesGateway._validate_issue_payload(detail, issue_id, context="issue detail")
 
     @staticmethod
     def _validate_issue_payload(defect: dict, issue_id: str, *, context: str) -> dict:
         defect = OnesGateway._require_mapping(defect, context=context)
-        defect_uuid = OnesGateway._require_field(defect, "uuid", context=context)
-        if defect_uuid != issue_id:
+        OnesGateway._require_field(defect, "uuid", context=context)
+        if not OnesGateway._matches_issue(defect, issue_id):
             raise OnesGatewayNotFoundError(f"ONES issue not found: {issue_id}")
         return defect
+
+    @staticmethod
+    def _matches_issue(defect: dict, issue_id: str) -> bool:
+        identities = {
+            str(defect.get("uuid") or "").strip(),
+            str(defect.get("key") or "").strip(),
+        }
+        identities.discard("")
+        return issue_id in identities
 
     @staticmethod
     def _require_mapping(payload: object, *, context: str) -> dict:
@@ -668,33 +1412,88 @@ class OnesGateway:
         if isinstance(exc, OnesGatewayError):
             return exc
 
+        from src.integrations.ones import OnesPaginationError as SyncOnesPaginationError
+        from src.integrations.ones_api import OnesPaginationError as AsyncOnesPaginationError
+
+        if isinstance(exc, (SyncOnesPaginationError, AsyncOnesPaginationError)):
+            return OnesGatewayPayloadError(f"Malformed ONES pagination during {context}")
+
         if OnesGateway._is_timeout_error(exc):
             return OnesGatewayTimeoutError(f"ONES upstream timeout during {context}")
 
         if OnesGateway._is_auth_error(exc):
             return OnesGatewayAuthError(f"ONES authentication failed during {context}")
 
-        if isinstance(exc, (KeyError, IndexError, TypeError, ValueError)):
-            return OnesGatewayPayloadError(f"Malformed ONES payload during {context}: {exc}")
+        if OnesGateway._status_code(exc) == 404:
+            return OnesGatewayNotFoundError(f"ONES entity not found during {context}")
 
-        return OnesGatewayError(f"ONES gateway request failed during {context}: {exc}")
+        if isinstance(exc, (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError)):
+            return OnesGatewayPayloadError(f"Malformed ONES payload during {context}")
+
+        if exc.__class__.__name__ == "OnesPayloadError":
+            return OnesGatewayPayloadError(f"Malformed ONES payload during {context}")
+
+        return OnesGatewayError(f"ONES gateway request failed during {context}")
+
+    @staticmethod
+    def _map_wiki_exception(exc: Exception, *, context: str) -> OnesGatewayError:
+        mapped = OnesGateway._map_exception(exc, context=context)
+        error_type = type(mapped)
+        if isinstance(mapped, OnesGatewayAuthError):
+            message = f"ONES authentication failed during {context}"
+        elif isinstance(mapped, OnesGatewayTimeoutError):
+            message = f"ONES upstream timeout during {context}"
+        elif isinstance(mapped, OnesGatewayNotFoundError):
+            message = f"ONES entity not found during {context}"
+        elif isinstance(mapped, OnesGatewayPayloadError):
+            message = f"Malformed ONES payload during {context}"
+        else:
+            error_type = OnesGatewayError
+            message = f"ONES gateway request failed during {context}"
+        return error_type(message)
 
     @staticmethod
     def _is_timeout_error(exc: Exception) -> bool:
-        if isinstance(exc, TimeoutError):
-            return True
-
-        class_name = exc.__class__.__name__.lower()
-        return "timeout" in class_name
+        return isinstance(exc, (TimeoutError, httpx.TimeoutException, requests.exceptions.Timeout))
 
     @staticmethod
     def _is_auth_error(exc: Exception) -> bool:
+        return OnesGateway._status_code(exc) in {401, 403}
+
+    @staticmethod
+    def _status_code(exc: Exception) -> int | None:
         status_code = getattr(exc, "status_code", None)
         response = getattr(exc, "response", None)
         if status_code is None and response is not None:
             status_code = getattr(response, "status_code", None)
+        return status_code
 
-        return status_code in {401, 403}
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        status_code = OnesGateway._status_code(exc)
+        if status_code == 429 or (status_code is not None and 500 <= status_code < 600):
+            return True
+        if isinstance(exc, (httpx.TransportError, requests.exceptions.ConnectionError)):
+            return True
+        if OnesGateway._is_timeout_error(exc):
+            return False
+        return False
+
+    @staticmethod
+    def _origin(parsed) -> tuple[str, str, int | None]:
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+        if port is None:
+            port = 443 if scheme == "https" else 80 if scheme == "http" else None
+        return scheme, hostname, port
+
+    @staticmethod
+    def _canonical_origin(parsed) -> str:
+        scheme, hostname, port = OnesGateway._origin(parsed)
+        default = 443 if scheme == "https" else 80 if scheme == "http" else None
+        suffix = "" if port == default else f":{port}"
+        return f"{scheme}://{hostname}{suffix}"
 
     @staticmethod
     def _identity_ref(payload: dict | None) -> IdentityRef | None:

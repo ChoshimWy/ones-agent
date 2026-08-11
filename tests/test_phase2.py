@@ -7,9 +7,15 @@ import json
 import pytest
 import httpx
 import respx
+from structlog.testing import capture_logs
 
 from config.settings import OnesSettings, AgentSettings
-from src.integrations.ones_api import OnesAsyncClient
+from src.integrations.ones_api import (
+    GQL_FETCH_TASKS,
+    OnesAsyncClient,
+    OnesGraphQLResponseError,
+    OnesPaginationError,
+)
 from src.core.queue import TaskQueue
 
 
@@ -17,6 +23,84 @@ from src.core.queue import TaskQueue
 
 
 class TestOnesAsyncClientGraphQL:
+    @pytest.mark.parametrize("bad_id", ["", ".", "..", "a/b", "a\\b", "a%b", "a?b", "a#b", "a b", "\nbad", "中文"])
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_wiki_read_rejects_unsafe_segments_without_request(self, bad_id):
+        settings = OnesSettings(base_url="https://ones.test", team_id="team-1", email="", password="", _env_file=None)
+        client = OnesAsyncClient(settings)
+
+        with pytest.raises(ValueError, match="Wiki"):
+            await client.fetch_wiki_page("space-1", bad_id)
+        assert not respx.calls
+        await client.close()
+
+    def test_fetch_tasks_query_includes_sprint_identity(self):
+        assert "sprint { uuid name }" in GQL_FETCH_TASKS
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_wiki_read_methods_reuse_async_client_and_use_exact_paths(self):
+        settings = OnesSettings(base_url="https://ones.test", team_id="team-1", email="", password="", _env_file=None)
+        client = OnesAsyncClient(settings)
+        routes = [
+            respx.get("https://ones.test/wiki/api/wiki/team/team-1/space/space-1/page/page-1").mock(
+                return_value=httpx.Response(200, json={"content": "body"}),
+            ),
+            respx.get("https://ones.test/wiki/api/wiki/team/team-1/page/page-1/detail").mock(
+                return_value=httpx.Response(200, json={"title": "Page"}),
+            ),
+            respx.get("https://ones.test/wiki/api/wiki/team/team-1/space/space-1/pages_with_history").mock(
+                return_value=httpx.Response(200, json={"pages": []}),
+            ),
+        ]
+
+        with capture_logs() as logs:
+            assert await client.fetch_wiki_page("space-1", "page-1") == {"content": "body"}
+            underlying = client._client
+            assert await client.fetch_wiki_page_info("page-1") == {"title": "Page"}
+            assert await client.fetch_wiki_pages_with_history("space-1") == {"pages": []}
+        assert client._client is underlying
+        assert all(route.called for route in routes)
+        allowed = {"event", "log_level", "team_id", "space_id", "page_id", "status"}
+        wiki_logs = [entry for entry in logs if entry.get("event") == "ones_wiki_read"]
+        assert len(wiki_logs) == 3 and all(set(entry) <= allowed for entry in wiki_logs)
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_wiki_read_rejects_non_mapping_json(self):
+        settings = OnesSettings(base_url="https://ones.test", team_id="team-1", email="", password="", _env_file=None)
+        client = OnesAsyncClient(settings)
+        respx.get("https://ones.test/wiki/api/wiki/team/team-1/page/page-1/detail").mock(
+            return_value=httpx.Response(200, json=["not", "mapping"]),
+        )
+
+        from src.integrations.ones_api import OnesPayloadError
+        with pytest.raises(OnesPayloadError, match="mapping"):
+            await client.fetch_wiki_page_info("page-1")
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_graphql_http_200_errors_are_not_treated_as_success(self):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        respx.post("http://ones.test/project/api/project/team/team1/items/graphql").mock(
+            return_value=httpx.Response(
+                200,
+                json={"data": None, "errors": [{"message": "invalid filter", "path": ["tasks"]}]},
+            ),
+        )
+
+        with pytest.raises(OnesGraphQLResponseError, match="invalid filter"):
+            await client._graphql("query Tasks { tasks { uuid } }", {})
+
+        await client.close()
+
     @respx.mock
     @pytest.mark.asyncio
     async def test_fetch_defects(self):
@@ -39,7 +123,7 @@ class TestOnesAsyncClientGraphQL:
                          "issueType": {"name": "缺陷"}, "project": {"name": "P"},
                          "createTime": 0, "deadline": None, "estimatedHours": 0,
                          "subTaskCount": 0, "subTaskDoneCount": 0},
-                    ]}
+                    ], "pageInfo": {"hasNextPage": False}}
                 ]
             }
         }
@@ -51,6 +135,150 @@ class TestOnesAsyncClientGraphQL:
         assert len(result) == 1
         assert result[0]["uuid"] == "d1"
         assert result[0]["_status_group"] == "待处理"
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_defects_forwards_status_in(self):
+        settings = OnesSettings(
+            base_url="http://ones.test",
+            email="",
+            password="",
+            team_id="team1",
+            project_id="proj1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+
+        captured: dict[str, object] = {}
+
+        def handler(request: httpx.Request):
+            captured.update(json.loads(request.content))
+            return httpx.Response(200, json={"data": {"buckets": []}})
+
+        respx.post("http://ones.test/project/api/project/team/team1/items/graphql").mock(side_effect=handler)
+
+        await client.fetch_defects(status_in=["status-uuid-1"])
+
+        variables = captured["variables"]
+        assert variables["filterGroup"][0]["status_in"] == ["status-uuid-1"]
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_defects_paginates_deduplicates_and_preserves_status(self):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        responses = iter([
+            httpx.Response(200, json={"data": {"buckets": [{
+                "key": "tasks",
+                "tasks": [
+                    {"uuid": "d1", "status": {"uuid": "s1", "category": "todo"}},
+                    {"uuid": "d2", "status": {"uuid": "s2", "category": "doing"}},
+                ],
+                "pageInfo": {"hasNextPage": True, "endCursor": "cursor-1"},
+            }]}}),
+            httpx.Response(200, json={"data": {"buckets": [{
+                "key": "tasks",
+                "tasks": [
+                    {"uuid": "d2", "status": {"uuid": "s2", "category": "doing"}},
+                    {"uuid": "d3", "status": {"uuid": "s3", "category": "pending"}},
+                ],
+                "pageInfo": {"hasNextPage": False, "endCursor": "cursor-2"},
+            }]}}),
+        ])
+        captured: list[dict] = []
+
+        def handler(request: httpx.Request):
+            captured.append(json.loads(request.content)["variables"])
+            return next(responses)
+
+        respx.post("http://ones.test/project/api/project/team/team1/items/graphql").mock(side_effect=handler)
+
+        defects = await client.fetch_defects(limit=10, page_size=2)
+
+        assert [item["uuid"] for item in defects] == ["d1", "d2", "d3"]
+        assert defects[2]["status"]["category"] == "pending"
+        assert [item["pagination"] for item in captured] == [
+            {"limit": 2, "after": "", "preciseCount": True},
+            {"limit": 2, "after": "cursor-1", "preciseCount": True},
+        ]
+        assert all(item["groupBy"] == {"tasks": {}} for item in captured)
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_defects_rejects_unstable_next_page_cursor(self):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        respx.post("http://ones.test/project/api/project/team/team1/items/graphql").mock(
+            return_value=httpx.Response(200, json={"data": {"buckets": [{
+                "key": "tasks",
+                "tasks": [{"uuid": "d1", "status": {"uuid": "s1"}}],
+                "pageInfo": {"hasNextPage": True, "endCursor": ""},
+            }]}}),
+        )
+
+        with pytest.raises(OnesPaginationError, match="cursor"):
+            await client.fetch_defects(limit=10, page_size=2)
+        await client.close()
+
+    @pytest.mark.parametrize(
+        "bucket",
+        [
+            {"key": "tasks", "tasks": [{"uuid": "d1"}]},
+            {"key": "tasks", "tasks": [{"uuid": "d1"}], "pageInfo": []},
+            {"key": "tasks", "tasks": [{"uuid": "d1"}], "pageInfo": {"endCursor": "a"}},
+            {
+                "key": "tasks",
+                "tasks": [{"uuid": "d1"}],
+                "pageInfo": {"hasNextPage": "false", "endCursor": "a"},
+            },
+        ],
+    )
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_defects_rejects_indeterminate_page_info(self, bucket):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        respx.post("http://ones.test/project/api/project/team/team1/items/graphql").mock(
+            return_value=httpx.Response(200, json={"data": {"buckets": [bucket]}}),
+        )
+
+        with pytest.raises(OnesPaginationError, match="pageInfo|hasNextPage"):
+            await client.fetch_defects(limit=10, page_size=2)
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_defects_rejects_cursor_cycles(self):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        responses = iter([
+            httpx.Response(200, json={"data": {"buckets": [{
+                "key": "tasks", "tasks": [{"uuid": uuid}],
+                "pageInfo": {"hasNextPage": True, "endCursor": cursor},
+            }]}})
+            for uuid, cursor in (("d1", "a"), ("d2", "b"), ("d3", "a"))
+        ])
+        respx.post("http://ones.test/project/api/project/team/team1/items/graphql").mock(
+            side_effect=lambda request: next(responses),
+        )
+
+        with pytest.raises(OnesPaginationError, match="cursor"):
+            await client.fetch_defects(limit=10, page_size=2)
         await client.close()
 
     @respx.mock
@@ -147,6 +375,47 @@ class TestOnesAsyncClientGraphQL:
 
         result = await client.fetch_role_members("proj1")
         assert result == [{"uuid": "role-member-1"}]
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_task_status_configs_uses_project_filter(self):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        route = respx.post("http://ones.test/project/api/project/team/team1/task_statuses").mock(
+            return_value=httpx.Response(
+                200,
+                json={"task_status_configs": [{"project_uuid": "proj1", "status_uuid": "status-1"}]},
+            ),
+        )
+
+        result = await client.fetch_task_status_configs(["proj1"])
+
+        assert result == [{"project_uuid": "proj1", "status_uuid": "status-1"}]
+        assert json.loads(route.calls[0].request.content) == {"project_uuids": ["proj1"]}
+        await client.close()
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_fetch_task_status_definitions_uses_get(self):
+        settings = OnesSettings(
+            base_url="http://ones.test", email="", password="", team_id="team1",
+            _env_file=None,
+        )
+        client = OnesAsyncClient(settings)
+        respx.get("http://ones.test/project/api/project/team/team1/task_statuses").mock(
+            return_value=httpx.Response(
+                200,
+                json={"task_statuses": [{"uuid": "status-1", "name": "待处理"}]},
+            ),
+        )
+
+        result = await client.fetch_task_status_definitions()
+
+        assert result == [{"uuid": "status-1", "name": "待处理"}]
         await client.close()
 
 
