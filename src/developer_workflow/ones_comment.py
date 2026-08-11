@@ -63,9 +63,22 @@ def build_comment_text(
 ) -> str:
     """Build a bounded, UTF-8-safe comment carrying a stable run marker."""
 
-    pr_url = _safe_text(run.publication.pr_url.strip(), label="PR URL")
-    if not pr_url:
-        raise ValueError("PR URL is required before commenting")
+    if run.group_publication is not None:
+        published = tuple(
+            (item.repository_key, item.commit_hash, item.pr_url)
+            for item in run.group_publication.repositories
+        )
+        if not published or any(not commit or not url for _, commit, url in published):
+            raise ValueError("Every repository PR is required before commenting")
+        pr_url = "\n".join(
+            f"- {_safe_text(key, label='repository key')}: "
+            f"{_safe_text(commit, label='commit')} {_safe_text(url, label='PR URL')}"
+            for key, commit, url in published
+        )
+    else:
+        pr_url = _safe_text(run.publication.pr_url.strip(), label="PR URL")
+        if not pr_url:
+            raise ValueError("PR URL is required before commenting")
     summary = _safe_text(summary.strip(), label="summary")
     tests_summary = _safe_text(tests_summary.strip(), label="tests summary")
     marker = comment_marker(run.run_id)
@@ -109,7 +122,12 @@ class OnesCommenter:
     def ensure_comment_locked(self, run: WorkflowRun) -> str:
         """Comment while the caller holds this run's publish operation lease."""
 
-        if not run.publication.pr_url.strip():
+        if run.group_publication is not None:
+            if not run.group_publication.repositories or any(
+                not item.pr_url for item in run.group_publication.repositories
+            ):
+                raise ValueError("Every repository PR is required before ONES comment")
+        elif not run.publication.pr_url.strip():
             raise ValueError("PR URL is required before ONES comment")
         marker = comment_marker(run.run_id)
         existing = self._find(run.work_item_id, marker)

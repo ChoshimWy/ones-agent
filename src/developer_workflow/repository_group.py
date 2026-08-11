@@ -6,10 +6,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .contracts import (
+    ApprovalPackage,
     PreparedWorktree,
     RepositoryGroupMapping,
     RepositoryMapping,
     RepositorySnapshot,
+    WorkflowRun,
     WorkflowType,
     validate_git_ref_name,
 )
@@ -134,6 +136,53 @@ class RepositoryGroupWorkspace:
     ) -> None:
         for item in prepared:
             self.repository.assert_head_unchanged(item.prepared)
+
+    def approval_trees(
+        self,
+        prepared: tuple[PreparedRepository, ...],
+        snapshots: dict[str, RepositorySnapshot],
+        commit_messages: dict[str, str],
+    ) -> dict[str, str]:
+        """Compute deterministic trees before approval so they enter its signature."""
+
+        keys = tuple(item.repository_key for item in prepared)
+        if tuple(snapshots) != keys or tuple(commit_messages) != keys:
+            raise RepositoryGroupError("approval tree inputs do not follow topology")
+        result: dict[str, str] = {}
+        for item in prepared:
+            snapshot = snapshots[item.repository_key]
+            message = commit_messages[item.repository_key]
+            if not snapshot.changed_files:
+                if message:
+                    raise RepositoryGroupError("unchanged repository cannot publish")
+                result[item.repository_key] = ""
+                continue
+            approval = ApprovalPackage(
+                work_item_id="repository-tree-intent",
+                repository=item.mapping,
+                repo_url=item.mapping.repo_url,
+                base_branch=item.mapping.base_branch,
+                base_commit=item.prepared.base_commit,
+                head_commit=snapshot.head_commit,
+                diff_hash=snapshot.diff_sha256,
+                diff_summary=(
+                    f"changed {len(snapshot.changed_files)} file(s): "
+                    f"{', '.join(snapshot.changed_files)}"
+                ),
+                branch=item.prepared.branch,
+                changed_files=snapshot.changed_files,
+                commit_message=message,
+            )
+            projection = WorkflowRun.new("requirement", "repository-tree-intent").validated_update(
+                repository=item.mapping,
+                prepared_worktree=item.prepared,
+                tested_snapshot=snapshot,
+                approval=approval,
+            )
+            result[item.repository_key] = self.repository.prepare_commit_intent(
+                projection, approval
+            )
+        return result
 
 
 __all__ = [

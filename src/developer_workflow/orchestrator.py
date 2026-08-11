@@ -142,6 +142,35 @@ class DeveloperWorkflowOrchestrator:
             run = self.store.load(run_id)
             if run.state is not WorkflowState.VALIDATING:
                 raise InvalidWorkflowAction("repository confirmation requires VALIDATING")
+            persisted_group = next(
+                (
+                    candidate for candidate in run.repository_group_candidates
+                    if candidate.key == mapping_key
+                ),
+                None,
+            )
+            if persisted_group is not None:
+                try:
+                    configured_group = self.config.resolve_group_key(
+                        mapping_key, run.project_id, run.iteration_id
+                    )
+                except RepositoryMappingNotFound:
+                    raise InvalidWorkflowAction(
+                        "repository group is not configured for this workflow"
+                    ) from None
+                if configured_group != persisted_group:
+                    raise InvalidWorkflowAction(
+                        "repository group differs from the persisted candidate"
+                    )
+                saved = self.store.save(
+                    run.validated_update(
+                        repository_model_version=2,
+                        repository_group=configured_group,
+                        repository=None,
+                    ),
+                    expected_version=run.version,
+                )
+                return self._flow_for(saved).execute(saved)
             try:
                 mapping = self.config.resolve_mapping_key(
                     mapping_key, run.project_id, run.iteration_id
@@ -166,7 +195,11 @@ class DeveloperWorkflowOrchestrator:
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
             if run.state is WorkflowState.PARTIAL_SUCCESS:
-                return self.publisher.retry_comment(run)
+                return (
+                    self.publisher.publish(run)
+                    if run.repository_group is not None
+                    else self.publisher.retry_comment(run)
+                )
             if run.state is WorkflowState.PUBLISHING:
                 return self.publisher.publish(run)
             if run.state is WorkflowState.BLOCKED and run.resume_state is None:
@@ -211,7 +244,7 @@ class DeveloperWorkflowOrchestrator:
                 raise InvalidWorkflowAction(
                     "revise requires WAITING_APPROVAL or BLOCKED"
                 )
-            if run.publication != PublicationResult():
+            if run.publication != PublicationResult() or run.group_publication is not None:
                 raise InvalidWorkflowAction(
                     "published workflow evidence cannot be revised; create a new workflow run"
                 )

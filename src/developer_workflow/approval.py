@@ -16,6 +16,8 @@ from src.contracts import WikiPageSnapshot
 from .contracts import (
     ApprovalPackage,
     CommandResult,
+    RepositoryApprovalEvidence,
+    RepositoryGroupMapping,
     RepositoryMapping,
     RootCauseEvidence,
     utc_now,
@@ -180,6 +182,26 @@ def _validate_runtime_types(package: ApprovalPackage) -> None:
     _require_exact(package.unrelated_changes_checked, bool)
     if package.repository is not None:
         _validate_repository_types(package.repository)
+    if package.repository_group is not None:
+        _require_exact(package.repository_group, RepositoryGroupMapping)
+    _require_exact(package.repositories, tuple)
+    for item in package.repositories:
+        if type(item) is not RepositoryApprovalEvidence:
+            raise _ApprovalFailure("Approval package has invalid field types")
+        _require_exact(item.repository_key, str)
+        _validate_repository_types(item.mapping)
+        for field in (
+            "base_commit", "head_commit", "diff_hash", "diff_summary", "branch",
+            "commit_message", "pr_title", "pr_body",
+        ):
+            _require_exact(getattr(item, field), str)
+        _require_string_tuple(item.changed_files)
+        _require_exact(item.tests, tuple)
+        for result in item.tests:
+            _validate_command_types(result)
+    _require_exact(package.integration_tests, tuple)
+    for result in package.integration_tests:
+        _validate_command_types(result)
     _require_exact(package.wiki_snapshots, tuple)
     for snapshot in package.wiki_snapshots:
         _validate_wiki_types(snapshot)
@@ -263,27 +285,129 @@ def approval_fingerprint(package: ApprovalPackage) -> str:
     return hashlib.sha256(_canonical_bytes(package)).hexdigest()
 
 
+def _validate_group_package(
+    package: ApprovalPackage, *, defect: bool
+) -> ApprovalPackage:
+    group = package.repository_group
+    if group is None or not package.repositories:
+        raise _ApprovalFailure("Approval package is not ready for approval")
+    if any(
+        (
+            package.repo_url,
+            package.base_branch,
+            package.base_commit,
+            package.head_commit,
+            package.diff_hash,
+            package.diff_summary,
+            package.branch,
+            package.changed_files,
+            package.tests,
+            package.commit_message,
+            package.pr_title,
+            package.pr_body,
+        )
+    ):
+        raise _ApprovalFailure("Approval package is not ready for approval")
+    if (
+        package.unrelated_changes_checked is not True
+        or not package.review
+        or package.unresolved_items
+        or not any(item.changed_files for item in package.repositories)
+    ):
+        raise _ApprovalFailure("Approval package is not ready for approval")
+    reproduction_binding: tuple[str, str, str] | None = None
+    if defect:
+        bindings = {
+            (
+                item.reproduction_file.repository_key,
+                item.reproduction_command,
+                item.test_selector,
+            )
+            for item in package.root_cause_evidence
+            if item.reproduction_file is not None
+        }
+        if (
+            len(bindings) != 1
+            or len(bindings) != len({
+                (item.reproduction_command, item.test_selector)
+                for item in package.root_cause_evidence
+            })
+            or not package.behavior_before.strip()
+            or not package.behavior_after.strip()
+            or not package.impact_scope
+            or package.risk_level not in {"low", "medium", "high"}
+            or len(package.pre_fix_tests) != 1
+            or package.pre_fix_tests[0].outcome.value != "test_failed"
+            or re.fullmatch(r"[0-9a-f]{64}", package.reproduction_test_sha256)
+            is None
+        ):
+            raise _ApprovalFailure("Approval package is not ready for approval")
+        reproduction_binding = next(iter(bindings))
+
+    by_key = {item.repository_key: item for item in package.repositories}
+    for key in group.topological_keys():
+        item = by_key[key]
+        configured = (
+            *item.mapping.lint_commands,
+            *item.mapping.build_commands,
+            *item.mapping.test_commands,
+        )
+        expected_argv = tuple(parse_command_argv(command) for command in configured)
+        actual = item.tests
+        if defect and reproduction_binding is not None and key == reproduction_binding[0]:
+            _, base_command, selector = reproduction_binding
+            if base_command not in item.mapping.test_commands:
+                raise _ApprovalFailure("Approval package is not ready for approval")
+            expected_argv = (
+                (*parse_command_argv(base_command), selector),
+                *expected_argv,
+            )
+        if (
+            len(actual) != len(expected_argv)
+            or tuple(result.argv for result in actual) != expected_argv
+            or any(
+                result.exit_code != 0
+                or result.outcome.value != "passed"
+                or not result.command.strip()
+                or not result.summary.strip()
+                for result in actual
+            )
+        ):
+            raise _ApprovalFailure("Approval package is not ready for approval")
+    integration_argv = tuple(
+        parse_command_argv(command) for command in group.integration_test_commands
+    )
+    if (
+        len(package.integration_tests) != len(integration_argv)
+        or tuple(result.argv for result in package.integration_tests)
+        != integration_argv
+        or any(
+            result.exit_code != 0 or result.outcome.value != "passed"
+            for result in package.integration_tests
+        )
+    ):
+        raise _ApprovalFailure("Approval package is not ready for approval")
+    return package
+
+
 def validate_for_approval(package: ApprovalPackage) -> ApprovalPackage:
     """Validate that a canonical package contains every approval-gate input."""
 
     normalized = _normalized_package(package)
 
     def validate() -> ApprovalPackage:
-        required_text = (
+        common_required = (
             normalized.work_item_id,
             normalized.work_item_title,
             normalized.work_item_status,
-            normalized.repo_url,
-            normalized.base_branch,
-            normalized.base_commit,
-            normalized.head_commit,
-            normalized.diff_hash,
-            normalized.diff_summary,
-            normalized.branch,
-            normalized.commit_message,
-            normalized.pr_title,
-            normalized.pr_body,
         )
+        singular_required = (
+            normalized.repo_url, normalized.base_branch, normalized.base_commit,
+            normalized.head_commit, normalized.diff_hash, normalized.diff_summary,
+            normalized.branch, normalized.commit_message, normalized.pr_title,
+            normalized.pr_body,
+        ) if normalized.repository_group is None else ()
+        required_text = (*common_required, *singular_required)
         if any(not value.strip() for value in required_text):
             raise _ApprovalFailure("Approval package is not ready for approval")
         if not normalized.source_versions or any(
@@ -309,7 +433,13 @@ def validate_for_approval(package: ApprovalPackage) -> ApprovalPackage:
                 expected_hashes[snapshot.page_id] = snapshot.content_sha256
             if normalized.wiki_hashes != expected_hashes or not normalized.coverage:
                 raise _ApprovalFailure("Approval package is not ready for approval")
+            if normalized.repository_group is not None:
+                return _validate_group_package(normalized, defect=False)
         else:
+            if normalized.repository_group is not None:
+                if normalized.wiki_hashes or not normalized.evidence:
+                    raise _ApprovalFailure("Approval package is not ready for approval")
+                return _validate_group_package(normalized, defect=True)
             reproduction_bindings = {
                 (item.reproduction_command, item.test_selector)
                 for item in normalized.root_cause_evidence

@@ -182,6 +182,16 @@ def test_group_run_requires_exact_repository_qualified_claims(tmp_path: Path) ->
             {"repository_key": "shared-sdk", "path": "src/shortcut.py"},
             {"repository_key": "desktop-app", "path": "src/window.py"},
         ],
+        acceptance_coverage=[{
+            "criterion_id": "AC-1",
+            "criterion_text": "window recreation remains safe",
+            "files": [],
+            "repository_files": [
+                {"repository_key": "shared-sdk", "path": "src/shortcut.py"},
+                {"repository_key": "desktop-app", "path": "src/window.py"},
+            ],
+            "tests": ["pytest"],
+        }],
     )))
 
     result = _runner(tmp_path, executor, repository).run_group(
@@ -192,6 +202,8 @@ def test_group_run_requires_exact_repository_qualified_claims(tmp_path: Path) ->
         RepositoryChangeClaim(repository_key="shared-sdk", path="src/shortcut.py"),
         RepositoryChangeClaim(repository_key="desktop-app", path="src/window.py"),
     )
+    assert result.acceptance_coverage[0].files == ()
+    assert len(result.acceptance_coverage[0].repository_files) == 2
     assert executor.calls[0][1] == prepared[0].prepared.path.parent
     assert repository.head_checks == 6
 
@@ -332,6 +344,51 @@ def test_run_parses_optional_strict_acceptance_coverage_and_review_flag(tmp_path
 
     assert result.acceptance_coverage[0].criterion_id == "AC-1"
     assert result.unrelated_changes_checked is True
+
+
+def test_run_parses_repository_qualified_root_cause_evidence(tmp_path: Path) -> None:
+    root = {
+        "file_path": "src/app.py",
+        "repository_file": {"repository_key": "repo", "path": "src/app.py"},
+        "location": "app:1",
+        "start_line": 1,
+        "end_line": 1,
+        "symbol": "run",
+        "mechanism": "invalid lifecycle",
+        "code_excerpt": "run()",
+        "call_chain": [],
+        "reproduction_test": "tests/test_app.py",
+        "reproduction_file": {
+            "repository_key": "repo", "path": "tests/test_app.py"
+        },
+        "test_selector": "tests/test_app.py::test_lifecycle",
+        "reproduction_command": "pytest",
+        "confidence": 0.9,
+        "insufficient_evidence": False,
+        "impacted_files": ["src/app.py"],
+        "impacted_repository_files": [
+            {"repository_key": "repo", "path": "src/app.py"}
+        ],
+        "fix_steps": ["guard lifecycle"],
+        "supporting_points": [{
+            "kind": "code",
+            "description": "unsafe call",
+            "source": "repo",
+            "file_path": "src/app.py",
+            "repository_file": {"repository_key": "repo", "path": "src/app.py"},
+            "snippet": "run()",
+            "start_line": 1,
+            "end_line": 1,
+            "direct_root_cause": True,
+        }],
+    }
+    result = _runner(
+        tmp_path,
+        FakeExecutor(json.dumps(_payload(root_cause_evidence=[root]))),
+    ).run(_prepared(tmp_path), _mapping(tmp_path), run_id="root", prompt="analyze")
+
+    assert result.root_cause_evidence[0].repository_file is not None
+    assert result.root_cause_evidence[0].reproduction_file is not None
 
 
 @pytest.mark.parametrize(

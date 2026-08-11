@@ -330,6 +330,29 @@ class RepositoryGroupMapping(WorkflowModel):
                     raise ValueError("repository dependency references an unknown repository")
                 if dependency == item.key:
                     raise ValueError("repository cannot depend on itself")
+        try:
+            integration_argv = tuple(
+                parse_command_argv(command)
+                for command in self.integration_test_commands
+            )
+        except CommandArgvError as error:
+            raise ValueError("integration commands cannot be parsed") from error
+        repository_argv = {
+            parse_command_argv(command)
+            for item in self.repositories
+            for command in (
+                *item.lint_commands,
+                *item.build_commands,
+                *item.test_commands,
+            )
+        }
+        if (
+            len(integration_argv) != len(set(integration_argv))
+            or any(argv in repository_argv for argv in integration_argv)
+        ):
+            raise ValueError(
+                "integration commands must be unique and distinct by canonical argv"
+            )
         self.topological_keys()
         return self
 
@@ -386,6 +409,22 @@ class DefectCandidate(WorkflowModel):
             raise ValueError("status_id is invalid")
         return value
 
+class RepositoryChangeClaim(WorkflowModel):
+    repository_key: str
+    path: str
+
+    @field_validator("repository_key")
+    @classmethod
+    def validate_repository_key(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+            raise ValueError("repository change key must be a safe repository key")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        RepositorySnapshot._validate_repository_path(value)
+        return value
 
 
 class RootCauseSupportingPoint(WorkflowModel):
@@ -395,6 +434,7 @@ class RootCauseSupportingPoint(WorkflowModel):
     description: str
     source: str
     file_path: str = ""
+    repository_file: RepositoryChangeClaim | None = None
     snippet: str = ""
     start_line: StrictInt | None = None
     end_line: StrictInt | None = None
@@ -427,6 +467,10 @@ class RootCauseSupportingPoint(WorkflowModel):
             or not (self.snippet.strip() or self.start_line is not None)
         ):
             raise ValueError("repository support requires a file and observable content")
+        if self.repository_file is not None and (
+            not self.file_path or self.repository_file.path != self.file_path
+        ):
+            raise ValueError("repository support claim must match its file path")
         return self
 
 
@@ -434,6 +478,7 @@ class RootCauseEvidence(WorkflowModel):
     """Repository-backed evidence required before a defect may be modified."""
 
     file_path: str
+    repository_file: RepositoryChangeClaim | None = None
     location: str
     start_line: StrictInt | None = None
     end_line: StrictInt | None = None
@@ -442,11 +487,15 @@ class RootCauseEvidence(WorkflowModel):
     code_excerpt: str = ""
     call_chain: tuple[str, ...] = Field(default_factory=tuple)
     reproduction_test: str
+    reproduction_file: RepositoryChangeClaim | None = None
     test_selector: str
     reproduction_command: str
     confidence: StrictFloat = Field(ge=0.0, le=1.0)
     insufficient_evidence: StrictBool
     impacted_files: tuple[str, ...] = Field(min_length=1)
+    impacted_repository_files: tuple[RepositoryChangeClaim, ...] = Field(
+        default_factory=tuple
+    )
     fix_steps: tuple[str, ...] = Field(min_length=1)
     supporting_points: tuple[RootCauseSupportingPoint, ...] = Field(min_length=1)
 
@@ -539,6 +588,17 @@ class RootCauseEvidence(WorkflowModel):
             raise ValueError("evidence location must include a line range or symbol")
         if not (self.code_excerpt.strip() or self.call_chain or self.reproduction_test):
             raise ValueError("root cause evidence needs code, call-chain, or reproduction support")
+        if self.repository_file is not None and self.repository_file.path != self.file_path:
+            raise ValueError("root cause repository claim must match its file path")
+        if (
+            self.reproduction_file is not None
+            and self.reproduction_file.path != self.reproduction_test
+        ):
+            raise ValueError("reproduction repository claim must match its test path")
+        if self.impacted_repository_files and tuple(
+            item.path for item in self.impacted_repository_files
+        ) != self.impacted_files:
+            raise ValueError("impacted repository claims must match impacted files")
         return self
 
 
@@ -697,28 +757,11 @@ class RepositoryRunEvidence(WorkflowModel):
         return self
 
 
-class RepositoryChangeClaim(WorkflowModel):
-    repository_key: str
-    path: str
-
-    @field_validator("repository_key")
-    @classmethod
-    def validate_repository_key(cls, value: str) -> str:
-        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
-            raise ValueError("repository change key must be a safe repository key")
-        return value
-
-    @field_validator("path")
-    @classmethod
-    def validate_path(cls, value: str) -> str:
-        RepositorySnapshot._validate_repository_path(value)
-        return value
-
-
 class AcceptanceCoverage(WorkflowModel):
     criterion_id: str
     criterion_text: str
-    files: tuple[str, ...] = Field(min_length=1)
+    files: tuple[str, ...] = Field(default_factory=tuple)
+    repository_files: tuple[RepositoryChangeClaim, ...] = Field(default_factory=tuple)
     tests: tuple[str, ...] = Field(min_length=1)
 
     @field_validator("criterion_id")
@@ -750,6 +793,17 @@ class AcceptanceCoverage(WorkflowModel):
         if len(commands) != len(set(commands)):
             raise ValueError("coverage tests must be unique")
         return commands
+
+    @model_validator(mode="after")
+    def validate_file_claim_mode(self) -> AcceptanceCoverage:
+        if bool(self.files) == bool(self.repository_files):
+            raise ValueError("acceptance coverage must use exactly one file claim mode")
+        qualified = tuple(
+            (item.repository_key, item.path) for item in self.repository_files
+        )
+        if len(qualified) != len(set(qualified)):
+            raise ValueError("repository-qualified coverage files must be unique")
+        return self
 
 
 class CodexResult(WorkflowModel):
@@ -795,6 +849,77 @@ class StateEvent(WorkflowModel):
     occurred_at: datetime
 
 
+class RepositoryApprovalEvidence(WorkflowModel):
+    repository_key: str
+    mapping: RepositoryMapping
+    base_commit: str
+    head_commit: str
+    diff_hash: str
+    diff_summary: str
+    branch: str
+    changed_files: tuple[str, ...] = Field(default_factory=tuple)
+    tests: tuple[CommandResult, ...] = Field(default_factory=tuple)
+    tree_hash: str = ""
+    commit_message: str = ""
+    pr_title: str = ""
+    pr_body: str = ""
+
+    @field_validator("repository_key")
+    @classmethod
+    def validate_repository_key(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+            raise ValueError("approval repository key is invalid")
+        return value
+
+    @field_validator("base_commit", "head_commit")
+    @classmethod
+    def validate_commit(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is None:
+            raise ValueError("approval repository commit is invalid")
+        return value
+
+    @field_validator("diff_hash")
+    @classmethod
+    def validate_diff_hash(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("approval repository diff hash is invalid")
+        return value
+
+    @field_validator("tree_hash")
+    @classmethod
+    def validate_tree_hash(cls, value: str) -> str:
+        if value and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value) is None:
+            raise ValueError("approval repository tree hash is invalid")
+        return value
+
+    @field_validator("branch")
+    @classmethod
+    def validate_branch(cls, value: str) -> str:
+        return validate_git_ref_name(value)
+
+    @field_validator("changed_files")
+    @classmethod
+    def validate_changed_files(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        for value in values:
+            RepositorySnapshot._validate_repository_path(value)
+        if len(values) != len(set(values)):
+            raise ValueError("approval repository changed files must be unique")
+        return values
+
+    @model_validator(mode="after")
+    def validate_repository_evidence(self) -> RepositoryApprovalEvidence:
+        if self.repository_key != self.mapping.key:
+            raise ValueError("approval repository mapping key differs")
+        publication = (self.tree_hash, self.commit_message, self.pr_title, self.pr_body)
+        if not self.diff_summary.strip():
+            raise ValueError("approval repository diff summary is required")
+        if self.changed_files and any(not value.strip() for value in publication):
+            raise ValueError("changed approval repository requires publication text")
+        if not self.changed_files and any(value for value in publication):
+            raise ValueError("unchanged approval repository cannot publish")
+        return self
+
+
 class ApprovalPackage(WorkflowModel):
     work_item_id: str
     work_item_title: str = ""
@@ -803,6 +928,9 @@ class ApprovalPackage(WorkflowModel):
     wiki_hashes: dict[str, str] = Field(default_factory=dict)
     wiki_snapshots: tuple[WikiPageSnapshot, ...] = Field(default_factory=tuple)
     repository: RepositoryMapping | None = None
+    repository_group: RepositoryGroupMapping | None = None
+    repositories: tuple[RepositoryApprovalEvidence, ...] = Field(default_factory=tuple)
+    integration_tests: tuple[CommandResult, ...] = Field(default_factory=tuple)
     repo_url: str = ""
     base_branch: str = ""
     base_commit: str = ""
@@ -843,6 +971,27 @@ class ApprovalPackage(WorkflowModel):
     @classmethod
     def validate_defect_risk_level(cls, value: str) -> str:
         return CodexResult.validate_risk_level(value)
+
+    @model_validator(mode="after")
+    def validate_repository_mode(self) -> ApprovalPackage:
+        if self.repository_group is None:
+            if self.repositories or self.integration_tests:
+                raise ValueError("aggregate approval facts require a repository group")
+            return self
+        if self.repository is not None:
+            raise ValueError("aggregate approval cannot use singular repository mapping")
+        expected = self.repository_group.topological_keys()
+        if tuple(item.repository_key for item in self.repositories) != expected:
+            raise ValueError("aggregate approval repositories must follow group topology")
+        configured = {
+            item.key: item for item in self.repository_group.repositories
+        }
+        if any(
+            item.mapping != configured[item.repository_key]
+            for item in self.repositories
+        ):
+            raise ValueError("aggregate approval repository mapping differs")
+        return self
 
 
 class PublicationResult(WorkflowModel):
@@ -962,7 +1111,9 @@ class MultiRepositoryPublicationResult(WorkflowModel):
     @model_validator(mode="after")
     def validate_repositories(self) -> MultiRepositoryPublicationResult:
         keys = tuple(item.repository_key for item in self.repositories)
-        if keys and keys != self.order:
+        if len(keys) != len(set(keys)) or any(key not in self.order for key in keys):
+            raise ValueError("publication repositories must belong to publication order")
+        if keys != tuple(key for key in self.order if key in set(keys)):
             raise ValueError("publication repositories must follow publication order")
         if self.comment_id and not self.comment_marker:
             raise ValueError("publication comment fact requires a marker")
@@ -991,6 +1142,9 @@ class WorkflowRun(WorkflowModel):
     wiki_snapshots: tuple[WikiPageSnapshot, ...] = Field(default_factory=tuple)
     repository: RepositoryMapping | None = None
     repository_candidates: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
+    repository_group_candidates: tuple[RepositoryGroupMapping, ...] = Field(
+        default_factory=tuple
+    )
     repository_group: RepositoryGroupMapping | None = None
     repository_evidence: tuple[RepositoryRunEvidence, ...] = Field(default_factory=tuple)
     integration_test_results: tuple[CommandResult, ...] = Field(default_factory=tuple)

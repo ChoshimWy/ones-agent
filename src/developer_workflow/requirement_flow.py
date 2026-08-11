@@ -35,14 +35,30 @@ from .contracts import (
     CommandOutcome,
     CommandResult,
     PreparedWorktree,
+    RepositoryApprovalEvidence,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryRunEvidence,
     RepositorySnapshot,
     WorkflowRun,
     WorkflowState,
+    WorkflowType,
 )
 from .repository import build_branch_name
+from .repository_group import PreparedRepository, RepositoryGroupWorkspace
+from .group_evidence import (
+    GroupEvidenceError,
+    assert_group_claims,
+    assert_group_commands_passed,
+    assert_group_snapshots_equal,
+    run_group_commands,
+)
 from .state_store import ConcurrentRunUpdateError
-from .test_evidence import FinalTestEvidenceError, select_requirement_final_tests
+from .test_evidence import (
+    FinalTestEvidenceError,
+    select_group_final_tests,
+    select_requirement_final_tests,
+)
 
 
 class RequirementFlowError(RuntimeError):
@@ -98,6 +114,17 @@ class RequirementCodex(PreflightAnalyzer, Protocol):
         *,
         prepared: PreparedWorktree,
         mapping: RepositoryMapping,
+        run_id: str,
+        prompt: str,
+        allow_changes: bool,
+    ) -> CodexResult: ...
+
+    def run_group_stage(
+        self,
+        stage: str,
+        *,
+        group: RepositoryGroupMapping,
+        prepared: tuple[PreparedRepository, ...],
         run_id: str,
         prompt: str,
         allow_changes: bool,
@@ -201,6 +228,32 @@ class CodexRequirementAdapter:
 
     def analyze_testing(self, *, run_id: str, prompt: str) -> CodexResult:
         return self.runner.run_preflight(run_id=run_id, prompt=prompt)
+
+    def run_group_stage(
+        self,
+        stage: str,
+        *,
+        group: RepositoryGroupMapping,
+        prepared: tuple[PreparedRepository, ...],
+        run_id: str,
+        prompt: str,
+        allow_changes: bool,
+    ) -> CodexResult:
+        if stage not in {
+            "implementation", "testing", "review", "root_cause", "reproduction"
+        }:
+            raise RequirementFlowError("unknown Codex repository-group stage")
+        if stage in {"review", "root_cause", "testing"} and allow_changes:
+            raise RequirementFlowError("read-only Codex stage cannot modify files")
+        if stage in {"implementation", "reproduction"} and not allow_changes:
+            raise RequirementFlowError("mutable Codex stage requires the workspace sandbox")
+        return self.runner.run_group(
+            group,
+            prepared,
+            run_id=run_id,
+            prompt=prompt,
+            allow_changes=allow_changes,
+        )
 
 
 _TEST_ENV_KEYS = frozenset(
@@ -640,6 +693,7 @@ class RequirementFlow:
     repository: RequirementRepository
     codex: RequirementCodex
     test_runner: ConfiguredTestRunner
+    group_workspace: RepositoryGroupWorkspace | None = None
 
     def execute(self, run: WorkflowRun) -> WorkflowRun:
         """Continue a requirement run from its persisted safe checkpoint."""
@@ -735,12 +789,16 @@ class RequirementFlow:
                 _Blocked("requirement has no verifiable acceptance criteria", WorkflowState.READING_ONES)
             )
         candidates = self._candidate_mappings(requirement.project.id, requirement.iteration.id)
+        group_candidates = self._candidate_groups(
+            requirement.project.id, requirement.iteration.id
+        )
         updated = run.validated_update(
             requirement=deepcopy(requirement),
             project_id=requirement.project.id,
             iteration_id=requirement.iteration.id,
             wiki_snapshots=tuple(deepcopy(snapshots)),
             repository_candidates=candidates,
+            repository_group_candidates=group_candidates,
             codex_results=(),
             prepared_worktree=None,
             base_commit="",
@@ -765,13 +823,34 @@ class RequirementFlow:
                 _Blocked("persisted requirement sources are incomplete", WorkflowState.READING_ONES)
             )
         mapping = run.repository
-        if mapping is None:
+        group = run.repository_group
+        if mapping is None and group is None:
             return run
-        candidates = self._candidate_mappings(run.project_id, run.iteration_id)
-        if not any(candidate == mapping for candidate in candidates):
-            raise _FlowBlocked(
-                _Blocked("confirmed repository mapping is not authorized", WorkflowState.VALIDATING)
-            )
+        if group is not None:
+            try:
+                authorized_group = self.config.resolve_group_key(
+                    group.key, run.project_id, run.iteration_id
+                )
+            except Exception as error:
+                raise _FlowBlocked(
+                    _Blocked(
+                        "confirmed repository group is not authorized",
+                        WorkflowState.VALIDATING,
+                    )
+                ) from error
+            if authorized_group != group:
+                raise _FlowBlocked(
+                    _Blocked(
+                        "confirmed repository group is not authorized",
+                        WorkflowState.VALIDATING,
+                    )
+                )
+        else:
+            candidates = self._candidate_mappings(run.project_id, run.iteration_id)
+            if not any(candidate == mapping for candidate in candidates):
+                raise _FlowBlocked(
+                    _Blocked("confirmed repository mapping is not authorized", WorkflowState.VALIDATING)
+                )
         if not run.codex_results:
             criteria = self._criteria(run.wiki_snapshots)
             result = self.codex.preflight(
@@ -787,6 +866,7 @@ class RequirementFlow:
         if (
             result.unresolved_items
             or result.changed_files
+            or result.repository_changes
             or result.commands
             or result.acceptance_coverage
         ):
@@ -797,6 +877,8 @@ class RequirementFlow:
         return self._transition(run, WorkflowState.PREPARING_REPO, "prepare isolated repository")
 
     def _prepare_repository(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._prepare_repository_group(run)
         mapping = self._mapping(run)
         prepared = run.prepared_worktree
         if prepared is None:
@@ -817,7 +899,158 @@ class RequirementFlow:
             )
         return self._transition(run, WorkflowState.IMPLEMENTING, "implement acceptance criteria")
 
+    def _prepare_repository_group(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        workspace = self._group_workspace()
+        if not run.repository_evidence:
+            requirement = self._requirement(run)
+            prepared = workspace.prepare_group(
+                run.run_id,
+                group,
+                WorkflowType.REQUIREMENT,
+                run.work_item_id,
+                requirement.title,
+            )
+            evidence = tuple(
+                RepositoryRunEvidence(
+                    repository_key=item.repository_key,
+                    mapping=item.mapping,
+                    prepared_worktree=item.prepared,
+                )
+                for item in prepared
+            )
+            workspace.assert_heads_unchanged(prepared)
+            primary = next(
+                item for item in evidence if item.repository_key == group.primary_repository
+            )
+            run = self._save(run.validated_update(
+                repository_evidence=evidence,
+                repository=primary.mapping,
+                prepared_worktree=primary.prepared_worktree,
+                base_commit=primary.prepared_worktree.base_commit,
+                head_commit=primary.prepared_worktree.head_commit,
+                branch=primary.prepared_worktree.branch,
+                worktree_path=str(primary.prepared_worktree.path),
+            ))
+        else:
+            workspace.assert_heads_unchanged(self._prepared_group(run))
+        return self._transition(run, WorkflowState.IMPLEMENTING, "implement repository group")
+
+    def _implement_group(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        prepared = self._prepared_group(run)
+        if len(run.codex_results) < 2:
+            result = self.codex.run_group_stage(
+                "implementation",
+                group=group,
+                prepared=prepared,
+                run_id=run.run_id,
+                prompt=self._implementation_prompt(run),
+                allow_changes=True,
+            )
+            snapshots = self._group_workspace().snapshots(prepared)
+            assert_group_claims(result, snapshots, group)
+            try:
+                self._assert_group_acceptance_coverage(
+                    result,
+                    self._criteria(run.wiki_snapshots),
+                    snapshots,
+                    group,
+                )
+                self._assert_no_unresolved(result)
+            except RequirementFlowError as error:
+                raise _FlowBlocked(
+                    _Blocked("implementation evidence is incomplete", WorkflowState.IMPLEMENTING),
+                    run,
+                ) from error
+            evidence = tuple(
+                item.validated_update(
+                    changed_files=snapshots[item.repository_key].changed_files,
+                    tested_snapshot=None,
+                    test_results=(),
+                )
+                for item in run.repository_evidence
+            )
+            run = self._save(run.validated_update(
+                codex_results=(*run.codex_results, result),
+                repository_evidence=evidence,
+                integration_test_results=(),
+                acceptance_coverage=result.acceptance_coverage,
+                tested_snapshot=None,
+            ))
+        return self._transition(run, WorkflowState.TESTING, "run repository group tests")
+
+    def _test_group(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        prepared = self._prepared_group(run)
+        workspace = self._group_workspace()
+        before = workspace.snapshots(prepared)
+        try:
+            repository_results, integration_results = run_group_commands(
+                group, prepared, self.test_runner
+            )
+        except GroupEvidenceError as error:
+            raise _FlowBlocked(
+                _Blocked("configured group test execution failed", WorkflowState.TESTING), run
+            ) from error
+        all_results = (
+            *(result for _, result in repository_results),
+            *integration_results,
+        )
+        try:
+            assert_group_commands_passed(repository_results, integration_results)
+        except GroupEvidenceError as error:
+            raise _FlowBlocked(
+                _Blocked("configured group tests did not pass", WorkflowState.TESTING), run
+            ) from error
+        after = workspace.snapshots(prepared)
+        workspace.assert_heads_unchanged(prepared)
+        if before != after:
+            raise _FlowBlocked(
+                _Blocked("group tests modified repository evidence", WorkflowState.TESTING), run
+            )
+        results_by_key = {
+            key: tuple(result for result_key, result in repository_results if result_key == key)
+            for key in group.topological_keys()
+        }
+        evidence = tuple(
+            item.validated_update(
+                tested_snapshot=after[item.repository_key],
+                changed_files=after[item.repository_key].changed_files,
+                test_results=results_by_key[item.repository_key],
+            )
+            for item in run.repository_evidence
+        )
+        current = self._save(run.validated_update(
+            repository_evidence=evidence,
+            integration_test_results=integration_results,
+            test_results=all_results,
+            retry_count=run.retry_count + 1,
+        ))
+        reported = self.codex.analyze_testing(
+            run_id=current.run_id,
+            prompt=self._testing_prompt(current, all_results),
+        )
+        if (
+            reported.changed_files
+            or reported.repository_changes
+            or reported.commands
+            or reported.acceptance_coverage
+            or reported.unresolved_items
+        ):
+            raise _FlowBlocked(
+                _Blocked("testing analysis is invalid", WorkflowState.TESTING), current
+            )
+        current = self._save(current.validated_update(
+            codex_results=(*current.codex_results, reported)
+        ))
+        return self._transition(
+            current, WorkflowState.AI_REVIEW, "review tested repository group evidence"
+        )
+
     def _implement(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._implement_group(run)
         prepared, mapping = self._prepared(run), self._mapping(run)
         # Index zero is the source preflight.  A persisted implementation result
         # makes resume idempotent across the next state transition.
@@ -864,6 +1097,8 @@ class RequirementFlow:
         return self._transition(run, WorkflowState.TESTING, "run configured tests")
 
     def _test(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._test_group(run)
         prepared, mapping = self._prepared(run), self._mapping(run)
         commands = _configured_commands(mapping)
         if not commands or not mapping.test_commands:
@@ -985,6 +1220,8 @@ class RequirementFlow:
         )
 
     def _review_and_package(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._review_group_and_package(run)
         prepared, mapping = self._prepared(run), self._mapping(run)
         current = run
         tested_snapshot = current.tested_snapshot
@@ -1078,6 +1315,138 @@ class RequirementFlow:
             )
         )
         return self._transition(current, WorkflowState.WAITING_APPROVAL, "await human approval")
+
+    def _review_group_and_package(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        prepared = self._prepared_group(run)
+        workspace = self._group_workspace()
+        before = workspace.snapshots(prepared)
+        try:
+            assert_group_snapshots_equal(run.repository_evidence, before, group)
+            select_group_final_tests(
+                run.repository_evidence, run.integration_test_results, group
+            )
+        except (GroupEvidenceError, FinalTestEvidenceError) as error:
+            raise _FlowBlocked(
+                _Blocked("tested repository group evidence changed", WorkflowState.AI_REVIEW),
+                run,
+            ) from error
+        current = run
+        if current.review is None:
+            review = self.codex.run_group_stage(
+                "review", group=group, prepared=prepared, run_id=current.run_id,
+                prompt=self._review_prompt(current), allow_changes=False,
+            )
+            after = workspace.snapshots(prepared)
+            workspace.assert_heads_unchanged(prepared)
+            try:
+                assert_group_snapshots_equal(current.repository_evidence, after, group)
+                assert_group_claims(review, after, group)
+            except GroupEvidenceError as error:
+                raise _FlowBlocked(
+                    _Blocked("AI review changed repository group evidence", WorkflowState.AI_REVIEW),
+                    current,
+                ) from error
+            current = self._save(current.validated_update(review=review))
+        else:
+            review, after = current.review, before
+        if (
+            review.acceptance_coverage
+            or review.unresolved_items
+            or review.unrelated_changes_checked is not True
+            or not review.review_findings
+        ):
+            raise _FlowBlocked(
+                _Blocked("AI review evidence is incomplete", WorkflowState.AI_REVIEW), current
+            )
+        final = workspace.snapshots(prepared)
+        try:
+            assert_group_snapshots_equal(current.repository_evidence, final, group)
+        except GroupEvidenceError as error:
+            raise _FlowBlocked(
+                _Blocked("repository group changed after tests", WorkflowState.AI_REVIEW),
+                current,
+            ) from error
+        package = self._group_approval_package(current, final)
+        try:
+            package = validate_for_approval(package)
+        except ApprovalValidationError as error:
+            raise _FlowBlocked(
+                _Blocked("approval evidence is incomplete", WorkflowState.AI_REVIEW), current
+            ) from error
+        current = self._save(current.validated_update(approval=package))
+        return self._transition(current, WorkflowState.WAITING_APPROVAL, "await human approval")
+
+    def _group_approval_package(
+        self, run: WorkflowRun, snapshots: dict[str, RepositorySnapshot]
+    ) -> ApprovalPackage:
+        requirement, group = self._requirement(run), self._group(run)
+        prepared = {item.repository_key: item for item in self._prepared_group(run)}
+        evidence_by_key = {item.repository_key: item for item in run.repository_evidence}
+        review = run.review or CodexResult()
+        commit_messages = {
+            key: (
+                f"feat({key}): {requirement.title}"
+                if snapshots[key].changed_files else ""
+            )
+            for key in group.topological_keys()
+        }
+        tree_hashes = self._group_workspace().approval_trees(
+            self._prepared_group(run), snapshots, commit_messages
+        )
+        repositories = tuple(
+            RepositoryApprovalEvidence(
+                repository_key=key,
+                mapping=evidence_by_key[key].mapping,
+                base_commit=prepared[key].prepared.base_commit,
+                head_commit=snapshots[key].head_commit,
+                diff_hash=snapshots[key].diff_sha256,
+                diff_summary=(f"changed {len(snapshots[key].changed_files)} file(s): "
+                              f"{', '.join(snapshots[key].changed_files)}"),
+                branch=prepared[key].prepared.branch,
+                changed_files=snapshots[key].changed_files,
+                tests=evidence_by_key[key].test_results,
+                tree_hash=tree_hashes[key],
+                commit_message=commit_messages[key],
+                pr_title=f"{requirement.number or requirement.requirement_id}: {requirement.title} [{key}]" if snapshots[key].changed_files else "",
+                pr_body=(f"Repository: {key}\n\nRequirement: {requirement.title}\n\n"
+                         f"Changed files: {', '.join(snapshots[key].changed_files)}") if snapshots[key].changed_files else "",
+            )
+            for key in group.topological_keys()
+        )
+        source_digest = hashlib.sha256(
+            json.dumps(asdict(requirement), ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        risks = tuple(dict.fromkeys(
+            item for result in (*run.codex_results, review) for item in result.risks
+        ))
+        evidence = tuple(dict.fromkeys(
+            item for result in (*run.codex_results, review) for item in result.evidence
+        )) or ("verified repository group diff and configured tests",)
+        return ApprovalPackage(
+            work_item_id=requirement.requirement_id,
+            work_item_title=requirement.title,
+            work_item_status=requirement.status.name or requirement.status.id,
+            source_versions={"requirement_sha256": source_digest},
+            wiki_hashes={item.page_id: item.content_sha256 for item in run.wiki_snapshots},
+            wiki_snapshots=run.wiki_snapshots,
+            repository_group=group,
+            repositories=repositories,
+            integration_tests=run.integration_test_results,
+            coverage={
+                f"{item.criterion_id}: {item.criterion_text}": (
+                    "files=" + ",".join(
+                        f"{claim.repository_key}:{claim.path}"
+                        for claim in item.repository_files
+                    ) + "; tests=" + ",".join(item.tests)
+                ) for item in run.acceptance_coverage
+            },
+            evidence=evidence,
+            review=review.review_findings,
+            risks=risks,
+            unrelated_changes_checked=True,
+        )
 
     def _approval_package(
         self,
@@ -1189,6 +1558,44 @@ class RequirementFlow:
             raise RequirementFlowError("implementation did not map every acceptance criterion")
 
     @staticmethod
+    def _assert_group_acceptance_coverage(
+        result: CodexResult,
+        criteria: tuple[str, ...],
+        snapshots: dict[str, RepositorySnapshot],
+        group: RepositoryGroupMapping,
+    ) -> None:
+        expected = tuple(
+            (f"AC-{index}", criterion)
+            for index, criterion in enumerate(criteria, start=1)
+        )
+        actual = tuple(
+            (item.criterion_id, item.criterion_text)
+            for item in result.acceptance_coverage
+        )
+        changed = {
+            (repository_key, path)
+            for repository_key in group.topological_keys()
+            for path in snapshots[repository_key].changed_files
+        }
+        allowed_tests = {
+            command
+            for mapping in group.repositories
+            for command in mapping.test_commands
+        } | set(group.integration_test_commands)
+        if actual != expected or any(
+            item.files
+            or not {
+                (claim.repository_key, claim.path)
+                for claim in item.repository_files
+            }.issubset(changed)
+            or not set(item.tests).issubset(allowed_tests)
+            for item in result.acceptance_coverage
+        ):
+            raise RequirementFlowError(
+                "implementation did not map every repository-group acceptance criterion"
+            )
+
+    @staticmethod
     def _assert_no_unresolved(result: CodexResult) -> None:
         if result.unresolved_items:
             raise RequirementFlowError("Codex stage has unresolved items")
@@ -1234,6 +1641,15 @@ class RequirementFlow:
             mapping
             for mapping in self.config.repositories
             if mapping.project_id == project_id and mapping.iteration_id in {iteration_id, "*"}
+        )
+
+    def _candidate_groups(
+        self, project_id: str, iteration_id: str
+    ) -> tuple[RepositoryGroupMapping, ...]:
+        return tuple(
+            group for group in self.config.repository_groups
+            if group.project_id == project_id
+            and group.iteration_id in {iteration_id, "*"}
         )
 
     @staticmethod
@@ -1301,6 +1717,31 @@ class RequirementFlow:
         return run.repository
 
     @staticmethod
+    def _group(run: WorkflowRun) -> RepositoryGroupMapping:
+        if run.repository_group is None:
+            raise RequirementFlowError("repository group is unavailable")
+        return run.repository_group
+
+    def _group_workspace(self) -> RepositoryGroupWorkspace:
+        if self.group_workspace is None:
+            raise RequirementFlowError("repository group workspace is unavailable")
+        return self.group_workspace
+
+    @staticmethod
+    def _prepared_group(run: WorkflowRun) -> tuple[PreparedRepository, ...]:
+        group = RequirementFlow._group(run)
+        if tuple(item.repository_key for item in run.repository_evidence) != group.topological_keys():
+            raise RequirementFlowError("prepared repository group is incomplete")
+        return tuple(
+            PreparedRepository(
+                repository_key=item.repository_key,
+                mapping=item.mapping,
+                prepared=item.prepared_worktree,
+            )
+            for item in run.repository_evidence
+        )
+
+    @staticmethod
     def _prepared(run: WorkflowRun) -> PreparedWorktree:
         if run.prepared_worktree is None:
             raise RequirementFlowError("prepared worktree is unavailable")
@@ -1329,15 +1770,35 @@ class RequirementFlow:
     def _implementation_prompt(self, run: WorkflowRun) -> str:
         criteria = self._criteria(run.wiki_snapshots)
         requirement = self._requirement(run)
-        mapping = self._mapping(run)
         source = _canonical_source_context(requirement, run.wiki_snapshots)
-        constraints = json.dumps(
-            {
+        if run.repository_group is None:
+            mapping = self._mapping(run)
+            constraint_data: object = {
                 "allowed_paths": mapping.allowed_paths,
                 "lint_commands": mapping.lint_commands,
                 "build_commands": mapping.build_commands,
                 "test_commands": mapping.test_commands,
-            },
+            }
+        else:
+            constraint_data = {
+                "repositories": [
+                    {
+                        "repository_key": mapping.key,
+                        "role": mapping.role.value,
+                        "depends_on": mapping.depends_on,
+                        "allowed_paths": mapping.allowed_paths,
+                        "lint_commands": mapping.lint_commands,
+                        "build_commands": mapping.build_commands,
+                        "test_commands": mapping.test_commands,
+                    }
+                    for mapping in run.repository_group.repositories
+                ],
+                "integration_test_commands": (
+                    run.repository_group.integration_test_commands
+                ),
+            }
+        constraints = json.dumps(
+            constraint_data,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),

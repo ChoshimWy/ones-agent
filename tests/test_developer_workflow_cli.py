@@ -13,8 +13,13 @@ from src.developer_workflow.contracts import (
     ApprovalPackage,
     CommandResult,
     DefectCandidate,
+    MultiRepositoryPublicationResult,
     PublicationResult,
+    RepositoryApprovalEvidence,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryPublicationResult,
+    RepositoryRole,
     WorkflowRun,
     WorkflowState,
     WorkflowType,
@@ -74,6 +79,107 @@ def _run(run_type: WorkflowType = WorkflowType.REQUIREMENT) -> WorkflowRun:
         iteration_id="ITER",
         repository_candidates=(_mapping(),),
     )
+
+
+def test_group_confirmation_display_is_topological_and_marks_primary() -> None:
+    from src.developer_workflow.cli import _show_repositories
+
+    dependency = _mapping("sdk").validated_update(
+        repo_name="sdk", role=RepositoryRole.DEPENDENCY
+    )
+    primary = _mapping("app").validated_update(
+        repo_name="app", role=RepositoryRole.PRIMARY, depends_on=("sdk",)
+    )
+    group = RepositoryGroupMapping(
+        key="suite", project_id="PROJ", iteration_id="ITER",
+        primary_repository="app", repositories=(dependency, primary),
+    )
+    run = _run().validated_update(
+        repository_candidates=(), repository_group_candidates=(group,)
+    )
+    output = Terminal(tty=False)
+
+    _show_repositories(run, output)
+
+    rendered = output.getvalue()
+    assert "repository group: suite" in rendered
+    assert "primary repository: app" in rendered
+    assert "source_path is read-only input" in rendered
+    assert rendered.index("1. sdk") < rendered.index("2. app")
+
+
+def test_group_waiting_approval_show_includes_per_repository_evidence() -> None:
+    from src.developer_workflow.cli import _show_run
+
+    dependency = _mapping("sdk").validated_update(
+        repo_name="sdk", role=RepositoryRole.DEPENDENCY
+    )
+    primary = _mapping("app").validated_update(
+        repo_name="app", role=RepositoryRole.PRIMARY, depends_on=("sdk",)
+    )
+    group = RepositoryGroupMapping(
+        key="suite", project_id="PROJ", iteration_id="ITER",
+        primary_repository="app", repositories=(dependency, primary),
+    )
+    repositories = tuple(
+        RepositoryApprovalEvidence(
+            repository_key=mapping.key, mapping=mapping,
+            base_commit="a" * 40, head_commit="b" * 40,
+            diff_hash=("c" if mapping.key == "sdk" else "d") * 64,
+            diff_summary=f"changed {mapping.key}",
+            branch=f"codex/REQ-1-{mapping.key}",
+            changed_files=(f"src/{mapping.key}.py",), tests=(),
+            tree_hash=("e" if mapping.key == "sdk" else "f") * 40,
+            commit_message=f"fix({mapping.key}): change",
+            pr_title=f"REQ-1 [{mapping.key}]", pr_body=f"Change {mapping.key}",
+        )
+        for mapping in group.repositories
+    )
+    approval = ApprovalPackage(
+        work_item_id="REQ-1", repository_group=group,
+        repositories=repositories, fingerprint="f" * 64,
+    )
+    run = _run().model_copy(update={
+        "state": WorkflowState.WAITING_APPROVAL, "approval": approval,
+        "repository_group": group, "repository_model_version": 2,
+    })
+    output = Terminal(tty=False)
+
+    _show_run(run, output)
+
+    rendered = output.getvalue()
+    assert "repository evidence: sdk | dependency" in rendered
+    assert "repository evidence: app | primary" in rendered
+    assert "changed file: sdk:src/sdk.py" in rendered
+    assert "approved tree: sdk | " + "e" * 40 in rendered
+    assert "diff summary: app | changed app" in rendered
+
+    marker = f"<!-- ones-dev-run:{run.run_id} -->"
+    item = repositories[0]
+    publication = MultiRepositoryPublicationResult(
+        order=group.topological_keys(), comment_marker=marker,
+        error="PR creation outcome is uncertain",
+        repositories=(RepositoryPublicationResult(
+            repository_key=item.repository_key,
+            approved_fingerprint=approval.fingerprint,
+            repo_url=item.mapping.repo_url, provider="github",
+            provider_host="example.invalid", expected_parent=item.head_commit,
+            expected_tree="e" * 40, commit_message=item.commit_message,
+            remote_branch=item.branch,
+            pr_marker=f"ones-dev-run:{run.run_id}:{item.repository_key}",
+            pr_base=item.mapping.base_branch, pr_head=item.branch,
+            pr_title=item.pr_title, pr_body=item.pr_body,
+            comment_marker=marker, commit_hash="1" * 40,
+            push_completed_at=utc_now(), error="PR creation outcome is uncertain",
+        ),),
+    )
+    output = Terminal(tty=False)
+    _show_run(run.model_copy(update={"group_publication": publication}), output)
+    rendered = output.getvalue()
+    assert "commit: sdk | " + "1" * 40 in rendered
+    assert "push: sdk | " in rendered
+    assert "repository error: sdk | PR creation outcome is uncertain" in rendered
+    assert "group publication error: PR creation outcome is uncertain" in rendered
 
 
 class Candidates:

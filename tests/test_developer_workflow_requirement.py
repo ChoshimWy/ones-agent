@@ -22,13 +22,17 @@ from src.developer_workflow.contracts import (
     CommandResult,
     CommandOutcome,
     PreparedWorktree,
+    RepositoryChangeClaim,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryRole,
     RepositorySnapshot,
     RevisionRecord,
     StateEvent,
     WorkflowRun,
     WorkflowState,
 )
+from src.developer_workflow.repository_group import PreparedRepository
 from src.developer_workflow.requirement_flow import (
     CodexRequirementAdapter,
     RequirementFlow,
@@ -323,6 +327,199 @@ def _flow(tmp_path: Path, *, run: WorkflowRun | None = None, gateway: FakeGatewa
         test_runner=tests or FakeTestRunner(),
     )
     return flow, store
+
+
+def test_repository_group_runs_all_tests_and_persists_each_snapshot(
+    tmp_path: Path,
+) -> None:
+    sdk = RepositoryMapping(
+        key="shared-sdk", project_id="project", iteration_id="sprint",
+        repo_url="https://example.invalid/sdk.git", repo_name="shared-sdk",
+        role=RepositoryRole.DEPENDENCY,
+        lint_commands=("ruff check src",), test_commands=("pytest sdk",),
+        allowed_paths=("src", "tests"),
+    )
+    app = RepositoryMapping(
+        key="desktop-app", project_id="project", iteration_id="sprint",
+        repo_url="https://example.invalid/app.git", repo_name="desktop-app",
+        role=RepositoryRole.PRIMARY, depends_on=("shared-sdk",),
+        build_commands=("python -m build",), test_commands=("pytest app",),
+        allowed_paths=("src", "tests"),
+    )
+    group = RepositoryGroupMapping(
+        key="desktop-suite", project_id="project", iteration_id="sprint",
+        primary_repository="desktop-app", repositories=(sdk, app),
+        integration_test_commands=("pytest integration",),
+    )
+    prepared = tuple(
+        PreparedRepository(
+            repository_key=mapping.key,
+            mapping=mapping,
+            prepared=PreparedWorktree(
+                path=(tmp_path / "workspace" / mapping.key).resolve(),
+                branch=f"codex/REQ-1-{mapping.key}",
+                base_commit=OID,
+                head_commit=OID,
+                mirror_path=(tmp_path / f"{mapping.key}.git").resolve(),
+            ),
+        )
+        for mapping in (sdk, app)
+    )
+    for item in prepared:
+        item.prepared.path.mkdir(parents=True)
+        item.prepared.mirror_path.mkdir()
+    snapshots = {
+        "shared-sdk": RepositorySnapshot(
+            head_commit=OID, diff_sha256="c" * 64,
+            changed_files=("src/shortcut.py",), patch="diff sdk", is_clean=False,
+        ),
+        "desktop-app": RepositorySnapshot(
+            head_commit=OID, diff_sha256="d" * 64,
+            changed_files=("src/window.py",), patch="diff app", is_clean=False,
+        ),
+    }
+    criteria = extract_acceptance_criteria(_wiki().normalized_content)
+
+    class GroupWorkspace:
+        def prepare_group(self, *args: object) -> tuple[PreparedRepository, ...]:
+            return prepared
+
+        def assert_heads_unchanged(self, items: tuple[PreparedRepository, ...]) -> None:
+            assert items == prepared
+
+        def snapshots(
+            self, items: tuple[PreparedRepository, ...]
+        ) -> dict[str, RepositorySnapshot]:
+            assert items == prepared
+            return snapshots
+
+        def approval_trees(self, items, current, messages):
+            assert items == prepared
+            assert current == snapshots
+            return {
+                "shared-sdk": "d" * 40,
+                "desktop-app": "e" * 40,
+            }
+
+    class GroupCodex(FakeCodex):
+        group_prompt = ""
+
+        def run_group_stage(self, stage: str, **kwargs: object) -> CodexResult:
+            self.group_prompt = str(kwargs["prompt"])
+            if stage == "review":
+                return CodexResult(
+                    summary="reviewed group",
+                    review_findings=("all repositories reviewed",),
+                    repository_changes=(
+                        RepositoryChangeClaim(repository_key="shared-sdk", path="src/shortcut.py"),
+                        RepositoryChangeClaim(repository_key="desktop-app", path="src/window.py"),
+                    ),
+                    unrelated_changes_checked=True,
+                )
+            assert stage == "implementation"
+            return CodexResult(
+                summary="implemented group",
+                repository_changes=(
+                    RepositoryChangeClaim(
+                        repository_key="shared-sdk", path="src/shortcut.py"
+                    ),
+                    RepositoryChangeClaim(
+                        repository_key="desktop-app", path="src/window.py"
+                    ),
+                ),
+                acceptance_coverage=(
+                    AcceptanceCoverage(
+                        criterion_id="AC-1",
+                        criterion_text=criteria[0],
+                        repository_files=(
+                            RepositoryChangeClaim(
+                                repository_key="shared-sdk", path="src/shortcut.py"
+                            ),
+                            RepositoryChangeClaim(
+                                repository_key="desktop-app", path="src/window.py"
+                            ),
+                        ),
+                        tests=("pytest sdk", "pytest app", "pytest integration"),
+                    ),
+                    AcceptanceCoverage(
+                        criterion_id="AC-2",
+                        criterion_text=criteria[1],
+                        repository_files=(
+                            RepositoryChangeClaim(
+                                repository_key="desktop-app", path="src/window.py"
+                            ),
+                        ),
+                        tests=("pytest app",),
+                    ),
+                ),
+            )
+
+    class GroupTestRunner(FakeTestRunner):
+        calls: list[tuple[str, Path]]
+
+        def __init__(self) -> None:
+            super().__init__(exit_codes=[0, 0, 0, 0, 0])
+            self.calls = []
+
+        def run(self, command: str, *, cwd: Path) -> CommandResult:
+            self.calls.append((command, cwd))
+            return super().run(command, cwd=cwd)
+
+    run = WorkflowRun.new("requirement", "REQ-1").validated_update(
+        run_id="8" * 32,
+        requirement=_requirement(),
+        project_id="project",
+        iteration_id="sprint",
+        wiki_snapshots=(_wiki(),),
+        repository_group=group,
+        codex_results=(CodexResult(summary="preflight"),),
+        version=1,
+    )
+    store = MemoryStore(run)
+    for state in (
+        WorkflowState.READING_ONES,
+        WorkflowState.VALIDATING,
+    ):
+        run = store.transition(run.run_id, run.version, state, "test setup")
+    codex = GroupCodex()
+    runner = GroupTestRunner()
+    flow = RequirementFlow(
+        store=store,
+        gateway=FakeGateway(),
+        config=_config(tmp_path).model_copy(
+            update={"repositories": (), "repository_groups": (group,)}
+        ),
+        repository=FakeRepository(),
+        group_workspace=GroupWorkspace(),  # type: ignore[arg-type]
+        codex=codex,
+        test_runner=runner,
+    )
+
+    run = flow._validate_sources(run)
+    assert run.state is WorkflowState.PREPARING_REPO
+    run = flow._prepare_repository(run)
+    run = flow._implement(run)
+    run = flow._test(run)
+    result = flow._review_and_package(run)
+
+    assert result.state is WorkflowState.WAITING_APPROVAL
+    assert result.approval is not None
+    assert tuple(item.repository_key for item in result.approval.repositories) == (
+        "shared-sdk", "desktop-app",
+    )
+    assert tuple(item.repository_key for item in result.repository_evidence) == (
+        "shared-sdk", "desktop-app",
+    )
+    assert all(item.tested_snapshot is not None for item in result.repository_evidence)
+    assert result.acceptance_coverage == result.codex_results[1].acceptance_coverage
+    assert "root" not in codex.group_prompt.lower()
+    assert [(command, cwd.name) for command, cwd in runner.calls] == [
+        ("ruff check src", "shared-sdk"),
+        ("pytest sdk", "shared-sdk"),
+        ("python -m build", "desktop-app"),
+        ("pytest app", "desktop-app"),
+        ("pytest integration", "desktop-app"),
+    ]
 
 
 def test_extract_acceptance_criteria_only_from_named_markdown_list() -> None:

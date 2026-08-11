@@ -1,5 +1,35 @@
 # ONES 开发工作流 CLI 运维指南
 
+## 多仓库工作流
+
+一个需求或缺陷可以选择一个 `repository_groups` 映射。组内必须且只能有一个
+`primary` 仓库；依赖关系通过 `depends_on` 表达，且必须是无环拓扑。`--mapping`
+仍只接收一个键，但该键可以是单仓映射，也可以是仓库组：
+
+```powershell
+uv run ones-dev defect `
+  --project <ONES_PROJECT_ID> `
+  --iteration <ONES_ITERATION_ID> `
+  --assignee <ONES_ASSIGNEE_ID> `
+  --select <DEFECT_UUID> `
+  --mapping desktop-suite
+```
+
+`source_path` 可选，只用于从现有本地仓库读取对象并创建隔离 mirror/worktree；工作流
+会验证源仓库的 HEAD、索引和状态在前后完全不变，绝不会把本地工作区当作发布目录。
+`repo_url` 始终必填，并且仍是远端基线、push 和 PR 的权威地址。每个仓库被放在同一
+运行目录下的固定同级子目录中，仓库键和相对路径都经过独立校验，不能跨仓访问。
+
+确认映射时 CLI 按拓扑顺序显示仓库、角色、基线、本地只读源和远端 URL。所有仓库的
+lint/build/test 依次通过后，才会在主仓库执行 `integration_test_commands`。人工审批
+指纹一次性绑定全部仓库的基线、HEAD、diff、测试、commit message 和 PR 文案。
+
+批准后，Publisher 先为所有有改动的仓库准备并持久化本地 commit，再按拓扑顺序执行
+push 和创建 PR。每个有改动的仓库各有一个 commit 和一个 PR；全部 PR 完成后只向
+ONES 写一条汇总评论，绝不自动修改 ONES 状态。若中途失败，状态为
+`PARTIAL_SUCCESS`；先运行 `uv run ones-dev show <run-id>` 检查事实，再执行
+`uv run ones-dev resume <run-id>`，只会继续尚未完成的仓库。已创建的 PR 不会自动回滚。
+
 `ones-dev` 是独立于现有 FastAPI、前端和调度器的本地开发工作流。它读取 ONES 需求/Wiki 或指定迭代中的缺陷，在隔离 worktree 中调用 Codex、执行配置测试并生成人工审批包。人工批准前不会 commit、push、创建 PR 或评论 ONES；它从不自动修改 ONES 状态。
 
 ## 配置

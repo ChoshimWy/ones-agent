@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from .command_utils import parse_command_argv
-from .contracts import CommandResult, RepositoryMapping
+from .contracts import (
+    CommandResult,
+    RepositoryGroupMapping,
+    RepositoryMapping,
+    RepositoryRunEvidence,
+)
 
 
 class FinalTestEvidenceError(ValueError):
@@ -59,8 +64,40 @@ def select_defect_final_tests(
     return _select_tail(results, commands, argvs)
 
 
+def select_group_final_tests(
+    evidence: tuple[RepositoryRunEvidence, ...],
+    integration_results: tuple[CommandResult, ...],
+    group: RepositoryGroupMapping,
+) -> tuple[tuple[str, CommandResult], ...]:
+    """Select one exact configured round per repository and group integration."""
+
+    keys = group.topological_keys()
+    if tuple(item.repository_key for item in evidence) != keys:
+        raise FinalTestEvidenceError("repository group evidence order changed")
+    selected: list[tuple[str, CommandResult]] = []
+    for item in evidence:
+        for result in select_requirement_final_tests(
+            item.test_results, item.mapping
+        ):
+            selected.append((item.repository_key, result))
+    commands = group.integration_test_commands
+    try:
+        argvs = tuple(parse_command_argv(command) for command in commands)
+    except ValueError:
+        raise FinalTestEvidenceError(
+            "configured integration command is invalid"
+        ) from None
+    if commands:
+        for result in _select_tail(integration_results, commands, argvs):
+            selected.append((group.primary_repository, result))
+    elif integration_results:
+        raise FinalTestEvidenceError("unexpected integration test evidence")
+    return tuple(selected)
+
+
 __all__ = [
     "FinalTestEvidenceError",
     "select_defect_final_tests",
+    "select_group_final_tests",
     "select_requirement_final_tests",
 ]

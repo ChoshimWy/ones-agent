@@ -165,8 +165,55 @@ def _show_run(run: WorkflowRun, stdout: TextIO) -> None:
         _line(stdout, "risks", risk)
     if run.approval is not None and run.approval.fingerprint:
         _line(stdout, "fingerprint", run.approval.fingerprint)
+    if run.approval is not None and run.approval.repository_group is not None:
+        _line(stdout, "repository group", run.approval.repository_group.key)
+        for item in run.approval.repositories:
+            role = item.mapping.role.value
+            _line(
+                stdout, "repository evidence",
+                f"{item.repository_key} | {role} | "
+                f"base {item.base_commit} | head {item.head_commit}",
+            )
+            _line(stdout, "diff", f"{item.repository_key} | {item.diff_hash}")
+            if item.tree_hash:
+                _line(stdout, "approved tree", f"{item.repository_key} | {item.tree_hash}")
+            _line(stdout, "diff summary", f"{item.repository_key} | {item.diff_summary}")
+            for path in item.changed_files:
+                _line(stdout, "changed file", f"{item.repository_key}:{path}")
+            for result in item.tests:
+                _line(stdout, "repository test", f"{item.repository_key} | {result.summary}")
+        for result in run.approval.integration_tests:
+            _line(stdout, "integration test", result.summary)
     if run.publication.pr_url:
         _line(stdout, "pr_url", run.publication.pr_url)
+    if run.group_publication is not None:
+        by_key = {
+            item.repository_key: item for item in run.group_publication.repositories
+        }
+        for key in run.group_publication.order:
+            item = by_key.get(key)
+            if item is None:
+                _line(stdout, "repository", f"{key} | unchanged")
+                continue
+            status = (
+                "pr-created" if item.pr_url else
+                "pushed" if item.push_completed_at is not None else
+                "committed" if item.commit_hash else "pending"
+            )
+            _line(stdout, "repository", f"{key} | {status}")
+            if item.commit_hash:
+                _line(stdout, "commit", f"{key} | {item.commit_hash}")
+            if item.push_completed_at is not None:
+                _line(
+                    stdout, "push",
+                    f"{key} | {item.push_completed_at.isoformat()}",
+                )
+            if item.pr_url:
+                _line(stdout, "pr_url", item.pr_url)
+            if item.error:
+                _line(stdout, "repository error", f"{key} | {item.error}")
+        if run.group_publication.error:
+            _line(stdout, "group publication error", run.group_publication.error)
 
 
 def _show_candidates(candidates: Sequence[DefectCandidate], stdout: TextIO) -> None:
@@ -261,6 +308,27 @@ def _show_repositories(run: WorkflowRun, stdout: TextIO) -> None:
         _write(stdout, "repository: " + " | ".join(_safe_value(value) for value in fields) + "\n")
         for configured in (*mapping.lint_commands, *mapping.build_commands, *mapping.test_commands):
             _line(stdout, "command", configured)
+    for group in run.repository_group_candidates:
+        _line(stdout, "repository group", group.key)
+        _line(stdout, "primary repository", group.primary_repository)
+        _line(
+            stdout, "local source policy",
+            "source_path is read-only input; changes use isolated managed worktrees",
+        )
+        by_key = {item.key: item for item in group.repositories}
+        for index, key in enumerate(group.topological_keys(), start=1):
+            mapping = by_key[key]
+            source = (
+                str(mapping.source_path)
+                if mapping.source_path is not None
+                else "remote mirror"
+            )
+            _write(
+                stdout,
+                f"  {index}. {_safe_value(key)} | {_safe_value(mapping.role.value)} | "
+                f"{_safe_value(mapping.base_branch)} | {_safe_value(source)} | "
+                f"{_safe_value(mapping.repo_url)}\n",
+            )
 
 
 def _tty(stream: TextIO) -> bool:
@@ -300,10 +368,11 @@ def _confirm_mapping(
         if selected is None or selected.casefold() in {"", "n", "no"}:
             return 0, run
         if selected.casefold() in {"y", "yes"}:
-            if len(run.repository_candidates) != 1:
+            candidates = (*run.repository_candidates, *run.repository_group_candidates)
+            if len(candidates) != 1:
                 _write(stderr, "error: mapping key is required for multiple candidates\n")
                 return 2, run
-            selected = run.repository_candidates[0].key
+            selected = candidates[0].key
     result = orchestrator.confirm_repository(run.run_id, selected)
     return 0, result
 
@@ -433,6 +502,7 @@ def build_production_orchestrator(
     from .publisher import Publisher
     from .private_paths import prepare_private_roots
     from .repository import WorktreeRepository
+    from .repository_group import RepositoryGroupWorkspace
     from .requirement_flow import RequirementFlow, SandboxCommandExecutor
     from .state_store import FileRunStore
 
@@ -480,7 +550,10 @@ def build_production_orchestrator(
         and config.publishing.provider.value in {"github", "gitlab"}
     ):
         raise RuntimeError("production runtime configuration is incomplete")
-    for mapping in config.repositories:
+    for mapping in (
+        *config.repositories,
+        *(repository for group in config.repository_groups for repository in group.repositories),
+    ):
         parse_repository_identity(mapping.repo_url, provider_host)
 
     run_root, mirror_root, worktree_root = prepare_private_roots(
@@ -510,10 +583,15 @@ def build_production_orchestrator(
     test_runner = SandboxCommandExecutor(
         permission_profile=config.sandbox_permission_profile
     )
+    group_workspace = RepositoryGroupWorkspace(repository)
     requirement_flow = RequirementFlow(
-        store, gateway, config, repository, codex, test_runner
+        store, gateway, config, repository, codex, test_runner,
+        group_workspace=group_workspace,
     )
-    defect_flow = DefectFlow(store, config, repository, codex, test_runner)
+    defect_flow = DefectFlow(
+        store, config, repository, codex, test_runner,
+        group_workspace=group_workspace,
+    )
     candidates = DefectCandidateService(gateway, settings.issue_type_id)
     pr_client = HttpPullRequestClient(
         provider=config.publishing.provider.value,

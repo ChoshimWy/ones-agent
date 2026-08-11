@@ -73,15 +73,30 @@
           "criterion_id": {"type": "string", "pattern": "^AC-[1-9][0-9]*$"},
           "criterion_text": {"type": "string", "minLength": 1, "maxLength": 20000},
           "files": {
-            "type": "array", "minItems": 1, "uniqueItems": true,
+            "type": "array", "uniqueItems": true,
             "items": {"type": "string", "minLength": 1, "maxLength": 4096,
               "pattern": "^(?!/)(?!.*//)(?!.*\\/$)(?!\\.git(?:/|$))(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*[:\\\\])[^\\u0000-\\u001f\\u007f]+$"}
+          },
+          "repository_files": {
+            "type": "array", "uniqueItems": true,
+            "items": {
+              "type": "object", "additionalProperties": false,
+              "required": ["repository_key", "path"],
+              "properties": {
+                "repository_key": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 128},
+                "path": {"$ref": "#/$defs/repositoryPath"}
+              }
+            }
           },
           "tests": {
             "type": "array", "minItems": 1, "uniqueItems": true,
             "items": {"type": "string", "minLength": 1, "maxLength": 20000}
           }
-        }
+        },
+        "oneOf": [
+          {"properties": {"files": {"minItems": 1}, "repository_files": {"maxItems": 0}}},
+          {"required": ["repository_files"], "properties": {"files": {"maxItems": 0}, "repository_files": {"minItems": 1}}}
+        ]
       }
     },
     "unrelated_changes_checked": {"type": "boolean"}
@@ -125,6 +140,7 @@
       ],
       "properties": {
         "file_path": {"$ref": "#/$defs/repositoryPath"},
+        "repository_file": {"anyOf": [{"$ref": "#/$defs/repositoryChangeClaim"}, {"type": "null"}]},
         "location": {"type": "string", "minLength": 1, "maxLength": 20000},
         "start_line": {"type": ["integer", "null"], "minimum": 1},
         "end_line": {"type": ["integer", "null"], "minimum": 1},
@@ -133,11 +149,13 @@
         "code_excerpt": {"type": "string", "maxLength": 20000},
         "call_chain": {"$ref": "#/$defs/stringList"},
         "reproduction_test": {"$ref": "#/$defs/repositoryPath"},
+        "reproduction_file": {"anyOf": [{"$ref": "#/$defs/repositoryChangeClaim"}, {"type": "null"}]},
         "test_selector": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^(?!-)(?!.*(?:^|/)\\.\\.(?:/|$))\\S+$"},
         "reproduction_command": {"type": "string", "minLength": 1, "maxLength": 20000},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "insufficient_evidence": {"type": "boolean"},
         "impacted_files": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/repositoryPath"}},
+        "impacted_repository_files": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/repositoryChangeClaim"}},
         "fix_steps": {"$ref": "#/$defs/stringList"},
         "supporting_points": {
           "type": "array", "minItems": 1,
@@ -160,6 +178,15 @@
         }
       ]
     },
+    "repositoryChangeClaim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository_key", "path"],
+      "properties": {
+        "repository_key": {"type": "string", "pattern": "^[A-Za-z0-9._-]+$", "maxLength": 128},
+        "path": {"$ref": "#/$defs/repositoryPath"}
+      }
+    },
     "rootCauseSupportingPoint": {
       "type": "object",
       "additionalProperties": false,
@@ -169,6 +196,7 @@
         "description": {"type": "string", "minLength": 1, "maxLength": 20000},
         "source": {"type": "string", "minLength": 1, "maxLength": 20000},
         "file_path": {"type": "string", "maxLength": 4096},
+        "repository_file": {"anyOf": [{"$ref": "#/$defs/repositoryChangeClaim"}, {"type": "null"}]},
         "snippet": {"type": "string", "maxLength": 20000},
         "start_line": {"type": ["integer", "null"], "minimum": 1},
         "end_line": {"type": ["integer", "null"], "minimum": 1},

@@ -157,6 +157,43 @@ def test_group_prepare_recovers_exact_existing_worktrees(
     assert second == first
 
 
+def test_group_approval_trees_are_deterministic_and_do_not_touch_real_index(
+    tmp_path: Path,
+    repository_group: tuple[RepositoryGroupMapping, dict[str, Path]],
+) -> None:
+    group, _ = repository_group
+    workspace = RepositoryGroupWorkspace(
+        WorktreeRepository(tmp_path / "mirrors", tmp_path / "worktrees")
+    )
+    prepared = workspace.prepare_group(
+        "run-tree", group, WorkflowType.REQUIREMENT, "REQ-1", "signed trees"
+    )
+    for item in prepared:
+        (item.prepared.path / "src" / "base.py").write_text(
+            f"NAME = {item.repository_key!r}\nCHANGED = True\n", encoding="utf-8"
+        )
+    snapshots = workspace.snapshots(prepared)
+    messages = {
+        item.repository_key: f"feat({item.repository_key}): signed tree"
+        for item in prepared
+    }
+    before_status = {
+        item.repository_key: _git("status", "--porcelain=v1", cwd=item.prepared.path)
+        for item in prepared
+    }
+
+    first = workspace.approval_trees(prepared, snapshots, messages)
+    second = workspace.approval_trees(prepared, snapshots, messages)
+
+    assert first == second
+    assert tuple(first) == group.topological_keys()
+    assert all(len(value) == 40 for value in first.values())
+    assert {
+        item.repository_key: _git("status", "--porcelain=v1", cwd=item.prepared.path)
+        for item in prepared
+    } == before_status
+
+
 def test_group_resolve_path_rejects_cross_repository_and_disallowed_path(
     tmp_path: Path,
     repository_group: tuple[RepositoryGroupMapping, dict[str, Path]],

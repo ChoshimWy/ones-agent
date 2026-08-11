@@ -31,6 +31,7 @@ from .contracts import (
     PreparedWorktree,
     PublicationResult,
     RepositoryGroupMapping,
+    RepositoryApprovalEvidence,
     RepositoryChangeClaim,
     RepositoryMapping,
     RepositoryPublicationResult,
@@ -82,6 +83,11 @@ from .repository_group import (
     RepositoryGroupError,
     RepositoryGroupWorkspace,
     repository_branch,
+)
+from .group_evidence import (
+    GroupEvidenceError,
+    assert_group_claims,
+    run_group_commands,
 )
 from .codex_runner import (
     CodexExecutionError,
@@ -154,6 +160,7 @@ __all__ = [
     "DefectGateway",
     "FileRunStore",
     "HeadChangedError",
+    "GroupEvidenceError",
     "MirrorOriginMismatch",
     "InvalidRunMutationError",
     "InvalidRunTransitionError",
@@ -170,6 +177,7 @@ __all__ = [
     "PublishingProvider",
     "RepositoryMapping",
     "RepositoryGroupMapping",
+    "RepositoryApprovalEvidence",
     "RepositoryChangeClaim",
     "RepositoryGroupError",
     "RepositoryGroupWorkspace",
@@ -220,6 +228,8 @@ __all__ = [
     "utc_now",
     "build_branch_name",
     "repository_branch",
+    "assert_group_claims",
+    "run_group_commands",
     "extract_acceptance_criteria",
     "issue_approval",
     "validate_for_approval",

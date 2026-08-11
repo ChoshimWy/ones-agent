@@ -484,24 +484,42 @@ def _validate_persisted_run_invariants(run: WorkflowRun) -> None:
     if run.retry_count < 0:
         raise InvalidRunMutationError("retry_count must not be negative")
     publication = run.publication
-    if run.state is WorkflowState.COMPLETED and not (
-        publication.approved_fingerprint
-        and publication.commit_hash
-        and publication.push_completed_at is not None
-        and publication.pr_url
-        and publication.comment_id
-        and not publication.error
-    ):
-        raise InvalidRunMutationError("completed publication facts are incomplete")
-    if run.state is WorkflowState.PARTIAL_SUCCESS and not (
-        publication.approved_fingerprint
-        and publication.commit_hash
-        and publication.push_completed_at is not None
-        and publication.pr_url
-        and not publication.comment_id
-        and publication.error.strip()
-    ):
-        raise InvalidRunMutationError("partial publication facts are invalid")
+    group_publication = run.group_publication
+    if group_publication is not None:
+        _validate_group_publication_binding(run, group_publication)
+        complete = (
+            bool(group_publication.repositories)
+            and all(
+                item.approved_fingerprint and item.commit_hash
+                and item.push_completed_at is not None and item.pr_url
+                and not item.error
+                for item in group_publication.repositories
+            )
+            and bool(group_publication.comment_id)
+            and not group_publication.error
+        )
+        partial = (
+            bool(group_publication.repositories)
+            and not group_publication.comment_id
+            and bool(group_publication.error.strip())
+        )
+        if run.state is WorkflowState.COMPLETED and not complete:
+            raise InvalidRunMutationError("completed group publication facts are incomplete")
+        if run.state is WorkflowState.PARTIAL_SUCCESS and not partial:
+            raise InvalidRunMutationError("partial group publication facts are invalid")
+    else:
+        if run.state is WorkflowState.COMPLETED and not (
+            publication.approved_fingerprint and publication.commit_hash
+            and publication.push_completed_at is not None and publication.pr_url
+            and publication.comment_id and not publication.error
+        ):
+            raise InvalidRunMutationError("completed publication facts are incomplete")
+        if run.state is WorkflowState.PARTIAL_SUCCESS and not (
+            publication.approved_fingerprint and publication.commit_hash
+            and publication.push_completed_at is not None and publication.pr_url
+            and not publication.comment_id and publication.error.strip()
+        ):
+            raise InvalidRunMutationError("partial publication facts are invalid")
 
     history = run.history
     if not history:
@@ -549,6 +567,109 @@ def _validate_publication_progress(current: WorkflowRun, incoming: WorkflowRun) 
             raise InvalidRunMutationError("publication facts are immutable")
     if old.comment_id and new.error:
         raise InvalidRunMutationError("completed comment fact cannot acquire an error")
+    _validate_group_publication_progress(current, incoming)
+
+
+def _validate_group_publication_progress(
+    current: WorkflowRun, incoming: WorkflowRun
+) -> None:
+    old, new = current.group_publication, incoming.group_publication
+    if old is None:
+        if new is not None:
+            _validate_initial_group_publication(incoming, new)
+        return
+    if new is None:
+        raise InvalidRunMutationError("group publication cannot be removed")
+    if old.order != new.order or old.comment_marker != new.comment_marker:
+        raise InvalidRunMutationError("group publication intent is immutable")
+    old_by_key = {item.repository_key: item for item in old.repositories}
+    new_by_key = {item.repository_key: item for item in new.repositories}
+    if old_by_key.keys() != new_by_key.keys():
+        raise InvalidRunMutationError("group publication repositories are immutable")
+    intent_fields = (
+        "approved_fingerprint", "repo_url", "provider", "provider_host",
+        "expected_parent", "expected_tree", "commit_message", "remote_branch",
+        "pr_marker", "pr_base", "pr_head", "pr_title", "pr_body", "comment_marker",
+    )
+    for key, before in old_by_key.items():
+        after = new_by_key[key]
+        if any(getattr(before, name) != getattr(after, name) for name in intent_fields):
+            raise InvalidRunMutationError("repository publication intent is immutable")
+        for name in ("commit_hash", "push_completed_at", "pr_url"):
+            prior, later = getattr(before, name), getattr(after, name)
+            if prior not in {"", None} and prior != later:
+                raise InvalidRunMutationError("repository publication facts are immutable")
+    if old.comment_id and old.comment_id != new.comment_id:
+        raise InvalidRunMutationError("group comment fact is immutable")
+
+
+def _validate_initial_group_publication(
+    run: WorkflowRun, publication: MultiRepositoryPublicationResult
+) -> None:
+    if run.state is not WorkflowState.PUBLISHING:
+        raise InvalidRunMutationError(
+            "group publication intent requires PUBLISHING state"
+        )
+    _validate_group_publication_binding(run, publication)
+    if publication.comment_id or publication.error:
+        raise InvalidRunMutationError(
+            "initial group publication cannot contain external facts"
+        )
+    if any(
+        item.commit_hash
+        or item.push_completed_at is not None
+        or item.pr_url
+        or item.comment_id
+        or item.error
+        for item in publication.repositories
+    ):
+        raise InvalidRunMutationError(
+            "initial repository publication cannot contain external facts"
+        )
+
+
+def _validate_group_publication_binding(
+    run: WorkflowRun, publication: MultiRepositoryPublicationResult
+) -> None:
+    approval, group = run.approval, run.repository_group
+    if (
+        approval is None
+        or group is None
+        or not approval.fingerprint
+        or approval.repository_group != group
+        or publication.order != group.topological_keys()
+        or publication.comment_marker != f"<!-- ones-dev-run:{run.run_id} -->"
+    ):
+        raise InvalidRunMutationError(
+            "group publication intent must match signed approval"
+        )
+    approved = tuple(item for item in approval.repositories if item.changed_files)
+    if tuple(item.repository_key for item in publication.repositories) != tuple(
+        item.repository_key for item in approved
+    ):
+        raise InvalidRunMutationError(
+            "group publication must include every changed repository"
+        )
+    approved_by_key = {item.repository_key: item for item in approved}
+    for item in publication.repositories:
+        expected = approved_by_key[item.repository_key]
+        if (
+            item.approved_fingerprint != approval.fingerprint
+            or item.repo_url != expected.mapping.repo_url
+            or item.expected_parent != expected.head_commit
+            or item.expected_tree != expected.tree_hash
+            or item.commit_message != expected.commit_message
+            or item.remote_branch != expected.branch
+            or item.pr_marker != f"ones-dev-run:{run.run_id}:{item.repository_key}"
+            or item.pr_base != expected.mapping.base_branch
+            or item.pr_head != expected.branch
+            or item.pr_title != expected.pr_title
+            or item.pr_body != expected.pr_body
+            or item.comment_marker != publication.comment_marker
+        ):
+            raise InvalidRunMutationError(
+                "repository publication intent must match signed approval"
+            )
 
 
 def _validate_persisted_edge(history: tuple[StateEvent, ...], index: int) -> None:

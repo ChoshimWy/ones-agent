@@ -32,7 +32,10 @@ from src.developer_workflow.contracts import (
     CommandOutcome,
     CommandResult,
     PreparedWorktree,
+    RepositoryChangeClaim,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryRole,
     RepositorySnapshot,
     RevisionRecord,
     RootCauseEvidence,
@@ -41,6 +44,7 @@ from src.developer_workflow.contracts import (
     WorkflowRun,
     WorkflowState,
 )
+from src.developer_workflow.repository_group import PreparedRepository
 from src.developer_workflow.defect_flow import (
     DefectCandidateError,
     DefectCandidateService,
@@ -652,6 +656,234 @@ def _root_evidence() -> RootCauseEvidence:
             ),
         ),
     )
+
+
+def test_defect_group_runs_focused_reproduction_in_owning_repository(
+    tmp_path: Path,
+) -> None:
+    sdk = RepositoryMapping(
+        key="shared-sdk", project_id="project", iteration_id="sprint",
+        repo_url="https://example.invalid/sdk.git", repo_name="shared-sdk",
+        role=RepositoryRole.DEPENDENCY,
+        test_commands=("pytest sdk",), allowed_paths=("src", "tests"),
+    )
+    app = RepositoryMapping(
+        key="desktop-app", project_id="project", iteration_id="sprint",
+        repo_url="https://example.invalid/app.git", repo_name="desktop-app",
+        role=RepositoryRole.PRIMARY, depends_on=("shared-sdk",),
+        build_commands=("python -m build",), test_commands=("pytest app",),
+        allowed_paths=("src", "tests"),
+    )
+    group = RepositoryGroupMapping(
+        key="desktop-suite", project_id="project", iteration_id="sprint",
+        primary_repository="desktop-app", repositories=(sdk, app),
+        integration_test_commands=("pytest integration",),
+    )
+    prepared = tuple(
+        PreparedRepository(
+            repository_key=mapping.key,
+            mapping=mapping,
+            prepared=PreparedWorktree(
+                path=(tmp_path / "workspace" / mapping.key).resolve(),
+                branch=f"codex/BUG-7-{mapping.key}", base_commit=OID,
+                head_commit=OID,
+                mirror_path=(tmp_path / f"{mapping.key}.git").resolve(),
+            ),
+        )
+        for mapping in (sdk, app)
+    )
+    for item in prepared:
+        item.prepared.path.mkdir(parents=True)
+        item.prepared.mirror_path.mkdir()
+        (item.prepared.path / "src").mkdir()
+        (item.prepared.path / "tests").mkdir()
+    (prepared[0].prepared.path / "src" / "shortcut.py").write_text(
+        "def destroy():\n    del shortcut\n", encoding="utf-8"
+    )
+    (prepared[1].prepared.path / "src" / "window.py").write_text(
+        "def rebuild():\n    shortcut.activate()\n", encoding="utf-8"
+    )
+    evidence = RootCauseEvidence(
+        file_path="src/window.py",
+        repository_file=RepositoryChangeClaim(
+            repository_key="desktop-app", path="src/window.py"
+        ),
+        location="rebuild", symbol="rebuild",
+        mechanism="window reuses a destroyed shortcut",
+        code_excerpt="shortcut.activate()",
+        reproduction_test="tests/test_shortcut.py",
+        reproduction_file=RepositoryChangeClaim(
+            repository_key="shared-sdk", path="tests/test_shortcut.py"
+        ),
+        test_selector="tests/test_shortcut.py::test_destroyed_shortcut",
+        reproduction_command="pytest sdk", confidence=0.9,
+        insufficient_evidence=False,
+        impacted_files=("src/window.py",),
+        impacted_repository_files=(RepositoryChangeClaim(
+            repository_key="desktop-app", path="src/window.py"
+        ),),
+        fix_steps=("guard destroyed shortcut",),
+        supporting_points=(RootCauseSupportingPoint(
+            kind="cross_file", description="dependency destroys shortcut",
+            source="shared-sdk", file_path="src/shortcut.py",
+            repository_file=RepositoryChangeClaim(
+                repository_key="shared-sdk", path="src/shortcut.py"
+            ),
+            snippet="del shortcut", direct_root_cause=True,
+        ),),
+    )
+
+    class GroupWorkspace:
+        phase = "base"
+
+        def prepare_group(self, *args: object) -> tuple[PreparedRepository, ...]:
+            return prepared
+
+        def assert_heads_unchanged(self, items: tuple[PreparedRepository, ...]) -> None:
+            assert items == prepared
+
+        def snapshots(self, items: tuple[PreparedRepository, ...]) -> dict[str, RepositorySnapshot]:
+            sdk_files = () if self.phase == "base" else ("tests/test_shortcut.py",)
+            app_files = ("src/window.py",) if self.phase == "repair" else ()
+            return {
+                "shared-sdk": _snapshot(*sdk_files),
+                "desktop-app": _snapshot(*app_files),
+            }
+
+        def approval_trees(self, items, current, messages):
+            assert items == prepared
+            return {
+                key: (("d" if key == "shared-sdk" else "e") * 40 if snapshot.changed_files else "")
+                for key, snapshot in current.items()
+            }
+
+    workspace = GroupWorkspace()
+
+    class GroupCodex:
+        def preflight(self, **kwargs: object) -> CodexResult:
+            return CodexResult(summary="source is sufficient")
+
+        def run_group_stage(self, stage: str, **kwargs: object) -> CodexResult:
+            if stage == "root_cause":
+                return CodexResult(
+                    summary="root verified", root_cause_evidence=(evidence,),
+                    behavior_before="shortcut access crashes", impact_scope=("src/window.py",),
+                    risk_level="medium",
+                )
+            if stage == "reproduction":
+                (prepared[0].prepared.path / "tests" / "test_shortcut.py").write_text(
+                    "def test_destroyed_shortcut(): assert False\n", encoding="utf-8"
+                )
+                workspace.phase = "reproduction"
+                return CodexResult(
+                    summary="reproduced",
+                    repository_changes=(RepositoryChangeClaim(
+                        repository_key="shared-sdk", path="tests/test_shortcut.py"
+                    ),),
+                    unrelated_changes_checked=True,
+                )
+            if stage == "review":
+                return CodexResult(
+                    summary="reviewed repair",
+                    review_findings=("repair is safe",),
+                    repository_changes=(
+                        RepositoryChangeClaim(repository_key="shared-sdk", path="tests/test_shortcut.py"),
+                        RepositoryChangeClaim(repository_key="desktop-app", path="src/window.py"),
+                    ),
+                    root_cause_evidence=(evidence,),
+                    behavior_before="shortcut access crashes",
+                    behavior_after="destroyed shortcuts are ignored",
+                    impact_scope=("src/window.py",),
+                    risk_level="medium",
+                    unrelated_changes_checked=True,
+                )
+            assert stage == "implementation"
+            (prepared[1].prepared.path / "src" / "window.py").write_text(
+                "def rebuild():\n    if shortcut: shortcut.activate()\n", encoding="utf-8"
+            )
+            workspace.phase = "repair"
+            return CodexResult(
+                summary="repaired",
+                repository_changes=(
+                    RepositoryChangeClaim(
+                        repository_key="shared-sdk", path="tests/test_shortcut.py"
+                    ),
+                    RepositoryChangeClaim(
+                        repository_key="desktop-app", path="src/window.py"
+                    ),
+                ),
+                root_cause_evidence=(evidence,), behavior_before="shortcut access crashes",
+                behavior_after="destroyed shortcuts are ignored",
+                impact_scope=("src/window.py",), risk_level="medium",
+                unrelated_changes_checked=True,
+            )
+
+        def analyze_testing(self, **kwargs: object) -> CodexResult:
+            return CodexResult(summary="tests passed")
+
+    class GroupRepository:
+        def content_sha256(
+            self, context: PreparedWorktree, repository_path: str
+        ) -> str:
+            return hashlib.sha256(
+                (context.path / repository_path).read_bytes()
+            ).hexdigest()
+
+    class GroupTestRunner:
+        codes = [1, 0, 0, 0, 0, 0]
+        calls: list[tuple[str, str]] = []
+
+        def run(self, command: str, *, cwd: Path) -> CommandResult:
+            self.calls.append((command, cwd.name))
+            return _command(command, self.codes.pop(0))
+
+        def run_argv(
+            self, argv: tuple[str, ...], *, display_command: str, cwd: Path
+        ) -> CommandResult:
+            self.calls.append((display_command, cwd.name))
+            return _command(display_command, self.codes.pop(0)).model_copy(
+                update={"argv": argv}
+            )
+
+    run = _selected_run().validated_update(
+        repository=None, repository_group=group,
+        defect_preflight=CodexResult(summary="source is sufficient"),
+    )
+    store = MemoryStore(run)
+    for state in (
+        WorkflowState.READING_ONES,
+        WorkflowState.VALIDATING,
+    ):
+        run = store.transition(run.run_id, run.version, state, "test setup")
+    runner = GroupTestRunner()
+    flow = DefectFlow(
+        store=store, config=_config(tmp_path).model_copy(
+            update={"repositories": (), "repository_groups": (group,)}
+        ),
+        repository=GroupRepository(),  # type: ignore[arg-type]
+        group_workspace=workspace,  # type: ignore[arg-type]
+        codex=GroupCodex(),  # type: ignore[arg-type]
+        test_runner=runner,
+    )
+
+    run = flow._validate_mapping(run)
+    assert run.state is WorkflowState.PREPARING_REPO
+    run = flow._prepare_repository(run)
+    run = flow._analyze_reproduce_and_fix(run)
+    run = flow._verify(run)
+    result = flow._review_and_package(run)
+
+    assert result.state is WorkflowState.WAITING_APPROVAL
+    assert result.approval is not None
+    assert tuple(item.repository_key for item in result.approval.repositories) == (
+        "shared-sdk", "desktop-app",
+    )
+    assert result.root_cause_evidence[0].reproduction_file is not None
+    assert runner.calls[0][1] == "shared-sdk"
+    assert runner.calls[1][1] == "shared-sdk"
+    assert runner.calls[-1] == ("pytest integration", "desktop-app")
+    assert all(item.tested_snapshot is not None for item in result.repository_evidence)
+    assert flow._valid_revision_checkpoint(result) is True
 
 
 @dataclass

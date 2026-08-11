@@ -29,7 +29,9 @@ from src.developer_workflow.contracts import (
     CommandResult,
     PreparedWorktree,
     PublicationResult,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryRole,
     RepositorySnapshot,
     WorkflowRun,
     WorkflowState,
@@ -497,6 +499,35 @@ def test_confirm_repository_saves_exact_or_project_default_mapping_then_resumes(
     assert result.repository is not None and result.repository.key == key
     assert requirement.calls == [result]
     assert any(call[0] == "save" and call[2] == 7 for call in store.calls)
+
+
+def test_confirm_repository_group_requires_exact_persisted_candidate(
+    tmp_path: Path,
+) -> None:
+    dependency = _mapping("sdk").validated_update(role=RepositoryRole.DEPENDENCY)
+    primary = _mapping("app").validated_update(
+        role=RepositoryRole.PRIMARY, depends_on=("sdk",)
+    )
+    group = RepositoryGroupMapping(
+        key="suite", project_id="PROJ-1", iteration_id="ITER-1",
+        primary_repository="app", repositories=(dependency, primary),
+    )
+    run = _at_state(
+        WorkflowRun.new("requirement", "REQ-1"), WorkflowState.VALIDATING,
+        project_id="PROJ-1", iteration_id="ITER-1",
+        repository_group_candidates=(group,),
+    )
+    orchestrator, store, requirement, defect, publisher = _orchestrator(tmp_path, run)
+    orchestrator.config = orchestrator.config.model_copy(
+        update={"repositories": (), "repository_groups": (group,)}
+    )
+
+    result = orchestrator.confirm_repository(run.run_id, "suite")
+
+    assert result.repository_model_version == 2
+    assert result.repository_group == group
+    assert result.repository is None
+    assert requirement.calls == [result]
 
 
 def test_confirm_repository_rejects_mapping_added_after_candidate_snapshot(

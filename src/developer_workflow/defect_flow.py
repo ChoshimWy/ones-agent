@@ -28,17 +28,34 @@ from .contracts import (
     DefectCandidate,
     DefectCheckpoint,
     PreparedWorktree,
+    RepositoryApprovalEvidence,
+    RepositoryGroupMapping,
+    RepositoryChangeClaim,
     RepositoryMapping,
+    RepositoryRunEvidence,
     RepositorySnapshot,
     RootCauseEvidence,
     RootCauseSupportingPoint,
     WorkflowRun,
     WorkflowState,
+    WorkflowType,
 )
-from .repository import _open_readonly_nofollow, build_branch_name
+from .group_evidence import (
+    GroupEvidenceError,
+    assert_group_claims,
+    assert_group_commands_passed,
+    assert_group_snapshots_equal,
+    run_group_commands,
+)
+from .repository_group import PreparedRepository, RepositoryGroupWorkspace
+from .repository import RepositoryBoundaryError, _open_readonly_nofollow, build_branch_name
 from .requirement_flow import ConfiguredTestRunner, RequirementCodex, _split_configured_command
 from .state_store import ConcurrentRunUpdateError
-from .test_evidence import select_defect_final_tests
+from .test_evidence import (
+    FinalTestEvidenceError,
+    select_defect_final_tests,
+    select_group_final_tests,
+)
 
 
 class DefectFlowError(RuntimeError):
@@ -490,6 +507,150 @@ def validate_root_cause_evidence(
     return evidence
 
 
+def validate_group_root_cause_evidence(
+    evidence: tuple[RootCauseEvidence, ...],
+    *,
+    prepared: tuple[PreparedRepository, ...],
+    group: RepositoryGroupMapping,
+    defect: DefectRecord | None = None,
+    allow_missing_reproduction: bool = False,
+    max_file_bytes: int = 2 * 1024 * 1024,
+) -> tuple[RootCauseEvidence, ...]:
+    """Verify every qualified evidence path in its frozen repository context."""
+
+    if not evidence or max_file_bytes <= 0:
+        raise DefectEvidenceError("root cause evidence could not be verified")
+    if tuple(item.repository_key for item in prepared) != group.topological_keys():
+        raise DefectEvidenceError("root cause evidence repository group is invalid")
+    by_key = {item.repository_key: item for item in prepared}
+    defect_text = (
+        json.dumps(asdict(defect), ensure_ascii=False, sort_keys=True)
+        if defect is not None
+        else ""
+    )
+
+    def read(claim: object) -> str:
+        repository_key = getattr(claim, "repository_key", "")
+        path = getattr(claim, "path", "")
+        context = by_key.get(repository_key)
+        if context is None:
+            raise DefectEvidenceError("root cause evidence repository is invalid")
+        try:
+            root = context.prepared.path.resolve(strict=True)
+        except OSError:
+            raise DefectEvidenceError("root cause evidence could not be verified") from None
+        try:
+            return _read_verified_text(root / path, root, max_bytes=max_file_bytes)
+        except (OSError, DefectEvidenceError, RepositoryBoundaryError):
+            raise DefectEvidenceError(
+                "root cause evidence could not be verified"
+            ) from None
+
+    for item in evidence:
+        if (
+            item.repository_file is None
+            or item.reproduction_file is None
+            or not item.impacted_repository_files
+        ):
+            raise DefectEvidenceError("root cause evidence lacks repository qualification")
+        source_text = read(item.repository_file)
+        lines = source_text.splitlines()
+        observed = source_text
+        if item.start_line is not None:
+            if item.end_line is None or item.end_line > len(lines):
+                raise DefectEvidenceError("root cause evidence could not be verified")
+            observed = "\n".join(lines[item.start_line - 1 : item.end_line])
+        if item.symbol and re.search(
+            rf"(?<![\w]){re.escape(item.symbol)}(?![\w])", source_text
+        ) is None:
+            raise DefectEvidenceError("root cause evidence could not be verified")
+        if item.code_excerpt and item.code_excerpt.strip() not in observed:
+            raise DefectEvidenceError("root cause evidence could not be verified")
+        if not _is_test_path(item.reproduction_file.path):
+            raise DefectEvidenceError("reproduction evidence must use a test path")
+        reproduction_context = by_key.get(item.reproduction_file.repository_key)
+        if reproduction_context is None or (
+            item.reproduction_command not in reproduction_context.mapping.test_commands
+        ):
+            raise DefectEvidenceError("reproduction command is not configured exactly")
+        reproduction_path = reproduction_context.prepared.path / item.reproduction_file.path
+        if not (
+            allow_missing_reproduction
+            and not reproduction_path.exists()
+            and not reproduction_path.is_symlink()
+        ):
+            read(item.reproduction_file)
+        for reference in item.call_chain:
+            possible_path, separator, symbol = reference.partition(":")
+            if "/" in possible_path or "." in PurePosixPath(possible_path).name:
+                raise DefectEvidenceError(
+                    "group call-chain paths require repository-qualified supporting points"
+                )
+            if reference not in source_text and (
+                not separator or symbol.strip() not in source_text
+            ):
+                raise DefectEvidenceError("root cause evidence could not be verified")
+        if item.confidence < 0.75 or item.insufficient_evidence or not item.fix_steps:
+            raise DefectEvidenceError("root cause evidence is not actionable")
+        support_kinds = {"code"}
+        supported = {
+            (item.repository_file.repository_key, item.repository_file.path)
+        }
+        direct = True
+        for point in item.supporting_points:
+            support_kinds.add(point.kind)
+            direct = direct or point.direct_root_cause
+            if point.kind == "defect":
+                quote = point.snippet.strip()
+                if defect is None or not quote or quote not in defect_text:
+                    raise DefectEvidenceError("defect support could not be verified")
+            elif point.kind == "repo_resolution":
+                support_claim = point.description + " " + point.source + " " + point.snippet
+                if not any(
+                    value and value in support_claim
+                    for mapping in group.repositories
+                    for value in (
+                        mapping.key,
+                        mapping.repo_name,
+                        mapping.repo_url,
+                        mapping.base_branch,
+                    )
+                ):
+                    raise DefectEvidenceError(
+                        "repository resolution support could not be verified"
+                    )
+            else:
+                if point.repository_file is None:
+                    raise DefectEvidenceError(
+                        "repository support lacks repository qualification"
+                    )
+                support_text = read(point.repository_file)
+                support_lines = support_text.splitlines()
+                observed_support = support_text
+                if point.start_line is not None:
+                    if point.end_line is None or point.end_line > len(support_lines):
+                        raise DefectEvidenceError(
+                            "repository support line range is invalid"
+                        )
+                    observed_support = "\n".join(
+                        support_lines[point.start_line - 1 : point.end_line]
+                    )
+                if point.snippet.strip() and point.snippet.strip() not in observed_support:
+                    raise DefectEvidenceError(
+                        "repository support snippet could not be verified"
+                    )
+                supported.add(
+                    (point.repository_file.repository_key, point.repository_file.path)
+                )
+        impacted = {
+            (claim.repository_key, claim.path)
+            for claim in item.impacted_repository_files
+        }
+        if len(support_kinds) < 2 or not direct or not impacted.issubset(supported):
+            raise DefectEvidenceError("root cause evidence lacks independent support")
+    return evidence
+
+
 @dataclass(frozen=True, slots=True)
 class _Blocked:
     reason: str
@@ -512,6 +673,7 @@ class DefectFlow:
     repository: DefectRepository
     codex: RequirementCodex
     test_runner: ConfiguredTestRunner
+    group_workspace: RepositoryGroupWorkspace | None = None
 
     def execute(self, run: WorkflowRun) -> WorkflowRun:
         current = run
@@ -585,9 +747,11 @@ class DefectFlow:
             )
         current = self._source_preflight(run)
         candidates = self._candidate_mappings(run.project_id, run.iteration_id)
+        group_candidates = self._candidate_groups(run.project_id, run.iteration_id)
         current = self._save(
             current.validated_update(
                 repository_candidates=candidates,
+                repository_group_candidates=group_candidates,
                 codex_results=(),
                 prepared_worktree=None,
                 base_commit="",
@@ -679,6 +843,28 @@ class DefectFlow:
         )
 
     def _validate_mapping(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            try:
+                authorized = self.config.resolve_group_key(
+                    run.repository_group.key, run.project_id, run.iteration_id
+                )
+            except Exception as error:
+                raise _FlowBlocked(
+                    _Blocked(
+                        "confirmed repository group is not authorized",
+                        WorkflowState.VALIDATING,
+                    )
+                ) from error
+            if authorized != run.repository_group:
+                raise _FlowBlocked(
+                    _Blocked(
+                        "confirmed repository group is not authorized",
+                        WorkflowState.VALIDATING,
+                    )
+                )
+            return self._transition(
+                run, WorkflowState.PREPARING_REPO, "prepare isolated repository group"
+            )
         if run.repository is None:
             return run
         if not any(candidate == run.repository for candidate in self._candidate_mappings(run.project_id, run.iteration_id)):
@@ -688,6 +874,8 @@ class DefectFlow:
         return self._transition(run, WorkflowState.PREPARING_REPO, "prepare isolated repository")
 
     def _prepare_repository(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._prepare_repository_group(run)
         mapping = self._mapping(run)
         prepared = run.prepared_worktree
         if prepared is None:
@@ -708,7 +896,49 @@ class DefectFlow:
             )
         return self._transition(run, WorkflowState.IMPLEMENTING, "analyze defect root cause")
 
+    def _prepare_repository_group(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        workspace = self._group_workspace()
+        if not run.repository_evidence:
+            defect = self._defect(run)
+            prepared = workspace.prepare_group(
+                run.run_id,
+                group,
+                WorkflowType.DEFECT,
+                run.work_item_id,
+                defect.title,
+            )
+            workspace.assert_heads_unchanged(prepared)
+            evidence = tuple(
+                RepositoryRunEvidence(
+                    repository_key=item.repository_key,
+                    mapping=item.mapping,
+                    prepared_worktree=item.prepared,
+                )
+                for item in prepared
+            )
+            primary = next(
+                item for item in evidence
+                if item.repository_key == group.primary_repository
+            )
+            run = self._save(run.validated_update(
+                repository_evidence=evidence,
+                repository=primary.mapping,
+                prepared_worktree=primary.prepared_worktree,
+                base_commit=primary.prepared_worktree.base_commit,
+                head_commit=primary.prepared_worktree.head_commit,
+                branch=primary.prepared_worktree.branch,
+                worktree_path=str(primary.prepared_worktree.path),
+            ))
+        else:
+            workspace.assert_heads_unchanged(self._prepared_group(run))
+        return self._transition(
+            run, WorkflowState.IMPLEMENTING, "analyze repository group root cause"
+        )
+
     def _analyze_reproduce_and_fix(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._analyze_reproduce_and_fix_group(run)
         prepared, mapping = self._prepared(run), self._mapping(run)
         current = run
         if not current.codex_results:
@@ -918,6 +1148,197 @@ class DefectFlow:
             )
         return self._transition(current, WorkflowState.TESTING, "verify defect repair")
 
+    def _analyze_reproduce_and_fix_group(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        prepared = self._prepared_group(run)
+        workspace = self._group_workspace()
+        current = run
+        if not current.codex_results:
+            base = workspace.snapshots(prepared)
+            if any(not snapshot.is_clean for snapshot in base.values()):
+                raise _FlowBlocked(
+                    _Blocked("base repository group is not clean", WorkflowState.IMPLEMENTING)
+                )
+            result = self.codex.run_group_stage(
+                "root_cause", group=group, prepared=prepared,
+                run_id=current.run_id, prompt=self._group_root_cause_prompt(current),
+                allow_changes=False,
+            )
+            after = workspace.snapshots(prepared)
+            if (
+                after != base
+                or result.changed_files
+                or result.repository_changes
+                or result.commands
+            ):
+                raise _FlowBlocked(
+                    _Blocked(
+                        "root cause analysis modified the repository group",
+                        WorkflowState.IMPLEMENTING,
+                    )
+                )
+            try:
+                evidence = validate_group_root_cause_evidence(
+                    result.root_cause_evidence,
+                    prepared=prepared,
+                    group=group,
+                    defect=self._defect(current),
+                    allow_missing_reproduction=True,
+                )
+                self._assert_defect_analysis(result, evidence)
+            except (DefectFlowError, ValueError) as error:
+                raise _FlowBlocked(
+                    _Blocked("root cause evidence is insufficient", WorkflowState.IMPLEMENTING),
+                    current,
+                ) from error
+            current = self._save(current.validated_update(
+                codex_results=(result,),
+                root_cause_evidence=evidence,
+                investigation_suggestions=(),
+                behavior_before=result.behavior_before,
+                impact_scope=result.impact_scope,
+                risk_level=result.risk_level,
+                defect_checkpoint=DefectCheckpoint.ROOT_VERIFIED,
+            ))
+
+        if len(current.codex_results) == 1:
+            reproduction = self.codex.run_group_stage(
+                "reproduction", group=group, prepared=prepared,
+                run_id=current.run_id, prompt=self._reproduction_prompt(current),
+                allow_changes=True,
+            )
+            snapshots = workspace.snapshots(prepared)
+            assert_group_claims(reproduction, snapshots, group)
+            target = current.root_cause_evidence[0].reproduction_file
+            if (
+                target is None
+                or reproduction.unresolved_items
+                or reproduction.unrelated_changes_checked is not True
+                or any(
+                    claim.repository_key != target.repository_key
+                    or not _is_test_path(claim.path)
+                    for claim in reproduction.repository_changes
+                )
+            ):
+                raise _FlowBlocked(
+                    _Blocked("reproduction stage changed unsafe files", WorkflowState.IMPLEMENTING),
+                    current,
+                )
+            validate_group_root_cause_evidence(
+                current.root_cause_evidence,
+                prepared=prepared,
+                group=group,
+                defect=self._defect(current),
+            )
+            current = self._save(current.validated_update(
+                codex_results=(*current.codex_results, reproduction),
+                repository_evidence=self._evidence_with_snapshots(
+                    current.repository_evidence, snapshots
+                ),
+                retry_count=current.retry_count + 1,
+                defect_checkpoint=DefectCheckpoint.REPRODUCTION_PREPARED,
+            ))
+            current = self._persist_group_prefail(current, prepared, group)
+
+        if len(current.codex_results) == 2:
+            target, target_context = self._group_reproduction_context(current, prepared)
+            if (
+                current.defect_checkpoint is not DefectCheckpoint.REPRODUCTION_FAILED
+                or not current.reproduction_test_sha256
+                or self.repository.content_sha256(
+                    target_context.prepared, target.path
+                ) != current.reproduction_test_sha256
+            ):
+                raise _FlowBlocked(
+                    _Blocked("reproduction checkpoint is incomplete", WorkflowState.IMPLEMENTING),
+                    current,
+                )
+            before = workspace.snapshots(prepared)
+            repair = self.codex.run_group_stage(
+                "implementation", group=group, prepared=prepared,
+                run_id=current.run_id, prompt=self._repair_prompt(current),
+                allow_changes=True,
+            )
+            after = workspace.snapshots(prepared)
+            assert_group_claims(repair, after, group)
+            impacted = {
+                (claim.repository_key, claim.path)
+                for item in current.root_cause_evidence
+                for claim in item.impacted_repository_files
+            }
+            before_files = {
+                (key, path)
+                for key, snapshot in before.items()
+                for path in snapshot.changed_files
+            }
+            new_production = {
+                (claim.repository_key, claim.path)
+                for claim in repair.repository_changes
+                if (claim.repository_key, claim.path) not in before_files
+                and not _is_test_path(claim.path)
+            }
+            if (
+                not new_production
+                or not new_production.issubset(impacted)
+                or repair.root_cause_evidence != current.root_cause_evidence
+                or repair.unrelated_changes_checked is not True
+                or repair.unresolved_items
+                or not repair.behavior_after.strip()
+                or not repair.risk_level
+                or self.repository.content_sha256(
+                    target_context.prepared, target.path
+                ) != current.reproduction_test_sha256
+            ):
+                raise _FlowBlocked(
+                    _Blocked("repair evidence is incomplete", WorkflowState.IMPLEMENTING),
+                    current,
+                )
+            current = self._save(current.validated_update(
+                codex_results=(*current.codex_results, repair),
+                repository_evidence=self._evidence_with_snapshots(
+                    current.repository_evidence, after
+                ),
+                behavior_after=repair.behavior_after,
+                impact_scope=repair.impact_scope,
+                risk_level=repair.risk_level,
+                retry_count=current.retry_count + 1,
+                defect_checkpoint=DefectCheckpoint.REPAIR_APPLIED,
+            ))
+        return self._transition(
+            current, WorkflowState.TESTING, "verify repository group repair"
+        )
+
+    def _persist_group_prefail(
+        self,
+        current: WorkflowRun,
+        prepared: tuple[PreparedRepository, ...],
+        group: RepositoryGroupMapping,
+    ) -> WorkflowRun:
+        workspace = self._group_workspace()
+        target, context = self._group_reproduction_context(current, prepared)
+        before = workspace.snapshots(prepared)
+        argv, command = self._reproduction_invocation(current)
+        actual = self._run_argv(argv, command, context.prepared.path)
+        after = workspace.snapshots(prepared)
+        if after != before:
+            raise _FlowBlocked(
+                _Blocked("reproduction tests modified repository evidence", WorkflowState.IMPLEMENTING),
+                current,
+            )
+        digest = self.repository.content_sha256(context.prepared, target.path)
+        current = self._save(current.validated_update(
+            pre_fix_snapshot=before[target.repository_key],
+            pre_fix_test_results=(actual,),
+            reproduction_test_sha256=digest,
+            defect_checkpoint=DefectCheckpoint.REPRODUCTION_FAILED,
+        ))
+        if actual.outcome is not CommandOutcome.TEST_FAILED:
+            raise _FlowBlocked(
+                _Blocked("defect could not be reproduced by a failing test", WorkflowState.IMPLEMENTING),
+                current,
+            )
+        return current
+
     def _persist_prefail(
         self,
         current: WorkflowRun,
@@ -962,6 +1383,8 @@ class DefectFlow:
         return current
 
     def _verify(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._verify_group(run)
         prepared, mapping = self._prepared(run), self._mapping(run)
         reproduction_argv, reproduction_command = self._reproduction_invocation(run)
         commands = (
@@ -1009,7 +1432,106 @@ class DefectFlow:
         )
         return self._transition(current, WorkflowState.AI_REVIEW, "review tested repair")
 
+    def _verify_group(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        prepared = self._prepared_group(run)
+        workspace = self._group_workspace()
+        target, target_context = self._group_reproduction_context(run, prepared)
+        before = workspace.snapshots(prepared)
+        if self.repository.content_sha256(
+            target_context.prepared, target.path
+        ) != run.reproduction_test_sha256:
+            raise _FlowBlocked(
+                _Blocked("reproduction test changed before final verification", WorkflowState.TESTING)
+            )
+        argv, display = self._reproduction_invocation(run)
+        focused = self._run_argv(argv, display, target_context.prepared.path)
+        try:
+            repository_results, integration_results = run_group_commands(
+                group, prepared, self.test_runner
+            )
+        except GroupEvidenceError as error:
+            raise _FlowBlocked(
+                _Blocked("configured group verification failed", WorkflowState.TESTING), run
+            ) from error
+        actual = (
+            focused,
+            *(result for _, result in repository_results),
+            *integration_results,
+        )
+        after = workspace.snapshots(prepared)
+        workspace.assert_heads_unchanged(prepared)
+        try:
+            assert_group_commands_passed(
+                ((target.repository_key, focused), *repository_results),
+                integration_results,
+            )
+        except GroupEvidenceError as error:
+            raise _FlowBlocked(
+                _Blocked("configured group verification did not pass", WorkflowState.TESTING),
+                run,
+            ) from error
+        if before != after:
+            raise _FlowBlocked(
+                _Blocked("verification commands modified repository evidence", WorkflowState.TESTING),
+                run,
+            )
+        if self.repository.content_sha256(
+            target_context.prepared, target.path
+        ) != run.reproduction_test_sha256:
+            raise _FlowBlocked(
+                _Blocked("reproduction test changed during final verification", WorkflowState.TESTING)
+            )
+        by_key = {
+            key: tuple(result for item_key, result in repository_results if item_key == key)
+            for key in group.topological_keys()
+        }
+        by_key[target.repository_key] = (focused, *by_key[target.repository_key])
+        evidence = tuple(
+            item.validated_update(
+                tested_snapshot=after[item.repository_key],
+                changed_files=after[item.repository_key].changed_files,
+                test_results=by_key[item.repository_key],
+            )
+            for item in run.repository_evidence
+        )
+        current = self._save(run.validated_update(
+            repository_evidence=evidence,
+            integration_test_results=integration_results,
+            test_results=actual,
+            tested_snapshot=after[group.primary_repository],
+            changed_files=after[group.primary_repository].changed_files,
+            head_commit=after[group.primary_repository].head_commit,
+            defect_checkpoint=DefectCheckpoint.FINAL_TESTED,
+        ))
+        reported = self.codex.analyze_testing(
+            run_id=current.run_id,
+            prompt=json.dumps(
+                [item.model_dump(mode="json") for item in actual],
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        if (
+            reported.changed_files
+            or reported.repository_changes
+            or reported.commands
+            or reported.root_cause_evidence
+            or reported.unresolved_items
+        ):
+            raise _FlowBlocked(
+                _Blocked("testing analysis is invalid", WorkflowState.TESTING), current
+            )
+        current = self._save(current.validated_update(
+            codex_results=(*current.codex_results, reported)
+        ))
+        return self._transition(
+            current, WorkflowState.AI_REVIEW, "review tested repository group repair"
+        )
+
     def _review_and_package(self, run: WorkflowRun) -> WorkflowRun:
+        if run.repository_group is not None:
+            return self._review_group_and_package(run)
         prepared, mapping = self._prepared(run), self._mapping(run)
         tested = run.tested_snapshot
         if tested is None:
@@ -1068,6 +1590,134 @@ class DefectFlow:
             ) from error
         current = self._save(current.validated_update(approval=package))
         return self._transition(current, WorkflowState.WAITING_APPROVAL, "await human approval")
+
+    def _review_group_and_package(self, run: WorkflowRun) -> WorkflowRun:
+        group = self._group(run)
+        prepared = self._prepared_group(run)
+        workspace = self._group_workspace()
+        before = workspace.snapshots(prepared)
+        try:
+            assert_group_snapshots_equal(run.repository_evidence, before, group)
+            select_group_final_tests(
+                run.repository_evidence, run.integration_test_results, group
+            )
+        except (GroupEvidenceError, FinalTestEvidenceError) as error:
+            raise _FlowBlocked(
+                _Blocked("tested repository group evidence changed", WorkflowState.AI_REVIEW), run
+            ) from error
+        current = run
+        if current.review is None:
+            review = self.codex.run_group_stage(
+                "review", group=group, prepared=prepared, run_id=current.run_id,
+                prompt=self._review_prompt(current), allow_changes=False,
+            )
+            after = workspace.snapshots(prepared)
+            workspace.assert_heads_unchanged(prepared)
+            try:
+                assert_group_snapshots_equal(current.repository_evidence, after, group)
+                assert_group_claims(review, after, group)
+            except GroupEvidenceError as error:
+                raise _FlowBlocked(
+                    _Blocked("AI review changed repository group evidence", WorkflowState.AI_REVIEW), current
+                ) from error
+            current = self._save(current.validated_update(review=review))
+        else:
+            review, after = current.review, before
+        if (
+            review.unresolved_items
+            or not review.summary.strip()
+            or not review.review_findings
+            or review.unrelated_changes_checked is not True
+            or review.root_cause_evidence != current.root_cause_evidence
+            or review.behavior_before != current.behavior_before
+            or review.behavior_after != current.behavior_after
+            or review.impact_scope != current.impact_scope
+            or review.risk_level != current.risk_level
+        ):
+            raise _FlowBlocked(
+                _Blocked("AI review evidence is incomplete", WorkflowState.AI_REVIEW), current
+            )
+        final = workspace.snapshots(prepared)
+        try:
+            assert_group_snapshots_equal(current.repository_evidence, final, group)
+        except GroupEvidenceError as error:
+            raise _FlowBlocked(
+                _Blocked("repository group changed after review", WorkflowState.AI_REVIEW), current
+            ) from error
+        package = self._group_approval_package(current, final)
+        try:
+            package = validate_for_approval(package)
+        except ApprovalValidationError as error:
+            raise _FlowBlocked(
+                _Blocked("approval evidence is incomplete", WorkflowState.AI_REVIEW), current
+            ) from error
+        current = self._save(current.validated_update(approval=package))
+        return self._transition(current, WorkflowState.WAITING_APPROVAL, "await human approval")
+
+    def _group_approval_package(
+        self, run: WorkflowRun, snapshots: dict[str, RepositorySnapshot]
+    ) -> ApprovalPackage:
+        defect, group = self._defect(run), self._group(run)
+        prepared = {item.repository_key: item for item in self._prepared_group(run)}
+        evidence_by_key = {item.repository_key: item for item in run.repository_evidence}
+        review = run.review or CodexResult()
+        commit_messages = {
+            key: (
+                f"fix({key}): {defect.title}"
+                if snapshots[key].changed_files else ""
+            )
+            for key in group.topological_keys()
+        }
+        tree_hashes = self._group_workspace().approval_trees(
+            self._prepared_group(run), snapshots, commit_messages
+        )
+        repositories = tuple(
+            RepositoryApprovalEvidence(
+                repository_key=key,
+                mapping=evidence_by_key[key].mapping,
+                base_commit=prepared[key].prepared.base_commit,
+                head_commit=snapshots[key].head_commit,
+                diff_hash=snapshots[key].diff_sha256,
+                diff_summary=(f"changed {len(snapshots[key].changed_files)} file(s): "
+                              f"{', '.join(snapshots[key].changed_files)}"),
+                branch=prepared[key].prepared.branch,
+                changed_files=snapshots[key].changed_files,
+                tests=evidence_by_key[key].test_results,
+                tree_hash=tree_hashes[key],
+                commit_message=commit_messages[key],
+                pr_title=f"{defect.number or defect.defect_id}: {defect.title} [{key}]" if snapshots[key].changed_files else "",
+                pr_body=(f"Repository: {key}\n\nDefect: {defect.title}\n\n"
+                         f"Changed files: {', '.join(snapshots[key].changed_files)}") if snapshots[key].changed_files else "",
+            ) for key in group.topological_keys()
+        )
+        source_digest = _defect_digest(defect)
+        reproduction_argv, reproduction_command = self._reproduction_invocation(run)
+        return ApprovalPackage(
+            work_item_id=defect.defect_id,
+            work_item_title=defect.title,
+            work_item_status=defect.status.name or defect.status.id,
+            source_versions={"defect_sha256": source_digest},
+            repository_group=group,
+            repositories=repositories,
+            integration_tests=run.integration_test_results,
+            evidence=tuple(
+                f"{item.repository_file.repository_key}:{item.file_path}:{item.location} - {item.mechanism}"
+                for item in run.root_cause_evidence if item.repository_file is not None
+            ),
+            review=review.review_findings,
+            risks=(*tuple(dict.fromkeys(
+                item for result in (*run.codex_results, review) for item in result.risks
+            )), f"risk_level={run.risk_level}"),
+            unrelated_changes_checked=True,
+            root_cause_evidence=run.root_cause_evidence,
+            behavior_before=run.behavior_before,
+            behavior_after=run.behavior_after,
+            impact_scope=run.impact_scope,
+            risk_level=run.risk_level,
+            pre_fix_tests=run.pre_fix_test_results,
+            reproduction_command=reproduction_command,
+            reproduction_test_sha256=run.reproduction_test_sha256,
+        )
 
     def _approval_package(
         self, run: WorkflowRun, snapshot: RepositorySnapshot
@@ -1218,6 +1868,15 @@ class DefectFlow:
             if item.project_id == project_id and item.iteration_id in {iteration_id, "*"}
         )
 
+    def _candidate_groups(
+        self, project_id: str, iteration_id: str
+    ) -> tuple[RepositoryGroupMapping, ...]:
+        return tuple(
+            group for group in self.config.repository_groups
+            if group.project_id == project_id
+            and group.iteration_id in {iteration_id, "*"}
+        )
+
     def _save(self, run: WorkflowRun) -> WorkflowRun:
         return self.store.save(run, expected_version=run.version)
 
@@ -1330,10 +1989,17 @@ class DefectFlow:
         ):
             return False
         try:
-            prepared = self._prepared(run)
+            if run.repository_group is not None:
+                target, context = self._group_reproduction_context(
+                    run, self._prepared_group(run)
+                )
+                prepared = context.prepared
+                reproduction_path = target.path
+            else:
+                prepared = self._prepared(run)
+                reproduction_path = run.root_cause_evidence[0].reproduction_test
             argv, command = self._reproduction_invocation(run)
             prefail = run.pre_fix_test_results[0]
-            reproduction_path = run.root_cause_evidence[0].reproduction_test
             return (
                 prefail.command == command
                 and prefail.argv == argv
@@ -1365,6 +2031,61 @@ class DefectFlow:
         return run.repository
 
     @staticmethod
+    def _group(run: WorkflowRun) -> RepositoryGroupMapping:
+        if run.repository_group is None:
+            raise DefectFlowError("repository group is unavailable")
+        return run.repository_group
+
+    def _group_workspace(self) -> RepositoryGroupWorkspace:
+        if self.group_workspace is None:
+            raise DefectFlowError("repository group workspace is unavailable")
+        return self.group_workspace
+
+    @staticmethod
+    def _prepared_group(run: WorkflowRun) -> tuple[PreparedRepository, ...]:
+        if not run.repository_evidence:
+            raise DefectFlowError("prepared repository group is unavailable")
+        return tuple(
+            PreparedRepository(
+                repository_key=item.repository_key,
+                mapping=item.mapping,
+                prepared=item.prepared_worktree,
+            )
+            for item in run.repository_evidence
+        )
+
+    @staticmethod
+    def _evidence_with_snapshots(
+        evidence: tuple[RepositoryRunEvidence, ...],
+        snapshots: dict[str, RepositorySnapshot],
+    ) -> tuple[RepositoryRunEvidence, ...]:
+        return tuple(
+            item.validated_update(
+                changed_files=snapshots[item.repository_key].changed_files,
+                tested_snapshot=None,
+                test_results=(),
+            )
+            for item in evidence
+        )
+
+    @staticmethod
+    def _group_reproduction_context(
+        run: WorkflowRun,
+        prepared: tuple[PreparedRepository, ...],
+    ) -> tuple[RepositoryChangeClaim, PreparedRepository]:
+        if not run.root_cause_evidence:
+            raise DefectFlowError("reproduction evidence is unavailable")
+        target = run.root_cause_evidence[0].reproduction_file
+        if target is None:
+            raise DefectFlowError("reproduction repository is unavailable")
+        matches = tuple(
+            item for item in prepared if item.repository_key == target.repository_key
+        )
+        if len(matches) != 1:
+            raise DefectFlowError("reproduction repository is unavailable")
+        return target, matches[0]
+
+    @staticmethod
     def _prepared(run: WorkflowRun) -> PreparedWorktree:
         if run.prepared_worktree is None:
             raise DefectFlowError("prepared worktree is unavailable")
@@ -1385,6 +2106,35 @@ class DefectFlow:
             + json.dumps(asdict(DefectFlow._defect(run)), ensure_ascii=False, sort_keys=True)
         )
         return prompt + DefectFlow._revision_feedback_block(run)
+
+    @staticmethod
+    def _group_root_cause_prompt(run: WorkflowRun) -> str:
+        group = DefectFlow._group(run)
+        context = {
+            "defect": asdict(DefectFlow._defect(run)),
+            "primary_repository": group.primary_repository,
+            "topological_order": group.topological_keys(),
+            "repositories": [
+                {
+                    "key": item.key,
+                    "role": item.role.value,
+                    "allowed_paths": item.allowed_paths,
+                    "test_commands": item.test_commands,
+                }
+                for item in group.repositories
+            ],
+            "integration_test_commands": group.integration_test_commands,
+        }
+        return (
+            "Read-only multi-repository root-cause analysis. Do not modify files. "
+            "Every RootCauseEvidence item must set repository_file and "
+            "reproduction_file, and every impacted path must be represented in "
+            "impacted_repository_files using an exact repository key and path. "
+            "Return repository-backed evidence with at least two independent support "
+            "points. Context:\n"
+            + json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            + DefectFlow._revision_feedback_block(run)
+        )
 
     @staticmethod
     def _reproduction_prompt(run: WorkflowRun) -> str:

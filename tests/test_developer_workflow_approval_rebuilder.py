@@ -10,7 +10,12 @@ from src.contracts import ProjectRef, RequirementRecord, StatusRef
 from src.developer_workflow.approval import ApprovalInvalidatedError, issue_approval, verify_approval
 from src.developer_workflow.approval_rebuilder import ApprovalRebuildError, WorkflowApprovalRebuilder
 from src.developer_workflow.contracts import (
-    AcceptanceCoverage, PreparedWorktree, RepositorySnapshot, WorkflowRun,
+    AcceptanceCoverage, CodexResult, CommandOutcome, CommandResult,
+    MultiRepositoryPublicationResult, PreparedWorktree,
+    RepositoryApprovalEvidence, RepositoryChangeClaim, RepositoryGroupMapping,
+    RepositoryMapping, RepositoryPublicationResult, RepositoryRole,
+    RepositoryRunEvidence, RepositorySnapshot,
+    WorkflowRun,
 )
 from tests.test_developer_workflow_publisher import _package
 
@@ -119,3 +124,148 @@ def test_live_evidence_change_invalidates_signed_fingerprint(tmp_path, changed) 
     expected = ApprovalRebuildError if changed == "diff" else ApprovalInvalidatedError
     with pytest.raises(expected):
         verify_approval(signed.fingerprint, rebuilder.rebuild(run))
+
+
+def test_group_rebuilder_checks_every_repository_and_recreates_same_fingerprint(
+    tmp_path: Path,
+) -> None:
+    now = __import__("datetime").datetime.now(__import__("datetime").UTC)
+    mappings = (
+        RepositoryMapping(
+            key="sdk", project_id="P", iteration_id="I",
+            repo_url="https://example.invalid/sdk.git", repo_name="sdk",
+            role=RepositoryRole.DEPENDENCY, test_commands=("pytest sdk",),
+            allowed_paths=("src",),
+        ),
+        RepositoryMapping(
+            key="app", project_id="P", iteration_id="I",
+            repo_url="https://example.invalid/app.git", repo_name="app",
+            role=RepositoryRole.PRIMARY, depends_on=("sdk",),
+            test_commands=("pytest app",), allowed_paths=("src",),
+        ),
+    )
+    group = RepositoryGroupMapping(
+        key="suite", project_id="P", iteration_id="I",
+        primary_repository="app", repositories=mappings,
+        integration_test_commands=("pytest integration",),
+    )
+    results = {
+        mapping.key: CommandResult(
+            command=mapping.test_commands[0], argv=tuple(mapping.test_commands[0].split()),
+            exit_code=0, outcome=CommandOutcome.PASSED, summary="passed",
+            started_at=now, finished_at=now,
+        ) for mapping in mappings
+    }
+    integration = CommandResult(
+        command="pytest integration", argv=("pytest", "integration"), exit_code=0,
+        outcome=CommandOutcome.PASSED, summary="passed", started_at=now, finished_at=now,
+    )
+    snapshots = {
+        key: RepositorySnapshot(
+            head_commit="a" * 40, diff_sha256=digest * 64,
+            changed_files=(f"src/{key}.py",), patch=f"diff {key}", is_clean=False,
+        ) for key, digest in (("sdk", "b"), ("app", "c"))
+    }
+    evidence = tuple(
+        RepositoryRunEvidence(
+            repository_key=mapping.key, mapping=mapping,
+            prepared_worktree=PreparedWorktree(
+                path=(tmp_path / mapping.key).resolve(),
+                mirror_path=(tmp_path / f"{mapping.key}.git").resolve(),
+                branch=f"codex/REQ-1-{mapping.key}", base_commit="a" * 40,
+                head_commit="a" * 40,
+            ),
+            tested_snapshot=snapshots[mapping.key],
+            test_results=(results[mapping.key],),
+            changed_files=snapshots[mapping.key].changed_files,
+        ) for mapping in mappings
+    )
+    repositories = tuple(
+        RepositoryApprovalEvidence(
+            repository_key=item.repository_key, mapping=item.mapping,
+            base_commit=item.prepared_worktree.base_commit,
+            head_commit=item.prepared_worktree.head_commit,
+            diff_hash=item.tested_snapshot.diff_sha256,
+            diff_summary=f"changed 1 file(s): src/{item.repository_key}.py",
+            branch=item.prepared_worktree.branch,
+            changed_files=item.changed_files, tests=item.test_results,
+            tree_hash=("d" if item.repository_key == "sdk" else "e") * 40,
+            commit_message=f"feat({item.repository_key}): Title",
+            pr_title=f"REQ-1: Title [{item.repository_key}]",
+            pr_body=f"Repository: {item.repository_key}",
+        ) for item in evidence
+    )
+    package = _package().model_copy(update={
+        "repository": None, "repo_url": "", "base_branch": "", "base_commit": "",
+        "head_commit": "", "diff_hash": "", "diff_summary": "", "branch": "",
+        "changed_files": (), "tests": (), "commit_message": "", "pr_title": "",
+        "pr_body": "", "repository_group": group, "repositories": repositories,
+        "integration_tests": (integration,),
+        "coverage": {"AC-1: AC": "files=sdk:src/sdk.py; tests=pytest sdk"},
+    })
+    run = WorkflowRun.new("requirement", "REQ-1").validated_update(
+        requirement=_requirement(), repository_group=group,
+        repository_evidence=evidence, integration_test_results=(integration,),
+        wiki_snapshots=package.wiki_snapshots,
+        acceptance_coverage=(AcceptanceCoverage(
+            criterion_id="AC-1", criterion_text="AC",
+            repository_files=(RepositoryChangeClaim(
+                repository_key="sdk", path="src/sdk.py"
+            ),), tests=("pytest sdk",),
+        ),), review=CodexResult(
+            summary="reviewed", review_findings=("reviewed",),
+            repository_changes=(
+                RepositoryChangeClaim(repository_key="sdk", path="src/sdk.py"),
+                RepositoryChangeClaim(repository_key="app", path="src/app.py"),
+            ), unrelated_changes_checked=True,
+        ), approval=package,
+    )
+
+    class GroupRepository(Repository):
+        reject_head: bool = False
+
+        def assert_head_unchanged(self, prepared):
+            if self.reject_head:
+                raise RuntimeError("publication advanced HEAD")
+            super().assert_head_unchanged(prepared)
+
+        def snapshot(self, prepared, mapping):
+            return snapshots[mapping.key]
+
+    repository = GroupRepository(snapshots["app"])
+    gateway = Gateway(_requirement(), package.wiki_snapshots[0])
+    rebuilt = WorkflowApprovalRebuilder(gateway, repository).rebuild(run)
+    signed = issue_approval(rebuilt, approved_by="alice")
+    verify_approval(
+        signed.fingerprint,
+        WorkflowApprovalRebuilder(gateway, repository).rebuild(
+            run.validated_update(approval=rebuilt)
+        ),
+    )
+    marker = f"<!-- ones-dev-run:{run.run_id} -->"
+    publication = MultiRepositoryPublicationResult(
+        order=group.topological_keys(), comment_marker=marker,
+        repositories=tuple(
+            RepositoryPublicationResult(
+                repository_key=item.repository_key,
+                approved_fingerprint=signed.fingerprint,
+                repo_url=item.mapping.repo_url, provider="github",
+                provider_host="example.invalid", expected_parent=item.head_commit,
+                expected_tree=("d" if item.repository_key == "sdk" else "e") * 40,
+                commit_message=item.commit_message, remote_branch=item.branch,
+                pr_marker=f"ones-dev-run:{run.run_id}:{item.repository_key}",
+                pr_base=item.mapping.base_branch, pr_head=item.branch,
+                pr_title=item.pr_title, pr_body=item.pr_body, comment_marker=marker,
+                commit_hash=("1" if item.repository_key == "sdk" else "2") * 40,
+            ) for item in signed.repositories
+        ),
+    )
+    repository.reject_head = True
+    recovered = WorkflowApprovalRebuilder(gateway, repository).rebuild(
+        run.validated_update(approval=signed, group_publication=publication)
+    )
+    verify_approval(signed.fingerprint, recovered)
+    repository.reject_head = False
+    snapshots["sdk"] = snapshots["sdk"].validated_update(diff_sha256="d" * 64)
+    with pytest.raises(ApprovalRebuildError, match="tested evidence"):
+        WorkflowApprovalRebuilder(gateway, repository).rebuild(run)

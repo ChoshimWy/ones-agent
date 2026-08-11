@@ -30,6 +30,47 @@
       "allowed_paths": ["src", "tests"]
     }
   ],
+  "repository_groups": [
+    {
+      "key": "desktop-suite",
+      "project_id": "project-multi-demo",
+      "iteration_id": "iteration-multi-demo",
+      "primary_repository": "desktop-app",
+      "repositories": [
+        {
+          "key": "shared-sdk",
+          "project_id": "project-multi-demo",
+          "iteration_id": "iteration-multi-demo",
+          "repo_url": "https://example.invalid/acme/shared-sdk.git",
+          "repo_name": "shared-sdk",
+          "base_branch": "main",
+          "source_path": "D:/REPLACE_WITH_LOCAL_SOURCES/shared-sdk",
+          "role": "dependency",
+          "depends_on": [],
+          "test_commands": ["uv run pytest"],
+          "lint_commands": [],
+          "build_commands": [],
+          "allowed_paths": ["src", "tests"]
+        },
+        {
+          "key": "desktop-app",
+          "project_id": "project-multi-demo",
+          "iteration_id": "iteration-multi-demo",
+          "repo_url": "https://example.invalid/acme/desktop-app.git",
+          "repo_name": "desktop-app",
+          "base_branch": "main",
+          "source_path": "D:/REPLACE_WITH_LOCAL_SOURCES/desktop-app",
+          "role": "primary",
+          "depends_on": ["shared-sdk"],
+          "test_commands": ["uv run pytest"],
+          "lint_commands": [],
+          "build_commands": [],
+          "allowed_paths": ["src", "tests"]
+        }
+      ],
+      "integration_test_commands": ["uv run pytest tests/integration"]
+    }
+  ],
   "publishing": {
     "provider": "local_fake",
     "default_target_branch": "main",
