@@ -22,6 +22,12 @@ from .models import (
     run_detail_from_run,
     safe_tui_text,
 )
+from .supervisor import (
+    RunTaskSupervisor,
+    SupervisorClosedError,
+    SupervisorLoopError,
+    TaskEvent,
+)
 
 __all__ = [
     "CandidateSessionView",
@@ -34,11 +40,15 @@ __all__ = [
     "RunDetail",
     "RunFilter",
     "RunSummary",
+    "RunTaskSupervisor",
+    "SupervisorClosedError",
+    "SupervisorLoopError",
     "TestView",
     "StaleTuiActionError",
     "TuiController",
     "TuiControllerError",
     "TuiDisplayError",
+    "TaskEvent",
     "run_detail_from_run",
     "safe_tui_text",
 ]
