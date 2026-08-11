@@ -195,13 +195,18 @@ def test_module_is_importable_and_help_lists_exact_commands() -> None:
 class DefectListClient:
     def __init__(self, candidates: tuple[DefectCandidate, ...] | None = None) -> None:
         self.candidates = candidates if candidates is not None else Candidates().list_candidates
-        self.calls: list[tuple[str, ...]] = []
+        self.calls: list[tuple[object, ...]] = []
         self.closed = False
 
     async def list_candidates(
-        self, project: str, iteration: str, assignee: str
+        self,
+        project: str,
+        iteration: str,
+        assignee: str,
+        *,
+        status_ids: tuple[str, ...] | None = None,
     ) -> tuple[DefectCandidate, ...]:
-        self.calls.append((project, iteration, assignee))
+        self.calls.append((project, iteration, assignee, status_ids))
         if callable(self.candidates):
             return await self.candidates(project, iteration, assignee)
         return self.candidates
@@ -243,7 +248,7 @@ def test_defects_list_is_read_only_table_with_bounded_pagination() -> None:
     )
     assert code == 0 and error == ""
     assert built == [(40, 20)]
-    assert client.calls == [("PROJ", "ITER", "USER")]
+    assert client.calls == [("PROJ", "ITER", "USER", None)]
     assert client.closed is True
     assert "BUG-7 | DEF-1 | High | Doing | Crash" in output
     assert "snapshot-1" not in output
@@ -267,9 +272,45 @@ def test_defects_list_json_uses_an_explicit_output_allowlist() -> None:
         "title": "Crash",
         "priority": "High",
         "status": "Doing",
+        "status_id": "",
         "updated_at": "2026-08-11T00:00:00Z",
     }
     assert "snapshot_token" not in output and "source" not in output
+
+
+def test_defects_list_passes_exact_comma_separated_status_ids() -> None:
+    client = DefectListClient()
+    code, output, error, built = _invoke_defect_list(
+        [
+            "defects", "list", "--project", "PROJ", "--iteration", "ITER",
+            "--assignee", "USER", "--status", "CKA6U955,WwhszYN8",
+        ],
+        client,
+    )
+    assert code == 0 and error == "" and output
+    assert built == [(5000, 200)]
+    assert client.calls == [
+        ("PROJ", "ITER", "USER", ("CKA6U955", "WwhszYN8"))
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", ",CKA6U955", "CKA6U955,", "CKA6U955,,WwhszYN8", "CKA6U955,CKA6U955", "待处理", "CKA6U955, WwhszYN8"],
+)
+def test_defects_list_rejects_malformed_status_ids_before_building_client(
+    value: str,
+) -> None:
+    client = DefectListClient()
+    code, _, error, built = _invoke_defect_list(
+        [
+            "defects", "list", "--project", "PROJ", "--iteration", "ITER",
+            "--assignee", "USER", "--status", value,
+        ],
+        client,
+    )
+    assert code == 2 and "invalid" in error
+    assert built == [] and client.calls == []
 
 
 def test_defects_list_empty_result_is_success() -> None:

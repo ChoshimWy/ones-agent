@@ -15,7 +15,7 @@ import json
 import math
 import re
 import time
-from typing import TYPE_CHECKING, Callable, Iterable
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
 from urllib.parse import unquote, urlsplit
 
 import httpx
@@ -290,6 +290,7 @@ class OnesGateway:
         *,
         limit: int = 5000,
         page_size: int = 200,
+        status_ids: Sequence[str] | None = None,
     ) -> list[DefectRecord]:
         statuses = await self.list_defect_statuses(project_id, issue_type_id)
         if not statuses:
@@ -307,7 +308,25 @@ class OnesGateway:
                     f"ONES workflow status {status.id or '<empty>'} has unknown category: {category}",
                 )
 
-        if not open_status_ids:
+        selected_status_ids = open_status_ids
+        if status_ids is not None:
+            requested = list(status_ids)
+            if (
+                not requested
+                or len(requested) != len(set(requested))
+                or any(
+                    type(status_id) is not str
+                    or re.fullmatch(r"[A-Za-z0-9_-]{1,128}", status_id) is None
+                    for status_id in requested
+                )
+                or not set(requested).issubset(open_status_ids)
+            ):
+                raise OnesGatewayPayloadError(
+                    "Requested ONES defect statuses are not configured open states"
+                )
+            selected_status_ids = requested
+
+        if not selected_status_ids:
             return []
 
         return await self.list_normalized_defects(
@@ -315,7 +334,7 @@ class OnesGateway:
             issue_type_id=issue_type_id,
             sprint_id=sprint_id,
             assignee=assignee,
-            status_ids=open_status_ids,
+            status_ids=selected_status_ids,
             limit=limit,
             page_size=page_size,
         )

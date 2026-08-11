@@ -63,6 +63,7 @@ class DefectGateway(Protocol):
         assignee: str,
         limit: int,
         page_size: int,
+        status_ids: tuple[str, ...] | None = None,
     ) -> list[DefectRecord]: ...
 
 
@@ -208,18 +209,28 @@ class DefectCandidateService:
             raise DefectCandidateError("candidate pagination bounds are invalid")
 
     async def list_candidates(
-        self, project_id: str, iteration_id: str, assignee_id: str
+        self,
+        project_id: str,
+        iteration_id: str,
+        assignee_id: str,
+        *,
+        status_ids: tuple[str, ...] | None = None,
     ) -> tuple[DefectCandidate, ...]:
         project_id = _required(project_id, "project_id")
         iteration_id = _required(iteration_id, "iteration_id")
         assignee_id = _required(assignee_id, "assignee_id")
+        query = {
+            "project_id": project_id,
+            "issue_type_id": self.issue_type_id,
+            "sprint_id": iteration_id,
+            "assignee": assignee_id,
+            "limit": self.candidate_limit,
+            "page_size": self.page_size,
+        }
+        if status_ids is not None:
+            query["status_ids"] = status_ids
         defects = await self.gateway.list_open_defects(
-            project_id=project_id,
-            issue_type_id=self.issue_type_id,
-            sprint_id=iteration_id,
-            assignee=assignee_id,
-            limit=self.candidate_limit,
-            page_size=self.page_size,
+            **query,
         )
         if not isinstance(defects, list) or len(defects) > self.candidate_limit:
             raise DefectCandidateError("ONES candidate snapshot is invalid")
@@ -268,6 +279,7 @@ class DefectCandidateService:
                     status=defect.status.name or defect.status.id,
                     updated_at=defect.updated_at,
                     snapshot_token=token,
+                    status_id=defect.status.id,
                 )
             )
             snapshots[defect.defect_id] = source

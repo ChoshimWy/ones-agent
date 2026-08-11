@@ -204,6 +204,55 @@ class TestOnesGatewayAsync(unittest.IsolatedAsyncioTestCase):
             page_size=200,
         )
 
+    async def test_list_open_defects_uses_only_verified_requested_status_ids(self):
+        gateway = OnesGateway()
+        statuses = unittest.mock.AsyncMock(return_value=[
+            WorkflowStatusRef(id="CKA6U955", name="待处理", category="to_do"),
+            WorkflowStatusRef(id="WwhszYN8", name="修复中", category="in_progress"),
+            WorkflowStatusRef(id="done-id", name="已关闭", category="done"),
+        ])
+        normalized = unittest.mock.AsyncMock(return_value=[])
+
+        with patch.object(OnesGateway, "list_defect_statuses", statuses), patch.object(
+            OnesGateway, "list_normalized_defects", normalized,
+        ):
+            await gateway.list_open_defects(
+                project_id="proj-1",
+                issue_type_id="defect-type",
+                sprint_id="sprint-1",
+                assignee="user-1",
+                status_ids=("CKA6U955", "WwhszYN8"),
+            )
+
+        normalized.assert_awaited_once_with(
+            project_id="proj-1",
+            issue_type_id="defect-type",
+            sprint_id="sprint-1",
+            assignee="user-1",
+            status_ids=["CKA6U955", "WwhszYN8"],
+            limit=5000,
+            page_size=200,
+        )
+
+    async def test_list_open_defects_rejects_unknown_or_closed_requested_status_ids(self):
+        gateway = OnesGateway()
+        statuses = unittest.mock.AsyncMock(return_value=[
+            WorkflowStatusRef(id="CKA6U955", name="待处理", category="to_do"),
+            WorkflowStatusRef(id="done-id", name="已关闭", category="done"),
+        ])
+
+        with patch.object(OnesGateway, "list_defect_statuses", statuses):
+            for requested in (("missing-id",), ("done-id",)):
+                with self.subTest(requested=requested):
+                    with self.assertRaises(OnesGatewayPayloadError):
+                        await gateway.list_open_defects(
+                            project_id="proj-1",
+                            issue_type_id="defect-type",
+                            sprint_id="sprint-1",
+                            assignee="user-1",
+                            status_ids=requested,
+                        )
+
     async def test_list_open_defects_rejects_unknown_status_category(self):
         gateway = OnesGateway()
         statuses = unittest.mock.AsyncMock(return_value=[

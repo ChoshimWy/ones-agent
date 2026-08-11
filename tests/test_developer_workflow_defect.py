@@ -171,9 +171,25 @@ async def test_list_candidates_uses_only_open_defect_gateway_with_complete_scope
             "title": "Export crashes",
             "priority": "High",
             "status": "Doing",
+            "status_id": "doing",
             "updated_at": "2026-08-10T01:02:03Z",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_list_candidates_forwards_exact_status_ids_to_gateway() -> None:
+    gateway = FakeGateway([_defect("1" * 32, key="BUG-7", number="7")])
+    service = DefectCandidateService(gateway=gateway, issue_type_id="bug")
+
+    await service.list_candidates(
+        "project",
+        "sprint",
+        "alice",
+        status_ids=("CKA6U955", "WwhszYN8"),
+    )
+
+    assert gateway.calls[0]["status_ids"] == ("CKA6U955", "WwhszYN8")
 
 
 @pytest.mark.asyncio

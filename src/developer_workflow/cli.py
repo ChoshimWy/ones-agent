@@ -24,7 +24,12 @@ class OrchestratorFactory(Protocol):
 
 class DefectListClient(Protocol):
     async def list_candidates(
-        self, project: str, iteration: str, assignee: str
+        self,
+        project: str,
+        iteration: str,
+        assignee: str,
+        *,
+        status_ids: tuple[str, ...] | None = None,
     ) -> tuple[DefectCandidate, ...]: ...
 
     async def close(self) -> None: ...
@@ -92,6 +97,7 @@ def _parser(stdout: TextIO, stderr: TextIO) -> _SafeParser:
     defect_list.add_argument("--project", required=True)
     defect_list.add_argument("--iteration", required=True)
     defect_list.add_argument("--assignee", required=True)
+    defect_list.add_argument("--status")
     defect_list.add_argument("--format", choices=("table", "json"), default="table")
     defect_list.add_argument("--limit", type=int, default=5000)
     defect_list.add_argument("--page-size", type=int, default=200)
@@ -165,7 +171,7 @@ def _show_run(run: WorkflowRun, stdout: TextIO) -> None:
 
 def _show_candidates(candidates: Sequence[DefectCandidate], stdout: TextIO) -> None:
     for index, item in enumerate(candidates, start=1):
-        fields = (item.key, item.uuid, item.priority, item.status, item.title)
+        fields = (item.key, item.uuid, item.priority, item.status, item.title, item.status_id)
         _write(stdout, f"{index}. {' | '.join(_safe_value(value, maximum=512) for value in fields)}\n")
 
 
@@ -177,8 +183,22 @@ def _candidate_output(candidate: DefectCandidate) -> dict[str, str]:
         "title": candidate.title,
         "priority": candidate.priority,
         "status": candidate.status,
+        "status_id": candidate.status_id,
         "updated_at": candidate.updated_at,
     }
+
+
+def _parse_status_ids(value: str | None) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    parts = value.split(",")
+    if (
+        not 1 <= len(parts) <= 128
+        or len(parts) != len(set(parts))
+        or any(re.fullmatch(r"[A-Za-z0-9_-]{1,128}", part) is None for part in parts)
+    ):
+        raise ValueError("status ids are invalid")
+    return tuple(parts)
 
 
 async def _read_defect_list(
@@ -186,9 +206,16 @@ async def _read_defect_list(
     project: str,
     iteration: str,
     assignee: str,
+    status_ids: tuple[str, ...] | None,
 ) -> tuple[DefectCandidate, ...]:
     try:
-        return tuple(await client.list_candidates(project, iteration, assignee))
+        if status_ids is None:
+            result = await client.list_candidates(project, iteration, assignee)
+        else:
+            result = await client.list_candidates(
+                project, iteration, assignee, status_ids=status_ids
+            )
+        return tuple(result)
     finally:
         await client.close()
 
@@ -207,9 +234,16 @@ def _execute_defect_list(
     ):
         _write(stderr, "error: invalid pagination bounds\n")
         return 2
+    try:
+        status_ids = _parse_status_ids(args.status)
+    except ValueError:
+        _write(stderr, "error: invalid status ids\n")
+        return 2
     client = factory(args.limit, args.page_size)
     candidates = asyncio.run(
-        _read_defect_list(client, args.project, args.iteration, args.assignee)
+        _read_defect_list(
+            client, args.project, args.iteration, args.assignee, status_ids
+        )
     )
     if args.format == "json":
         payload = [_candidate_output(candidate) for candidate in candidates]
@@ -508,9 +542,16 @@ class _ProductionDefectListClient:
         self._candidates = candidates
 
     async def list_candidates(
-        self, project: str, iteration: str, assignee: str
+        self,
+        project: str,
+        iteration: str,
+        assignee: str,
+        *,
+        status_ids: tuple[str, ...] | None = None,
     ) -> tuple[DefectCandidate, ...]:
-        result = await self._candidates.list_candidates(project, iteration, assignee)
+        result = await self._candidates.list_candidates(
+            project, iteration, assignee, status_ids=status_ids
+        )
         return tuple(result)
 
     async def close(self) -> None:

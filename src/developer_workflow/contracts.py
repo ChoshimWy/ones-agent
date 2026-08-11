@@ -264,11 +264,21 @@ class DefectCandidate(WorkflowModel):
     status: str
     updated_at: str
     snapshot_token: str
+    status_id: str = ""
 
     @field_validator("uuid", "key", "number", "title", "priority", "status", "updated_at", "snapshot_token")
     @classmethod
     def validate_candidate_text(cls, value: str, info: Any) -> str:
         return _non_empty(value, info.field_name)
+
+    @field_validator("status_id")
+    @classmethod
+    def validate_status_id(cls, value: str) -> str:
+        if value == "":
+            return value
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value) is None:
+            raise ValueError("status_id is invalid")
+        return value
 
 
 

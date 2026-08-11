@@ -90,7 +90,7 @@ Git author 与 committer 使用同一组 `ONES_DEV_GIT_AUTHOR_NAME/EMAIL` 生成
 ```text
 ones-dev requirement <requirement-id> [--mapping <key>] [--config <path>]
 ones-dev defect --project <id> --iteration <id> --assignee <id> [--select <uuid>] [--mapping <key>] [--config <path>]
-ones-dev defects list --project <id> --iteration <id> --assignee <id> [--format table|json] [--limit <1..5000>] [--page-size <1..200>]
+ones-dev defects list --project <id> --iteration <id> --assignee <id> [--status <id>[,<id>...]] [--format table|json] [--limit <1..5000>] [--page-size <1..200>]
 ones-dev show <run-id> [--config <path>]
 ones-dev resume <run-id> [--config <path>]
 ones-dev revise <run-id> --feedback "..." [--scope implementation|repair] [--config <path>]
@@ -98,7 +98,17 @@ ones-dev approve <run-id> --actor <identity> [--config <path>]
 ones-dev cancel <run-id> --actor <identity> [--config <path>]
 ```
 
-`defects list` 是独立的只读查询，不创建 run 或 worktree，也不调用 Codex、Git、PR 和 ONES 评论接口。它只需要 `ONES_BASE_URL`、`ONES_TEAM_ID`、`ONES_ISSUE_TYPE_ID`、`ONES_EMAIL` 和 `ONES_PASSWORD`；默认输出开放缺陷表格，`--format json` 输出白名单字段 `uuid/key/number/title/priority/status/updated_at`。`limit` 最大 5000，`page-size` 最大 200 且不得大于 `limit`。若要选中缺陷并启动修复流程，仍使用单数命令 `defect`。
+`defects list` 是独立的只读查询，不创建 run 或 worktree，也不调用 Codex、Git、PR 和 ONES 评论接口。它只需要 `ONES_BASE_URL`、`ONES_TEAM_ID`、`ONES_ISSUE_TYPE_ID`、`ONES_EMAIL` 和 `ONES_PASSWORD`；默认输出开放缺陷表格，`--format json` 输出白名单字段 `uuid/key/number/title/priority/status/status_id/updated_at`。`limit` 最大 5000，`page-size` 最大 200 且不得大于 `limit`。若要选中缺陷并启动修复流程，仍使用单数命令 `defect`。
+
+`--status` 只接受 ONES 工作流状态 ID，多个 ID 以英文逗号分隔。CLI 不按状态名称匹配；Gateway 会先验证每个 ID 都属于当前项目和缺陷类型的开放状态，再把 ID 原样传入 GraphQL `status_in`。例如当前授权项目中的“待处理”和“修复中”：
+
+```powershell
+uv run ones-dev defects list `
+  --project XjJ3QvWeJyNQWgwu `
+  --iteration JkYR4hqe `
+  --assignee Q6kE8A2m `
+  --status CKA6U955,WwhszYN8
+```
 
 TTY 下，`requirement` 可交互确认唯一仓库映射，`defect` 用候选序号完成单选。非 TTY 下必须显式提供 `--mapping`，缺陷还必须提供当前快照中的 `--select` UUID；不允许根据名称或模糊匹配自动选择。`revise` 的 scope 固定为：需求 `implementation`、缺陷 `repair`。缺陷若需要推翻既有根因或复现证据，应新建运行，而不是扩大 revision scope。
 

@@ -39,3 +39,21 @@
 - [ ] Document the new command, its read-only behavior, required ONES variables, output modes, and distinction from `defect`.
 - [ ] Run CLI, candidate-service, gateway, and configuration regression tests.
 - [ ] Run `uv run ones-dev --help`, `uv lock --check --offline`, Python compilation, and `git diff --check`.
+
+### Task 4: Filter by verified ONES status IDs
+
+**Files:**
+- Modify: `src/developer_workflow/cli.py`
+- Modify: `src/developer_workflow/defect_flow.py`
+- Modify: `src/developer_workflow/contracts.py`
+- Modify: `src/services/ones_gateway.py`
+- Modify: `tests/test_developer_workflow_cli.py`
+- Modify: `tests/test_developer_workflow_defect.py`
+- Modify: `tests/test_ones_gateway.py`
+- Modify: `docs/ones_dev_cli.md`
+
+- [ ] Add failing CLI tests showing `--status CKA6U955,WwhszYN8` becomes the exact ordered ID tuple and malformed comma lists fail before client construction.
+- [ ] Add failing Gateway tests showing requested IDs must be configured open states and are passed unchanged to `status_in`.
+- [ ] Add `status_id` to candidate output while preserving compatibility with previously persisted candidates.
+- [ ] Implement strict comma parsing, candidate-service forwarding, and Gateway subset validation without name matching.
+- [ ] Run focused tests, the real authorized read-only command, adjacent regression tests, compilation, lock validation, and `git diff --check`.
