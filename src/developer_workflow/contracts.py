@@ -697,6 +697,24 @@ class RepositoryRunEvidence(WorkflowModel):
         return self
 
 
+class RepositoryChangeClaim(WorkflowModel):
+    repository_key: str
+    path: str
+
+    @field_validator("repository_key")
+    @classmethod
+    def validate_repository_key(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", value) or value in {".", ".."}:
+            raise ValueError("repository change key must be a safe repository key")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        RepositorySnapshot._validate_repository_path(value)
+        return value
+
+
 class AcceptanceCoverage(WorkflowModel):
     criterion_id: str
     criterion_text: str
@@ -737,6 +755,7 @@ class AcceptanceCoverage(WorkflowModel):
 class CodexResult(WorkflowModel):
     summary: str = ""
     changed_files: tuple[str, ...] = Field(default_factory=tuple)
+    repository_changes: tuple[RepositoryChangeClaim, ...] = Field(default_factory=tuple)
     commands: tuple[CommandResult, ...] = Field(default_factory=tuple)
     evidence: tuple[str, ...] = Field(default_factory=tuple)
     review_findings: tuple[str, ...] = Field(default_factory=tuple)
@@ -1160,6 +1179,7 @@ __all__ = [
     "PreparedWorktree",
     "RepositoryMapping",
     "RepositoryGroupMapping",
+    "RepositoryChangeClaim",
     "RepositoryRole",
     "RepositoryRunEvidence",
     "RepositorySnapshot",

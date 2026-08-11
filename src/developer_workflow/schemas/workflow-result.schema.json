@@ -26,6 +26,24 @@
         "pattern": "^(?!/)(?!.*//)(?!.*\\/$)(?!\\.git(?:/|$))(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*[:\\\\])[^\\u0000-\\u001f\\u007f]+$"
       }
     },
+    "repository_changes": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 10000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository_key", "path"],
+        "properties": {
+          "repository_key": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._-]+$",
+            "maxLength": 128
+          },
+          "path": {"$ref": "#/$defs/repositoryPath"}
+        }
+      }
+    },
     "commands": {
       "type": "array",
       "maxItems": 1000,

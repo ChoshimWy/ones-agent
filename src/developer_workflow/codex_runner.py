@@ -27,10 +27,14 @@ from .contracts import (
     CodexResult,
     CommandResult,
     PreparedWorktree,
+    RepositoryChangeClaim,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositorySnapshot,
     RootCauseEvidence,
 )
 from .repository import HeadChangedError, WorktreeRepository
+from .repository_group import PreparedRepository
 
 
 class CodexRunnerError(RuntimeError):
@@ -1091,6 +1095,82 @@ class CodexRunner:
         payload = self._validate_output(output, None)
         return self._result_from_payload(payload)
 
+    def run_group(
+        self,
+        group: RepositoryGroupMapping,
+        prepared: tuple[PreparedRepository, ...],
+        *,
+        run_id: str,
+        prompt: str,
+        timeout_seconds: float = 1800,
+        allow_changes: bool = True,
+    ) -> CodexResult:
+        expected_keys = group.topological_keys()
+        if tuple(item.repository_key for item in prepared) != expected_keys:
+            raise UnsafeCodexRunError("prepared repositories do not match group topology")
+        configured = {item.key: item for item in group.repositories}
+        if any(item.mapping != configured[item.repository_key] for item in prepared):
+            raise UnsafeCodexRunError("prepared repository mapping differs from group")
+        parents = {item.prepared.path.parent.resolve(strict=True) for item in prepared}
+        if len(parents) != 1:
+            raise UnsafeCodexRunError("prepared repositories do not share one workspace")
+        workspace = next(iter(parents))
+        for item in prepared:
+            self.repository.assert_head_unchanged(item.prepared)
+        try:
+            output, removed_secrets = self._invoke(
+                run_id=run_id,
+                prompt=prompt,
+                cwd=workspace,
+                sandbox="workspace-write" if allow_changes else "read-only",
+                timeout_seconds=timeout_seconds,
+            )
+        finally:
+            for item in prepared:
+                self.repository.assert_head_unchanged(item.prepared)
+
+        payload = self._validate_group_output(output, group)
+        before: dict[str, RepositorySnapshot] = {}
+        sensitive = False
+        for item in prepared:
+            snapshot = self.repository.snapshot(item.prepared, item.mapping)
+            if snapshot.head_commit != item.prepared.head_commit:
+                raise HeadChangedError("worktree HEAD changed")
+            before[item.repository_key] = snapshot
+            if _contains_secret(snapshot.model_dump(mode="json"), removed_secrets):
+                raise CodexOutputError("Codex returned invalid structured output")
+            sensitive = self.repository.contains_sensitive_content(
+                item.prepared, item.mapping, removed_secrets
+            ) or sensitive
+
+        after = {
+            item.repository_key: self.repository.snapshot(item.prepared, item.mapping)
+            for item in prepared
+        }
+        for item in prepared:
+            self.repository.assert_head_unchanged(item.prepared)
+        if any(
+            after[key].head_commit != next(
+                item.prepared.head_commit for item in prepared if item.repository_key == key
+            )
+            for key in after
+        ):
+            raise HeadChangedError("worktree HEAD changed")
+        if before != after or sensitive:
+            raise CodexOutputError("Codex returned invalid structured output")
+        actual = tuple(
+            (key, path)
+            for key in expected_keys
+            for path in after[key].changed_files
+        )
+        claimed = tuple(
+            (item["repository_key"], item["path"])
+            for item in payload.get("repository_changes", [])
+        )
+        if len(claimed) != len(actual) or set(claimed) != set(actual):
+            raise CodexOutputError("Codex returned invalid structured output")
+        return self._result_from_payload(payload)
+
     def _invoke(
         self,
         *,
@@ -1167,6 +1247,10 @@ class CodexRunner:
         )
         return CodexResult(
             summary=payload["summary"], changed_files=tuple(payload["changed_files"]),
+            repository_changes=tuple(
+                RepositoryChangeClaim.model_validate(item)
+                for item in payload.get("repository_changes", [])
+            ),
             commands=commands, evidence=tuple(payload["evidence"]),
             review_findings=tuple(payload["review_findings"]), risks=tuple(payload["risks"]),
             unresolved_items=tuple(payload["unresolved_items"]),
@@ -1263,13 +1347,9 @@ class CodexRunner:
         self, text: str, mapping: RepositoryMapping | None
     ) -> dict[str, Any]:
         try:
-            payload = json.loads(
-                text,
-                object_pairs_hook=_reject_duplicate_keys,
-                parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
-            )
-            schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
-            Draft202012Validator(schema).validate(payload)
+            payload = self._parse_output(text)
+            if payload.get("repository_changes"):
+                raise ValueError("single repository output cannot contain group claims")
             if mapping is None and (payload["changed_files"] or payload["commands"]):
                 raise ValueError("preflight cannot claim repository effects")
             for path in payload["changed_files"]:
@@ -1278,11 +1358,41 @@ class CodexRunner:
                     path, mapping.allowed_paths
                 ):
                     raise ValueError("unsafe changed path")
-            for command in payload["commands"]:
-                if _is_forbidden_command(command["command"]):
-                    raise ValueError("publication command is forbidden")
         except Exception as error:
             raise CodexOutputError("Codex returned invalid structured output") from error
+        return payload
+
+    def _validate_group_output(
+        self, text: str, group: RepositoryGroupMapping
+    ) -> dict[str, Any]:
+        try:
+            payload = self._parse_output(text)
+            if payload["changed_files"]:
+                raise ValueError("group output must use repository change claims")
+            mappings = {item.key: item for item in group.repositories}
+            claims = payload.get("repository_changes", [])
+            if not isinstance(claims, list):
+                raise ValueError("group claims must be a list")
+            for claim in claims:
+                parsed = RepositoryChangeClaim.model_validate(claim)
+                mapping = mappings.get(parsed.repository_key)
+                if mapping is None or not _path_allowed(parsed.path, mapping.allowed_paths):
+                    raise ValueError("unsafe repository change claim")
+        except Exception as error:
+            raise CodexOutputError("Codex returned invalid structured output") from error
+        return payload
+
+    def _parse_output(self, text: str) -> dict[str, Any]:
+        payload = json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
+        )
+        schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
+        Draft202012Validator(schema).validate(payload)
+        for command in payload["commands"]:
+            if _is_forbidden_command(command["command"]):
+                raise ValueError("publication command is forbidden")
         return payload
 
 

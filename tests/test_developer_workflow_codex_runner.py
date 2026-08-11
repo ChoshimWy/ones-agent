@@ -19,10 +19,14 @@ from src.developer_workflow.codex_runner import (
 )
 from src.developer_workflow.contracts import (
     PreparedWorktree,
+    RepositoryChangeClaim,
+    RepositoryGroupMapping,
     RepositoryMapping,
+    RepositoryRole,
     RepositorySnapshot,
 )
 from src.developer_workflow.repository import HeadChangedError
+from src.developer_workflow.repository_group import PreparedRepository
 
 
 OID = "a" * 40
@@ -66,21 +70,28 @@ class FakeRepository:
     def __init__(
         self, *, changed_files: tuple[str, ...] = ("src/app.py",),
         contains_sensitive_content: bool = False,
+        changed_by_mapping: dict[str, tuple[str, ...]] | None = None,
     ) -> None:
         self.head_checks = 0
         self.changed_files = changed_files
         self.sensitive_content = contains_sensitive_content
+        self.changed_by_mapping = changed_by_mapping
 
     def assert_head_unchanged(self, prepared: PreparedWorktree) -> None:
         self.head_checks += 1
 
     def snapshot(self, prepared: PreparedWorktree, mapping: RepositoryMapping) -> RepositorySnapshot:
+        changed_files = (
+            self.changed_files
+            if self.changed_by_mapping is None
+            else self.changed_by_mapping[mapping.key]
+        )
         return RepositorySnapshot(
             head_commit=OID,
-            diff_sha256="b" * 64,
-            changed_files=self.changed_files,
-            patch="diff" if self.changed_files else "",
-            is_clean=not self.changed_files,
+            diff_sha256="b" * 64 if changed_files else EMPTY_HASH,
+            changed_files=changed_files,
+            patch="diff" if changed_files else "",
+            is_clean=not changed_files,
         )
 
     def contains_sensitive_content(
@@ -120,6 +131,95 @@ def _runner(root: Path, executor: FakeExecutor, repository: FakeRepository | Non
         run_root=(root / "runs").resolve(), repository=repository or FakeRepository(),
         command_executor=executor,
     )
+
+
+def _prepared_group(root: Path) -> tuple[RepositoryGroupMapping, tuple[PreparedRepository, ...]]:
+    workspace = root / "workspace"
+    workspace.mkdir()
+    mappings = (
+        RepositoryMapping(
+            key="shared-sdk", project_id="project", iteration_id="iteration",
+            repo_url="https://example.invalid/shared-sdk.git", repo_name="shared-sdk",
+            role=RepositoryRole.DEPENDENCY, allowed_paths=("src",),
+        ),
+        RepositoryMapping(
+            key="desktop-app", project_id="project", iteration_id="iteration",
+            repo_url="https://example.invalid/desktop-app.git", repo_name="desktop-app",
+            role=RepositoryRole.PRIMARY, depends_on=("shared-sdk",),
+            allowed_paths=("src",),
+        ),
+    )
+    prepared: list[PreparedRepository] = []
+    for mapping in mappings:
+        worktree = workspace / mapping.key
+        mirror = root / f"{mapping.key}.git"
+        worktree.mkdir()
+        mirror.mkdir()
+        prepared.append(PreparedRepository(
+            repository_key=mapping.key,
+            mapping=mapping,
+            prepared=PreparedWorktree(
+                path=worktree.resolve(), branch=f"bugfix/DEF-1-{mapping.key}",
+                base_commit=OID, head_commit=OID, mirror_path=mirror.resolve(),
+            ),
+        ))
+    group = RepositoryGroupMapping(
+        key="desktop-suite", project_id="project", iteration_id="iteration",
+        primary_repository="desktop-app", repositories=mappings,
+    )
+    return group, tuple(prepared)
+
+
+def test_group_run_requires_exact_repository_qualified_claims(tmp_path: Path) -> None:
+    group, prepared = _prepared_group(tmp_path)
+    repository = FakeRepository(changed_by_mapping={
+        "shared-sdk": ("src/shortcut.py",),
+        "desktop-app": ("src/window.py",),
+    })
+    executor = FakeExecutor(json.dumps(_payload(
+        changed_files=[],
+        repository_changes=[
+            {"repository_key": "shared-sdk", "path": "src/shortcut.py"},
+            {"repository_key": "desktop-app", "path": "src/window.py"},
+        ],
+    )))
+
+    result = _runner(tmp_path, executor, repository).run_group(
+        group, prepared, run_id="group-run", prompt="fix across repositories"
+    )
+
+    assert result.repository_changes == (
+        RepositoryChangeClaim(repository_key="shared-sdk", path="src/shortcut.py"),
+        RepositoryChangeClaim(repository_key="desktop-app", path="src/window.py"),
+    )
+    assert executor.calls[0][1] == prepared[0].prepared.path.parent
+    assert repository.head_checks == 6
+
+
+def test_group_run_rejects_unknown_repository_and_claim_drift(tmp_path: Path) -> None:
+    group, prepared = _prepared_group(tmp_path)
+    repository = FakeRepository(changed_by_mapping={
+        "shared-sdk": ("src/shortcut.py",), "desktop-app": (),
+    })
+    unknown = FakeExecutor(json.dumps(_payload(
+        changed_files=[],
+        repository_changes=[{"repository_key": "other", "path": "src/x.py"}],
+    )))
+    with pytest.raises(CodexOutputError, match="invalid structured output"):
+        _runner(tmp_path / "unknown", unknown, repository).run_group(
+            group, prepared, run_id="unknown", prompt="fix"
+        )
+
+    drift = FakeExecutor(json.dumps(_payload(
+        changed_files=[],
+        repository_changes=[
+            {"repository_key": "shared-sdk", "path": "src/different.py"}
+        ],
+    )))
+    with pytest.raises(CodexOutputError, match="invalid structured output"):
+        _runner(tmp_path / "drift", drift, repository).run_group(
+            group, prepared, run_id="drift", prompt="fix"
+        )
 
 
 def test_run_uses_noninteractive_command_safe_environment_and_persisted_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
