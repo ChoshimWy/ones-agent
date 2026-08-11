@@ -1,5 +1,6 @@
 """Stable display-model API for the developer workflow terminal UI."""
 
+from .app import DeveloperWorkflowTuiApp
 from .controller import (
     CandidateSessionView,
     StaleTuiActionError,
@@ -32,6 +33,7 @@ from .supervisor import (
 __all__ = [
     "CandidateSessionView",
     "DangerousActionRequest",
+    "DeveloperWorkflowTuiApp",
     "DefectChoice",
     "HistoryView",
     "PublicationView",
