@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://aputure.local/schemas/workflow-result.schema.json",
+  "title": "Codex developer workflow result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "summary",
+    "changed_files",
+    "commands",
+    "evidence",
+    "review_findings",
+    "risks",
+    "unresolved_items"
+  ],
+  "properties": {
+    "summary": {"type": "string", "minLength": 1, "maxLength": 20000},
+    "changed_files": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 10000,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
+        "pattern": "^(?!/)(?!.*//)(?!.*\\/$)(?!\\.git(?:/|$))(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*[:\\\\])[^\\u0000-\\u001f\\u007f]+$"
+      }
+    },
+    "commands": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["command", "exit_code", "summary"],
+        "properties": {
+          "command": {"type": "string", "minLength": 1, "maxLength": 20000},
+          "exit_code": {"type": "integer"},
+          "summary": {"type": "string", "minLength": 1, "maxLength": 20000}
+        }
+      }
+    },
+    "evidence": {"$ref": "#/$defs/stringList"},
+    "review_findings": {"$ref": "#/$defs/stringList"},
+    "risks": {"$ref": "#/$defs/stringList"},
+    "unresolved_items": {"$ref": "#/$defs/stringList"},
+    "acceptance_coverage": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion_id", "criterion_text", "files", "tests"],
+        "properties": {
+          "criterion_id": {"type": "string", "pattern": "^AC-[1-9][0-9]*$"},
+          "criterion_text": {"type": "string", "minLength": 1, "maxLength": 20000},
+          "files": {
+            "type": "array", "minItems": 1, "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 4096,
+              "pattern": "^(?!/)(?!.*//)(?!.*\\/$)(?!\\.git(?:/|$))(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*[:\\\\])[^\\u0000-\\u001f\\u007f]+$"}
+          },
+          "tests": {
+            "type": "array", "minItems": 1, "uniqueItems": true,
+            "items": {"type": "string", "minLength": 1, "maxLength": 20000}
+          }
+        }
+      }
+    },
+    "unrelated_changes_checked": {"type": "boolean"}
+    ,
+    "root_cause_evidence": {
+      "type": "array",
+      "maxItems": 1000,
+      "items": {"$ref": "#/$defs/rootCauseEvidence"}
+    },
+    "investigation_suggestions": {"$ref": "#/$defs/stringList"},
+    "behavior_before": {"type": "string", "maxLength": 20000},
+    "behavior_after": {"type": "string", "maxLength": 20000},
+    "impact_scope": {
+      "type": "array",
+      "uniqueItems": true,
+      "maxItems": 10000,
+      "items": {"$ref": "#/$defs/repositoryPath"}
+    },
+    "risk_level": {"type": "string", "enum": ["", "low", "medium", "high"]}
+  },
+  "$defs": {
+    "repositoryPath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096,
+      "pattern": "^(?!/)(?!.*//)(?!.*\\/$)(?!\\.git(?:/|$))(?!.*(?:^|/)(?:\\.|\\.\\.)(?:/|$))(?!.*[:\\\\])[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "stringList": {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {"type": "string", "minLength": 1, "maxLength": 20000}
+    },
+    "rootCauseEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "file_path", "location", "start_line", "end_line", "symbol",
+        "mechanism", "code_excerpt", "call_chain", "reproduction_test", "test_selector",
+        "reproduction_command", "confidence", "insufficient_evidence",
+        "impacted_files", "fix_steps", "supporting_points"
+      ],
+      "properties": {
+        "file_path": {"$ref": "#/$defs/repositoryPath"},
+        "location": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "start_line": {"type": ["integer", "null"], "minimum": 1},
+        "end_line": {"type": ["integer", "null"], "minimum": 1},
+        "symbol": {"type": "string", "maxLength": 1000},
+        "mechanism": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "code_excerpt": {"type": "string", "maxLength": 20000},
+        "call_chain": {"$ref": "#/$defs/stringList"},
+        "reproduction_test": {"$ref": "#/$defs/repositoryPath"},
+        "test_selector": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^(?!-)(?!.*(?:^|/)\\.\\.(?:/|$))\\S+$"},
+        "reproduction_command": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "insufficient_evidence": {"type": "boolean"},
+        "impacted_files": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/repositoryPath"}},
+        "fix_steps": {"$ref": "#/$defs/stringList"},
+        "supporting_points": {
+          "type": "array", "minItems": 1,
+          "items": {"$ref": "#/$defs/rootCauseSupportingPoint"}
+        }
+      },
+      "allOf": [
+        {
+          "anyOf": [
+            {"properties": {"start_line": {"type": "integer"}, "end_line": {"type": "integer"}}},
+            {"properties": {"start_line": {"type": "null"}, "end_line": {"type": "null"}, "symbol": {"minLength": 1}}}
+          ]
+        },
+        {
+          "anyOf": [
+            {"properties": {"code_excerpt": {"minLength": 1}}},
+            {"properties": {"call_chain": {"minItems": 1}}},
+            {"properties": {"reproduction_test": {"minLength": 1}}}
+          ]
+        }
+      ]
+    },
+    "rootCauseSupportingPoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "description", "source", "file_path", "snippet", "start_line", "end_line", "direct_root_cause"],
+      "properties": {
+        "kind": {"enum": ["defect", "repo_resolution", "code", "cross_file"]},
+        "description": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "source": {"type": "string", "minLength": 1, "maxLength": 20000},
+        "file_path": {"type": "string", "maxLength": 4096},
+        "snippet": {"type": "string", "maxLength": 20000},
+        "start_line": {"type": ["integer", "null"], "minimum": 1},
+        "end_line": {"type": ["integer", "null"], "minimum": 1},
+        "direct_root_cause": {"type": "boolean"}
+      }
+    }
+  }
+}

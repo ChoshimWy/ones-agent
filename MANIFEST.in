@@ -1,0 +1,14 @@
+include README.md pyproject.toml server.py main.py
+recursive-include config *.py
+recursive-include src *.py *.json
+prune tests
+prune agent-gui
+prune data
+prune docs
+prune openspec
+prune build
+prune dist
+prune .agents
+prune .codex
+prune .git
+global-exclude .env .env.* *.py[cod] *.pem *.key

@@ -1,0 +1,40 @@
+{
+  "run_root": "../../data/developer-workflow/runs",
+  "worktree_root": "../../data/developer-workflow/worktrees",
+  "mirror_root": "../../data/developer-workflow/mirrors",
+  "sandbox_permission_profile": "REPLACE_WITH_MANAGED_WORKTREE_TEST_PROFILE",
+  "max_codex_attempts": 3,
+  "repositories": [
+    {
+      "key": "demo-exact",
+      "project_id": "project-demo",
+      "iteration_id": "iteration-demo",
+      "repo_url": "https://example.invalid/acme/demo-exact.git",
+      "repo_name": "demo-exact",
+      "base_branch": "main",
+      "test_commands": ["uv run pytest"],
+      "lint_commands": [],
+      "build_commands": [],
+      "allowed_paths": ["src", "tests"]
+    },
+    {
+      "key": "demo-default",
+      "project_id": "project-demo",
+      "iteration_id": "*",
+      "repo_url": "https://example.invalid/acme/demo-default.git",
+      "repo_name": "demo-default",
+      "base_branch": "main",
+      "test_commands": ["uv run pytest"],
+      "lint_commands": [],
+      "build_commands": [],
+      "allowed_paths": ["src", "tests"]
+    }
+  ],
+  "publishing": {
+    "provider": "local_fake",
+    "default_target_branch": "main",
+    "commit_template": "feat: {summary}",
+    "pr_title_template": "{summary}",
+    "pr_body_template": "## Summary\n\n{body}"
+  }
+}
