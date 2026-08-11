@@ -669,6 +669,12 @@ class OnesGateway:
         status = self._require_nested_mapping(defect, "status", context=f"defect payload {defect_id}")
         issue_type = self._require_nested_mapping(defect, "issueType", context=f"defect payload {defect_id}")
         priority = self._require_nested_mapping(defect, "priority", context=f"defect payload {defect_id}")
+        updated_at_raw = defect.get("serverUpdateStamp", "")
+        updated_at = (
+            self._normalize_timestamp(updated_at_raw, context="defect updated_at")
+            if updated_at_raw not in (None, "")
+            else ""
+        )
 
         return DefectRecord(
             defect_id=defect_id,
@@ -699,7 +705,7 @@ class OnesGateway:
             description=defect.get("description", ""),
             deadline=defect.get("deadline", ""),
             created_at=defect.get("createTime", ""),
-            updated_at=defect.get("serverUpdateStamp", ""),
+            updated_at=updated_at,
             source="ones",
             raw=defect,
         )
@@ -984,28 +990,37 @@ class OnesGateway:
 
     @staticmethod
     def _normalize_wiki_timestamp(value: object) -> str:
+        return OnesGateway._normalize_timestamp(value, context="Wiki updated_at")
+
+    @staticmethod
+    def _normalize_timestamp(value: object, *, context: str) -> str:
         lower = datetime(2000, 1, 1, tzinfo=UTC)
         upper = datetime(3000, 1, 1, tzinfo=UTC)
         parsed: datetime
         if type(value) is int:
-            seconds = value / 1000 if value >= 100_000_000_000 else value
+            if value >= 100_000_000_000_000:
+                seconds = value / 1_000_000
+            elif value >= 100_000_000_000:
+                seconds = value / 1_000
+            else:
+                seconds = value
             try:
                 parsed = datetime.fromtimestamp(seconds, tz=UTC)
             except (OverflowError, OSError, ValueError):
-                raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at") from None
+                raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}") from None
         elif type(value) is str and value and value == value.strip():
             candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
             try:
                 parsed = datetime.fromisoformat(candidate)
             except ValueError:
-                raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at") from None
+                raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}") from None
             if parsed.tzinfo is None or parsed.utcoffset() is None:
-                raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at")
+                raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}")
             parsed = parsed.astimezone(UTC)
         else:
-            raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at")
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}")
         if parsed < lower or parsed >= upper:
-            raise OnesGatewayPayloadError("Malformed ONES payload for Wiki updated_at")
+            raise OnesGatewayPayloadError(f"Malformed ONES payload for {context}")
         return parsed.isoformat().replace("+00:00", "Z")
 
     @staticmethod

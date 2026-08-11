@@ -521,6 +521,24 @@ class TestOnesGatewayAsync(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(OnesGatewayPayloadError):
             gateway.normalize_defect({"uuid": "bug-1", "name": "Broken payload"})
 
+    async def test_normalize_defect_canonicalizes_real_microsecond_update_stamp(self):
+        gateway = OnesGateway()
+
+        defect = gateway.normalize_defect(
+            {
+                "uuid": "bug-1",
+                "name": "Broken export",
+                "number": 7,
+                "project": {"uuid": "proj-1", "name": "Project"},
+                "status": {"uuid": "status-1", "name": "Doing", "category": "in_progress"},
+                "issueType": {"uuid": "defect-type", "name": "Defect"},
+                "priority": {"uuid": "priority-1", "value": "High", "position": 1},
+                "serverUpdateStamp": 1786351001326130,
+            }
+        )
+
+        self.assertEqual(defect.updated_at, "2026-08-10T08:36:41.326130Z")
+
 
 class TestOnesGatewaySync(unittest.TestCase):
     def test_list_defects_sync_maps_sync_pagination_failure_to_safe_payload_error(self):
