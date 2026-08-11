@@ -166,7 +166,14 @@ async def test_mouse_selects_run_and_opens_settings() -> None:
     app = app_factory()
     async with app.run_test(size=(120, 32)) as pilot:
         await pilot.click("#run-item-1")
-        assert app.controller.shown[-1] == "run-2"  # type: ignore[attr-defined]
+        controller = app.controller
+        async with asyncio.timeout(2):
+            while not (
+                controller.shown  # type: ignore[attr-defined]
+                and controller.shown[-1] == "run-2"  # type: ignore[attr-defined]
+                and "BUG-2" in _plain(app.screen.query_one("#overview-content"))
+            ):
+                await asyncio.sleep(0)
         await pilot.click("#nav-settings")
         assert app.screen.query_one("#settings").display
 
