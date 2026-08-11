@@ -87,10 +87,10 @@ class RunListPane(Vertical):
         yield Label("Runs", classes="pane-title")
         yield ListView(id="run-list")
 
-    def replace_runs(self, runs: tuple[RunSummary, ...]) -> None:
+    async def replace_runs(self, runs: tuple[RunSummary, ...]) -> None:
         run_list = self.query_one("#run-list", ListView)
-        run_list.clear()
-        run_list.extend(
+        await run_list.clear()
+        await run_list.extend(
             [
                 ListItem(
                     Label(
@@ -189,6 +189,18 @@ class RunDetailPane(Vertical):
             or "No history"
         )
 
+    def clear_detail(self) -> None:
+        self.query_one("#overview-content", Static).update("No run selected")
+        self.query_one("#repositories-content", Static).update(
+            "No repository evidence"
+        )
+        self.query_one("#tests-content", Static).update("No test evidence")
+        self.query_one("#review-content", Static).update("No review evidence")
+        self.query_one("#publication-content", Static).update(
+            "No publication evidence"
+        )
+        self.query_one("#history-content", Static).update("No history")
+
     def next_tab(self) -> None:
         tabs = self.query_one("#detail-tabs", TabbedContent)
         index = _DETAIL_TABS.index(tabs.active)
@@ -285,9 +297,9 @@ class DashboardScreen(Screen[None]):
                 markup=False,
             )
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self._set_mode(self.size.width)
-        self.refresh_runs()
+        await self.refresh_runs()
 
     def on_resize(self, event: events.Resize) -> None:
         self._set_mode(event.size.width)
@@ -298,11 +310,30 @@ class DashboardScreen(Screen[None]):
         mode = "three" if width >= 100 else "two" if width >= 70 else "one"
         dashboard.add_class(mode)
 
-    def refresh_runs(self) -> None:
-        self._runs = self._controller.list_runs(RunFilter())
-        self.query_one(RunListPane).replace_runs(self._runs)
-        if self._runs:
-            self._show_detail(0)
+    async def refresh_runs(self) -> None:
+        selected_index = self._selected_index()
+        selected_run_id = (
+            self._runs[selected_index].run_id
+            if selected_index is not None
+            and 0 <= selected_index < len(self._runs)
+            else None
+        )
+        runs = self._controller.list_runs(RunFilter())
+        await self.query_one(RunListPane).replace_runs(runs)
+        self._runs = runs
+        if not runs:
+            self.query_one(RunDetailPane).clear_detail()
+            return
+        target = next(
+            (
+                index
+                for index, item in enumerate(runs)
+                if item.run_id == selected_run_id
+            ),
+            0,
+        )
+        self.query_one("#run-list", ListView).index = target
+        self._show_detail(target)
 
     def _selected_index(self) -> int | None:
         return self.query_one("#run-list", ListView).index

@@ -18,7 +18,7 @@ from src.developer_workflow.tui.models import (
     RunSummary,
     TestView as TuiTestView,
 )
-from src.developer_workflow.tui.screens import SettingsView
+from src.developer_workflow.tui.screens import DashboardScreen, SettingsView
 
 
 NOW = datetime(2026, 8, 11, 9, 0, tzinfo=UTC)
@@ -233,3 +233,32 @@ async def test_detail_tabs_render_complete_safe_evidence() -> None:
         assert "primary" in publication
         assert "comment delivered" in publication
         assert "TESTING -> AI_REVIEW" in history
+
+
+@pytest.mark.asyncio
+async def test_refresh_replaces_list_atomically_and_preserves_selected_run() -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)) as pilot:
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        await pilot.press("j", "enter")
+        assert app.controller.shown[-1] == "run-2"  # type: ignore[attr-defined]
+
+        app.controller.runs = (_summary(2), _summary(3))  # type: ignore[attr-defined]
+        await screen.refresh_runs()
+        assert screen.query_one("#run-list").index == 0
+        assert app.controller.shown[-1] == "run-2"  # type: ignore[attr-defined]
+        assert len(screen.query("#run-list ListItem")) == 2
+
+        app.controller.runs = (_summary(3),)  # type: ignore[attr-defined]
+        await screen.refresh_runs()
+        assert screen.query_one("#run-list").index == 0
+        assert app.controller.shown[-1] == "run-3"  # type: ignore[attr-defined]
+        assert len(screen.query("#run-list ListItem")) == 1
+
+        app.controller.runs = ()  # type: ignore[attr-defined]
+        await screen.refresh_runs()
+        assert screen.query_one("#run-list").index is None
+        assert len(screen.query("#run-list ListItem")) == 0
+        overview = screen.query_one("#overview-content")
+        assert str(overview.renderable) == "No run selected"
