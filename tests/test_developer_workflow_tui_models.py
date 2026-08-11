@@ -128,6 +128,7 @@ def _dirty_snapshot(head: str, path: str) -> RepositorySnapshot:
 def _publication(
     *,
     fingerprint: str,
+    parent: str,
     tree: str,
     commit: str,
     pr_url: str,
@@ -138,7 +139,7 @@ def _publication(
         repo_url="https://git.example.invalid/team/repo.git",
         provider="github",
         provider_host="git.example.invalid",
-        expected_parent="1" * 40,
+        expected_parent=parent,
         expected_tree=tree,
         commit_message="feat: safe change",
         commit_hash=commit,
@@ -168,9 +169,9 @@ def _single_run(tmp_path: Path) -> WorkflowRun:
         base_branch="main",
         base_commit=base,
         head_commit=head,
-        diff_hash="b" * 64,
+        diff_hash="d" * 64,
         diff_summary="1 file changed",
-        branch="codex/safe-change",
+        branch="codex/repo-change",
         changed_files=("src/app.py",),
         tests=(_test(),),
         review=(f"{SENTINEL} raw AI review",),
@@ -194,12 +195,14 @@ def _single_run(tmp_path: Path) -> WorkflowRun:
         tested_snapshot=_dirty_snapshot(head, "src/app.py"),
         base_commit=base,
         head_commit=head,
+        branch="codex/repo-change",
         changed_files=("src/app.py",),
         test_results=(_test(),),
         review={"summary": f"{SENTINEL} Codex review summary"},
         approval=approval,
         publication=_publication(
             fingerprint=fingerprint,
+            parent=head,
             tree=tree,
             commit="4" * 40,
             pr_url="https://git.example.invalid/team/repo/pull/7?token=SECRET#fragment",
@@ -313,7 +316,7 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
             mapping=item,
             base_commit=bases[item.key],
             head_commit=heads[item.key],
-            diff_hash="5" * 64,
+            diff_hash="d" * 64,
             diff_summary="1 file changed",
             branch=f"codex/{item.key}-change",
             changed_files=(paths[item.key],),
@@ -342,6 +345,7 @@ def _multi_run(tmp_path: Path) -> WorkflowRun:
         _publication(
             repository_key=key,
             fingerprint=fingerprint,
+            parent=heads[key],
             tree=("6" if key == "sdk" else "7") * 40,
             commit=("9" if key == "sdk" else "a") * 40,
             pr_url=f"https://git.example.invalid/team/{key}/pull/{1 if key == 'sdk' else 2}",
@@ -434,17 +438,31 @@ def test_single_repository_uses_validated_snapshot_paths_not_unvalidated_run_pat
         changed_files=(f"C:/Users/alice/{SENTINEL}/source.py",)
     )
 
-    detail = RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError) as raised:
+        RunDetail.from_run(run)
 
-    assert detail.repositories[0].changed_files == ("src/app.py",)
-    assert SENTINEL not in _all_strings(detail)
+    assert str(raised.value) == "workflow display facts are invalid"
+    assert SENTINEL not in str(raised.value)
 
 
 def test_test_view_never_displays_environment_or_credential_bearing_command(
     tmp_path: Path,
 ) -> None:
     result = _test(f"API_TOKEN={SENTINEL} uv run pytest tests/private.py")
-    run = _single_run(tmp_path).validated_update(test_results=(result,))
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    approval = run.approval.validated_update(
+        tests=(result,), fingerprint="", approved_by=None, approved_at=None
+    )
+    approval = approval.validated_update(
+        fingerprint=approval_fingerprint(approval), approved_by="alice", approved_at=NOW
+    )
+    publication = run.publication.validated_update(
+        approved_fingerprint=approval.fingerprint
+    )
+    run = run.validated_update(
+        test_results=(result,), approval=approval, publication=publication
+    )
 
     detail = RunDetail.from_run(run)
 
@@ -510,11 +528,159 @@ def test_forged_group_approval_fingerprint_cannot_authorize_publication_facts(
         ),
     )
 
-    detail = RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
 
-    assert all(repository.tree_hash == "" for repository in detail.repositories)
-    assert all(repository.commit_hash == "" for repository in detail.repositories)
-    assert all(repository.pr_url == "" for repository in detail.repositories)
+
+@pytest.mark.parametrize("fact", ["mapping", "base", "head", "files", "tests"])
+def test_signed_group_approval_rejects_mismatched_repository_evidence(
+    tmp_path: Path, fact: str
+) -> None:
+    run = _multi_run(tmp_path)
+    evidence = run.repository_evidence[0]
+    updates: dict[str, object] = {}
+    if fact == "mapping":
+        updates["mapping"] = evidence.mapping.validated_update(
+            repo_url="https://git.example.invalid/other/sdk.git"
+        )
+    elif fact == "base":
+        updates["prepared_worktree"] = evidence.prepared_worktree.validated_update(
+            base_commit="e" * 40
+        )
+    elif fact == "head":
+        updates["prepared_worktree"] = evidence.prepared_worktree.validated_update(
+            head_commit="e" * 40
+        )
+        assert evidence.tested_snapshot is not None
+        updates["tested_snapshot"] = evidence.tested_snapshot.validated_update(
+            head_commit="e" * 40
+        )
+    elif fact == "files":
+        updates["changed_files"] = ("src/other.py",)
+        assert evidence.tested_snapshot is not None
+        updates["tested_snapshot"] = evidence.tested_snapshot.validated_update(
+            changed_files=("src/other.py",)
+        )
+    else:
+        updates["test_results"] = (
+            evidence.test_results[0].validated_update(
+                exit_code=1, outcome=CommandOutcome.TEST_FAILED
+            ),
+        )
+    changed = evidence.validated_update(**updates)
+    if fact == "mapping":
+        run = run.model_construct(
+            **{**run.__dict__, "repository_evidence": (changed, *run.repository_evidence[1:])}
+        )
+    else:
+        run = run.validated_update(
+            repository_evidence=(changed, *run.repository_evidence[1:])
+        )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+def test_signed_single_approval_rejects_mismatched_snapshot_and_tests(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    assert run.tested_snapshot is not None
+    changed_snapshot = run.tested_snapshot.validated_update(
+        changed_files=("src/other.py",)
+    )
+    changed_test = run.test_results[0].validated_update(
+        exit_code=1, outcome=CommandOutcome.TEST_FAILED
+    )
+    run = run.validated_update(
+        tested_snapshot=changed_snapshot,
+        changed_files=changed_snapshot.changed_files,
+        test_results=(changed_test,),
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(run, action="approve")
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repo_url", "https://git.example.invalid/other/repo.git"),
+        ("base_branch", "release"),
+    ],
+)
+def test_signed_single_approval_binds_top_level_repository_identity(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    approval = run.approval.validated_update(
+        **{
+            field: value,
+            "fingerprint": "",
+            "approved_by": None,
+            "approved_at": None,
+        }
+    )
+    approval = approval.validated_update(
+        fingerprint=approval_fingerprint(approval), approved_by="alice", approved_at=NOW
+    )
+    publication = run.publication.validated_update(
+        approved_fingerprint=approval.fingerprint
+    )
+    run = run.validated_update(approval=approval, publication=publication)
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+
+
+def test_group_publication_tree_must_match_signed_repository_tree(tmp_path: Path) -> None:
+    run = _multi_run(tmp_path)
+    assert run.group_publication is not None
+    publications = list(run.group_publication.repositories)
+    publications[0] = publications[0].validated_update(expected_tree="f" * 40)
+    run = run.validated_update(
+        group_publication=run.group_publication.validated_update(
+            repositories=tuple(publications)
+        )
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
+
+
+@pytest.mark.parametrize("shape", ["empty", "partial", "wrong-key"])
+def test_group_publication_requires_complete_changed_repository_key_set(
+    tmp_path: Path, shape: str
+) -> None:
+    run = _multi_run(tmp_path)
+    assert run.group_publication is not None
+    publications = run.group_publication.repositories
+    if shape == "empty":
+        group_publication = run.group_publication.validated_update(repositories=())
+        run = run.validated_update(group_publication=group_publication)
+    elif shape == "partial":
+        group_publication = run.group_publication.validated_update(
+            repositories=publications[:1]
+        )
+        run = run.validated_update(group_publication=group_publication)
+    else:
+        wrong = publications[0].model_construct(
+            **{**publications[0].__dict__, "repository_key": "wrong"}
+        )
+        group_publication = run.group_publication.model_construct(
+            **{**run.group_publication.__dict__, "repositories": (wrong, publications[1])}
+        )
+        run = run.model_construct(
+            **{**run.__dict__, "group_publication": group_publication}
+        )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        RunDetail.from_run(run)
 
 
 def test_defect_choice_omits_snapshot_token() -> None:
@@ -593,6 +759,40 @@ def test_dangerous_action_request_captures_unsigned_package_fingerprint(
     request = DangerousActionRequest.from_run(run, action="approve")
 
     assert request.fingerprint == run.approval.fingerprint
+
+
+def test_unsigned_package_allows_approve_but_rejects_resume_publication(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    assert run.approval is not None
+    unsigned = run.approval.validated_update(
+        fingerprint="", approved_by=None, approved_at=None
+    )
+    run = run.validated_update(approval=unsigned, publication=PublicationResult())
+
+    request = DangerousActionRequest.from_run(run, action="approve")
+
+    assert request.action == "approve"
+    assert request.fingerprint == ""
+    with pytest.raises(TuiDisplayError, match="^workflow action is unavailable$"):
+        DangerousActionRequest.from_run(run, action="resume-publication")
+
+
+def test_canonical_but_forged_fingerprint_rejects_request_and_stale_check(
+    tmp_path: Path,
+) -> None:
+    run = _single_run(tmp_path)
+    original = DangerousActionRequest.from_run(run, action="approve")
+    assert run.approval is not None
+    forged = run.validated_update(
+        approval=run.approval.validated_update(fingerprint="f" * 64)
+    )
+
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        DangerousActionRequest.from_run(forged, action="approve")
+    with pytest.raises(TuiDisplayError, match="^workflow display facts are invalid$"):
+        original.assert_current(forged)
 
 
 @pytest.mark.parametrize("action", ["delete", "approve\nforged", "", "APPROVE"])

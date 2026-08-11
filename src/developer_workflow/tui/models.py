@@ -13,6 +13,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from ..approval import approval_fingerprint
 from ..contracts import (
+    ApprovalPackage,
     CommandResult,
     DefectCandidate,
     PublicationResult,
@@ -28,6 +29,7 @@ _INVALID_DISPLAY = "display value is invalid"
 _INVALID_PR_URL = "PR URL is invalid"
 _PUBLICATION_FAILED = "publication failed safely"
 _BLOCKED = "workflow blocked safely"
+_INVALID_FACTS = "workflow display facts are invalid"
 _ACTIONS = {"approve", "revise", "cancel", "resume-publication"}
 
 
@@ -228,6 +230,9 @@ class DangerousActionRequest:
             raise TuiDisplayError("workflow action is invalid")
         if expected_version is not None and expected_version != run.version:
             raise TuiDisplayError("workflow action is stale")
+        _, signed = _approval_status(run.approval)
+        if action == "resume-publication" and not signed:
+            raise TuiDisplayError("workflow action is unavailable")
         detail = run_detail_from_run(run)
         return cls(
             run_id=detail.summary.run_id,
@@ -254,14 +259,12 @@ class DangerousActionRequest:
 
 def run_detail_from_run(run: WorkflowRun) -> RunDetail:
     approval = run.approval
-    fingerprint = _safe_fingerprint(approval.fingerprint) if approval else ""
-    signed = bool(
-        approval
-        and fingerprint
-        and approval.approved_by
-        and approval.approved_at
-        and hmac.compare_digest(fingerprint, approval_fingerprint(approval))
-    )
+    fingerprint, signed = _approval_status(approval)
+    if signed and approval is not None:
+        if run.repository_group is not None:
+            _validate_signed_group_facts(run, approval)
+        else:
+            _validate_signed_single_facts(run, approval)
     repositories: tuple[RepositoryView, ...]
     tests: tuple[TestView, ...]
     if run.repository_group is not None:
@@ -465,6 +468,126 @@ def _safe_fingerprint(value: str) -> str:
     if checked and re.fullmatch(r"[0-9a-f]{64}", checked) is None:
         raise TuiDisplayError(_INVALID_DISPLAY)
     return checked
+
+
+def _approval_status(approval: ApprovalPackage | None) -> tuple[str, bool]:
+    if approval is None:
+        return "", False
+    fingerprint = _safe_fingerprint(approval.fingerprint)
+    if fingerprint:
+        try:
+            actual = approval_fingerprint(approval)
+        except Exception:
+            raise TuiDisplayError(_INVALID_FACTS) from None
+        if not hmac.compare_digest(fingerprint, actual):
+            raise TuiDisplayError(_INVALID_FACTS)
+    signed = bool(fingerprint and approval.approved_by and approval.approved_at)
+    return fingerprint, signed
+
+
+def _validate_signed_single_facts(
+    run: WorkflowRun, approval: ApprovalPackage
+) -> None:
+    mapping = run.repository
+    prepared = run.prepared_worktree
+    snapshot = run.tested_snapshot
+    if (
+        mapping is None
+        or prepared is None
+        or snapshot is None
+        or approval.repository != mapping
+        or approval.repo_url != mapping.repo_url
+        or approval.base_branch != mapping.base_branch
+        or approval.base_commit != prepared.base_commit
+        or approval.base_commit != run.base_commit
+        or approval.head_commit != prepared.head_commit
+        or approval.head_commit != snapshot.head_commit
+        or approval.head_commit != run.head_commit
+        or approval.diff_hash != snapshot.diff_sha256
+        or approval.branch != prepared.branch
+        or approval.branch != run.branch
+        or approval.changed_files != snapshot.changed_files
+        or approval.changed_files != run.changed_files
+        or not _approved_tail_matches(run.test_results, approval.tests)
+    ):
+        raise TuiDisplayError(_INVALID_FACTS)
+    publication = run.publication
+    if publication.approved_fingerprint and (
+        publication.approved_fingerprint != approval.fingerprint
+        or publication.expected_parent != approval.head_commit
+    ):
+        raise TuiDisplayError(_INVALID_FACTS)
+
+
+def _validate_signed_group_facts(
+    run: WorkflowRun, approval: ApprovalPackage
+) -> None:
+    group = run.repository_group
+    if group is None or approval.repository_group != group:
+        raise TuiDisplayError(_INVALID_FACTS)
+    keys = group.topological_keys()
+    if (
+        tuple(item.repository_key for item in run.repository_evidence) != keys
+        or tuple(item.repository_key for item in approval.repositories) != keys
+        or approval.integration_tests != run.integration_test_results
+    ):
+        raise TuiDisplayError(_INVALID_FACTS)
+    approved_by_key = {
+        item.repository_key: item for item in approval.repositories
+    }
+    for evidence in run.repository_evidence:
+        approved = approved_by_key.get(evidence.repository_key)
+        snapshot = evidence.tested_snapshot
+        if (
+            approved is None
+            or snapshot is None
+            or approved.repository_key != evidence.repository_key
+            or approved.mapping != evidence.mapping
+            or approved.base_commit != evidence.prepared_worktree.base_commit
+            or approved.head_commit != evidence.prepared_worktree.head_commit
+            or approved.head_commit != snapshot.head_commit
+            or approved.diff_hash != snapshot.diff_sha256
+            or approved.branch != evidence.prepared_worktree.branch
+            or approved.changed_files != evidence.changed_files
+            or approved.changed_files != snapshot.changed_files
+            or approved.tests != evidence.test_results
+        ):
+            raise TuiDisplayError(_INVALID_FACTS)
+    publication = run.group_publication
+    if publication is None:
+        return
+    changed = tuple(
+        item for item in approval.repositories if item.changed_files
+    )
+    expected_keys = tuple(item.repository_key for item in changed)
+    actual_keys = tuple(
+        item.repository_key for item in publication.repositories
+    )
+    if (
+        not expected_keys
+        or publication.order != keys
+        or len(actual_keys) != len(set(actual_keys))
+        or set(actual_keys) != set(expected_keys)
+    ):
+        raise TuiDisplayError(_INVALID_FACTS)
+    changed_by_key = {item.repository_key: item for item in changed}
+    for item in publication.repositories:
+        approved = changed_by_key.get(item.repository_key)
+        if (
+            approved is None
+            or item.approved_fingerprint != approval.fingerprint
+            or item.expected_parent != approved.head_commit
+            or item.expected_tree != approved.tree_hash
+        ):
+            raise TuiDisplayError(_INVALID_FACTS)
+
+
+def _approved_tail_matches(
+    results: tuple[CommandResult, ...], approved: tuple[CommandResult, ...]
+) -> bool:
+    if not approved:
+        return not results
+    return len(results) >= len(approved) and results[-len(approved):] == approved
 
 
 def _safe_pr_url(value: str) -> str:
