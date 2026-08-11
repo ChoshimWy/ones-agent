@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import sys
 import threading
 import time
 from dataclasses import FrozenInstanceError
@@ -373,12 +375,116 @@ def test_max_concurrency_requires_exact_int_in_range(value: object) -> None:
         RunTaskSupervisor(value)  # type: ignore[arg-type]
 
 
-def test_constructor_requires_a_running_loop() -> None:
-    with pytest.raises(
-        SupervisorLoopError,
-        match="^workflow task supervisor requires its running event loop$",
-    ):
-        RunTaskSupervisor(1)
+def test_sync_constructor_binds_on_first_use_inside_running_loop() -> None:
+    supervisor = RunTaskSupervisor(1)
+
+    async def use_supervisor() -> None:
+        assert await supervisor.run_mutation("run-a", "resume", lambda: 1) == 1
+        await supervisor.close()
+
+    asyncio.run(use_supervisor())
+    assert supervisor.closed
+
+
+def test_sync_constructor_can_bind_by_closing_inside_running_loop() -> None:
+    supervisor = RunTaskSupervisor(1)
+    asyncio.run(supervisor.close())
+    assert supervisor.closed
+
+
+def test_bound_supervisor_rejects_a_different_running_loop() -> None:
+    supervisor = RunTaskSupervisor(1)
+
+    async def bind_owner() -> None:
+        assert await supervisor.run_mutation("run-a", "resume", lambda: 1) == 1
+
+    asyncio.run(bind_owner())
+
+    async def use_other_loop() -> None:
+        with pytest.raises(
+            SupervisorLoopError,
+            match="^workflow task supervisor requires its running event loop$",
+        ):
+            supervisor.submit("run-b", "resume", lambda: 2)
+
+    asyncio.run(use_other_loop())
+
+
+def test_invalid_first_run_mutation_still_binds_owner_loop() -> None:
+    supervisor = RunTaskSupervisor(1)
+
+    async def bind_with_invalid_call() -> None:
+        with pytest.raises(TypeError, match="^workflow task call is invalid$"):
+            await supervisor.run_mutation(  # type: ignore[arg-type]
+                "run-a", "resume", None
+            )
+
+    asyncio.run(bind_with_invalid_call())
+
+    async def use_other_loop() -> None:
+        with pytest.raises(
+            SupervisorLoopError,
+            match="^workflow task supervisor requires its running event loop$",
+        ):
+            supervisor.submit("run-b", "resume", lambda: 2)
+
+    asyncio.run(use_other_loop())
+
+
+def test_simultaneous_first_use_accepts_exactly_one_owner_loop() -> None:
+    supervisor = RunTaskSupervisor(1)
+    paused_before_assignment = threading.Event()
+    release_assignment = threading.Event()
+    accepted: list[str] = []
+    errors: list[BaseException] = []
+    source, first_line = inspect.getsourcelines(RunTaskSupervisor._require_loop)
+    assignment_line = next(
+        first_line + offset
+        for offset, line in enumerate(source)
+        if "self._loop = loop" in line
+    )
+
+    def trace_first(frame, event, arg):  # type: ignore[no-untyped-def]
+        del arg
+        if (
+            frame.f_code is RunTaskSupervisor._require_loop.__code__
+            and event == "line"
+            and frame.f_lineno == assignment_line
+        ):
+            paused_before_assignment.set()
+            assert release_assignment.wait(2)
+        return trace_first
+
+    async def bind(name: str) -> None:
+        try:
+            supervisor._require_loop()
+        except BaseException as error:
+            errors.append(error)
+        else:
+            accepted.append(name)
+
+    def run_first() -> None:
+        sys.settrace(trace_first)
+        try:
+            asyncio.run(bind("first"))
+        finally:
+            sys.settrace(None)
+
+    first = threading.Thread(target=run_first)
+    second = threading.Thread(target=lambda: asyncio.run(bind("second")))
+    first.start()
+    assert paused_before_assignment.wait(2)
+    second.start()
+    second.join(0.2)
+    release_assignment.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert len(accepted) == 1
+    assert len(errors) == 1
+    assert type(errors[0]) is SupervisorLoopError
 
 
 @pytest.mark.asyncio

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from threading import Lock
 from typing import Callable, TypeVar, cast
 
 from .models import RunActivity, TuiDisplayError, safe_tui_text
@@ -107,10 +108,8 @@ class RunTaskSupervisor:
     ) -> None:
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 8:
             raise ValueError("max_concurrency must be between 1 and 8")
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            raise SupervisorLoopError(_WRONG_LOOP) from None
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._loop_binding_lock = Lock()
         if not callable(sink):
             raise TypeError("workflow task sink is invalid")
         self._semaphore = asyncio.Semaphore(max_concurrency)
@@ -137,7 +136,7 @@ class RunTaskSupervisor:
     ) -> asyncio.Task[T]:
         """Queue synchronous mutation work on the owning event loop."""
 
-        self._require_loop()
+        loop = self._require_loop()
         if self._closed:
             raise SupervisorClosedError(_CLOSED)
         safe_run_id = safe_tui_text(run_id, maximum=64)
@@ -152,7 +151,7 @@ class RunTaskSupervisor:
         gate.references += 1
         state = _TaskState(run_id=safe_run_id, action=safe_action)
         self._emit(TaskEvent.queued(safe_run_id, safe_action))
-        task = self._loop.create_task(
+        task = loop.create_task(
             self._execute_mutation(gate, state, call),
             name=f"tui-workflow-{safe_action}",
         )
@@ -168,6 +167,7 @@ class RunTaskSupervisor:
     ) -> T:
         """Submit a synchronous mutation and await its original result."""
 
+        self._require_loop()
         if not callable(call):
             raise TypeError(_INVALID_CALL)
         return await self.submit(run_id, action, lambda: call(*args))
@@ -177,7 +177,7 @@ class RunTaskSupervisor:
     ) -> T:
         """Run synchronous read-only work without acquiring a per-run lock."""
 
-        self._require_loop()
+        loop = self._require_loop()
         if self._closed:
             raise SupervisorClosedError(_CLOSED)
         safe_action = safe_tui_text(action, maximum=64)
@@ -186,7 +186,7 @@ class RunTaskSupervisor:
         self._readonly_sequence += 1
         internal_key = f"readonly-{self._readonly_sequence}"
         state = _TaskState(run_id=None, action=safe_action)
-        task = self._loop.create_task(
+        task = loop.create_task(
             self._execute_readonly(state, call, args),
             name=internal_key,
         )
@@ -259,7 +259,9 @@ class RunTaskSupervisor:
     async def _invoke(
         self, call: Callable[[], T]
     ) -> tuple[bool, T | None, BaseException | None]:
-        thread_task = self._loop.create_task(asyncio.to_thread(call))
+        loop = self._loop
+        assert loop is not None
+        thread_task = loop.create_task(asyncio.to_thread(call))
         cancelled = False
         while not thread_task.done():
             try:
@@ -321,13 +323,18 @@ class RunTaskSupervisor:
         except BaseException:
             pass
 
-    def _require_loop(self) -> None:
+    def _require_loop(self) -> asyncio.AbstractEventLoop:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             raise SupervisorLoopError(_WRONG_LOOP) from None
-        if loop is not self._loop or not self._loop.is_running():
+        with self._loop_binding_lock:
+            if self._loop is None:
+                self._loop = loop
+            owner = self._loop
+        if loop is not owner or not loop.is_running():
             raise SupervisorLoopError(_WRONG_LOOP)
+        return loop
 
 
 __all__ = [
