@@ -123,9 +123,47 @@ class FileRunStore:
             self._atomic_write(run_file, stored, run_identity)
             return stored
 
-    def load(self, run_id: str) -> WorkflowRun:
+    def load(self, run_id: str, *, read_only: bool = False) -> WorkflowRun:
+        self._validate_run_id(run_id)
+        if read_only:
+            run_identity = self._validate_run_identity(run_id)
+            return self._load_unlocked(run_id, run_identity)
         with self._locked(run_id) as run_identity:
             return self._load_unlocked(run_id, run_identity)
+
+    def list_run_ids(self) -> tuple[str, ...]:
+        """Return canonical direct-child run identifiers without writing storage."""
+
+        self._validate_root_identity()
+        run_ids: list[str] = []
+        try:
+            with os.scandir(self._run_root) as entries:
+                for entry in entries:
+                    run_id = entry.name
+                    if _RUN_ID.fullmatch(run_id) is None:
+                        continue
+                    run_dir = self._run_root / run_id
+                    try:
+                        _reject_reparse_point(run_dir, "run directory")
+                        info = entry.stat(follow_symlinks=False)
+                        if not stat.S_ISDIR(info.st_mode):
+                            continue
+                        self._validate_run_identity(run_id)
+                    except (
+                        FileNotFoundError,
+                        RunNotFoundError,
+                        UnsafeRunPathError,
+                        OSError,
+                    ):
+                        continue
+                    run_ids.append(run_id)
+        except OSError as exc:
+            self._validate_root_identity()
+            raise UnsafeRunPathError(
+                "workflow run root cannot be safely enumerated"
+            ) from exc
+        self._validate_root_identity()
+        return tuple(sorted(run_ids))
 
     def save(self, run: WorkflowRun, expected_version: int) -> WorkflowRun:
         with self._locked(run.run_id) as run_identity:
@@ -232,12 +270,21 @@ class FileRunStore:
         run_file = self._run_file(run_id)
         self._validate_run_identity(run_id, run_identity)
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        try:
-            descriptor = os.open(run_file, flags)
-        except FileNotFoundError as exc:
-            raise RunNotFoundError("workflow run was not found") from exc
-        except (OSError, UnicodeError):
-            raise RunCorruptedError("stored workflow run is corrupted") from None
+        descriptor: int | None = None
+        for attempt in range(10):
+            try:
+                descriptor = os.open(run_file, flags)
+                break
+            except FileNotFoundError as exc:
+                raise RunNotFoundError("workflow run was not found") from exc
+            except OSError:
+                if attempt == 9:
+                    raise RunCorruptedError(
+                        "stored workflow run is corrupted"
+                    ) from None
+                time.sleep(0.001)
+        if descriptor is None:  # pragma: no cover - loop either opens or raises
+            raise RunCorruptedError("stored workflow run is corrupted")
         try:
             with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
                 raw = stream.read()
