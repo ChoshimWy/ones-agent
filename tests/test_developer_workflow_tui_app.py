@@ -54,6 +54,46 @@ def _plain(widget) -> str:
     return renderable.plain if hasattr(renderable, "plain") else str(renderable)
 
 
+async def _wait_for_dashboard_filter(
+    app: DeveloperWorkflowTuiApp,
+    expected_filter: RunFilter,
+    expected_run_ids: tuple[str, ...],
+    expected_detail: str,
+) -> DashboardScreen:
+    controller = app.controller
+    async with asyncio.timeout(2):
+        while True:
+            screen = app.screen
+            list_items = (
+                tuple(screen.query("#run-list ListItem"))
+                if isinstance(screen, DashboardScreen)
+                else ()
+            )
+            list_labels = (
+                tuple(screen.query("#run-list ListItem Label"))
+                if isinstance(screen, DashboardScreen)
+                else ()
+            )
+            if (
+                isinstance(screen, DashboardScreen)
+                and controller.filters  # type: ignore[attr-defined]
+                and controller.filters[-1] == expected_filter  # type: ignore[attr-defined]
+                and tuple(item.run_id for item in screen._runs)
+                == expected_run_ids
+                and tuple(item.name for item in list_items)
+                == expected_run_ids
+                and len(list_labels) == len(expected_run_ids)
+                and any(
+                    expected_detail in _plain(label)
+                    for label in list_labels
+                )
+                and expected_detail
+                in _plain(screen.query_one("#overview-content"))
+            ):
+                return screen
+            await asyncio.sleep(0)
+
+
 def test_tui_package_exports_application_entry() -> None:
     assert tui.DeveloperWorkflowTuiApp is DeveloperWorkflowTuiApp
 
@@ -228,9 +268,12 @@ async def test_search_and_filter_apply_clear_and_escape_without_mutation() -> No
         assert isinstance(app.screen, RunFilterScreen)
         app.screen.query_one("#work-item-query", Input).value = "BUG-2"
         await pilot.click("#apply-run-filter")
-        assert isinstance(app.screen, DashboardScreen)
-        assert controller.filters[-1].query == "BUG-2"  # type: ignore[attr-defined]
-        assert len(app.screen._runs) == 1
+        await _wait_for_dashboard_filter(
+            app,
+            RunFilter(query="BUG-2"),
+            ("run-2",),
+            "BUG-2",
+        )
 
         await pilot.press("f")
         assert isinstance(app.screen, RunFilterScreen)
@@ -243,10 +286,19 @@ async def test_search_and_filter_apply_clear_and_escape_without_mutation() -> No
             "2026-08-11T10:00:00+00:00"
         )
         await pilot.click("#apply-run-filter")
-        applied = controller.filters[-1]  # type: ignore[attr-defined]
-        assert applied.states == (WorkflowState.WAITING_APPROVAL,)
-        assert applied.workflow_types == (WorkflowType.DEFECT,)
-        assert applied.query == "BUG-2"
+        applied = RunFilter(
+            states=(WorkflowState.WAITING_APPROVAL,),
+            workflow_types=(WorkflowType.DEFECT,),
+            query="BUG-2",
+            updated_after=datetime(2026, 8, 11, 8, tzinfo=UTC),
+            updated_before=datetime(2026, 8, 11, 10, tzinfo=UTC),
+        )
+        await _wait_for_dashboard_filter(
+            app,
+            applied,
+            ("run-2",),
+            "BUG-2",
+        )
 
         await pilot.press("f")
         app.screen.query_one("#filter-states", Input).value = "BROKEN"
@@ -254,12 +306,12 @@ async def test_search_and_filter_apply_clear_and_escape_without_mutation() -> No
         assert controller.filters[-1] == applied  # type: ignore[attr-defined]
         await pilot.press("f")
         await pilot.click("#clear-run-filter")
-        async with asyncio.timeout(2):
-            while not (
-                controller.filters[-1] == RunFilter()  # type: ignore[attr-defined]
-                and len(app.screen._runs) == 2
-            ):
-                await asyncio.sleep(0)
+        await _wait_for_dashboard_filter(
+            app,
+            RunFilter(),
+            ("run-1", "run-2"),
+            "BUG-2",
+        )
 
 
 @pytest.mark.asyncio
@@ -281,9 +333,13 @@ async def test_search_preserves_literal_rich_brackets_and_backslashes() -> None:
         await pilot.press("/")
         app.screen.query_one("#work-item-query", Input).value = literal_query
         await pilot.click("#apply-run-filter")
-        assert controller.filters[-1].query == literal_query  # type: ignore[attr-defined]
-        assert len(app.screen._runs) == 1
-        assert raw_work_item in _plain(app.screen.query_one("#run-item-0 Label"))
+        dashboard = await _wait_for_dashboard_filter(
+            app,
+            RunFilter(query=literal_query),
+            ("run-2",),
+            raw_work_item,
+        )
+        assert raw_work_item in _plain(dashboard.query_one("#run-item-0 Label"))
 
         await pilot.press("/")
         assert app.screen.query_one("#work-item-query", Input).value == literal_query
