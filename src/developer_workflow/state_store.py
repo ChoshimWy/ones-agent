@@ -82,7 +82,12 @@ class InvalidRunMutationError(RunStoreError, ValueError):
     """Raised when caller-owned updates violate persisted run invariants."""
 
 
+class _RunFileReplacedError(UnsafeRunPathError):
+    """Internal signal for a regular-file atomic replacement retry."""
+
+
 _RUN_ID = re.compile(r"[0-9a-f]{32}\Z")
+_READ_ONLY_REPLACE_ATTEMPTS = 3
 _MAIN_CHAIN = (
     WorkflowState.CREATED,
     WorkflowState.READING_ONES,
@@ -329,22 +334,36 @@ class FileRunStore:
     ) -> WorkflowRun:
         run_file = self._run_file(run_id)
         self._validate_run_identity(run_id, run_identity)
+        for attempt in range(_READ_ONLY_REPLACE_ATTEMPTS):
+            try:
+                raw = _read_run_file_nofollow(run_file)
+            except _RunFileReplacedError as exc:
+                self._validate_read_run_identity(run_id, run_identity)
+                if attempt + 1 == _READ_ONLY_REPLACE_ATTEMPTS:
+                    raise UnsafeRunPathError(
+                        "workflow run file identity changed repeatedly"
+                    ) from exc
+                continue
+            except Exception as exc:
+                load_error: Exception | None = exc
+                raw = ""
+            else:
+                load_error = None
+            self._validate_read_run_identity(run_id, run_identity)
+            if load_error is not None:
+                raise load_error
+            return self._parse_loaded_run(run_id, raw)
+        raise UnsafeRunPathError("workflow run file identity changed repeatedly")
+
+    def _validate_read_run_identity(
+        self, run_id: str, expected: tuple[int, int]
+    ) -> None:
         try:
-            raw = _read_run_file_nofollow(run_file)
-        except Exception as exc:
-            load_error: Exception | None = exc
-            raw = ""
-        else:
-            load_error = None
-        try:
-            self._validate_run_identity(run_id, run_identity)
+            self._validate_run_identity(run_id, expected)
         except (RunNotFoundError, UnsafeRunPathError) as exc:
             raise UnsafeRunPathError(
                 "workflow run directory identity changed"
             ) from exc
-        if load_error is not None:
-            raise load_error
-        return self._parse_loaded_run(run_id, raw)
 
     @staticmethod
     def _parse_loaded_run(run_id: str, raw: str) -> WorkflowRun:
@@ -569,6 +588,16 @@ def _open_run_file_nofollow(
             descriptor = os.open(path, flags)
         except OSError as exc:
             raise UnsafeRunPathError("workflow run file is unsafe") from exc
+
+    try:
+        opened = os.fstat(descriptor)
+        opened_identity = (opened.st_dev, opened.st_ino)
+        signature = _validated_run_file_descriptor(opened, opened_identity)
+    except (OSError, UnsafeRunPathError) as exc:
+        os.close(descriptor)
+        raise UnsafeRunPathError("workflow run file is unsafe") from exc
+
+    if os.name != "nt":
         try:
             descriptor_path = next(
                 candidate
@@ -582,17 +611,20 @@ def _open_run_file_nofollow(
             expected_path = path.resolve(strict=True)
         except (OSError, StopIteration) as exc:
             os.close(descriptor)
+            try:
+                _validate_run_file_identity(path, expected_identity)
+            except _RunFileReplacedError:
+                raise
             raise UnsafeRunPathError("workflow run file is unsafe") from exc
         if actual_path != expected_path:
             os.close(descriptor)
+            _validate_run_file_identity(path, expected_identity)
             raise UnsafeRunPathError("workflow run file is unsafe")
 
-    try:
-        opened = os.fstat(descriptor)
-        signature = _validated_run_file_descriptor(opened, expected_identity)
-    except (OSError, UnsafeRunPathError) as exc:
+    if opened_identity != expected_identity:
         os.close(descriptor)
-        raise UnsafeRunPathError("workflow run file is unsafe") from exc
+        _validate_run_file_identity(path, expected_identity)
+        raise UnsafeRunPathError("workflow run file is unsafe")
     return descriptor, expected_identity, signature
 
 
@@ -600,6 +632,7 @@ def _read_run_file_nofollow(path: Path) -> str:
     descriptor, file_identity, initial_signature = _open_run_file_nofollow(path)
     read_error: OSError | None = None
     chunks: list[bytes] = []
+    descriptor_closed = False
     try:
         while True:
             try:
@@ -619,6 +652,11 @@ def _read_run_file_nofollow(path: Path) -> str:
             raise UnsafeRunPathError("workflow run file identity changed") from exc
         if final_signature != initial_signature:
             raise UnsafeRunPathError("workflow run file identity changed")
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            raise UnsafeRunPathError("workflow run file is unsafe") from exc
+        descriptor_closed = True
         _validate_run_file_identity(path, file_identity)
         if read_error is not None:
             raise RunCorruptedError("stored workflow run is corrupted") from None
@@ -627,10 +665,11 @@ def _read_run_file_nofollow(path: Path) -> str:
         except UnicodeError:
             raise RunCorruptedError("stored workflow run is corrupted") from None
     finally:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+        if not descriptor_closed:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
 
 
 def _validated_run_file_descriptor(
@@ -701,9 +740,10 @@ def _validate_run_file_identity(
         raise UnsafeRunPathError("workflow run file identity changed") from exc
     if (
         not stat.S_ISREG(metadata.st_mode)
-        or (metadata.st_dev, metadata.st_ino) != expected_identity
     ):
         raise UnsafeRunPathError("workflow run file identity changed")
+    if (metadata.st_dev, metadata.st_ino) != expected_identity:
+        raise _RunFileReplacedError("workflow run file was atomically replaced")
 
 
 def _reject_reparse_point(path: Path, label: str) -> None:

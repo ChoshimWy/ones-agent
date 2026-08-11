@@ -36,6 +36,15 @@ def _set_updated_at(root: Path, run_id: str, updated_at: datetime) -> None:
     run_file.write_text(json.dumps(payload), encoding="utf-8")
 
 
+def _stored_payload(run: WorkflowRun) -> bytes:
+    return json.dumps(
+        run.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
 def _tree_snapshot(root: Path) -> tuple[tuple[str, int, int], ...]:
     return tuple(
         sorted(
@@ -114,6 +123,31 @@ def test_corrupted_run_is_fixed_safe_entry_after_valid_runs(tmp_path: Path) -> N
     assert listed[1].corrupted is True
     assert listed[1].work_item_id == "storage-corrupted"
     assert secret not in repr(listed)
+
+
+@pytest.mark.parametrize(
+    "unsafe_work_item",
+    (
+        "SECRET-newline\nforged",
+        "SECRET-control\x01forged",
+        "SECRET-overlong-" + "x" * 300,
+    ),
+)
+def test_run_index_isolates_legacy_run_with_unsafe_display_work_item(
+    unsafe_work_item: str, tmp_path: Path
+) -> None:
+    store = FileRunStore(tmp_path)
+    valid_id = "a" * 32
+    unsafe_id = "b" * 32
+    store.create(_run(valid_id, work_item_id="REQ-safe"))
+    store.create(_run(unsafe_id, work_item_id=unsafe_work_item))
+
+    listed = RunIndex(store).list(RunFilter())
+
+    assert tuple(item.run_id for item in listed) == (valid_id, unsafe_id)
+    assert listed[0].corrupted is False
+    assert listed[1] == listed[1].corrupted_entry(unsafe_id)
+    assert "SECRET" not in repr(listed)
 
 
 def test_list_run_ids_ignores_noncanonical_files_and_is_sorted(tmp_path: Path) -> None:
@@ -451,9 +485,12 @@ def test_read_only_load_gives_path_swap_precedence_over_read_error(
     run_id = "a" * 32
     store.create(_run(run_id))
     run_file = tmp_path / run_id / "run.json"
-    displaced = tmp_path / "displaced-run.json"
+    attempts = 0
 
     def failing_read(_descriptor: int, _size: int) -> bytes:
+        nonlocal attempts
+        attempts += 1
+        displaced = tmp_path / f"displaced-run-{attempts}.json"
         run_file.rename(displaced)
         run_file.write_text("REPLACEMENT-SECRET", encoding="utf-8")
         raise OSError("simulated read failure")
@@ -461,6 +498,7 @@ def test_read_only_load_gives_path_swap_precedence_over_read_error(
     monkeypatch.setattr(os, "read", failing_read)
     with pytest.raises(UnsafeRunPathError):
         store.load(run_id, read_only=True)
+    assert attempts == 3
 
 
 def test_read_only_load_classifies_disappearance_after_lstat_as_unsafe(
@@ -507,6 +545,106 @@ def test_read_only_load_preserves_unsafe_when_run_directory_disappears(
     monkeypatch.setattr(state_store_module, "_read_run_file_nofollow", unsafe_read)
     with pytest.raises(UnsafeRunPathError):
         store.load(run_id, read_only=True)
+
+
+@pytest.mark.parametrize("replacement_count", (1, 2))
+def test_read_only_load_retries_bounded_atomic_replaces_to_complete_json(
+    replacement_count: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    original = store.create(_run(run_id))
+    updated = original.validated_update(work_item_id="REQ-updated")
+    run_file = tmp_path / run_id / "run.json"
+    payloads = (_stored_payload(updated), _stored_payload(original))
+    real_validate = state_store_module._validate_run_file_identity
+    replacements = 0
+
+    def replacing_validate(path: Path, expected_identity: tuple[int, int]) -> None:
+        nonlocal replacements
+        if replacements < replacement_count:
+            replacements += 1
+            temporary = run_file.with_name(f".replacement-{replacements}.tmp")
+            temporary.write_bytes(payloads[replacements - 1])
+            os.replace(temporary, run_file)
+        real_validate(path, expected_identity)
+
+    monkeypatch.setattr(
+        state_store_module,
+        "_validate_run_file_identity",
+        replacing_validate,
+    )
+
+    expected = updated if replacement_count == 1 else original
+    assert store.load(run_id, read_only=True) == expected
+    assert replacements == replacement_count
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows pre-open race probe")
+def test_read_only_load_retries_atomic_replace_before_descriptor_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    original = store.create(_run(run_id))
+    updated = original.validated_update(work_item_id="REQ-new-complete")
+    run_file = tmp_path / run_id / "run.json"
+    real_open = state_store_module._open_windows_run_file
+    replaced = False
+
+    def replacing_open(path: Path) -> int:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            temporary = run_file.with_name(".pre-open-replacement.tmp")
+            temporary.write_bytes(_stored_payload(updated))
+            os.replace(temporary, run_file)
+        return real_open(path)
+
+    monkeypatch.setattr(state_store_module, "_open_windows_run_file", replacing_open)
+
+    assert store.load(run_id, read_only=True) == updated
+    assert replaced is True
+
+
+def test_read_only_load_fails_closed_after_atomic_replace_retry_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / run_id / "run.json"
+    payload = run_file.read_bytes()
+    real_close = os.close
+    real_validate = state_store_module._validate_run_file_identity
+    replacements = 0
+    closed: list[int] = []
+
+    def replacing_validate(path: Path, expected_identity: tuple[int, int]) -> None:
+        nonlocal replacements
+        replacements += 1
+        temporary = run_file.with_name(f".replacement-{replacements}.tmp")
+        temporary.write_bytes(payload)
+        os.replace(temporary, run_file)
+        real_validate(path, expected_identity)
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "close", recording_close)
+    monkeypatch.setattr(
+        state_store_module,
+        "_validate_run_file_identity",
+        replacing_validate,
+    )
+
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+    assert replacements == 3
+    assert len(closed) == 3
 
 
 def test_read_only_load_rejects_final_descriptor_identity_change(

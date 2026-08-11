@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from ..state_store import FileRunStore, RunCorruptedError, RunNotFoundError
-from .models import RunActivity, RunFilter, RunSummary
+from .models import RunActivity, RunFilter, RunSummary, TuiDisplayError
 
 
 class RunIndex:
@@ -32,10 +32,16 @@ class RunIndex:
                 continue
             except RunNotFoundError:
                 continue
-            item = RunSummary.from_run(
-                run,
-                activity=activity_by_id.get(run_id, RunActivity.IDLE),
-            )
+            try:
+                item = RunSummary.from_run(
+                    run,
+                    activity=activity_by_id.get(run_id, RunActivity.IDLE),
+                )
+            except TuiDisplayError:
+                item = RunSummary.corrupted_entry(run_id)
+                if filters.matches(item):
+                    corrupted.append(item)
+                continue
             if filters.matches(item):
                 valid.append(item)
 
