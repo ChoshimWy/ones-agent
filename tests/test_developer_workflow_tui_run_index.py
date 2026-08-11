@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from src.developer_workflow import state_store as state_store_module
 from src.developer_workflow.contracts import WorkflowRun, WorkflowState, WorkflowType
 from src.developer_workflow.state_store import FileRunStore, UnsafeRunPathError
 from src.developer_workflow.tui.models import RunActivity, RunFilter
@@ -147,6 +150,116 @@ def test_list_run_ids_ignores_directory_symlink_without_reading_target(
     assert loaded == []
 
 
+def test_list_run_ids_rejects_first_seen_directory_replaced_after_entry_stat(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    writer.create(_run(run_id, work_item_id="REQ-original"))
+    store = FileRunStore(tmp_path)
+    run_dir = tmp_path / run_id
+    displaced = tmp_path / "displaced"
+
+    class RacingEntry:
+        name = run_id
+
+        def stat(self, *, follow_symlinks: bool) -> os.stat_result:
+            assert follow_symlinks is False
+            enumerated = run_dir.stat(follow_symlinks=False)
+            run_dir.rename(displaced)
+            run_dir.mkdir()
+            (run_dir / "run.json").write_text(
+                "REPLACEMENT-SECRET", encoding="utf-8"
+            )
+            return enumerated
+
+    class RacingScan:
+        def __enter__(self) -> object:
+            return iter((RacingEntry(),))
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(os, "scandir", lambda _path: RacingScan())
+
+    assert store.list_run_ids() == ()
+
+
+def test_list_run_ids_rejects_windows_zero_identity_entry_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    writer.create(_run(run_id))
+    store = FileRunStore(tmp_path)
+    run_dir = tmp_path / run_id
+    displaced = tmp_path / "displaced"
+
+    class ZeroIdentityRacingEntry:
+        name = run_id
+
+        def stat(self, *, follow_symlinks: bool) -> object:
+            assert follow_symlinks is False
+            mode = run_dir.stat(follow_symlinks=False).st_mode
+            run_dir.rename(displaced)
+            run_dir.mkdir()
+            return SimpleNamespace(st_mode=mode, st_dev=0, st_ino=0)
+
+    class RacingScan:
+        def __enter__(self) -> object:
+            return iter((ZeroIdentityRacingEntry(),))
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(os, "scandir", lambda _path: RacingScan())
+
+    assert store.list_run_ids() == ()
+
+
+def test_run_index_does_not_load_first_seen_replacement_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    writer = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    writer.create(_run(run_id))
+    store = FileRunStore(tmp_path)
+    run_dir = tmp_path / run_id
+    displaced = tmp_path / "displaced"
+
+    class RacingEntry:
+        name = run_id
+
+        def stat(self, *, follow_symlinks: bool) -> os.stat_result:
+            assert follow_symlinks is False
+            enumerated = run_dir.stat(follow_symlinks=False)
+            run_dir.rename(displaced)
+            run_dir.mkdir()
+            (run_dir / "run.json").write_text(
+                "REPLACEMENT-SECRET", encoding="utf-8"
+            )
+            return enumerated
+
+    class RacingScan:
+        def __enter__(self) -> object:
+            return iter((RacingEntry(),))
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(os, "scandir", lambda _path: RacingScan())
+    loaded: list[str] = []
+
+    def forbidden_load(candidate: str, **_kwargs: object) -> WorkflowRun:
+        loaded.append(candidate)
+        raise AssertionError("replacement directory content was read")
+
+    monkeypatch.setattr(store, "load", forbidden_load)
+
+    assert RunIndex(store).list(RunFilter()) == ()
+    assert loaded == []
+
+
 def test_list_run_ids_fails_closed_when_root_identity_changes(tmp_path: Path) -> None:
     root = tmp_path / "runs"
     store = FileRunStore(root)
@@ -240,6 +353,238 @@ def test_run_index_does_not_wait_for_an_existing_run_lock(tmp_path: Path) -> Non
 
     with store._locked(run_id):
         assert len(RunIndex(store).list(RunFilter())) == 1
+
+
+def test_read_only_load_rejects_internal_run_file_symlink_before_reading_target(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / run_id / "run.json"
+    target = tmp_path / run_id / "target.json"
+    target.write_bytes(run_file.read_bytes())
+    run_file.unlink()
+    try:
+        run_file.symlink_to(target)
+    except OSError:
+        pytest.skip("file symlinks unavailable")
+
+    def forbidden_read(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("symlink target content was read")
+
+    monkeypatch.setattr(os, "read", forbidden_read)
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+
+
+def test_run_index_rejects_external_run_file_symlink_as_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path / "runs")
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / "runs" / run_id / "run.json"
+    target = tmp_path / "outside.json"
+    target.write_bytes(run_file.read_bytes())
+    run_file.unlink()
+    try:
+        run_file.symlink_to(target)
+    except OSError:
+        pytest.skip("file symlinks unavailable")
+
+    def forbidden_read(*_args: object, **_kwargs: object) -> bytes:
+        raise AssertionError("external symlink target content was read")
+
+    monkeypatch.setattr(os, "read", forbidden_read)
+    with pytest.raises(UnsafeRunPathError):
+        RunIndex(store).list(RunFilter())
+
+
+def test_read_only_load_rejects_directory_reparse_at_run_file(
+    tmp_path: Path,
+) -> None:
+    store = FileRunStore(tmp_path / "runs")
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / "runs" / run_id / "run.json"
+    target = tmp_path / "outside-directory"
+    target.mkdir()
+    (target / "secret.json").write_text("EXTERNAL-SECRET", encoding="utf-8")
+    run_file.unlink()
+    try:
+        run_file.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks unavailable")
+
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction test")
+def test_read_only_load_rejects_windows_junction_at_run_file(tmp_path: Path) -> None:
+    store = FileRunStore(tmp_path / "runs")
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / "runs" / run_id / "run.json"
+    target = tmp_path / "junction-target"
+    target.mkdir()
+    (target / "secret.json").write_text("EXTERNAL-SECRET", encoding="utf-8")
+    run_file.unlink()
+    created = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(run_file), str(target)],
+        capture_output=True,
+        check=False,
+    )
+    if created.returncode != 0:
+        pytest.skip("directory junctions unavailable")
+    assert run_file.is_symlink() is False
+
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+
+
+def test_read_only_load_gives_path_swap_precedence_over_read_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / run_id / "run.json"
+    displaced = tmp_path / "displaced-run.json"
+
+    def failing_read(_descriptor: int, _size: int) -> bytes:
+        run_file.rename(displaced)
+        run_file.write_text("REPLACEMENT-SECRET", encoding="utf-8")
+        raise OSError("simulated read failure")
+
+    monkeypatch.setattr(os, "read", failing_read)
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+
+
+def test_read_only_load_classifies_disappearance_after_lstat_as_unsafe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_file = tmp_path / run_id / "run.json"
+    path_type = type(run_file)
+    real_stat = path_type.stat
+    observations = 0
+
+    def disappearing_stat(
+        path: Path, *, follow_symlinks: bool = True
+    ) -> os.stat_result:
+        nonlocal observations
+        if path == run_file and follow_symlinks is False:
+            observations += 1
+            if observations == 2:
+                run_file.unlink()
+                raise FileNotFoundError("simulated post-lstat disappearance")
+        return real_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(path_type, "stat", disappearing_stat)
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+    assert observations == 2
+
+
+def test_read_only_load_preserves_unsafe_when_run_directory_disappears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    run_dir = tmp_path / run_id
+    displaced = tmp_path / "displaced-run"
+
+    def unsafe_read(_path: Path) -> str:
+        run_dir.rename(displaced)
+        raise UnsafeRunPathError("workflow run file identity changed")
+
+    monkeypatch.setattr(state_store_module, "_read_run_file_nofollow", unsafe_read)
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+
+
+def test_read_only_load_rejects_final_descriptor_identity_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    real_fstat = os.fstat
+    calls = 0
+
+    def changing_fstat(descriptor: int) -> object:
+        nonlocal calls
+        calls += 1
+        info = real_fstat(descriptor)
+        if calls == 2:
+            return SimpleNamespace(
+                st_mode=info.st_mode,
+                st_dev=info.st_dev,
+                st_ino=info.st_ino + 1,
+                st_size=info.st_size,
+                st_mtime_ns=info.st_mtime_ns,
+                st_file_attributes=getattr(info, "st_file_attributes", 0),
+            )
+        return info
+
+    monkeypatch.setattr(os, "fstat", changing_fstat)
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+    assert calls == 2
+
+
+def test_read_only_load_closes_descriptor_when_initial_fstat_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    store.create(_run(run_id))
+    real_close = os.close
+    closed: list[int] = []
+
+    def failing_fstat(_descriptor: int) -> object:
+        raise OSError("simulated fstat failure")
+
+    def recording_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        real_close(descriptor)
+
+    monkeypatch.setattr(os, "fstat", failing_fstat)
+    monkeypatch.setattr(os, "close", recording_close)
+    with pytest.raises(UnsafeRunPathError):
+        store.load(run_id, read_only=True)
+    assert len(closed) == 1
+
+
+def test_normal_load_preserves_transient_open_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = FileRunStore(tmp_path)
+    run_id = "a" * 32
+    expected = store.create(_run(run_id))
+    real_open = os.open
+    attempts = 0
+
+    def transient_open(
+        path: object, flags: int, mode: int = 0o777
+    ) -> int:
+        nonlocal attempts
+        if Path(path).name == "run.json":
+            attempts += 1
+            if attempts == 1:
+                raise PermissionError("simulated replace window")
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(os, "open", transient_open)
+
+    assert store.load(run_id) == expected
+    assert attempts == 2
 
 
 def test_replaced_run_directory_is_not_loaded_as_corruption(

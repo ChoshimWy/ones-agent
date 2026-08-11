@@ -18,7 +18,30 @@ from pydantic import ValidationError
 from .contracts import StateEvent, WorkflowRun, WorkflowState
 
 if os.name == "nt":
+    import ctypes
     import msvcrt
+    from ctypes import wintypes
+
+    _store_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _store_kernel32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    _store_kernel32.CreateFileW.restype = wintypes.HANDLE
+    _store_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _store_kernel32.CloseHandle.restype = wintypes.BOOL
+    _store_kernel32.GetFinalPathNameByHandleW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+    ]
+    _store_kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
 else:
     import fcntl
 
@@ -127,7 +150,7 @@ class FileRunStore:
         self._validate_run_id(run_id)
         if read_only:
             run_identity = self._validate_run_identity(run_id)
-            return self._load_unlocked(run_id, run_identity)
+            return self._load_read_only(run_id, run_identity)
         with self._locked(run_id) as run_identity:
             return self._load_unlocked(run_id, run_identity)
 
@@ -145,10 +168,18 @@ class FileRunStore:
                     run_dir = self._run_root / run_id
                     try:
                         _reject_reparse_point(run_dir, "run directory")
+                        path_identity = _path_identity(run_dir)
                         info = entry.stat(follow_symlinks=False)
                         if not stat.S_ISDIR(info.st_mode):
                             continue
-                        self._validate_run_identity(run_id)
+                        entry_identity = (info.st_dev, info.st_ino)
+                        if entry_identity != (0, 0):
+                            if entry_identity != path_identity:
+                                continue
+                            enumerated_identity = entry_identity
+                        else:
+                            enumerated_identity = path_identity
+                        self._validate_run_identity(run_id, enumerated_identity)
                     except (
                         FileNotFoundError,
                         RunNotFoundError,
@@ -291,6 +322,32 @@ class FileRunStore:
         except (OSError, UnicodeError):
             raise RunCorruptedError("stored workflow run is corrupted") from None
         self._validate_run_identity(run_id, run_identity)
+        return self._parse_loaded_run(run_id, raw)
+
+    def _load_read_only(
+        self, run_id: str, run_identity: tuple[int, int]
+    ) -> WorkflowRun:
+        run_file = self._run_file(run_id)
+        self._validate_run_identity(run_id, run_identity)
+        try:
+            raw = _read_run_file_nofollow(run_file)
+        except Exception as exc:
+            load_error: Exception | None = exc
+            raw = ""
+        else:
+            load_error = None
+        try:
+            self._validate_run_identity(run_id, run_identity)
+        except (RunNotFoundError, UnsafeRunPathError) as exc:
+            raise UnsafeRunPathError(
+                "workflow run directory identity changed"
+            ) from exc
+        if load_error is not None:
+            raise load_error
+        return self._parse_loaded_run(run_id, raw)
+
+    @staticmethod
+    def _parse_loaded_run(run_id: str, raw: str) -> WorkflowRun:
         try:
             run = WorkflowRun.model_validate_json(raw)
         except (ValidationError, ValueError, TypeError):
@@ -485,6 +542,168 @@ class FileRunStore:
 def _path_identity(path: Path) -> tuple[int, int]:
     info = path.stat(follow_symlinks=False)
     return info.st_dev, info.st_ino
+
+
+def _open_run_file_nofollow(
+    path: Path,
+) -> tuple[int, tuple[int, int], tuple[int, int, int, int]]:
+    """Open one stable regular run file without following its final component."""
+
+    try:
+        _reject_reparse_point(path, "run file")
+    except FileNotFoundError as exc:
+        raise RunNotFoundError("workflow run was not found") from exc
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise UnsafeRunPathError("workflow run file is unsafe") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise UnsafeRunPathError("workflow run file is unsafe")
+    expected_identity = (metadata.st_dev, metadata.st_ino)
+
+    if os.name == "nt":
+        descriptor = _open_windows_run_file(path)
+    else:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise UnsafeRunPathError("workflow run file is unsafe") from exc
+        try:
+            descriptor_path = next(
+                candidate
+                for candidate in (
+                    Path(f"/proc/self/fd/{descriptor}"),
+                    Path(f"/dev/fd/{descriptor}"),
+                )
+                if candidate.exists()
+            )
+            actual_path = descriptor_path.resolve(strict=True)
+            expected_path = path.resolve(strict=True)
+        except (OSError, StopIteration) as exc:
+            os.close(descriptor)
+            raise UnsafeRunPathError("workflow run file is unsafe") from exc
+        if actual_path != expected_path:
+            os.close(descriptor)
+            raise UnsafeRunPathError("workflow run file is unsafe")
+
+    try:
+        opened = os.fstat(descriptor)
+        signature = _validated_run_file_descriptor(opened, expected_identity)
+    except (OSError, UnsafeRunPathError) as exc:
+        os.close(descriptor)
+        raise UnsafeRunPathError("workflow run file is unsafe") from exc
+    return descriptor, expected_identity, signature
+
+
+def _read_run_file_nofollow(path: Path) -> str:
+    descriptor, file_identity, initial_signature = _open_run_file_nofollow(path)
+    read_error: OSError | None = None
+    chunks: list[bytes] = []
+    try:
+        while True:
+            try:
+                chunk = os.read(descriptor, 64 * 1024)
+            except OSError as exc:
+                read_error = exc
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        try:
+            final = os.fstat(descriptor)
+            final_signature = _validated_run_file_descriptor(
+                final, file_identity
+            )
+        except (OSError, UnsafeRunPathError) as exc:
+            raise UnsafeRunPathError("workflow run file identity changed") from exc
+        if final_signature != initial_signature:
+            raise UnsafeRunPathError("workflow run file identity changed")
+        _validate_run_file_identity(path, file_identity)
+        if read_error is not None:
+            raise RunCorruptedError("stored workflow run is corrupted") from None
+        try:
+            return b"".join(chunks).decode("utf-8", errors="strict")
+        except UnicodeError:
+            raise RunCorruptedError("stored workflow run is corrupted") from None
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
+def _validated_run_file_descriptor(
+    metadata: os.stat_result, expected_identity: tuple[int, int]
+) -> tuple[int, int, int, int]:
+    reparse_attribute = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    identity = (metadata.st_dev, metadata.st_ino)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or getattr(metadata, "st_file_attributes", 0) & reparse_attribute
+        or identity != expected_identity
+    ):
+        raise UnsafeRunPathError("workflow run file is unsafe")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _open_windows_run_file(path: Path) -> int:
+    handle = _store_kernel32.CreateFileW(  # type: ignore[name-defined]
+        str(path),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002 | 0x00000004,  # Share read/write/delete.
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:  # type: ignore[name-defined]
+        raise UnsafeRunPathError("workflow run file is unsafe")
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)  # type: ignore[name-defined]
+        length = _store_kernel32.GetFinalPathNameByHandleW(  # type: ignore[name-defined]
+            handle, buffer, len(buffer), 0
+        )
+        if not length or length >= len(buffer):
+            raise UnsafeRunPathError("workflow run file is unsafe")
+        final_text = buffer.value
+        if final_text.startswith("\\\\?\\UNC\\"):
+            final_text = "\\\\" + final_text[8:]
+        elif final_text.startswith("\\\\?\\"):
+            final_text = final_text[4:]
+        actual = os.path.normcase(os.path.abspath(final_text))
+        expected = os.path.normcase(os.path.abspath(path))
+        if actual != expected:
+            raise UnsafeRunPathError("workflow run file is unsafe")
+        try:
+            return msvcrt.open_osfhandle(  # type: ignore[name-defined]
+                int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            )
+        except OSError as exc:
+            raise UnsafeRunPathError("workflow run file is unsafe") from exc
+    except BaseException:
+        _store_kernel32.CloseHandle(handle)  # type: ignore[name-defined]
+        raise
+
+
+def _validate_run_file_identity(
+    path: Path, expected_identity: tuple[int, int]
+) -> None:
+    try:
+        _reject_reparse_point(path, "run file")
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise UnsafeRunPathError("workflow run file identity changed") from exc
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or (metadata.st_dev, metadata.st_ino) != expected_identity
+    ):
+        raise UnsafeRunPathError("workflow run file identity changed")
 
 
 def _reject_reparse_point(path: Path, label: str) -> None:
