@@ -9,7 +9,7 @@ from pathlib import Path
 from string import Formatter
 from typing import Any
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
 
 from .contracts import (
     RepositoryGroupMapping,
@@ -91,6 +91,7 @@ class DeveloperWorkflowConfig(WorkflowModel):
     mirror_root: Path
     sandbox_permission_profile: str
     max_codex_attempts: int = Field(ge=1, le=10)
+    tui_max_concurrency: StrictInt = Field(default=3, ge=1, le=8)
     repositories: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
     repository_groups: tuple[RepositoryGroupMapping, ...] = Field(default_factory=tuple)
     publishing: PublishingConfig

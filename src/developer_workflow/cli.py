@@ -118,6 +118,7 @@ def _parser(stdout: TextIO, stderr: TextIO) -> _SafeParser:
     cancel = command("cancel")
     cancel.add_argument("run_id")
     cancel.add_argument("--actor", required=True)
+    command("tui")
     return parser
 
 

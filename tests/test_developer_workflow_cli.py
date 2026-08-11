@@ -298,6 +298,17 @@ def test_module_is_importable_and_help_lists_exact_commands() -> None:
         assert command in output.getvalue()
 
 
+def test_tui_parser_accepts_custom_config_path() -> None:
+    from src.developer_workflow.cli import _parser
+
+    args = _parser(Terminal(tty=False), Terminal(tty=False)).parse_args(
+        ["tui", "--config", "custom.json"]
+    )
+
+    assert args.command == "tui"
+    assert args.config == "custom.json"
+
+
 class DefectListClient:
     def __init__(self, candidates: tuple[DefectCandidate, ...] | None = None) -> None:
         self.candidates = candidates if candidates is not None else Candidates().list_candidates

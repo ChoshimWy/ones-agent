@@ -22,6 +22,7 @@ dependencies = [
     "pyjwt>=2.12.1",
     "aiosmtplib>=5.1.0",
     "jsonschema>=4.0",
+    "textual>=0.89,<2",
 ]
 
 [dependency-groups]

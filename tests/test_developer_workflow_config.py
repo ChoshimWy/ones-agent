@@ -259,6 +259,22 @@ def test_max_codex_attempts_is_bounded(tmp_path: Path, max_attempts: int) -> Non
         )
 
 
+def test_tui_max_concurrency_defaults_to_three(tmp_path: Path) -> None:
+    config = DeveloperWorkflowConfig.load(_write_config(tmp_path / "ones-dev.json"))
+
+    assert config.tui_max_concurrency == 3
+
+
+@pytest.mark.parametrize("value", [0, 9, True, "3"])
+def test_tui_max_concurrency_is_strictly_bounded(
+    tmp_path: Path, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        DeveloperWorkflowConfig.load(
+            _write_config(tmp_path / "ones-dev.json", tui_max_concurrency=value)
+        )
+
+
 @pytest.mark.parametrize("repositories", [None, []])
 def test_repositories_are_required_and_non_empty(
     tmp_path: Path, repositories: list[object] | None
