@@ -315,17 +315,14 @@ class TuiController:
             session = self._candidate_sessions.pop(session_id, None)
             if session is None or candidate_id not in session.candidate_ids:
                 raise TuiControllerError(_CANDIDATE_ERROR)
-            try:
-                run = self._orchestrator.start_defect(
-                    session.project,
-                    session.iteration,
-                    session.assignee,
-                    session.snapshot_token,
-                    candidate_id,
-                )
-            except Exception:
-                raise TuiControllerError(_CANDIDATE_ERROR) from None
         try:
+            run = self._orchestrator.start_defect(
+                session.project,
+                session.iteration,
+                session.assignee,
+                session.snapshot_token,
+                candidate_id,
+            )
             return self._detail(run)
         except Exception:
             raise TuiControllerError(_CANDIDATE_ERROR) from None

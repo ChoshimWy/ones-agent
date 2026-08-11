@@ -260,56 +260,52 @@ def test_query_start_and_close_threads_finish_without_deadlock():
     assert len(outcomes) == 3
 
 
-def test_close_cannot_return_between_session_pop_and_token_dispatch():
-    orchestrator = Orchestrator([(candidate(token="TOKEN-DISPATCH"),)])
+def test_close_does_not_wait_for_start_committed_before_close():
+    orchestrator = Orchestrator([
+        (candidate("D-1", token="TOKEN-DISPATCH"),),
+        (candidate("D-2", token="TOKEN-REMAINING"),),
+    ])
     controller = TuiController(orchestrator, Index())
-    view = controller.query_defects("P", "I", "A", ())
-    original = controller._candidate_sessions[view.session_id]
-    token_read = threading.Event()
-    release_token = threading.Event()
+    committed = controller.query_defects("P", "I", "A", ())
+    remaining = controller.query_defects("P", "I", "A", ())
+    start_entered = threading.Event()
+    release_start = threading.Event()
     close_returned = threading.Event()
-    order = []
-
-    class BlockingSession:
-        project = original.project
-        iteration = original.iteration
-        assignee = original.assignee
-        candidate_ids = original.candidate_ids
-
-        @property
-        def snapshot_token(self):
-            token_read.set()
-            assert release_token.wait(5)
-            return original.snapshot_token
-
-    controller._candidate_sessions[view.session_id] = BlockingSession()
     original_start = orchestrator.start_defect
+    start_results = []
 
     def record_start(*args):
-        order.append("start")
+        start_entered.set()
+        assert release_start.wait(5)
         return original_start(*args)
 
     orchestrator.start_defect = record_start
     start_thread = threading.Thread(
-        target=lambda: controller.start_defect(view.session_id, "D-1")
+        target=lambda: start_results.append(
+            controller.start_defect(committed.session_id, "D-1")
+        )
     )
 
     def close_controller():
         controller.close()
-        order.append("close")
         close_returned.set()
 
     close_thread = threading.Thread(target=close_controller)
     start_thread.start()
-    assert token_read.wait(5)
+    assert start_entered.wait(5)
     close_thread.start()
-    returned_before_dispatch = close_returned.wait(0.1)
-    release_token.set()
+    returned_while_start_running = close_returned.wait(0.2)
+    sessions_cleared = controller._candidate_sessions == {}
+    token_cleared = "TOKEN-REMAINING" not in repr(controller._candidate_sessions)
+    release_start.set()
     start_thread.join(5)
     close_thread.join(5)
 
-    assert not returned_before_dispatch
-    assert order == ["start", "close"]
+    assert returned_while_start_running
+    assert sessions_cleared and token_cleared
+    assert start_results and isinstance(start_results[0], RunDetail)
+    assert remaining.session_id != committed.session_id
+    assert [call[0] for call in orchestrator.calls].count("start_defect") == 1
 
 
 def test_query_from_controller_event_loop_is_rejected_without_deadlock():
