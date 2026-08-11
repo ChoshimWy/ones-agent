@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 import re
 from typing import Literal
@@ -32,6 +34,7 @@ from .models import (
     DefectChoice,
     MappingCandidateView,
     RepositoryView,
+    RunActivity,
     RunDetail,
     RunFilter,
     RunSummary,
@@ -132,6 +135,7 @@ class RunListPane(Vertical):
                         markup=True,
                     ),
                     id=f"run-item-{index}",
+                    name=item.run_id,
                 )
                 for index, item in enumerate(runs)
             ]
@@ -922,6 +926,9 @@ class DashboardScreen(Screen[None]):
         self._settings = settings
         self._runs: tuple[RunSummary, ...] = ()
         self._detail_error = ""
+        self._refreshing = False
+        self._refresh_requested = False
+        self._refresh_activities: Mapping[str, RunActivity] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
@@ -954,7 +961,29 @@ class DashboardScreen(Screen[None]):
         mode = "three" if width >= 100 else "two" if width >= 70 else "one"
         dashboard.add_class(mode)
 
-    async def refresh_runs(self) -> None:
+    async def refresh_runs(
+        self,
+        activities: Mapping[str, RunActivity] | None = None,
+    ) -> None:
+        self._refresh_activities = activities
+        if self._refreshing:
+            self._refresh_requested = True
+            return
+        self._refreshing = True
+        try:
+            while True:
+                self._refresh_requested = False
+                current_activities = self._refresh_activities
+                await self._refresh_runs(current_activities)
+                if not self._refresh_requested:
+                    break
+        finally:
+            self._refreshing = False
+
+    async def _refresh_runs(
+        self,
+        activities: Mapping[str, RunActivity] | None,
+    ) -> None:
         selected_index = self._selected_index()
         selected_run_id = (
             self._runs[selected_index].run_id
@@ -963,16 +992,20 @@ class DashboardScreen(Screen[None]):
             else None
         )
         try:
-            runs = self._controller.list_runs(RunFilter())
+            runs = await asyncio.to_thread(
+                self._controller.list_runs,
+                RunFilter(),
+                activities,
+            )
         except TuiControllerError:
             runs = ()
-            await self.query_one(RunListPane).replace_runs(runs)
             self._runs = runs
+            await self.query_one(RunListPane).replace_runs(runs)
             self._detail_error = _LIST_UNAVAILABLE
             self.query_one(RunDetailPane).show_error(self._detail_error)
             return
-        await self.query_one(RunListPane).replace_runs(runs)
         self._runs = runs
+        await self.query_one(RunListPane).replace_runs(runs)
         if not runs:
             self._detail_error = ""
             self.query_one(RunDetailPane).clear_detail()
@@ -1254,13 +1287,11 @@ class DashboardScreen(Screen[None]):
     @on(ListView.Selected, "#run-list")
     def select_run(self, event: ListView.Selected) -> None:
         index = event.list_view.index
-        if index is not None and 0 <= index < len(self._runs):
-            self._show_detail(index)
-
-    @on(ListView.Highlighted, "#run-list")
-    def highlight_run(self, event: ListView.Highlighted) -> None:
-        index = event.list_view.index
-        if index is not None and 0 <= index < len(self._runs):
+        if (
+            index is not None
+            and 0 <= index < len(self._runs)
+            and event.item.name == self._runs[index].run_id
+        ):
             self._show_detail(index)
 
     @on(events.Click, "#run-list ListItem")
