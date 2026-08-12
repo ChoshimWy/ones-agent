@@ -162,10 +162,23 @@ class RepositoryProbeInput(SetupModel):
     @field_validator("remote_url")
     @classmethod
     def validate_remote(cls, value: str) -> str:
-        if re.fullmatch(r"git@[^\s:]+:[^\s]+", value):
-            return value
+        if any(ord(character) < 0x20 for character in value) or "\\" in value:
+            raise ValueError("repository remote is invalid")
         parsed = urlsplit(value)
-        if parsed.scheme not in {"https", "ssh"} or parsed.username or parsed.password:
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("repository remote is invalid") from error
+        if (
+            parsed.scheme not in {"https", "ssh"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path
+            or port is not None and not 1 <= port <= 65535
+        ):
             raise ValueError("repository remote is invalid")
         return value
 
@@ -734,6 +747,8 @@ async def _invoke(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 class _RepositoryReadSnapshot:
     root_identity: tuple[int, int]
     git_identity: tuple[int, int, int]
+    config_identity: tuple[int, int, int, int]
+    config_sha256: str
     head: str
     index: str
     tracked_patch_sha256: str
@@ -746,27 +761,52 @@ class ReadOnlyRepositoryInspector:
 
     max_output_bytes: int = 10 * 1024 * 1024
 
-    def _environment(self) -> dict[str, str]:
+    def _environment(self, private_root: Path, hooks: Path) -> dict[str, str]:
         environment = _clean_doctor_environment()
         environment.update(
             {
-                "HOME": os.devnull,
-                "USERPROFILE": os.devnull,
+                "HOME": str(private_root),
+                "USERPROFILE": str(private_root),
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_CONFIG_COUNT": "5",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": str(hooks),
+                "GIT_CONFIG_KEY_1": "core.fsmonitor",
+                "GIT_CONFIG_VALUE_1": "false",
+                "GIT_CONFIG_KEY_2": "diff.external",
+                "GIT_CONFIG_VALUE_2": "",
+                "GIT_CONFIG_KEY_3": "core.attributesFile",
+                "GIT_CONFIG_VALUE_3": os.devnull,
+                "GIT_CONFIG_KEY_4": "credential.helper",
+                "GIT_CONFIG_VALUE_4": "",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_TERMINAL_PROMPT": "0",
                 "GCM_INTERACTIVE": "Never",
+                "GIT_SSH_COMMAND": "ssh -oBatchMode=yes -oIdentitiesOnly=yes",
             }
         )
         return environment
 
-    def _run(self, argv: list[str], *, cwd: Path, timeout: float) -> str:
+    @staticmethod
+    def _git_configuration(hooks: Path) -> list[str]:
+        return [
+            "-c", f"core.hooksPath={hooks}",
+            "-c", "core.fsmonitor=false",
+            "-c", "diff.external=",
+            "-c", f"core.attributesFile={os.devnull}",
+            "-c", "credential.helper=",
+            "-c", "core.sshCommand=ssh -oBatchMode=yes -oIdentitiesOnly=yes",
+        ]
+
+    def _run(
+        self, argv: list[str], *, cwd: Path, private_root: Path, hooks: Path, timeout: float
+    ) -> str:
         completed = _bounded_subprocess(
             argv,
             cwd=cwd,
-            env=self._environment(),
+            env=self._environment(private_root, hooks),
             timeout=timeout,
             max_output_bytes=self.max_output_bytes,
         )
@@ -774,60 +814,154 @@ class ReadOnlyRepositoryInspector:
             raise RuntimeError("read-only Git probe failed")
         return completed.stdout
 
+    @staticmethod
+    def _git_config_path(root: Path, git_entry: Path) -> Path:
+        if git_entry.is_dir():
+            return git_entry / "config"
+        payload = git_entry.read_bytes()
+        if len(payload) > 4096:
+            raise RuntimeError("repository source path is unsafe")
+        try:
+            line = payload.decode("utf-8", "strict").strip()
+        except UnicodeDecodeError as error:
+            raise RuntimeError("repository source path is unsafe") from error
+        if not line.startswith("gitdir: ") or "\n" in line or "\r" in line:
+            raise RuntimeError("repository source path is unsafe")
+        target = Path(line[8:])
+        if not target.is_absolute():
+            target = root / target
+        return target.resolve(strict=True) / "config"
+
+    @staticmethod
+    def _config_fingerprint(config: Path) -> tuple[tuple[int, int, int, int], str]:
+        metadata = config.lstat()
+        if (
+            _is_link_or_reparse(config)
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_size > _MAX_DOCUMENT_BYTES
+        ):
+            raise RuntimeError("repository source path is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(config, flags)
+        digest = hashlib.sha256()
+        try:
+            opened = os.fstat(descriptor)
+            identity = (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns)
+            if identity != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ):
+                raise RuntimeError("repository source identity changed")
+            while chunk := os.read(descriptor, 64 * 1024):
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
+        final = config.lstat()
+        if identity != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns):
+            raise RuntimeError("repository source identity changed")
+        return identity, digest.hexdigest()
+
     def snapshot(self, path: Path, *, timeout: float = 10.0) -> _RepositoryReadSnapshot:
         root = path.resolve(strict=True)
         root_stat = root.stat()
         git_entry = root / ".git"
         git_stat = git_entry.lstat()
+        config = self._git_config_path(root, git_entry)
+        config_before = self._config_fingerprint(config)
         deadline = time.monotonic() + timeout
+        with tempfile.TemporaryDirectory(prefix="ones-repository-probe-") as raw_private:
+            private_root = prepare_private_directory(Path(raw_private) / "private")
+            hooks = private_root / "empty-hooks"
+            hooks.mkdir()
 
-        def read(arguments: list[str]) -> str:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise subprocess.TimeoutExpired(arguments, timeout)
-            return self._run(["git", "-C", str(root), *arguments], cwd=root, timeout=remaining)
+            def read(arguments: list[str]) -> str:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(arguments, timeout)
+                argv = ["git", *self._git_configuration(hooks), "-C", str(root), *arguments]
+                return self._run(
+                    argv, cwd=private_root, private_root=private_root, hooks=hooks, timeout=remaining
+                )
 
-        tracked_patch = read(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
-        untracked = read(["ls-files", "--others", "--exclude-standard", "-z"])
-        hashes: list[tuple[str, str]] = []
-        for relative in sorted(item for item in untracked.split("\0") if item):
-            candidate = root.joinpath(*Path(relative).parts)
-            resolved = candidate.resolve(strict=True)
-            if not resolved.is_relative_to(root) or _is_link_or_reparse(candidate):
-                raise RuntimeError("repository source path is unsafe")
-            metadata = candidate.stat()
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > self.max_output_bytes:
-                raise RuntimeError("repository source path is unsafe")
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(candidate, flags)
-            digest = hashlib.sha256()
-            try:
-                opened = os.fstat(descriptor)
-                if (opened.st_dev, opened.st_ino, opened.st_size) != (
-                    metadata.st_dev, metadata.st_ino, metadata.st_size
+            tracked_patch = read(
+                ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--"]
+            )
+            untracked = read(["ls-files", "--others", "--exclude-standard", "-z"])
+            hashes: list[tuple[str, str]] = []
+            for relative in sorted(item for item in untracked.split("\0") if item):
+                candidate = root.joinpath(*Path(relative).parts)
+                resolved = candidate.resolve(strict=True)
+                if not resolved.is_relative_to(root) or _is_link_or_reparse(candidate):
+                    raise RuntimeError("repository source path is unsafe")
+                metadata = candidate.stat()
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > self.max_output_bytes:
+                    raise RuntimeError("repository source path is unsafe")
+                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                descriptor = os.open(candidate, flags)
+                digest = hashlib.sha256()
+                try:
+                    opened = os.fstat(descriptor)
+                    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                        metadata.st_dev, metadata.st_ino, metadata.st_size
+                    ):
+                        raise RuntimeError("repository source identity changed")
+                    while chunk := os.read(descriptor, 64 * 1024):
+                        digest.update(chunk)
+                finally:
+                    os.close(descriptor)
+                final = candidate.stat()
+                if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (
+                    metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
                 ):
                     raise RuntimeError("repository source identity changed")
-                while chunk := os.read(descriptor, 64 * 1024):
-                    digest.update(chunk)
-            finally:
-                os.close(descriptor)
-            final = candidate.stat()
-            if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (
-                metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
-            ):
-                raise RuntimeError("repository source identity changed")
-            hashes.append((relative, digest.hexdigest()))
-        return _RepositoryReadSnapshot(
-            root_identity=(root_stat.st_dev, root_stat.st_ino),
-            git_identity=(git_stat.st_dev, git_stat.st_ino, git_stat.st_mode),
-            head=read(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]),
-            index=read(["ls-files", "--stage", "-z"]),
-            tracked_patch_sha256=hashlib.sha256(tracked_patch.encode("utf-8", "surrogateescape")).hexdigest(),
-            untracked_hashes=tuple(hashes),
-        )
+                hashes.append((relative, digest.hexdigest()))
+            snapshot = _RepositoryReadSnapshot(
+                root_identity=(root_stat.st_dev, root_stat.st_ino),
+                git_identity=(git_stat.st_dev, git_stat.st_ino, git_stat.st_mode),
+                config_identity=config_before[0],
+                config_sha256=config_before[1],
+                head=read(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]),
+                index=read(["ls-files", "--stage", "-z"]),
+                tracked_patch_sha256=hashlib.sha256(
+                    tracked_patch.encode("utf-8", "surrogateescape")
+                ).hexdigest(),
+                untracked_hashes=tuple(hashes),
+            )
+        if self._config_fingerprint(config) != config_before:
+            raise RuntimeError("repository source identity changed")
+        return snapshot
 
     def ls_remote(self, path: Path, url: str, *, timeout: float) -> None:
-        self._run(["git", "ls-remote", "--refs", url], cwd=path, timeout=timeout)
+        del path
+        if type(url) is not str or any(ord(character) < 0x20 for character in url):
+            raise RuntimeError("read-only Git probe failed")
+        parsed = urlsplit(url)
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise RuntimeError("read-only Git probe failed") from error
+        if (
+            parsed.scheme not in {"https", "ssh"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or not parsed.path
+            or "\\" in url
+            or port is not None and not 1 <= port <= 65535
+        ):
+            raise RuntimeError("read-only Git probe failed")
+        with tempfile.TemporaryDirectory(prefix="ones-ls-remote-") as raw_private:
+            private_root = prepare_private_directory(Path(raw_private) / "private")
+            hooks = private_root / "empty-hooks"
+            hooks.mkdir()
+            argv = ["git", *self._git_configuration(hooks), "ls-remote", "--refs", url]
+            self._run(
+                argv, cwd=private_root, private_root=private_root, hooks=hooks, timeout=timeout
+            )
 
 
 def _result(step: SetupStep, category: _CATEGORIES = "ok") -> ConnectionTestResult:

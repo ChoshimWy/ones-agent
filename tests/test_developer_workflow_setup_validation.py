@@ -502,7 +502,6 @@ def test_read_only_repository_inspector_preserves_source_index_and_status(tmp_pa
 
     inspector = ReadOnlyRepositoryInspector()
     before = inspector.snapshot(source, timeout=10)
-    inspector.ls_remote(source, str(source), timeout=10)
     after = inspector.snapshot(source, timeout=10)
 
     index_after = index.stat()
@@ -515,6 +514,61 @@ def test_read_only_repository_inspector_preserves_source_index_and_status(tmp_pa
     assert (index_before.st_size, index_before.st_mtime_ns) == (
         index_after.st_size, index_after.st_mtime_ns
     )
+
+
+def test_repository_inspector_never_executes_repo_local_programs(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    tracked = source / "tracked.txt"
+    attributes = source / ".gitattributes"
+    tracked.write_text("before\n", encoding="utf-8")
+    attributes.write_text("*.txt diff=hostile\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "-c", "user.name=Test", "-c",
+         "user.email=test@example.invalid", "commit", "-qm", "initial"], check=True,
+    )
+    tracked.write_text("after\n", encoding="utf-8")
+
+    markers = {name: tmp_path / f"{name}.marker" for name in (
+        "ssh", "textconv", "fsmonitor", "include", "credential"
+    )}
+
+    def marker_command(marker: Path) -> str:
+        program = (
+            "from pathlib import Path; import sys; "
+            "Path(sys.argv[1]).write_text('executed', encoding='utf-8'); raise SystemExit(1)"
+        )
+        return subprocess.list2cmdline([sys.executable, "-I", "-c", program, str(marker)])
+
+    included = tmp_path / "included.gitconfig"
+    included.write_text(
+        '[core]\n\tsshCommand = "{}"\n'.format(
+            marker_command(markers["include"]).replace("\\", "\\\\").replace('"', '\\"')
+        ),
+        encoding="utf-8",
+    )
+    settings = {
+        "core.sshCommand": marker_command(markers["ssh"]),
+        "diff.hostile.textconv": marker_command(markers["textconv"]),
+        "core.fsmonitor": marker_command(markers["fsmonitor"]),
+        "include.path": str(included),
+        "credential.helper": "!" + marker_command(markers["credential"]),
+    }
+    for key, value in settings.items():
+        subprocess.run(["git", "-C", str(source), "config", key, value], check=True)
+
+    config = source / ".git" / "config"
+    config_before = (config.stat().st_dev, config.stat().st_ino, config.read_bytes())
+    inspector = ReadOnlyRepositoryInspector()
+    inspector.snapshot(source, timeout=10)
+    with pytest.raises(RuntimeError, match="Git probe"):
+        inspector.ls_remote(source, "ssh://example.invalid/repository.git", timeout=2)
+    config_after = (config.stat().st_dev, config.stat().st_ino, config.read_bytes())
+
+    assert config_before == config_after
+    assert all(not marker.exists() for marker in markers.values())
 
 
 class _OnesGateway:
