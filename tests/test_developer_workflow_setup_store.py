@@ -163,6 +163,28 @@ def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
     return tuple(result)
 
 
+_EXPECTED_OWNER_ERRORS = {5, 1307, 1314}
+
+
+def _select_assignable_owner(
+    attempts: tuple[tuple[str, str], ...], setter: object
+) -> str:
+    failures: list[str] = []
+    for label, sid in attempts:
+        try:
+            setter(sid)  # type: ignore[operator]
+        except OSError as error:
+            code = getattr(error, "winerror", None)
+            if code not in _EXPECTED_OWNER_ERRORS:
+                raise AssertionError(
+                    f"unexpected owner error for {label}: {code}"
+                ) from None
+            failures.append(f"{label}={code}")
+            continue
+        return sid
+    pytest.skip("owner assignment unavailable: " + ", ".join(failures))
+
+
 def _commit_process(
     config_path: str,
     root: str,
@@ -835,16 +857,10 @@ def test_windows_config_file_real_owner_mismatch_fails_closed(
         finally:
             kernel.LocalFree(sid)
 
-    changed_owner: str | None = None
-    for candidate_owner in ("S-1-1-0", "S-1-5-32-544"):
-        try:
-            set_owner(candidate_owner)
-        except OSError:
-            continue
-        changed_owner = candidate_owner
-        break
-    if changed_owner is None:
-        pytest.skip("no assignable non-current owner SID is available")
+    changed_owner = _select_assignable_owner(
+        (("everyone", "S-1-1-0"), ("administrators", "S-1-5-32-544")),
+        set_owner,
+    )
     try:
         actual_owner, _, _ = private_paths._windows_descriptor(path)
         assert actual_owner == changed_owner
@@ -855,6 +871,53 @@ def test_windows_config_file_real_owner_mismatch_fails_closed(
             setup.load()
     finally:
         set_owner(current_owner)
+
+
+@pytest.mark.parametrize("code", (5, 1307, 1314))
+def test_owner_selection_skips_only_after_both_expected_permission_errors(
+    code: int,
+) -> None:
+    attempted: list[str] = []
+
+    def reject(sid: str) -> None:
+        attempted.append(sid)
+        error = OSError("TOKEN-SECRET target-path")
+        error.winerror = code  # type: ignore[attr-defined]
+        raise error
+
+    with pytest.raises(pytest.skip.Exception) as captured:
+        _select_assignable_owner(
+            (("everyone", "S-1-1-0"), ("administrators", "S-1-5-32-544")),
+            reject,
+        )
+
+    assert attempted == ["S-1-1-0", "S-1-5-32-544"]
+    message = str(captured.value)
+    assert message == (
+        f"owner assignment unavailable: everyone={code}, administrators={code}"
+    )
+    assert "TOKEN-SECRET" not in message and "target-path" not in message
+
+
+def test_owner_selection_fails_immediately_on_unexpected_windows_error() -> None:
+    attempted: list[str] = []
+
+    def reject(sid: str) -> None:
+        attempted.append(sid)
+        error = OSError("TOKEN-SECRET target-path")
+        error.winerror = 87  # type: ignore[attr-defined]
+        raise error
+
+    with pytest.raises(
+        AssertionError, match="^unexpected owner error for everyone: 87$"
+    ) as captured:
+        _select_assignable_owner(
+            (("everyone", "S-1-1-0"), ("administrators", "S-1-5-32-544")),
+            reject,
+        )
+
+    assert attempted == ["S-1-1-0"]
+    assert "TOKEN-SECRET" not in repr(captured.value)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows final-path identity contract")
