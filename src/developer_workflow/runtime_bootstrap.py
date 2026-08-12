@@ -63,6 +63,13 @@ _CODEX_BASE_ENV = frozenset(
         "OPENAI_BASE_URL", "OPENAI_ORGANIZATION", "OPENAI_ORG_ID", "OPENAI_PROJECT",
     }
 )
+_PREFLIGHT_ENV = frozenset(
+    {
+        "COMSPEC", "LANG", "LC_ALL", "NO_COLOR", "PATH", "PATHEXT",
+        "SYSTEMROOT", "TEMP", "TERM", "TMP", "TMPDIR", "WINDIR",
+        "SSL_CERT_DIR", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    }
+)
 
 
 def _validate_runtime_secret(value: str) -> str:
@@ -78,6 +85,18 @@ def _validate_runtime_secret(value: str) -> str:
     if len(encoded) > 2560:
         raise ValueError
     return value
+
+
+def _preflight_environment(source: Mapping[str, str]) -> dict[str, str]:
+    environment: dict[str, str] = {}
+    for key, value in source.items():
+        normalized = key.upper()
+        if normalized not in _PREFLIGHT_ENV or type(value) is not str:
+            continue
+        if any(ord(character) < 32 or ord(character) == 127 for character in value):
+            continue
+        environment[key] = value
+    return environment
 
 
 def _default_sandbox_validator(
@@ -154,21 +173,30 @@ class RuntimeBootstrapper:
         try:
             if type(active) is not ActiveSetup or type(secrets) is not RuntimeSecrets:
                 raise ValueError
+            if set(secrets.values) != set(active.credential_kinds):
+                raise ValueError
             public = active.runtime
             workflow = active.workflow
             validated_secrets = {
                 kind: _validate_runtime_secret(value)
                 for kind, value in secrets.values.items()
             }
-            settings = OnesSettings(
-                _env_file=None,
-                base_url=public.ones_base_url,
-                team_id=public.ones_team_id,
-                issue_type_id=public.ones_issue_type_id,
-                comment_list_path_template=public.ones_comment_list_path_template,
-                email=validated_secrets[SecretKind.ONES_EMAIL],
-                password=validated_secrets[SecretKind.ONES_PASSWORD],
-                api_token="",
+            settings = OnesSettings.model_validate(
+                {
+                    "base_url": public.ones_base_url,
+                    "email": validated_secrets[SecretKind.ONES_EMAIL],
+                    "password": validated_secrets[SecretKind.ONES_PASSWORD],
+                    "team_id": public.ones_team_id,
+                    "project_id": "",
+                    "issue_type_id": public.ones_issue_type_id,
+                    "api_token": "",
+                    "defect_status_ids": "",
+                    "comment_list_path_template": public.ones_comment_list_path_template,
+                    "comment_timeout_seconds": 30.0,
+                    "comment_max_pages": 50,
+                    "comment_max_comments": 10_000,
+                    "comment_max_payload_bytes": 10 * 1024 * 1024,
+                }
             )
             provider_token = validated_secrets[SecretKind.PROVIDER_TOKEN]
             codex_environment = self._codex_environment(public, secrets)
@@ -191,7 +219,8 @@ class RuntimeBootstrapper:
             ):
                 parse_repository_identity(mapping.repo_url, public.provider_host)
             self.sandbox_profile_validator(
-                workflow.sandbox_permission_profile, codex_environment
+                workflow.sandbox_permission_profile,
+                _preflight_environment(codex_environment),
             )
             run_root, mirror_root, worktree_root = self.private_root_preparer(
                 (workflow.run_root, workflow.mirror_root, workflow.worktree_root)

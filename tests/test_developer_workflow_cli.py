@@ -866,6 +866,8 @@ def test_production_factory_delegates_legacy_environment_to_runtime_bootstrap(
 
     assert result is expected
     assert len(calls) == 1
+    active, secrets = calls[0]
+    assert set(secrets.values) == set(active.credential_kinds)
 
 
 def test_production_factory_rejects_invalid_git_email_before_creating_roots(

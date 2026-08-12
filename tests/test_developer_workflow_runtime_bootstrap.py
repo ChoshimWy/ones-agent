@@ -71,7 +71,6 @@ def _secrets(**updates: str) -> RuntimeSecrets:
         SecretKind.ONES_PASSWORD: "STORED-PASSWORD",
         SecretKind.PROVIDER_TOKEN: "STORED-PROVIDER-TOKEN",
         SecretKind.CODEX_API_KEY: "STORED-CODEX-KEY",
-        SecretKind.GIT_ASKPASS: "C:/trusted/askpass.exe",
     }
     values.update({SecretKind(key): value for key, value in updates.items()})
     return RuntimeSecrets(values)
@@ -102,6 +101,98 @@ def test_bootstrap_uses_explicit_inputs_without_mutating_parent_environment(
         assert environment["CODEX_API_KEY"] == "STORED-CODEX-KEY"
         assert "PARENT-CODEX-KEY" not in environment.values()
         assert os.environ == before
+    finally:
+        handle.close()
+
+
+def test_bootstrap_ones_settings_ignore_all_unspecified_ambient_values(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    monkeypatch.setenv("ONES_PROJECT_ID", "AMBIENT-PROJECT")
+    monkeypatch.setenv("ONES_DEFECT_STATUS_IDS", "AMBIENT-STATUS")
+    monkeypatch.setenv("ONES_COMMENT_TIMEOUT_SECONDS", "999")
+    handle = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, environment: None,
+    ).build(_active(tmp_path), _secrets())
+    try:
+        settings = handle.gateway.settings
+        assert settings.project_id == ""
+        assert settings.defect_status_ids == ""
+        assert settings.comment_timeout_seconds == 30.0
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize("mode", ["missing", "extra"])
+def test_bootstrap_requires_exact_active_credential_kind_set(
+    tmp_path: Path, mode: str
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeBootstrapError,
+        RuntimeBootstrapper,
+    )
+
+    active = _active(tmp_path)
+    secrets = _secrets()
+    if mode == "missing":
+        secrets = RuntimeSecrets(
+            {
+                kind: value
+                for kind, value in secrets.values.items()
+                if kind is not SecretKind.PROVIDER_TOKEN
+            }
+        )
+    else:
+        secrets = RuntimeSecrets(
+            {**secrets.values, SecretKind.GIT_ASKPASS: "C:/trusted/askpass.exe"}
+        )
+    root_calls: list[object] = []
+    sandbox_calls: list[object] = []
+    bootstrapper = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: (
+            root_calls.append(tuple(roots)) or tuple(roots)
+        ),
+        sandbox_profile_validator=lambda profile, environment: sandbox_calls.append(
+            environment
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeBootstrapError,
+        match="production runtime configuration is incomplete",
+    ):
+        bootstrapper.build(active, secrets)
+    assert root_calls == []
+    assert sandbox_calls == []
+
+
+def test_sandbox_preflight_never_receives_credentials_or_userinfo_urls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    monkeypatch.setenv("HTTPS_PROXY", "https://proxy-user:proxy-secret@proxy.invalid")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api-user:api-secret@api.invalid/v1")
+    seen: list[dict[str, str]] = []
+    handle = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, environment: seen.append(
+            dict(environment)
+        ),
+    ).build(_active(tmp_path), _secrets())
+    try:
+        assert len(seen) == 1
+        assert "HTTPS_PROXY" not in seen[0]
+        assert "OPENAI_BASE_URL" not in seen[0]
+        assert not (
+            {"CODEX_API_KEY", "CODEX_AUTH_TOKEN", "OPENAI_API_KEY"}
+            & seen[0].keys()
+        )
+        assert "proxy-secret" not in repr(seen)
+        assert "api-secret" not in repr(seen)
     finally:
         handle.close()
 
