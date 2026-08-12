@@ -211,14 +211,13 @@ class SetupStore:
     def restore_previous(self, profile_id: str) -> SetupDocument:
         with self._locked():
             current = self._load_unlocked_for_profile(profile_id)
-            if current.previous is None:
-                raise SetupStoreError("previous configuration is unavailable")
             failed = current.active
+            if failed is None:
+                raise SetupStoreError("previous configuration is unavailable")
             restored = current.validated_update(
                 active=current.previous, previous=None
             )
-            self._write_or_fail(restored)
-            loaded = self._load_exact(restored)
+            loaded = self._write_confirmed_monotonic(restored)
             if failed is not None:
                 try:
                     self._credentials.delete_generation(
@@ -233,8 +232,7 @@ class SetupStore:
             current = self._load_unlocked_for_profile(profile_id)
             obsolete = current.previous
             finalized = current.validated_update(previous=None)
-            self._write_or_fail(finalized)
-            loaded = self._load_exact(finalized)
+            loaded = self._write_confirmed_monotonic(finalized)
             if obsolete is not None:
                 try:
                     self._credentials.delete_generation(
@@ -349,6 +347,29 @@ class SetupStore:
             failed = True
         if failed:
             raise SetupStoreError("configuration save failed")
+
+    def _write_confirmed_monotonic(self, document: SetupDocument) -> SetupDocument:
+        """Accept a post-replace failure only after confirming the exact pointer."""
+
+        write_failed = False
+        replaced = False
+        try:
+            self._atomic_write(document)
+        except _AtomicWriteError as error:
+            replaced = error.replaced
+            write_failed = True
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            write_failed = True
+        if write_failed and not replaced:
+            try:
+                replaced = self._load_unlocked() == document
+            except SetupStoreError:
+                pass
+        if write_failed and not replaced:
+            raise SetupStoreError("configuration save failed")
+        return self._load_exact(document)
 
     def _atomic_write(self, document: SetupDocument) -> None:
         self._validate_directory()

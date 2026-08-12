@@ -309,6 +309,67 @@ def test_commit_switches_generation_and_reads_only_active_kinds(
     assert setup.read_active_secrets(second).require(SecretKind.ONES_PASSWORD) == "new"
 
 
+def test_restore_previous_clears_first_failed_generation(
+    store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
+) -> None:
+    setup, credentials, _ = store
+    failed = setup.commit(
+        "profile-1", _candidate(tmp_path, "f" * 32), _secrets("failed")
+    )
+    assert failed.previous is None
+
+    restored = setup.restore_previous("profile-1")
+
+    assert restored.active is None
+    assert restored.previous is None
+    assert ("profile-1", "f" * 32) not in credentials.data
+    assert setup.orphan_generations() == ()
+
+
+def test_restore_first_generation_write_failure_keeps_active_and_credentials(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup, credentials, _ = store
+    failed = setup.commit(
+        "profile-1", _candidate(tmp_path, "f" * 32), _secrets("failed")
+    )
+    monkeypatch.setattr(
+        setup,
+        "_atomic_write",
+        lambda _document: (_ for _ in ()).throw(OSError("TOKEN-SECRET")),
+    )
+
+    with pytest.raises(SetupStoreError, match="^configuration save failed$") as error:
+        setup.restore_previous("profile-1")
+
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert setup.load() == failed
+    assert ("profile-1", "f" * 32) in credentials.data
+    assert credentials.deletes == []
+
+
+def test_restore_first_generation_post_replace_failure_never_deletes_active_credentials(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup, credentials, _ = store
+    setup.commit("profile-1", _candidate(tmp_path, "f" * 32), _secrets("failed"))
+    monkeypatch.setattr(
+        "src.developer_workflow.setup_store._fsync_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("TOKEN-SECRET")),
+    )
+
+    restored = setup.restore_previous("profile-1")
+
+    assert restored.active is None
+    assert restored.previous is None
+    assert ("profile-1", "f" * 32) not in credentials.data
+
+
 @pytest.mark.parametrize("referenced", ("active", "previous"))
 def test_commit_rejects_referenced_generation_before_any_mutation(
     tmp_path: Path, referenced: str, monkeypatch: pytest.MonkeyPatch
@@ -904,6 +965,27 @@ def test_finalize_keeps_new_active_when_old_credential_delete_fails(
     assert finalized.previous is None
     assert finalized.active is not None and finalized.active.generation == "b" * 32
     assert setup.orphan_generations() == ("a" * 32,)
+
+
+def test_finalize_post_replace_failure_is_monotonic_success(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup, credentials, _ = store
+    setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
+    monkeypatch.setattr(
+        "src.developer_workflow.setup_store._fsync_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("TOKEN-SECRET")),
+    )
+
+    finalized = setup.finalize_activation("profile-1")
+
+    assert finalized.active is not None
+    assert finalized.active.generation == "b" * 32
+    assert finalized.previous is None
+    assert ("profile-1", "a" * 32) not in credentials.data
 
 
 @pytest.mark.parametrize(
