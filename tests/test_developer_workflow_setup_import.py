@@ -80,6 +80,18 @@ def test_detection_template_path_can_be_omitted(tmp_path: Path) -> None:
     assert detection.template_available is False
 
 
+def test_detection_dotenv_and_template_paths_can_both_be_omitted() -> None:
+    detection = detect_import_sources(
+        environment={"ONES_EMAIL": "developer@example.invalid"}
+    )
+    assert detection == ImportDetection((SecretKind.ONES_EMAIL,), (), False)
+
+
+def test_detection_requires_explicit_environment_mapping() -> None:
+    with pytest.raises(SetupImportError, match="^import source is invalid$"):
+        detect_import_sources(environment=None)
+
+
 def test_detection_rejects_non_string_environment_values_without_leaking() -> None:
     with pytest.raises(SetupImportError) as caught:
         detect_import_sources(
@@ -122,6 +134,10 @@ def test_parse_dotenv_accepts_simple_utf8_values_and_whole_line_comments(
         "ONES_PASSWORD=value # ambiguous\n",
         "ONES_PASSWORD=value\\\ncontinued\n",
         "ONES_PASSWORD=${HOME}\n",
+        "ONES_PASSWORD=$HOME\n",
+        "ONES_PASSWORD=$VAR\n",
+        "ONES_PASSWORD=$1\n",
+        "ONES_PASSWORD=\\$HOME\n",
         "ONES_PASSWORD=$(whoami)\n",
         "ONES_PASSWORD=`whoami`\n",
         "source secrets.env\n",

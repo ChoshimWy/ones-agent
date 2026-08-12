@@ -57,7 +57,7 @@ _MAX_DOTENV_LINES = 4096
 _MAX_DOTENV_LINE_BYTES = 8192
 _MAX_SECRET_BYTES = 2560
 _NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
-_UNSAFE_VALUE_FRAGMENTS = ("${", "$(", "`", "#")
+_UNSAFE_VALUE_FRAGMENTS = ("$", "`", "#")
 _READ_CHUNK = 64 * 1024
 
 
@@ -68,10 +68,10 @@ def detect_import_sources(
 ) -> ImportDetection:
     """Report only allowlisted credential kinds and template availability."""
 
-    if dotenv_path is None or environment is None:
+    if environment is None:
         raise SetupImportError("import source is invalid")
     environment_values = _copy_string_mapping(environment)
-    dotenv_values = parse_dotenv(dotenv_path)
+    dotenv_values = {} if dotenv_path is None else parse_dotenv(dotenv_path)
     template_available = _validate_template(template_config_path)
     return ImportDetection(
         environment=_detected_kinds(environment_values),
