@@ -38,23 +38,31 @@ def _has_link_or_reparse_ancestor(path: Path) -> bool:
         current = current.parent
 
 
-def _validate_shape(paths: tuple[Path, ...]) -> tuple[Path, ...]:
-    if len(paths) != 3:
-        raise PrivatePathError("exactly three private workflow roots are required")
+def _validate_shape(
+    paths: tuple[Path, ...], *, require_three: bool
+) -> tuple[Path, ...]:
+    if not paths or require_three and len(paths) != 3:
+        message = (
+            "exactly three private workflow roots are required"
+            if require_three
+            else "private workflow root is unsafe"
+        )
+        raise PrivatePathError(message)
     absolute = tuple(path.absolute() for path in paths)
     if any(not path.is_absolute() for path in absolute):
         raise PrivatePathError("private workflow root is unsafe")
     if any(_has_link_or_reparse_ancestor(path) for path in absolute):
         raise PrivatePathError("private workflow root is unsafe")
     canonical = tuple(path.resolve(strict=False) for path in absolute)
-    for index, left in enumerate(canonical):
-        for right in canonical[index + 1 :]:
-            try:
-                nested = left.is_relative_to(right) or right.is_relative_to(left)
-            except ValueError:
-                nested = False
-            if nested:
-                raise PrivatePathError("private workflow roots must not overlap")
+    if require_three:
+        for index, left in enumerate(canonical):
+            for right in canonical[index + 1 :]:
+                try:
+                    nested = left.is_relative_to(right) or right.is_relative_to(left)
+                except ValueError:
+                    nested = False
+                if nested:
+                    raise PrivatePathError("private workflow roots must not overlap")
     return absolute
 
 
@@ -262,13 +270,17 @@ def _prepare_windows(path: Path, user_sid: str) -> None:
         raise PrivatePathError("private workflow root is unsafe") from None
 
 
-def prepare_private_roots(paths: Iterable[Path]) -> tuple[Path, ...]:
-    """Create/verify three non-overlapping roots with fail-closed local access."""
-
-    roots = _validate_shape(tuple(Path(path) for path in paths))
+def _prepare_private_directories(
+    paths: tuple[Path, ...], *, require_three: bool
+) -> tuple[Path, ...]:
+    roots = _validate_shape(paths, require_three=require_three)
+    identities: dict[Path, tuple[int, int]] = {}
     for path in roots:
         if path.exists() and (_is_link_or_reparse(path) or not path.is_dir()):
             raise PrivatePathError("private workflow root is unsafe")
+        if path.exists():
+            metadata = path.stat(follow_symlinks=False)
+            identities[path] = (metadata.st_dev, metadata.st_ino)
     created: list[Path] = []
     if os.name == "nt":
         try:
@@ -279,10 +291,15 @@ def prepare_private_roots(paths: Iterable[Path]) -> tuple[Path, ...]:
             for path in roots:
                 if path.exists():
                     _verify_windows(path, user_sid)
+                    metadata = path.stat(follow_symlinks=False)
+                    if (metadata.st_dev, metadata.st_ino) != identities.get(path):
+                        raise PrivatePathError("private workflow root is unsafe")
             for path in roots:
                 if not path.exists():
                     _prepare_windows(path, user_sid)
                     created.append(path)
+                    metadata = path.stat(follow_symlinks=False)
+                    identities[path] = (metadata.st_dev, metadata.st_ino)
         except (OSError, PrivatePathError):
             for path in reversed(created):
                 try:
@@ -295,10 +312,15 @@ def prepare_private_roots(paths: Iterable[Path]) -> tuple[Path, ...]:
             for path in roots:
                 if path.exists():
                     _verify_posix(path)
+                    metadata = path.stat(follow_symlinks=False)
+                    if (metadata.st_dev, metadata.st_ino) != identities.get(path):
+                        raise PrivatePathError("private workflow root is unsafe")
             for path in roots:
                 if not path.exists():
                     _prepare_posix(path)
                     created.append(path)
+                    metadata = path.stat(follow_symlinks=False)
+                    identities[path] = (metadata.st_dev, metadata.st_ino)
         except (OSError, PrivatePathError):
             for path in reversed(created):
                 try:
@@ -306,7 +328,42 @@ def prepare_private_roots(paths: Iterable[Path]) -> tuple[Path, ...]:
                 except OSError:
                     pass
             raise PrivatePathError("private workflow root is unsafe") from None
-    return tuple(path.resolve(strict=True) for path in roots)
+    resolved: list[Path] = []
+    for path in roots:
+        try:
+            if _is_link_or_reparse(path):
+                raise PrivatePathError("private workflow root is unsafe")
+            before = path.stat(follow_symlinks=False)
+            canonical = path.resolve(strict=True)
+            after = canonical.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(after.st_mode)
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or (before.st_dev, before.st_ino) != identities[path]
+            ):
+                raise PrivatePathError("private workflow root is unsafe")
+            resolved.append(canonical)
+        except (OSError, PrivatePathError):
+            raise PrivatePathError("private workflow root is unsafe") from None
+    return tuple(resolved)
 
 
-__all__ = ["PrivatePathError", "prepare_private_roots"]
+def prepare_private_directory(path: Path) -> Path:
+    """Create or verify one private directory using the workflow ACL boundary."""
+
+    return _prepare_private_directories((Path(path),), require_three=False)[0]
+
+
+def prepare_private_roots(paths: Iterable[Path]) -> tuple[Path, ...]:
+    """Create/verify three non-overlapping roots with fail-closed local access."""
+
+    return _prepare_private_directories(
+        tuple(Path(path) for path in paths), require_three=True
+    )
+
+
+__all__ = [
+    "PrivatePathError",
+    "prepare_private_directory",
+    "prepare_private_roots",
+]
