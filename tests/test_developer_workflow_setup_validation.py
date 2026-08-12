@@ -571,6 +571,66 @@ def test_repository_inspector_never_executes_repo_local_programs(tmp_path: Path)
     assert all(not marker.exists() for marker in markers.values())
 
 
+def test_repository_snapshot_never_runs_content_filters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    attributes = source / ".gitattributes"
+    attributes.write_text(
+        "clean.txt filter=clean\nsmudge.txt filter=smudge\nprocess.txt filter=process\n",
+        encoding="utf-8",
+    )
+    files = [source / name for name in ("clean.txt", "smudge.txt", "process.txt")]
+    for candidate in files:
+        candidate.write_text("before\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(source), "-c", "user.name=Test",
+            "-c", "user.email=test@example.invalid", "commit", "-qm", "initial",
+        ],
+        check=True,
+    )
+
+    markers = {name: tmp_path / f"{name}.marker" for name in ("clean", "smudge", "process")}
+
+    def marker_command(marker: Path) -> str:
+        program = (
+            "from pathlib import Path; import sys; "
+            "Path(sys.argv[1]).write_text('executed', encoding='utf-8'); raise SystemExit(1)"
+        )
+        return subprocess.list2cmdline([sys.executable, "-I", "-c", program, str(marker)])
+
+    settings = {
+        "filter.clean.clean": marker_command(markers["clean"]),
+        "filter.smudge.smudge": marker_command(markers["smudge"]),
+        "filter.process.process": marker_command(markers["process"]),
+    }
+    for key, value in settings.items():
+        subprocess.run(["git", "-C", str(source), "config", key, value], check=True)
+    for candidate in files:
+        candidate.write_text("after\n", encoding="utf-8")
+
+    commands: list[tuple[str, ...]] = []
+    original_run = ReadOnlyRepositoryInspector._run
+
+    def recording_run(self, argv, **kwargs):
+        commands.append(tuple(argv))
+        return original_run(self, argv, **kwargs)
+
+    monkeypatch.setattr(ReadOnlyRepositoryInspector, "_run", recording_run)
+    inspector = ReadOnlyRepositoryInspector()
+    before = inspector.snapshot(source, timeout=10)
+    files[0].write_text("changed-again\n", encoding="utf-8")
+    after = inspector.snapshot(source, timeout=10)
+
+    assert before != after
+    assert all(not marker.exists() for marker in markers.values())
+    assert all("diff" not in command for command in commands)
+
+
 class _OnesGateway:
     def __init__(self):
         self.calls = []

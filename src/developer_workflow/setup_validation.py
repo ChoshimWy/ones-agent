@@ -751,8 +751,7 @@ class _RepositoryReadSnapshot:
     config_sha256: str
     head: str
     index: str
-    tracked_patch_sha256: str
-    untracked_hashes: tuple[tuple[str, str], ...]
+    worktree_hashes: tuple[tuple[str, str], ...]
 
 
 @dataclass(slots=True)
@@ -770,17 +769,13 @@ class ReadOnlyRepositoryInspector:
                 "GIT_CONFIG_NOSYSTEM": "1",
                 "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_SYSTEM": os.devnull,
-                "GIT_CONFIG_COUNT": "5",
+                "GIT_CONFIG_COUNT": "3",
                 "GIT_CONFIG_KEY_0": "core.hooksPath",
                 "GIT_CONFIG_VALUE_0": str(hooks),
                 "GIT_CONFIG_KEY_1": "core.fsmonitor",
                 "GIT_CONFIG_VALUE_1": "false",
-                "GIT_CONFIG_KEY_2": "diff.external",
+                "GIT_CONFIG_KEY_2": "credential.helper",
                 "GIT_CONFIG_VALUE_2": "",
-                "GIT_CONFIG_KEY_3": "core.attributesFile",
-                "GIT_CONFIG_VALUE_3": os.devnull,
-                "GIT_CONFIG_KEY_4": "credential.helper",
-                "GIT_CONFIG_VALUE_4": "",
                 "GIT_OPTIONAL_LOCKS": "0",
                 "GIT_TERMINAL_PROMPT": "0",
                 "GCM_INTERACTIVE": "Never",
@@ -794,8 +789,6 @@ class ReadOnlyRepositoryInspector:
         return [
             "-c", f"core.hooksPath={hooks}",
             "-c", "core.fsmonitor=false",
-            "-c", "diff.external=",
-            "-c", f"core.attributesFile={os.devnull}",
             "-c", "credential.helper=",
             "-c", "core.sshCommand=ssh -oBatchMode=yes -oIdentitiesOnly=yes",
         ]
@@ -863,6 +856,49 @@ class ReadOnlyRepositoryInspector:
             raise RuntimeError("repository source identity changed")
         return identity, digest.hexdigest()
 
+    def _worktree_fingerprint(self, root: Path, relative: str) -> tuple[str, str]:
+        relative_path = Path(relative)
+        if (
+            relative_path.is_absolute()
+            or not relative_path.parts
+            or any(part in {"", ".", ".."} for part in relative_path.parts)
+        ):
+            raise RuntimeError("repository source path is unsafe")
+        candidate = root.joinpath(*relative_path.parts)
+        if _has_link_or_reparse_ancestor(candidate):
+            raise RuntimeError("repository source path is unsafe")
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            return relative, "missing"
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > self.max_output_bytes:
+            raise RuntimeError("repository source path is unsafe")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(candidate, flags)
+        digest = hashlib.sha256()
+        try:
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ):
+                raise RuntimeError("repository source identity changed")
+            while chunk := os.read(descriptor, 64 * 1024):
+                digest.update(chunk)
+        finally:
+            os.close(descriptor)
+        final = candidate.lstat()
+        if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        ):
+            raise RuntimeError("repository source identity changed")
+        return relative, digest.hexdigest()
+
     def snapshot(self, path: Path, *, timeout: float = 10.0) -> _RepositoryReadSnapshot:
         root = path.resolve(strict=True)
         root_stat = root.stat()
@@ -885,38 +921,12 @@ class ReadOnlyRepositoryInspector:
                     argv, cwd=private_root, private_root=private_root, hooks=hooks, timeout=remaining
                 )
 
-            tracked_patch = read(
-                ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--"]
-            )
+            tracked = read(["ls-files", "--cached", "-z"])
             untracked = read(["ls-files", "--others", "--exclude-standard", "-z"])
-            hashes: list[tuple[str, str]] = []
-            for relative in sorted(item for item in untracked.split("\0") if item):
-                candidate = root.joinpath(*Path(relative).parts)
-                resolved = candidate.resolve(strict=True)
-                if not resolved.is_relative_to(root) or _is_link_or_reparse(candidate):
-                    raise RuntimeError("repository source path is unsafe")
-                metadata = candidate.stat()
-                if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > self.max_output_bytes:
-                    raise RuntimeError("repository source path is unsafe")
-                flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-                descriptor = os.open(candidate, flags)
-                digest = hashlib.sha256()
-                try:
-                    opened = os.fstat(descriptor)
-                    if (opened.st_dev, opened.st_ino, opened.st_size) != (
-                        metadata.st_dev, metadata.st_ino, metadata.st_size
-                    ):
-                        raise RuntimeError("repository source identity changed")
-                    while chunk := os.read(descriptor, 64 * 1024):
-                        digest.update(chunk)
-                finally:
-                    os.close(descriptor)
-                final = candidate.stat()
-                if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (
-                    metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
-                ):
-                    raise RuntimeError("repository source identity changed")
-                hashes.append((relative, digest.hexdigest()))
+            paths = sorted(
+                {item for listing in (tracked, untracked) for item in listing.split("\0") if item}
+            )
+            hashes = tuple(self._worktree_fingerprint(root, relative) for relative in paths)
             snapshot = _RepositoryReadSnapshot(
                 root_identity=(root_stat.st_dev, root_stat.st_ino),
                 git_identity=(git_stat.st_dev, git_stat.st_ino, git_stat.st_mode),
@@ -924,10 +934,7 @@ class ReadOnlyRepositoryInspector:
                 config_sha256=config_before[1],
                 head=read(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]),
                 index=read(["ls-files", "--stage", "-z"]),
-                tracked_patch_sha256=hashlib.sha256(
-                    tracked_patch.encode("utf-8", "surrogateescape")
-                ).hexdigest(),
-                untracked_hashes=tuple(hashes),
+                worktree_hashes=hashes,
             )
         if self._config_fingerprint(config) != config_before:
             raise RuntimeError("repository source identity changed")
