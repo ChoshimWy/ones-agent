@@ -39,6 +39,16 @@ class FakeCredentials:
             raise CredentialStoreError("credential operation failed")
         self.data[key] = secrets
 
+    def write_fresh_generation(
+        self, profile_id: str, generation: str, secrets: RuntimeSecrets
+    ) -> bool:
+        key = (profile_id, generation)
+        if key in self.data:
+            raise CredentialStoreError("credential operation failed")
+        self.writes.append(key)
+        self.data[key] = secrets
+        return True
+
     def read_generation(
         self, profile_id: str, generation: str, kinds: tuple[SecretKind, ...]
     ) -> RuntimeSecrets:
@@ -90,6 +100,19 @@ class SharedCredentials:
                 raise CredentialStoreError("credential operation failed")
             for kind, value in secrets.values.items():
                 self.data[(profile_id, generation, kind.value)] = value  # type: ignore[index]
+
+    def write_fresh_generation(
+        self, profile_id: str, generation: str, secrets: RuntimeSecrets
+    ) -> bool:
+        with self.lock:  # type: ignore[attr-defined]
+            if any(
+                key[:2] == (profile_id, generation)
+                for key in self.data.keys()  # type: ignore[attr-defined]
+            ):
+                raise CredentialStoreError("credential operation failed")
+            for kind, value in secrets.values.items():
+                self.data[(profile_id, generation, kind.value)] = value  # type: ignore[index]
+        return True
 
     def read_generation(
         self, profile_id: str, generation: str, kinds: tuple[SecretKind, ...]
@@ -217,6 +240,31 @@ def _commit_process(
     )
 
 
+def _fresh_claim_process(
+    config_path: str,
+    root: str,
+    generation: str,
+    credentials: object,
+    start: object,
+    results: object,
+    fail_before_replace: bool = False,
+) -> None:
+    setup = SetupStore(credentials, config_path=Path(config_path))  # type: ignore[arg-type]
+    if fail_before_replace:
+        setup._atomic_write = lambda _document: (_ for _ in ()).throw(  # type: ignore[method-assign]
+            OSError("TOKEN-SECRET target-path")
+        )
+    start.wait(10)  # type: ignore[attr-defined]
+    try:
+        setup.commit(
+            "profile-1", _candidate(Path(root), generation), _secrets(generation)
+        )
+    except SetupStoreError:
+        results.put(False)  # type: ignore[attr-defined]
+    else:
+        results.put(True)  # type: ignore[attr-defined]
+
+
 @pytest.fixture
 def store(tmp_path: Path) -> tuple[SetupStore, FakeCredentials, Path]:
     credentials = FakeCredentials()
@@ -317,6 +365,41 @@ def test_preexisting_orphan_generation_is_never_deleted_on_write_failure(
     assert credentials.writes == []
     assert credentials.deletes == []
     assert ("profile-1", generation) in credentials.data
+
+
+def test_commit_uses_only_atomic_fresh_claim_for_generation_ownership(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    setup, credentials, _ = store
+    fresh_calls: list[tuple[str, str]] = []
+    original_fresh = credentials.write_fresh_generation
+
+    def fresh(
+        profile_id: str, generation: str, secrets: RuntimeSecrets
+    ) -> bool:
+        fresh_calls.append((profile_id, generation))
+        return original_fresh(profile_id, generation, secrets)
+
+    monkeypatch.setattr(credentials, "write_fresh_generation", fresh)
+    monkeypatch.setattr(
+        credentials,
+        "list_generations",
+        lambda _profile: (_ for _ in ()).throw(AssertionError("list-before-write")),
+    )
+    monkeypatch.setattr(
+        credentials,
+        "write_generation",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("legacy-write")),
+    )
+
+    document = setup.commit(
+        "profile-1", _candidate(tmp_path, "1" * 32), _secrets()
+    )
+
+    assert document.active is not None
+    assert fresh_calls == [("profile-1", "1" * 32)]
 
 
 @pytest.mark.parametrize("mismatch", ("missing", "extra"))
@@ -688,6 +771,104 @@ def test_two_process_commits_are_serialized_without_mixed_document(
             )
         finally:
             for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+
+def test_two_config_files_cannot_both_claim_the_same_generation(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        credentials = SharedCredentials(manager.dict(), manager.RLock())
+        start = context.Event()
+        results = context.Queue()
+        generation = "e" * 32
+        paths = (
+            tmp_path / "first" / "ones-dev" / "config.json",
+            tmp_path / "second" / "ones-dev" / "config.json",
+        )
+        processes = [
+            context.Process(
+                target=_fresh_claim_process,
+                args=(
+                    str(path),
+                    str(tmp_path),
+                    generation,
+                    credentials,
+                    start,
+                    results,
+                ),
+            )
+            for path in paths
+        ]
+        try:
+            for process in processes:
+                process.start()
+            start.set()
+            for process in processes:
+                process.join(timeout=20)
+                assert process.exitcode == 0
+            assert sorted(results.get(timeout=5) for _ in processes) == [False, True]
+            existing = tuple(path for path in paths if path.exists())
+            assert len(existing) == 1
+            document = SetupStore(credentials, config_path=existing[0]).load()
+            assert document.active is not None
+            assert document.active.generation == generation
+            assert credentials.list_generations("profile-1") == (generation,)
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+
+def test_failed_pre_replace_claim_can_be_followed_by_success_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    context = multiprocessing.get_context("spawn")
+    with context.Manager() as manager:
+        credentials = SharedCredentials(manager.dict(), manager.RLock())
+        generation = "f" * 32
+        results = context.Queue()
+        fail_start = context.Event()
+        success_start = context.Event()
+        failed_path = tmp_path / "failed" / "ones-dev" / "config.json"
+        success_path = tmp_path / "success" / "ones-dev" / "config.json"
+        failed = context.Process(
+            target=_fresh_claim_process,
+            args=(
+                str(failed_path), str(tmp_path), generation, credentials,
+                fail_start, results, True,
+            ),
+        )
+        succeeded = context.Process(
+            target=_fresh_claim_process,
+            args=(
+                str(success_path), str(tmp_path), generation, credentials,
+                success_start, results,
+            ),
+        )
+        try:
+            failed.start()
+            fail_start.set()
+            assert results.get(timeout=15) is False
+            failed.join(timeout=15)
+            assert failed.exitcode == 0
+            succeeded.start()
+            success_start.set()
+            assert results.get(timeout=15) is True
+            succeeded.join(timeout=15)
+            assert succeeded.exitcode == 0
+            document = SetupStore(credentials, config_path=success_path).load()
+            assert document.active is not None
+            assert document.active.generation == generation
+            assert credentials.read_generation(
+                "profile-1", generation, document.active.credential_kinds
+            ).require(SecretKind.ONES_PASSWORD) == generation
+        finally:
+            for process in (failed, succeeded):
                 if process.is_alive():
                     process.terminate()
                     process.join(timeout=5)

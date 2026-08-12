@@ -420,6 +420,77 @@ def test_generation_write_is_idempotent_only_for_the_same_complete_values(
     assert fake_wincred.write_count == writes_after_first_call
 
 
+def test_fresh_generation_claim_rejects_every_existing_target(
+    fake_wincred: FakeWinCred,
+) -> None:
+    store = WindowsCredentialStore(fake_wincred)
+    generation = "c" * 32
+    value = RuntimeSecrets({SecretKind.ONES_PASSWORD: "password"})
+
+    assert store.write_fresh_generation("profile-1", generation, value) is True
+    writes = fake_wincred.write_count
+    with pytest.raises(CredentialStoreError, match="^credential operation failed$"):
+        store.write_fresh_generation("profile-1", generation, value)
+
+    assert fake_wincred.write_count == writes
+
+
+def test_fresh_generation_claim_rolls_back_partial_write(
+    fake_wincred: FakeWinCred,
+) -> None:
+    store = WindowsCredentialStore(fake_wincred)
+    fake_wincred.fail_on_write = 2
+
+    with pytest.raises(CredentialStoreError, match="^credential operation failed$"):
+        store.write_fresh_generation(
+            "profile-1",
+            "d" * 32,
+            RuntimeSecrets(
+                {
+                    SecretKind.ONES_EMAIL: "agent@example.invalid",
+                    SecretKind.ONES_PASSWORD: "password",
+                }
+            ),
+        )
+
+    assert store.list_generations("profile-1") == ()
+
+
+def test_fresh_generation_enumerate_and_write_share_generation_lock(
+    fake_wincred: FakeWinCred,
+) -> None:
+    lock_depth = 0
+
+    @contextmanager
+    def lock_factory(_profile: str, _generation: str) -> Iterator[None]:
+        nonlocal lock_depth
+        lock_depth += 1
+        try:
+            yield
+        finally:
+            lock_depth -= 1
+
+    original_list = fake_wincred.list_generic_targets
+    original_write = fake_wincred.write_generic
+
+    def checked_list(prefix: str) -> tuple[str, ...]:
+        assert lock_depth == 1
+        return original_list(prefix)
+
+    def checked_write(target: str, value: bytearray, *, persist: str) -> None:
+        assert lock_depth == 1
+        original_write(target, value, persist=persist)
+
+    fake_wincred.list_generic_targets = checked_list  # type: ignore[method-assign]
+    fake_wincred.write_generic = checked_write  # type: ignore[method-assign]
+    store = WindowsCredentialStore(fake_wincred, lock_factory=lock_factory)
+
+    assert store.write_fresh_generation(
+        "profile-1",
+        "e" * 32,
+        RuntimeSecrets({SecretKind.ONES_PASSWORD: "password"}),
+    ) is True
+
 def test_generation_lock_covers_write_compare_and_delete(
     fake_wincred: FakeWinCred,
 ) -> None:

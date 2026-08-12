@@ -150,22 +150,16 @@ class SetupStore:
                 for setup in (current.active, current.previous)
                 if setup is not None
             }
-            try:
-                existing_generations = self._credentials.list_generations(profile_id)
-            except CredentialStoreError:
-                raise SetupStoreError("credential enumeration failed") from None
-            if (
-                candidate.generation in referenced
-                or candidate.generation in existing_generations
-            ):
+            if candidate.generation in referenced:
                 raise SetupStoreError("configuration generation is unavailable")
-            fresh_generation = True
             try:
-                self._credentials.write_generation(
+                fresh_generation = self._credentials.write_fresh_generation(
                     profile_id, candidate.generation, secrets
                 )
             except CredentialStoreError:
-                raise SetupStoreError("credential operation failed") from None
+                raise SetupStoreError("configuration generation is unavailable") from None
+            if fresh_generation is not True:
+                raise SetupStoreError("configuration generation is unavailable")
             document = current.validated_update(
                 active=candidate, previous=current.active
             )
