@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from threading import Event, Lock, Thread
 from types import MappingProxyType
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 import unicodedata
 from uuid import uuid4
 
@@ -36,6 +37,79 @@ class SetupActionError(RuntimeError):
 
 class _ConfigurationChanged(RuntimeError):
     """Internal CAS failure without draft or credential details."""
+
+
+_NO_HANDLE = object()
+
+
+class _CloseOnce:
+    """Allow loop and fallback workers to race without closing twice."""
+
+    def __init__(self, handle: object) -> None:
+        self._handle = handle
+        self._lock = Lock()
+        self.started = Event()
+        self._claimed = False
+
+    def run(self) -> None:
+        with self._lock:
+            if self._claimed:
+                return
+            self._claimed = True
+            self.started.set()
+        _close_handle(self._handle)
+
+
+class _BuildAttempt:
+    """Transfer ownership of a runtime handle exactly once across loop shutdown."""
+
+    def __init__(
+        self,
+        cleanup_timeout: float,
+        abandoned_handoff: Callable[[object], None],
+    ) -> None:
+        self._lock = Lock()
+        self._cleanup_timeout = cleanup_timeout
+        self._abandoned_handoff = abandoned_handoff
+        self._abandoned = False
+        self._claimed = False
+        self._completed: object = _NO_HANDLE
+
+    def run(
+        self,
+        builder: RuntimeBuilder,
+        active: ActiveSetup,
+        secrets: RuntimeSecrets,
+    ) -> object:
+        handle = builder.build(active, secrets)
+        close_here = False
+        with self._lock:
+            self._completed = handle
+            if self._abandoned and not self._claimed:
+                self._claimed = True
+                close_here = True
+        if close_here:
+            self._abandoned_handoff(handle)
+        return handle
+
+    def abandon(self) -> object | None:
+        with self._lock:
+            self._abandoned = True
+            if self._completed is _NO_HANDLE or self._claimed:
+                return None
+            self._claimed = True
+            return self._completed
+
+    def claim_late(self) -> bool:
+        with self._lock:
+            if self._claimed:
+                return False
+            self._claimed = True
+            return True
+
+    def deliver(self) -> None:
+        with self._lock:
+            self._claimed = True
 
 
 class RuntimeBuilder(Protocol):
@@ -156,6 +230,7 @@ class SetupController:
         self._activation_error: str | None = None
         self._finalizing = False
         self._background_close_tasks: set[asyncio.Task[None]] = set()
+        self._abandoned_build_tasks: set[asyncio.Task[object]] = set()
 
     @property
     def closed(self) -> bool:
@@ -488,7 +563,11 @@ class SetupController:
                 self._finalizing = True
                 self._require_revision(revision)
                 finalize_task = asyncio.create_task(
-                    asyncio.to_thread(self._store.finalize_activation, profile_id)
+                    asyncio.to_thread(
+                        self._store.finalize_activation,
+                        profile_id,
+                        candidate.generation,
+                    )
                 )
                 try:
                     await asyncio.shield(finalize_task)
@@ -507,6 +586,9 @@ class SetupController:
                     self._cleanup_save(
                         handle,
                         profile_id=profile_id,
+                        expected_generation=(
+                            candidate.generation if candidate is not None else None
+                        ),
                         rollback=committed and not finalized,
                     )
                 )
@@ -528,6 +610,9 @@ class SetupController:
                     self._cleanup_save(
                         handle,
                         profile_id=profile_id,
+                        expected_generation=(
+                            candidate.generation if candidate is not None else None
+                        ),
                         rollback=committed and not finalized,
                     )
                 )
@@ -568,6 +653,18 @@ class SetupController:
             return
         self.cancel_edit()
         self._closed = True
+
+    async def aclose(self) -> None:
+        """Close setup and drain owned background work up to the cleanup deadline."""
+
+        self.close()
+        tasks: set[asyncio.Task[Any]] = {
+            *self._background_close_tasks,
+            *self._abandoned_build_tasks,
+        }
+        if not tasks:
+            return
+        await asyncio.wait(tasks, timeout=self._cleanup_timeout)
 
     async def _probe(
         self, step: SetupStep, probe: object | None
@@ -630,15 +727,33 @@ class SetupController:
     async def _bounded_build(
         self, active: ActiveSetup, secrets: RuntimeSecrets
     ) -> object:
+        loop = asyncio.get_running_loop()
+        attempt = _BuildAttempt(
+            self._cleanup_timeout,
+            lambda handle: self._handoff_abandoned_handle(loop, handle),
+        )
         task = asyncio.create_task(
-            asyncio.to_thread(self._runtime_builder.build, active, secrets)
+            asyncio.to_thread(
+                attempt.run,
+                self._runtime_builder,
+                active,
+                secrets,
+            )
         )
         try:
-            return await asyncio.wait_for(
+            handle = await asyncio.wait_for(
                 asyncio.shield(task), timeout=self._activation_timeout
             )
+            attempt.deliver()
+            return handle
         except (asyncio.TimeoutError, asyncio.CancelledError):
-            task.add_done_callback(self._close_late_build)
+            completed = attempt.abandon()
+            if completed is not None:
+                self._schedule_background_close(completed)
+            self._abandoned_build_tasks.add(task)
+            task.add_done_callback(
+                lambda finished: self._finish_abandoned_build(finished, attempt)
+            )
             raise
 
     async def _harvest_task(
@@ -667,13 +782,14 @@ class SetupController:
         handle: object | None,
         *,
         profile_id: str,
+        expected_generation: str | None,
         rollback: bool,
     ) -> None:
         """Run all failure cleanup in one child task protected from parent cancellation."""
 
         try:
-            if rollback:
-                await self._rollback(profile_id)
+            if rollback and expected_generation is not None:
+                await self._rollback(profile_id, expected_generation)
         finally:
             self._clear_transient_secrets()
         if handle is not None:
@@ -687,10 +803,40 @@ class SetupController:
     def _schedule_background_close(self, handle: object) -> asyncio.Task[None]:
         """Schedule exactly one observed close without running it on the event loop."""
 
-        close_task = asyncio.create_task(asyncio.to_thread(_close_handle, handle))
+        return self._schedule_close_once(_CloseOnce(handle))
+
+    def _schedule_close_once(self, closer: _CloseOnce) -> asyncio.Task[None]:
+        close_task = asyncio.create_task(asyncio.to_thread(closer.run))
         self._background_close_tasks.add(close_task)
         close_task.add_done_callback(self._consume_close_task)
         return close_task
+
+    def _handoff_abandoned_handle(
+        self, loop: asyncio.AbstractEventLoop, handle: object
+    ) -> None:
+        """Give a late handle to a live loop once, otherwise close off-loop once."""
+
+        closer = _CloseOnce(handle)
+
+        def accept() -> None:
+            try:
+                self._schedule_close_once(closer)
+            except BaseException:
+                pass
+
+        try:
+            loop.call_soon_threadsafe(accept)
+        except RuntimeError:
+            pass
+        if closer.started.wait(self._cleanup_timeout):
+            return
+        fallback_thread = Thread(
+            target=closer.run,
+            name="ones-setup-abandoned-close",
+            daemon=True,
+        )
+        fallback_thread.start()
+        fallback_thread.join(self._cleanup_timeout)
 
     def _consume_close_task(self, task: asyncio.Task[None]) -> None:
         """Consume a detached close outcome and release its lifecycle reference."""
@@ -703,19 +849,27 @@ class SetupController:
         except BaseException:
             pass
 
-    def _close_late_build(self, task: asyncio.Task[object]) -> None:
+    def _finish_abandoned_build(
+        self, task: asyncio.Task[object], attempt: _BuildAttempt
+    ) -> None:
+        self._abandoned_build_tasks.discard(task)
         if task.cancelled():
             return
         try:
             handle = task.result()
         except BaseException:
             return
-        self._schedule_background_close(handle)
+        if attempt.claim_late():
+            self._schedule_background_close(handle)
 
-    async def _rollback(self, profile_id: str) -> None:
+    async def _rollback(self, profile_id: str, expected_generation: str) -> None:
         try:
             await asyncio.shield(
-                asyncio.to_thread(self._store.restore_previous, profile_id)
+                asyncio.to_thread(
+                    self._store.restore_previous,
+                    profile_id,
+                    expected_generation,
+                )
             )
         except BaseException:
             # Cleanup is best-effort and must not replace the primary control-flow

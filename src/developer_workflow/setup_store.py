@@ -208,9 +208,12 @@ class SetupStore:
         except CredentialStoreError:
             raise SetupStoreError("active credentials are unavailable") from None
 
-    def restore_previous(self, profile_id: str) -> SetupDocument:
+    def restore_previous(
+        self, profile_id: str, expected_generation: str
+    ) -> SetupDocument:
         with self._locked():
             current = self._load_unlocked_for_profile(profile_id)
+            self._require_active_generation(current, expected_generation)
             failed = current.active
             if failed is None:
                 raise SetupStoreError("previous configuration is unavailable")
@@ -227,9 +230,12 @@ class SetupStore:
                     raise SetupStoreError("credential cleanup failed") from None
             return loaded
 
-    def finalize_activation(self, profile_id: str) -> SetupDocument:
+    def finalize_activation(
+        self, profile_id: str, expected_generation: str
+    ) -> SetupDocument:
         with self._locked():
             current = self._load_unlocked_for_profile(profile_id)
+            self._require_active_generation(current, expected_generation)
             obsolete = current.previous
             finalized = current.validated_update(previous=None)
             loaded = self._write_confirmed_monotonic(finalized)
@@ -241,6 +247,18 @@ class SetupStore:
                 except CredentialStoreError:
                     logger.warning("setup credential cleanup deferred")
             return loaded
+
+    @staticmethod
+    def _require_active_generation(
+        document: SetupDocument, expected_generation: str
+    ) -> None:
+        if (
+            type(expected_generation) is not str
+            or _GENERATION.fullmatch(expected_generation) is None
+            or document.active is None
+            or document.active.generation != expected_generation
+        ):
+            raise SetupStoreError("configuration generation is superseded")
 
     def orphan_generations(self) -> tuple[str, ...]:
         with self._locked():

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from threading import Event
+import time
 from types import MappingProxyType
 from typing import Any
 
@@ -167,16 +168,30 @@ class FakeStore:
             )
         )
 
-    def restore_previous(self, profile_id: str) -> SetupDocument:
+    def restore_previous(
+        self, profile_id: str, expected_generation: str
+    ) -> SetupDocument:
         assert profile_id == "managed-profile"
+        if (
+            self.document.active is None
+            or self.document.active.generation != expected_generation
+        ):
+            raise SetupStoreError("configuration generation is superseded")
         self.restores += 1
         self.document = self.document.validated_update(
             active=self.document.previous, previous=None
         )
         return self.document
 
-    def finalize_activation(self, profile_id: str) -> SetupDocument:
+    def finalize_activation(
+        self, profile_id: str, expected_generation: str
+    ) -> SetupDocument:
         assert profile_id == "managed-profile"
+        if (
+            self.document.active is None
+            or self.document.active.generation != expected_generation
+        ):
+            raise SetupStoreError("configuration generation is superseded")
         self.finalizes += 1
         if self.finalize_error is not None:
             raise self.finalize_error
@@ -525,10 +540,12 @@ async def test_cancel_during_finalize_harvests_success_without_rollback(
             self.finalize_started = Event()
             self.finalize_release = Event()
 
-        def finalize_activation(self, profile_id: str) -> SetupDocument:
+        def finalize_activation(
+            self, profile_id: str, expected_generation: str
+        ) -> SetupDocument:
             self.finalize_started.set()
             assert self.finalize_release.wait(2)
-            return super().finalize_activation(profile_id)
+            return super().finalize_activation(profile_id, expected_generation)
 
     store = BlockingFinalizeStore()
     controller, _, builder, _ = _controller(tmp_path, store=store)
@@ -740,10 +757,12 @@ async def test_repeated_cancel_after_finalize_completes_all_cleanup(
             self.finalize_started = Event()
             self.finalize_release = Event()
 
-        def finalize_activation(self, profile_id: str) -> SetupDocument:
+        def finalize_activation(
+            self, profile_id: str, expected_generation: str
+        ) -> SetupDocument:
             self.finalize_started.set()
             assert self.finalize_release.wait(2)
-            return super().finalize_activation(profile_id)
+            return super().finalize_activation(profile_id, expected_generation)
 
     store = BlockingFinalizeStore()
     builder = FakeRuntimeBuilder()
@@ -782,10 +801,12 @@ async def test_repeated_cancel_during_rollback_waits_for_pointer_restoration(
             self.restore_started = Event()
             self.restore_release = Event()
 
-        def restore_previous(self, profile_id: str) -> SetupDocument:
+        def restore_previous(
+            self, profile_id: str, expected_generation: str
+        ) -> SetupDocument:
             self.restore_started.set()
             assert self.restore_release.wait(2)
-            return super().restore_previous(profile_id)
+            return super().restore_previous(profile_id, expected_generation)
 
     store = BlockingRestoreStore()
     old_controller, _, _, _ = _controller(tmp_path, store=store)
@@ -867,6 +888,7 @@ async def test_blocked_close_cannot_delay_rollback_secret_clear_or_lock_release(
     assert builder.handle.close_calls == 1
     assert builder.handle.closed == 1
     assert controller._background_close_tasks == set()
+    assert controller._abandoned_build_tasks == set()
 
 
 @pytest.mark.asyncio
@@ -879,10 +901,12 @@ async def test_finalized_active_survives_background_close_timeout(
             self.finalize_started = Event()
             self.finalize_release = Event()
 
-        def finalize_activation(self, profile_id: str) -> SetupDocument:
+        def finalize_activation(
+            self, profile_id: str, expected_generation: str
+        ) -> SetupDocument:
             self.finalize_started.set()
             assert self.finalize_release.wait(2)
-            return super().finalize_activation(profile_id)
+            return super().finalize_activation(profile_id, expected_generation)
 
     store = BlockingFinalizeStore()
     builder = FakeRuntimeBuilder()
@@ -1030,3 +1054,130 @@ async def test_late_build_failures_are_consumed_without_secret_leak(
         assert handle.calls == (1 if late_failure == "close" else 0)
     finally:
         loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.asyncio
+async def test_superseded_controller_cannot_finalize_newer_generation(
+    tmp_path: Path,
+) -> None:
+    old_controller, store, _, _ = _controller(tmp_path)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    first_builder = BlockingMutationBuilder()
+    first, _, _, _ = _controller(tmp_path, store=store, builder=first_builder)
+    await _pass_all(first)
+    first_task = asyncio.create_task(first.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(first_builder.started.wait, 2)
+
+    second_builder = FakeRuntimeBuilder()
+    second, _, _, _ = _controller(tmp_path, store=store, builder=second_builder)
+    await _pass_all(second)
+    second_handle = await second.save_and_activate(confirmed=True)
+    current = store.document.active
+    first_builder.release.set()
+
+    with pytest.raises(SetupActionError, match="^runtime validation failed$"):
+        await first_task
+    assert second_handle is second_builder.handle
+    assert store.document.active == current
+    assert store.document.previous is None
+    assert first_builder.handle.closed == 1
+    assert first.secret_presence(SecretKind.ONES_PASSWORD) is False
+
+
+@pytest.mark.asyncio
+async def test_superseded_rollback_cannot_restore_or_delete_newer_generation(
+    tmp_path: Path,
+) -> None:
+    class ReleasingErrorBuilder(BlockingMutationBuilder):
+        def build(self, active: ActiveSetup, secrets: RuntimeSecrets) -> Handle:
+            self.calls.append((active, secrets))
+            self.started.set()
+            assert self.release.wait(2)
+            raise RuntimeError("TOKEN-SECRET")
+
+    old_controller, store, _, _ = _controller(tmp_path)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    first_builder = ReleasingErrorBuilder()
+    first, _, _, _ = _controller(tmp_path, store=store, builder=first_builder)
+    await _pass_all(first)
+    first_task = asyncio.create_task(first.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(first_builder.started.wait, 2)
+
+    second_builder = BlockingMutationBuilder()
+    second, _, _, _ = _controller(tmp_path, store=store, builder=second_builder)
+    await _pass_all(second)
+    second_task = asyncio.create_task(second.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(second_builder.started.wait, 2)
+    newer = store.document.active
+    first_builder.release.set()
+
+    with pytest.raises(SetupActionError, match="^runtime validation failed$"):
+        await first_task
+    assert store.document.active == newer
+    assert store.document.previous is not None
+    second_builder.release.set()
+    await second_task
+    assert store.document.active == newer
+    assert store.document.previous is None
+
+
+def test_asyncio_run_shutdown_still_closes_abandoned_build_handle_once(
+    tmp_path: Path,
+) -> None:
+    class DelayedBuilder(FakeRuntimeBuilder):
+        def __init__(self) -> None:
+            super().__init__()
+            self.handle = Handle()
+
+        def build(self, active: ActiveSetup, secrets: RuntimeSecrets) -> Handle:
+            self.calls.append((active, secrets))
+            time.sleep(0.1)
+            return self.handle
+
+    builder = DelayedBuilder()
+
+    async def scenario() -> SetupController:
+        controller, _, _, _ = _controller(tmp_path, builder=builder)
+        controller._activation_timeout = 0.01
+        await _pass_all(controller)
+        with pytest.raises(SetupActionError, match="^runtime validation failed$"):
+            await controller.save_and_activate(confirmed=True)
+        controller.close()
+        return controller
+
+    controller = asyncio.run(scenario())
+
+    assert builder.handle.closed == 1
+    assert controller._background_close_tasks == set()
+    assert controller._abandoned_build_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_aclose_drains_background_tasks_only_to_cleanup_deadline(
+    tmp_path: Path,
+) -> None:
+    handle = LongBlockingCloseHandle()
+    builder = LateRuntimeBuilder(handle)
+    controller, _, _, _ = _controller(tmp_path, builder=builder)
+    controller._activation_timeout = 0.01
+    await _pass_all(controller)
+    with pytest.raises(SetupActionError, match="^runtime validation failed$"):
+        await controller.save_and_activate(confirmed=True)
+    builder.release.set()
+    assert await asyncio.to_thread(handle.close_started.wait, 2)
+
+    started = asyncio.get_running_loop().time()
+    await controller.aclose()
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert controller.closed is True
+    assert len(controller._background_close_tasks) == 1
+
+    handle.close_release.set()
+    for _ in range(50):
+        if not controller._background_close_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert controller._background_close_tasks == set()
+    assert handle.close_calls == 1

@@ -318,7 +318,7 @@ def test_restore_previous_clears_first_failed_generation(
     )
     assert failed.previous is None
 
-    restored = setup.restore_previous("profile-1")
+    restored = setup.restore_previous("profile-1", "f" * 32)
 
     assert restored.active is None
     assert restored.previous is None
@@ -342,7 +342,7 @@ def test_restore_first_generation_write_failure_keeps_active_and_credentials(
     )
 
     with pytest.raises(SetupStoreError, match="^configuration save failed$") as error:
-        setup.restore_previous("profile-1")
+        setup.restore_previous("profile-1", "f" * 32)
 
     assert error.value.__cause__ is None
     assert error.value.__context__ is None
@@ -363,7 +363,7 @@ def test_restore_first_generation_post_replace_failure_never_deletes_active_cred
         lambda _path: (_ for _ in ()).throw(OSError("TOKEN-SECRET")),
     )
 
-    restored = setup.restore_previous("profile-1")
+    restored = setup.restore_previous("profile-1", "f" * 32)
 
     assert restored.active is None
     assert restored.previous is None
@@ -947,7 +947,7 @@ def test_restore_finalize_and_orphan_cleanup_are_pointer_safe(
     with pytest.raises(SetupStoreError, match="^credential cleanup refused$"):
         setup.cleanup_orphan_generations(("a" * 32, "c" * 32))
     setup.cleanup_orphan_generations(("c" * 32,))
-    restored = setup.restore_previous("profile-1")
+    restored = setup.restore_previous("profile-1", "b" * 32)
     assert restored.active is not None and restored.active.generation == "a" * 32
     assert ("profile-1", "b" * 32) not in credentials.data
 
@@ -960,7 +960,7 @@ def test_finalize_keeps_new_active_when_old_credential_delete_fails(
     setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
     credentials.fail_delete = True
 
-    finalized = setup.finalize_activation("profile-1")
+    finalized = setup.finalize_activation("profile-1", "b" * 32)
 
     assert finalized.previous is None
     assert finalized.active is not None and finalized.active.generation == "b" * 32
@@ -980,12 +980,42 @@ def test_finalize_post_replace_failure_is_monotonic_success(
         lambda _path: (_ for _ in ()).throw(OSError("TOKEN-SECRET")),
     )
 
-    finalized = setup.finalize_activation("profile-1")
+    finalized = setup.finalize_activation("profile-1", "b" * 32)
 
     assert finalized.active is not None
     assert finalized.active.generation == "b" * 32
     assert finalized.previous is None
     assert ("profile-1", "a" * 32) not in credentials.data
+
+
+@pytest.mark.parametrize("operation", ("finalize", "restore"))
+def test_generation_cas_rejects_superseded_controller_without_mutation(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    operation: str,
+) -> None:
+    setup, credentials, _ = store
+    setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("first"))
+    current = setup.commit(
+        "profile-1", _candidate(tmp_path, "c" * 32), _secrets("second")
+    )
+    credentials.deletes.clear()
+
+    with pytest.raises(
+        SetupStoreError, match="^configuration generation is superseded$"
+    ) as error:
+        if operation == "finalize":
+            setup.finalize_activation("profile-1", "b" * 32)
+        else:
+            setup.restore_previous("profile-1", "b" * 32)
+
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert setup.load() == current
+    assert credentials.deletes == []
+    assert ("profile-1", "b" * 32) in credentials.data
+    assert ("profile-1", "c" * 32) in credentials.data
 
 
 @pytest.mark.parametrize(
