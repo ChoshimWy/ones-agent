@@ -568,20 +568,27 @@ async def test_activate_existing_refuses_crash_recovery_pending_before_secret_re
     assert restarted.load() == before
 
     restored = restarted.restore_previous("managed-profile", pending.generation)
-    recovery_builder = FakeRuntimeBuilder()
-    recovered, _, _, _ = _controller(
-        tmp_path, store=restarted, builder=recovery_builder  # type: ignore[arg-type]
-    )
-    handle = await recovered.activate_existing()
+    handle = await loader.activate_existing()
     if has_stable:
-        assert handle is recovery_builder.handle
-        assert len(recovery_builder.calls) == 1
+        assert handle is builder.handle
+        assert len(builder.calls) == 1
+        assert loader.activation_error is None
         assert restored.active is not None
         assert restored.active.generation == "a" * 32
+        assert await loader.activate_existing() is builder.handle
+        assert len(builder.calls) == 2
+        assert loader.activation_error is None
     else:
         assert handle is None
-        assert recovery_builder.calls == []
+        assert builder.calls == []
+        assert loader.activation_error is None
         assert restored.active is None
+        assert await loader.activate_existing() is None
+        assert builder.calls == []
+        assert loader.activation_error is None
+        loader._activation_error = "runtime validation failed"
+        assert await loader.activate_existing() is None
+        assert loader.activation_error == "runtime validation failed"
 
 
 @pytest.mark.asyncio

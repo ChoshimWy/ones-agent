@@ -491,6 +491,8 @@ class SetupController:
                     self._activation_error = "activation recovery required"
                     return None
                 if document.active is None:
+                    if self._activation_error == "activation recovery required":
+                        self._activation_error = None
                     return None
                 secrets = await asyncio.to_thread(
                     self._store.read_active_secrets, document
