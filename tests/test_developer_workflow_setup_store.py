@@ -27,10 +27,13 @@ class FakeCredentials:
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], RuntimeSecrets] = {}
         self.fail_delete = False
+        self.writes: list[tuple[str, str]] = []
+        self.deletes: list[tuple[str, str]] = []
 
     def write_generation(
         self, profile_id: str, generation: str, secrets: RuntimeSecrets
     ) -> None:
+        self.writes.append((profile_id, generation))
         key = (profile_id, generation)
         if key in self.data:
             raise CredentialStoreError("credential operation failed")
@@ -46,12 +49,25 @@ class FakeCredentials:
             raise CredentialStoreError("credential operation failed") from None
 
     def delete_generation(self, profile_id: str, generation: str) -> None:
+        self.deletes.append((profile_id, generation))
         if self.fail_delete:
             raise CredentialStoreError("credential operation failed")
         self.data.pop((profile_id, generation), None)
 
     def list_generations(self, profile_id: str) -> tuple[str, ...]:
         return tuple(sorted(g for p, g in self.data if p == profile_id))
+
+
+class IdempotentFakeCredentials(FakeCredentials):
+    def write_generation(
+        self, profile_id: str, generation: str, secrets: RuntimeSecrets
+    ) -> None:
+        self.writes.append((profile_id, generation))
+        key = (profile_id, generation)
+        existing = self.data.get(key)
+        if existing is not None and existing.values != secrets.values:
+            raise CredentialStoreError("credential operation failed")
+        self.data[key] = secrets
 
 
 class SharedCredentials:
@@ -243,6 +259,123 @@ def test_commit_switches_generation_and_reads_only_active_kinds(
     assert setup.load() == second
     assert second.previous == first.active
     assert setup.read_active_secrets(second).require(SecretKind.ONES_PASSWORD) == "new"
+
+
+@pytest.mark.parametrize("referenced", ("active", "previous"))
+def test_commit_rejects_referenced_generation_before_any_mutation(
+    tmp_path: Path, referenced: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials = IdempotentFakeCredentials()
+    path = tmp_path / "local" / "ones-dev" / "config.json"
+    setup = SetupStore(credentials, config_path=path)
+    first = setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
+    generation = (
+        setup.load().active.generation
+        if referenced == "active"
+        else setup.load().previous.generation
+    )
+    credentials.writes.clear()
+    credentials.deletes.clear()
+    atomic_calls = 0
+    original = setup._atomic_write
+
+    def count_write(document: object) -> None:
+        nonlocal atomic_calls
+        atomic_calls += 1
+        original(document)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(setup, "_atomic_write", count_write)
+    with pytest.raises(SetupStoreError, match="^configuration generation is unavailable$"):
+        setup.commit("profile-1", _candidate(tmp_path, generation), _secrets("old"))
+
+    assert credentials.writes == []
+    assert credentials.deletes == []
+    assert atomic_calls == 0
+    assert setup.load().previous == first.active
+
+
+def test_preexisting_orphan_generation_is_never_deleted_on_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    credentials = IdempotentFakeCredentials()
+    path = tmp_path / "local" / "ones-dev" / "config.json"
+    setup = SetupStore(credentials, config_path=path)
+    generation = "c" * 32
+    credentials.data[("profile-1", generation)] = _secrets("existing")
+    monkeypatch.setattr(
+        setup,
+        "_atomic_write",
+        lambda _document: (_ for _ in ()).throw(OSError("TOKEN-SECRET")),
+    )
+
+    with pytest.raises(SetupStoreError, match="^configuration generation is unavailable$"):
+        setup.commit(
+            "profile-1", _candidate(tmp_path, generation), _secrets("existing")
+        )
+
+    assert credentials.writes == []
+    assert credentials.deletes == []
+    assert ("profile-1", generation) in credentials.data
+
+
+@pytest.mark.parametrize("mismatch", ("missing", "extra"))
+def test_commit_rejects_secret_kind_mismatch_before_any_mutation(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mismatch: str,
+) -> None:
+    setup, credentials, _ = store
+    candidate = _candidate(tmp_path, "d" * 32)
+    secrets = (
+        RuntimeSecrets({})
+        if mismatch == "missing"
+        else RuntimeSecrets(
+            {
+                SecretKind.ONES_PASSWORD: "TOKEN-SECRET",
+                SecretKind.PROVIDER_TOKEN: "EXTRA-SECRET",
+            }
+        )
+    )
+    atomic_calls = 0
+
+    def count_write(_document: object) -> None:
+        nonlocal atomic_calls
+        atomic_calls += 1
+
+    monkeypatch.setattr(setup, "_atomic_write", count_write)
+    with pytest.raises(
+        SetupStoreError, match="^configuration credentials are invalid$"
+    ) as captured:
+        setup.commit("profile-1", candidate, secrets)
+
+    assert credentials.writes == []
+    assert credentials.deletes == []
+    assert atomic_calls == 0
+    assert "provider_token" not in repr(captured.value)
+    assert "EXTRA-SECRET" not in repr(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("candidate", "secrets"),
+    ((object(), _secrets()), (object(), object())),
+)
+def test_commit_rejects_wrong_types_before_credential_mutation(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    candidate: object,
+    secrets: object,
+) -> None:
+    setup, credentials, path = store
+
+    with pytest.raises(
+        SetupStoreError, match="^configuration credentials are invalid$"
+    ):
+        setup.commit("profile-1", candidate, secrets)  # type: ignore[arg-type]
+
+    assert credentials.writes == []
+    assert credentials.deletes == []
+    assert not path.exists()
 
 
 def test_json_failure_rolls_back_new_credentials_and_preserves_old_document(

@@ -87,7 +87,7 @@ def _active_payload(**workflow_overrides: object) -> dict[str, object]:
         "generation": "a" * 32,
         "runtime": _public_config().model_dump(mode="json"),
         "workflow": workflow,
-        "credential_kinds": (),
+        "credential_kinds": (SecretKind.ONES_PASSWORD,),
     }
 
 
@@ -464,6 +464,44 @@ def test_active_setup_holds_complete_workflow_and_credential_kinds(
 
 
 @pytest.mark.parametrize(
+    "credential_kinds",
+    (
+        (),
+        (SecretKind.ONES_PASSWORD, SecretKind.ONES_PASSWORD),
+        (SecretKind.ONES_PASSWORD, 123),
+    ),
+)
+def test_active_setup_requires_nonempty_unique_strict_credential_kinds(
+    tmp_path: Path, credential_kinds: tuple[object, ...]
+) -> None:
+    with pytest.raises(ValidationError):
+        ActiveSetup(
+            generation="a" * 32,
+            runtime=_public_config(),
+            workflow=_workflow_config(tmp_path),
+            credential_kinds=credential_kinds,
+        )
+
+
+def test_setup_document_rejects_shared_active_previous_generation(
+    tmp_path: Path,
+) -> None:
+    active = ActiveSetup(
+        generation="a" * 32,
+        runtime=_public_config(),
+        workflow=_workflow_config(tmp_path),
+        credential_kinds=(SecretKind.ONES_PASSWORD,),
+    )
+
+    with pytest.raises(ValidationError):
+        SetupDocument(
+            profile_id="default",
+            active=active,
+            previous=active,
+        )
+
+
+@pytest.mark.parametrize(
     "workflow_update",
     [
         {"run_root": "relative/runs"},
@@ -582,7 +620,7 @@ def test_generation_is_a_canonical_credential_target_segment(generation: str) ->
                 repositories=(_repository(),),
                 publishing=PublishingConfig(provider="local_fake"),
             ),
-            credential_kinds=(),
+            credential_kinds=(SecretKind.ONES_PASSWORD,),
         )
 
 

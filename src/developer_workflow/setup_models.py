@@ -373,7 +373,7 @@ class ActiveSetup(SetupModel):
     generation: StrictStr
     runtime: RuntimePublicConfig
     workflow: _CommittedDeveloperWorkflowConfig
-    credential_kinds: tuple[SecretKind, ...]
+    credential_kinds: tuple[SecretKind, ...] = Field(min_length=1)
 
     @field_validator("generation")
     @classmethod
@@ -381,6 +381,22 @@ class ActiveSetup(SetupModel):
         _validated_text(value, "generation", maximum=32)
         if re.fullmatch(r"[0-9a-f]{32}", value) is None:
             raise ValueError("generation must be 32 lowercase hexadecimal characters")
+        return value
+
+    @field_validator("credential_kinds", mode="before")
+    @classmethod
+    def validate_strict_credential_kinds(cls, value: object) -> object:
+        if (
+            not isinstance(value, (tuple, list))
+            or not value
+            or any(
+                type(kind) is not SecretKind
+                and (type(kind) is not str or kind not in SecretKind._value2member_map_)
+                for kind in value
+            )
+            or len(set(value)) != len(value)
+        ):
+            raise ValueError("credential_kinds must be nonempty and unique")
         return value
 
     @field_validator("workflow", mode="before")
@@ -414,6 +430,16 @@ class SetupDocument(SetupModel):
         if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", value) is None:
             raise ValueError("profile_id is invalid")
         return value
+
+    @model_validator(mode="after")
+    def validate_distinct_generations(self) -> SetupDocument:
+        if (
+            self.active is not None
+            and self.previous is not None
+            and self.active.generation == self.previous.generation
+        ):
+            raise ValueError("active and previous generations must differ")
+        return self
 
 
 @dataclass(frozen=True, slots=True, repr=False)

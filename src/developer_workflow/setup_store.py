@@ -139,6 +139,27 @@ class SetupStore:
             current = self._load_or_empty_unlocked(profile_id)
             if current.profile_id != profile_id:
                 raise SetupStoreError("configuration profile is invalid")
+            if (
+                type(candidate) is not ActiveSetup
+                or type(secrets) is not RuntimeSecrets
+                or set(candidate.credential_kinds) != set(secrets.values)
+            ):
+                raise SetupStoreError("configuration credentials are invalid")
+            referenced = {
+                setup.generation
+                for setup in (current.active, current.previous)
+                if setup is not None
+            }
+            try:
+                existing_generations = self._credentials.list_generations(profile_id)
+            except CredentialStoreError:
+                raise SetupStoreError("credential enumeration failed") from None
+            if (
+                candidate.generation in referenced
+                or candidate.generation in existing_generations
+            ):
+                raise SetupStoreError("configuration generation is unavailable")
+            fresh_generation = True
             try:
                 self._credentials.write_generation(
                     profile_id, candidate.generation, secrets
@@ -163,7 +184,7 @@ class SetupStore:
                     pass
                 write_failure = _AtomicWriteError(replaced=replaced)
             if write_failure is not None:
-                if not write_failure.replaced:
+                if fresh_generation and not write_failure.replaced:
                     try:
                         self._credentials.delete_generation(
                             profile_id, candidate.generation
