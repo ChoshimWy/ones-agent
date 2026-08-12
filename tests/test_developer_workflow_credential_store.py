@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import os
 import secrets
+from threading import Barrier, BrokenBarrierError, Lock
 
 import pytest
 
@@ -274,6 +275,134 @@ def test_generation_write_rolls_back_only_targets_written_in_this_call(
         "profile-1", "a" * 32, SecretKind.ONES_EMAIL
     ) not in fake_wincred.records
     assert store.read("profile-1", other_generation, SecretKind.PROVIDER_TOKEN) == "keep"
+
+
+def test_generation_overwrite_failure_preserves_existing_complete_generation(
+    fake_wincred: FakeWinCred,
+) -> None:
+    store = WindowsCredentialStore(fake_wincred)
+    generation = "a" * 32
+    old = RuntimeSecrets(
+        {
+            SecretKind.ONES_EMAIL: "old@example.invalid",
+            SecretKind.ONES_PASSWORD: "old-password",
+        }
+    )
+    store.write_generation("profile-1", generation, old)
+    fake_wincred.write_count = 0
+    fake_wincred.fail_on_write = 2
+
+    with pytest.raises(CredentialStoreError, match="^credential operation failed$"):
+        store.write_generation(
+            "profile-1",
+            generation,
+            RuntimeSecrets(
+                {
+                    SecretKind.ONES_EMAIL: "new@example.invalid",
+                    SecretKind.ONES_PASSWORD: "new-password",
+                }
+            ),
+        )
+
+    assert store.read_generation(
+        "profile-1",
+        generation,
+        (SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD),
+    ).values == old.values
+
+
+def test_generation_write_is_idempotent_only_for_the_same_complete_values(
+    fake_wincred: FakeWinCred,
+) -> None:
+    store = WindowsCredentialStore(fake_wincred)
+    generation = "a" * 32
+    secrets_value = RuntimeSecrets(
+        {
+            SecretKind.ONES_EMAIL: "agent@example.invalid",
+            SecretKind.ONES_PASSWORD: "password",
+        }
+    )
+    store.write_generation("profile-1", generation, secrets_value)
+    writes_after_first_call = fake_wincred.write_count
+
+    store.write_generation("profile-1", generation, secrets_value)
+    assert fake_wincred.write_count == writes_after_first_call
+
+    with pytest.raises(CredentialStoreError, match="^credential operation failed$"):
+        store.write_generation(
+            "profile-1",
+            generation,
+            RuntimeSecrets(
+                {
+                    SecretKind.ONES_EMAIL: "agent@example.invalid",
+                    SecretKind.ONES_PASSWORD: "different",
+                }
+            ),
+        )
+    assert fake_wincred.write_count == writes_after_first_call
+
+
+def test_two_store_instances_cannot_create_a_mixed_generation() -> None:
+    class RacingWinCred(FakeWinCred):
+        def __init__(self) -> None:
+            super().__init__()
+            self._list_barrier = Barrier(2)
+            self._state_lock = Lock()
+            self._empty_list_calls = 0
+
+        def list_generic_targets(self, prefix: str) -> tuple[str, ...]:
+            with self._state_lock:
+                result = super().list_generic_targets(prefix)
+                should_wait = not result and self._empty_list_calls < 2
+                if should_wait:
+                    self._empty_list_calls += 1
+            if should_wait:
+                try:
+                    self._list_barrier.wait(timeout=0.05)
+                except BrokenBarrierError:
+                    pass
+            return result
+
+        def write_generic(
+            self, target: str, value: bytearray, *, persist: str
+        ) -> None:
+            with self._state_lock:
+                super().write_generic(target, value, persist=persist)
+
+    backend = RacingWinCred()
+    stores = (WindowsCredentialStore(backend), WindowsCredentialStore(backend))
+    candidates = (
+        RuntimeSecrets(
+            {
+                SecretKind.ONES_EMAIL: "first@example.invalid",
+                SecretKind.ONES_PASSWORD: "first-password",
+            }
+        ),
+        RuntimeSecrets(
+            {
+                SecretKind.ONES_EMAIL: "second@example.invalid",
+                SecretKind.ONES_PASSWORD: "second-password",
+            }
+        ),
+    )
+
+    def create(index: int) -> bool:
+        try:
+            stores[index].write_generation("profile-1", "a" * 32, candidates[index])
+        except CredentialStoreError:
+            return False
+        return True
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(executor.map(create, range(2)))
+
+    assert sum(outcomes) == 1
+    loaded = stores[0].read_generation(
+        "profile-1",
+        "a" * 32,
+        (SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD),
+    )
+    assert loaded.values in (candidates[0].values, candidates[1].values)
 
 
 def test_generation_read_fails_if_any_requested_kind_is_missing(

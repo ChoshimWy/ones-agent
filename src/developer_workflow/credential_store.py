@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import os
 import re
 from collections.abc import Callable
+from threading import RLock
 from typing import Protocol, runtime_checkable
 import unicodedata
 
@@ -22,6 +23,7 @@ _TARGET_PREFIX = "ones-dev"
 _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}")
 _PROFILE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ERROR_MESSAGE = "credential operation failed"
+_GENERATION_WRITE_LOCK = RLock()
 
 
 class CredentialStoreError(RuntimeError):
@@ -208,18 +210,41 @@ class WindowsCredentialStore:
             credential_target(profile_id, generation, kind)
             probe = _validate_secret(value)
             _zero(probe)
-        written: list[SecretKind] = []
-        try:
-            for kind, value in entries:
-                self.write(profile_id, generation, kind, value)
-                written.append(kind)
-        except BaseException:
-            for kind in written:
-                try:
-                    self.delete(profile_id, generation, kind)
-                except CredentialStoreError:
-                    pass
-            raise
+        profile = _validate_profile(profile_id)
+        canonical_generation = _validate_generation(generation)
+        prefix = f"{_TARGET_PREFIX}/{profile}/{canonical_generation}/"
+        expected_targets = {
+            credential_target(profile, canonical_generation, kind): (kind, value)
+            for kind, value in entries
+        }
+        with _GENERATION_WRITE_LOCK:
+            targets = _safe_backend_call(
+                lambda: self._backend.list_generic_targets(prefix)
+            )
+            if type(targets) is not tuple:
+                raise _fail()
+            if targets:
+                if len(targets) != len(expected_targets) or set(targets) != set(
+                    expected_targets
+                ):
+                    raise _fail()
+                for kind, value in expected_targets.values():
+                    if self.read(profile, canonical_generation, kind) != value:
+                        raise _fail()
+                return
+
+            written: list[SecretKind] = []
+            try:
+                for kind, value in entries:
+                    self.write(profile, canonical_generation, kind, value)
+                    written.append(kind)
+            except BaseException:
+                for kind in written:
+                    try:
+                        self.delete(profile, canonical_generation, kind)
+                    except CredentialStoreError:
+                        pass
+                raise
 
     def read_generation(
         self, profile_id: str, generation: str, kinds: tuple[SecretKind, ...]
