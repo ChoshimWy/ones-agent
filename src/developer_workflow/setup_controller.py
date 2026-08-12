@@ -677,17 +677,20 @@ class SetupController:
         finally:
             self._clear_transient_secrets()
         if handle is not None:
-            close_task = asyncio.create_task(
-                asyncio.to_thread(_close_handle, handle)
-            )
+            close_task = self._schedule_background_close(handle)
             done, _ = await asyncio.wait(
                 {close_task}, timeout=self._cleanup_timeout
             )
             if close_task in done:
                 self._consume_close_task(close_task)
-            else:
-                self._background_close_tasks.add(close_task)
-                close_task.add_done_callback(self._consume_close_task)
+
+    def _schedule_background_close(self, handle: object) -> asyncio.Task[None]:
+        """Schedule exactly one observed close without running it on the event loop."""
+
+        close_task = asyncio.create_task(asyncio.to_thread(_close_handle, handle))
+        self._background_close_tasks.add(close_task)
+        close_task.add_done_callback(self._consume_close_task)
+        return close_task
 
     def _consume_close_task(self, task: asyncio.Task[None]) -> None:
         """Consume a detached close outcome and release its lifecycle reference."""
@@ -700,15 +703,14 @@ class SetupController:
         except BaseException:
             pass
 
-    @staticmethod
-    def _close_late_build(task: asyncio.Task[object]) -> None:
+    def _close_late_build(self, task: asyncio.Task[object]) -> None:
         if task.cancelled():
             return
         try:
             handle = task.result()
         except BaseException:
             return
-        _close_handle(handle)
+        self._schedule_background_close(handle)
 
     async def _rollback(self, profile_id: str) -> None:
         try:

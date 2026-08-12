@@ -935,3 +935,98 @@ async def test_close_error_is_consumed_and_never_exposes_raw_exception(
     assert error.value.__context__ is None
     assert store.restores == 1
     assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+
+
+class LateRuntimeBuilder(FakeRuntimeBuilder):
+    def __init__(self, handle: Handle, *, error: BaseException | None = None) -> None:
+        super().__init__()
+        self.handle = handle
+        self.error = error
+        self.started = Event()
+        self.release = Event()
+
+    def build(self, active: ActiveSetup, secrets: RuntimeSecrets) -> Handle:
+        self.calls.append((active, secrets))
+        self.started.set()
+        assert self.release.wait(2)
+        if self.error is not None:
+            raise self.error
+        return self.handle
+
+
+@pytest.mark.asyncio
+async def test_late_handle_close_never_blocks_loop_and_is_tracked(
+    tmp_path: Path,
+) -> None:
+    handle = LongBlockingCloseHandle()
+    builder = LateRuntimeBuilder(handle)
+    controller, _, _, _ = _controller(tmp_path, builder=builder)
+    controller._activation_timeout = 0.02
+    await _pass_all(controller)
+
+    with pytest.raises(SetupActionError, match="^runtime validation failed$"):
+        await controller.save_and_activate(confirmed=True)
+    controller.close()
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+
+    started = asyncio.get_running_loop().time()
+    builder.release.set()
+    assert await asyncio.to_thread(handle.close_started.wait, 2)
+    assert asyncio.get_running_loop().time() - started < 0.2
+    assert len(controller._background_close_tasks) == 1
+    await asyncio.wait_for(asyncio.sleep(0.01), timeout=0.05)
+
+    handle.close_release.set()
+    for _ in range(50):
+        if not controller._background_close_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert controller._background_close_tasks == set()
+    assert handle.close_calls == 1
+    assert handle.closed == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("late_failure", ("close", "build"))
+async def test_late_build_failures_are_consumed_without_secret_leak(
+    tmp_path: Path, late_failure: str
+) -> None:
+    class CountingErrorCloseHandle(Handle):
+        def __init__(self) -> None:
+            super().__init__()
+            self.calls = 0
+
+        def close(self) -> None:
+            self.calls += 1
+            raise RuntimeError("TOKEN-SECRET")
+
+    handle = CountingErrorCloseHandle()
+    builder = LateRuntimeBuilder(
+        handle,
+        error=RuntimeError("TOKEN-SECRET") if late_failure == "build" else None,
+    )
+    controller, _, _, _ = _controller(tmp_path, builder=builder)
+    controller._activation_timeout = 0.02
+    await _pass_all(controller)
+    loop = asyncio.get_running_loop()
+    observed: list[dict[str, object]] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: observed.append(context))
+    try:
+        with pytest.raises(SetupActionError, match="^runtime validation failed$"):
+            await controller.save_and_activate(confirmed=True)
+        builder.release.set()
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if (
+                late_failure == "close"
+                and handle.calls == 1
+                and not controller._background_close_tasks
+            ):
+                break
+        assert observed == []
+        assert "TOKEN-SECRET" not in repr(observed)
+        assert controller._background_close_tasks == set()
+        assert handle.calls == (1 if late_failure == "close" else 0)
+    finally:
+        loop.set_exception_handler(previous_handler)
