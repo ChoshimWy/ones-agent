@@ -227,6 +227,7 @@ def _controller(
         runtime_bootstrap=bootstrap,
         runtime_builder=actual_builder,
         activation_timeout=1.0,
+        cleanup_timeout=0.05,
     )
     controller.apply_runtime(_runtime())
     controller.apply_workflow(_workflow(tmp_path))
@@ -812,3 +813,125 @@ async def test_repeated_cancel_during_rollback_waits_for_pointer_restoration(
     builder.release.set()
     await asyncio.sleep(0.05)
     assert builder.handle.closed == 1
+
+
+class LongBlockingCloseHandle(Handle):
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+        self.close_started = Event()
+        self.close_release = Event()
+
+    def close(self) -> None:
+        self.close_calls += 1
+        self.close_started.set()
+        assert self.close_release.wait(2)
+        super().close()
+
+
+@pytest.mark.asyncio
+async def test_blocked_close_cannot_delay_rollback_secret_clear_or_lock_release(
+    tmp_path: Path,
+) -> None:
+    old_controller, store, _, _ = _controller(tmp_path)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    old_active = store.document.active
+    builder = FakeRuntimeBuilder()
+    builder.handle = LongBlockingCloseHandle()
+    store.finalize_error = RuntimeError("TOKEN-SECRET")
+    controller, _, _, _ = _controller(tmp_path, store=store, builder=builder)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(builder.handle.close_started.wait, 2)
+    for _ in range(8):
+        task.cancel()
+        await asyncio.sleep(0)
+
+    try:
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        assert task in done
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert store.restores == 1
+        assert store.document.active == old_active
+        assert store.document.previous is None
+        assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+        result = await asyncio.wait_for(
+            controller.test_step(SetupStep.PRIVATE_PATHS, object()), timeout=0.1
+        )
+        assert result.status is ValidationStatus.PASSED
+    finally:
+        builder.handle.close_release.set()
+    await asyncio.sleep(0.05)
+    assert builder.handle.close_calls == 1
+    assert builder.handle.closed == 1
+    assert controller._background_close_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_finalized_active_survives_background_close_timeout(
+    tmp_path: Path,
+) -> None:
+    class BlockingFinalizeStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalize_started = Event()
+            self.finalize_release = Event()
+
+        def finalize_activation(self, profile_id: str) -> SetupDocument:
+            self.finalize_started.set()
+            assert self.finalize_release.wait(2)
+            return super().finalize_activation(profile_id)
+
+    store = BlockingFinalizeStore()
+    builder = FakeRuntimeBuilder()
+    builder.handle = LongBlockingCloseHandle()
+    controller, _, _, _ = _controller(tmp_path, store=store, builder=builder)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(store.finalize_started.wait, 2)
+    task.cancel()
+    store.finalize_release.set()
+    assert await asyncio.to_thread(builder.handle.close_started.wait, 2)
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.2)
+        assert store.finalizes == 1
+        assert store.restores == 0
+        assert store.document.active is not None
+        assert store.document.previous is None
+        assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+    finally:
+        builder.handle.close_release.set()
+    await asyncio.sleep(0.05)
+    assert builder.handle.close_calls == 1
+    assert builder.handle.closed == 1
+    assert controller._background_close_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_close_error_is_consumed_and_never_exposes_raw_exception(
+    tmp_path: Path,
+) -> None:
+    class ErrorCloseHandle(Handle):
+        def close(self) -> None:
+            raise RuntimeError("TOKEN-SECRET")
+
+    old_controller, store, _, _ = _controller(tmp_path)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    builder = FakeRuntimeBuilder()
+    builder.handle = ErrorCloseHandle()
+    store.finalize_error = RuntimeError("TOKEN-SECRET")
+    controller, _, _, _ = _controller(tmp_path, store=store, builder=builder)
+    await _pass_all(controller)
+
+    with pytest.raises(SetupActionError, match="^runtime validation failed$") as error:
+        await controller.save_and_activate(confirmed=True)
+
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert store.restores == 1
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False

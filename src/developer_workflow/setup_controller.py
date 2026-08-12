@@ -118,6 +118,7 @@ class SetupController:
         validator: SetupValidator | None = None,
         profile_catalog: object | None = None,
         activation_timeout: float = 30.0,
+        cleanup_timeout: float = 0.25,
         draft: SetupDraft | None = None,
     ) -> None:
         if (
@@ -126,6 +127,9 @@ class SetupController:
             or isinstance(activation_timeout, bool)
             or not isinstance(activation_timeout, (int, float))
             or activation_timeout <= 0
+            or isinstance(cleanup_timeout, bool)
+            or not isinstance(cleanup_timeout, (int, float))
+            or cleanup_timeout <= 0
         ):
             raise SetupActionError("setup configuration is invalid")
         bootstrap_validator = getattr(runtime_bootstrap, "validator", None)
@@ -140,6 +144,7 @@ class SetupController:
         self._validator = actual_validator
         self._profile_catalog = actual_catalog
         self._activation_timeout = float(activation_timeout)
+        self._cleanup_timeout = float(cleanup_timeout)
         self._draft = (draft or SetupDraft()).model_copy(deep=True)
         self._results: dict[SetupStep, ConnectionTestResult] = {}
         self._secrets: dict[SecretKind, bytearray] = {}
@@ -150,6 +155,7 @@ class SetupController:
         self._operation_task: asyncio.Task[Any] | None = None
         self._activation_error: str | None = None
         self._finalizing = False
+        self._background_close_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def closed(self) -> bool:
@@ -666,12 +672,33 @@ class SetupController:
         """Run all failure cleanup in one child task protected from parent cancellation."""
 
         try:
-            if handle is not None:
-                await asyncio.to_thread(_close_handle, handle)
             if rollback:
                 await self._rollback(profile_id)
         finally:
             self._clear_transient_secrets()
+        if handle is not None:
+            close_task = asyncio.create_task(
+                asyncio.to_thread(_close_handle, handle)
+            )
+            done, _ = await asyncio.wait(
+                {close_task}, timeout=self._cleanup_timeout
+            )
+            if close_task in done:
+                self._consume_close_task(close_task)
+            else:
+                self._background_close_tasks.add(close_task)
+                close_task.add_done_callback(self._consume_close_task)
+
+    def _consume_close_task(self, task: asyncio.Task[None]) -> None:
+        """Consume a detached close outcome and release its lifecycle reference."""
+
+        self._background_close_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            pass
 
     @staticmethod
     def _close_late_build(task: asyncio.Task[object]) -> None:
