@@ -1,0 +1,319 @@
+from __future__ import annotations
+
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+from src.developer_workflow.config import DeveloperWorkflowConfig, PublishingConfig
+from src.developer_workflow.contracts import RepositoryMapping
+from src.developer_workflow.setup_models import (
+    ActiveSetup,
+    RuntimeInputs,
+    RuntimePublicConfig,
+    RuntimeSecrets,
+    SecretKind,
+    SetupDocument,
+    SetupValidationError,
+    WorkflowDraft,
+)
+
+
+def _public_config(**overrides: object) -> RuntimePublicConfig:
+    payload: dict[str, object] = {
+        "ones_base_url": "https://ones.example.invalid",
+        "ones_team_id": "team-1",
+        "ones_issue_type_id": "issue-type-1",
+        "ones_comment_list_path_template": "/team/{team_id}/comments",
+        "provider_host": "github.example.invalid",
+        "provider_api_url": "https://github.example.invalid/api/v3",
+        "git_author_name": "ONES Agent",
+        "git_author_email": "agent@example.invalid",
+        "codex_auth_mode": "credential",
+        "codex_home": None,
+    }
+    payload.update(overrides)
+    return RuntimePublicConfig.model_validate(payload)
+
+
+def _secret_bundle() -> RuntimeSecrets:
+    return RuntimeSecrets(
+        {
+            SecretKind.ONES_EMAIL: "agent@example.invalid",
+            SecretKind.ONES_PASSWORD: "TOKEN-SECRET",
+        }
+    )
+
+
+def _repository() -> RepositoryMapping:
+    return RepositoryMapping(
+        key="repo",
+        project_id="project",
+        iteration_id="iteration",
+        repo_url="https://example.invalid/repo.git",
+        repo_name="repo",
+    )
+
+
+def _workflow_config(tmp_path: Path) -> DeveloperWorkflowConfig:
+    return DeveloperWorkflowConfig(
+        run_root=tmp_path / "runs",
+        worktree_root=tmp_path / "worktrees",
+        mirror_root=tmp_path / "mirrors",
+        sandbox_permission_profile="ones-worktree-tests",
+        max_codex_attempts=3,
+        repositories=(_repository(),),
+        publishing=PublishingConfig(provider="local_fake"),
+    )
+
+
+def test_setup_document_never_accepts_secret_fields() -> None:
+    payload = {
+        "schema_version": 1,
+        "profile_id": "default",
+        "draft": {"ones_password": "TOKEN-SECRET"},
+    }
+    with pytest.raises(ValidationError):
+        SetupDocument.model_validate(payload)
+
+
+def test_runtime_inputs_keep_secrets_out_of_model_dump() -> None:
+    inputs = RuntimeInputs(public=_public_config(), secrets=_secret_bundle())
+    assert "TOKEN-SECRET" not in repr(inputs)
+    assert not hasattr(inputs, "model_dump")
+
+
+def test_secret_kind_is_a_fixed_allowlist() -> None:
+    assert {kind.value for kind in SecretKind} == {
+        "ones_email",
+        "ones_password",
+        "provider_token",
+        "codex_api_key",
+        "codex_auth_token",
+        "git_askpass",
+        "git_ssh",
+        "git_ssh_command",
+        "ssh_askpass",
+        "ssh_auth_sock",
+    }
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("ones_base_url", 123),
+        ("ones_team_id", 123),
+        ("provider_host", 123),
+        ("git_author_email", 123),
+        ("codex_auth_mode", True),
+    ],
+)
+def test_runtime_public_config_rejects_type_coercion(
+    field_name: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("ones_team_id", "team\x00evil"),
+        ("ones_issue_type_id", "issue\u200bevil"),
+        ("git_author_name", "agent\u2028evil"),
+        ("provider_host", "github.example.invalid\u202eevil"),
+    ],
+)
+def test_runtime_public_config_rejects_control_and_format_characters(
+    field_name: str, value: str
+) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("ones_base_url", "http://ones.example.invalid"),
+        ("ones_base_url", "https://user:password@ones.example.invalid"),
+        ("provider_api_url", "ftp://github.example.invalid/api"),
+        ("provider_api_url", "https://github.example.invalid/api?token=value"),
+        ("provider_api_url", "https://github.example.invalid:invalid/api"),
+        ("provider_host", "https://github.example.invalid"),
+        ("ones_comment_list_path_template", "https://ones.example.invalid/comments"),
+    ],
+)
+def test_runtime_public_config_rejects_unsafe_urls_and_hosts(
+    field_name: str, value: str
+) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    "email", ["", "agent", "agent @example.invalid", "a<b>@example.invalid"]
+)
+def test_runtime_public_config_rejects_invalid_git_email(email: str) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(git_author_email=email)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("codex_home", Path("relative/codex")),
+        ("run_root", Path("relative/runs")),
+        ("mirror_root", Path("relative/mirrors")),
+        ("worktree_root", Path("relative/worktrees")),
+    ],
+)
+def test_setup_paths_must_be_absolute(field_name: str, value: Path) -> None:
+    if field_name == "codex_home":
+        with pytest.raises(ValidationError):
+            _public_config(codex_home=value)
+    else:
+        with pytest.raises(ValidationError):
+            WorkflowDraft.model_validate({field_name: value})
+
+
+def test_setup_paths_reject_control_characters(tmp_path: Path) -> None:
+    unsafe = Path(f"{tmp_path}\x00nested")
+
+    with pytest.raises(ValidationError):
+        WorkflowDraft(run_root=unsafe)
+
+
+@pytest.mark.parametrize("field_name", ["max_codex_attempts", "tui_max_concurrency"])
+@pytest.mark.parametrize("value", [True, "3", 3.0])
+def test_workflow_draft_integer_fields_are_strict(
+    field_name: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkflowDraft.model_validate({field_name: value})
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("max_codex_attempts", 0),
+        ("max_codex_attempts", 11),
+        ("tui_max_concurrency", 0),
+        ("tui_max_concurrency", 9),
+    ],
+)
+def test_workflow_draft_integer_fields_are_bounded(
+    field_name: str, value: int
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkflowDraft.model_validate({field_name: value})
+
+
+def test_setup_document_is_strict_and_forbids_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        SetupDocument.model_validate({"schema_version": "1", "profile_id": "default"})
+    with pytest.raises(ValidationError):
+        SetupDocument.model_validate(
+            {"schema_version": 1, "profile_id": "default", "unknown": True}
+        )
+
+
+def test_active_setup_holds_complete_workflow_and_credential_kinds(
+    tmp_path: Path,
+) -> None:
+    active = ActiveSetup(
+        generation="a" * 32,
+        runtime=_public_config(),
+        workflow=_workflow_config(tmp_path),
+        credential_kinds=(SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD),
+    )
+
+    document = SetupDocument(profile_id="default", active=active)
+
+    assert document.active is not None
+    assert document.active.workflow.repositories[0].key == "repo"
+    assert document.model_dump(mode="json")["active"]["credential_kinds"] == [
+        "ones_email",
+        "ones_password",
+    ]
+
+
+def test_setup_document_round_trips_its_json_form(tmp_path: Path) -> None:
+    document = SetupDocument(
+        profile_id="default",
+        active=ActiveSetup(
+            generation="a" * 32,
+            runtime=_public_config(codex_home=(tmp_path / "codex").resolve()),
+            workflow=_workflow_config(tmp_path),
+            credential_kinds=(SecretKind.ONES_PASSWORD,),
+        ),
+    )
+
+    restored = SetupDocument.model_validate(document.model_dump(mode="json"))
+
+    assert restored == document
+
+
+def test_runtime_secrets_are_read_only_frozen_and_do_not_leak() -> None:
+    source = {SecretKind.ONES_PASSWORD: "TOKEN-SECRET"}
+    secrets = RuntimeSecrets(source)
+    source[SecretKind.ONES_PASSWORD] = "changed"
+
+    assert secrets.require(SecretKind.ONES_PASSWORD) == "TOKEN-SECRET"
+    assert "TOKEN-SECRET" not in repr(secrets)
+    with pytest.raises(TypeError):
+        secrets.values[SecretKind.ONES_PASSWORD] = "changed"  # type: ignore[index]
+    with pytest.raises(FrozenInstanceError):
+        secrets.values = {}  # type: ignore[misc]
+
+
+def test_runtime_secrets_require_has_a_fixed_missing_error() -> None:
+    with pytest.raises(
+        SetupValidationError, match="^runtime credential is unavailable$"
+    ):
+        RuntimeSecrets({}).require(SecretKind.PROVIDER_TOKEN)
+
+
+def test_runtime_inputs_are_frozen() -> None:
+    inputs = RuntimeInputs(public=_public_config(), secrets=_secret_bundle())
+
+    with pytest.raises(FrozenInstanceError):
+        inputs.public = _public_config()  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        inputs.public.ones_team_id = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize("generation", ["x", "../escape", "profile/generation", "A" * 32])
+def test_generation_is_a_canonical_credential_target_segment(generation: str) -> None:
+    with pytest.raises(ValidationError):
+        ActiveSetup(
+            generation=generation,
+            runtime=_public_config(),
+            workflow=DeveloperWorkflowConfig(
+                run_root=Path("C:/runs"),
+                worktree_root=Path("C:/worktrees"),
+                mirror_root=Path("C:/mirrors"),
+                sandbox_permission_profile="ones-worktree-tests",
+                max_codex_attempts=3,
+                repositories=(_repository(),),
+                publishing=PublishingConfig(provider="local_fake"),
+            ),
+            credential_kinds=(),
+        )
+
+
+def test_package_root_exports_setup_contracts() -> None:
+    import src.developer_workflow as public
+
+    for name in (
+        "ActiveSetup",
+        "RuntimeInputs",
+        "RuntimePublicConfig",
+        "RuntimeSecrets",
+        "SecretKind",
+        "SetupDocument",
+        "SetupDraft",
+        "SetupValidationError",
+        "WorkflowDraft",
+    ):
+        assert hasattr(public, name)

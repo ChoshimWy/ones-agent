@@ -18,6 +18,17 @@ from .config import (
     PublishingProvider,
     RepositoryMappingNotFound,
 )
+from .setup_models import (
+    ActiveSetup,
+    RuntimeInputs,
+    RuntimePublicConfig,
+    RuntimeSecrets,
+    SecretKind,
+    SetupDocument,
+    SetupDraft,
+    SetupValidationError,
+    WorkflowDraft,
+)
 from .contracts import (
     AcceptanceCoverage,
     ApprovalPackage,
@@ -126,6 +137,7 @@ from .approval_rebuilder import ApprovalRebuildError, WorkflowApprovalRebuilder
 from .orchestrator import DeveloperWorkflowOrchestrator, InvalidWorkflowAction
 
 __all__ = [
+    "ActiveSetup",
     "ApprovalError",
     "ApprovalRebuildError",
     "AcceptanceCoverage",
@@ -207,6 +219,13 @@ __all__ = [
     "RunLockTimeoutError",
     "RunNotFoundError",
     "RunStoreError",
+    "RuntimeInputs",
+    "RuntimePublicConfig",
+    "RuntimeSecrets",
+    "SecretKind",
+    "SetupDocument",
+    "SetupDraft",
+    "SetupValidationError",
     "StateEvent",
     "SubprocessConfiguredTestRunner",
     "WikiPageRef",
@@ -214,6 +233,7 @@ __all__ = [
     "WorkflowRun",
     "WorkflowApprovalRebuilder",
     "WorkflowModel",
+    "WorkflowDraft",
     "WorkflowState",
     "WorkflowType",
     "WorktreeRepository",
