@@ -13,6 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.developer_workflow.setup_models import SetupValidationError
+from src.developer_workflow.requirement_flow import sandbox_preflight_command
 from src.developer_workflow.setup_validation import (
     CodexProbeInput,
     ConnectionTestResult,
@@ -140,7 +141,7 @@ def test_profile_catalog_uses_exact_permissions_table_and_rechecks_selection(
     )
     assert catalog.list_profiles() == ("managed-a", "managed-b")
     probe_roots = [executor.calls[0][1] for executor in executors]
-    assert all(executor.calls[0][0] == ("git", "status", "--short") for executor in executors)
+    assert all(executor.calls[0][0] == tuple(sandbox_preflight_command()) for executor in executors)
     assert all(root != tmp_path and not root.exists() for root in probe_roots)
     assert catalog.require_selected("managed-a") == "managed-a"
     config.write_text('[permissions."managed-b"]\nextends = ":workspace"\n', encoding="utf-8")
@@ -258,6 +259,32 @@ def test_profile_catalog_excludes_candidates_that_fail_full_executor_probe(
         file_security=lambda path, admin: True,
     )
     assert catalog.list_profiles() == ("good",)
+
+
+def test_profile_catalog_final_child_succeeds_without_git_repository(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
+    executed: list[tuple[str, ...]] = []
+
+    class RealChildExecutor(_CapabilityExecutor):
+        def __call__(self, command, *, cwd, env, timeout, **kwargs):
+            executed.append(tuple(command))
+            if command[:2] == ["git", "status"]:
+                return subprocess.CompletedProcess(command, 128, "", "not a repository")
+            completed = subprocess.run(
+                command, cwd=cwd, env=env, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+            return completed
+
+    catalog = ManagedProfileCatalog._testing(
+        _doctor(config), trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=RealChildExecutor, file_security=lambda path, admin: True,
+    )
+    assert catalog.list_profiles() == ("managed",)
+    assert len(executed) == 1
+    assert executed[0][0] == sys.executable
+    assert executed[0][1:3] == ("-I", "-c")
 
 
 def test_profile_probe_uses_private_directory_boundary(

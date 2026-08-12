@@ -500,13 +500,13 @@ def _valid_runtime_text(value: str) -> bool:
 def _validate_sandbox_permission_profile(profile: str) -> None:
     """Prove the managed profile's sandbox capabilities before service startup."""
 
-    from .requirement_flow import SandboxCommandExecutor
+    from .requirement_flow import SandboxCommandExecutor, sandbox_preflight_command
 
     with tempfile.TemporaryDirectory(prefix="ones-dev-sandbox-preflight-") as raw:
         cwd = Path(raw).resolve(strict=True)
         executor = SandboxCommandExecutor(permission_profile=profile)
         completed = executor(
-            [sys.executable, "-I", "-c", "print('sandbox-preflight')"],
+            sandbox_preflight_command(),
             cwd=cwd,
             env=dict(os.environ),
             timeout=20,

@@ -276,6 +276,12 @@ _TEST_ENV_KEYS = frozenset(
 )
 
 
+def sandbox_preflight_command() -> list[str]:
+    """Return the shared read-only child used after sandbox capability probes."""
+
+    return [sys.executable, "-I", "-c", "print('sandbox-preflight')"]
+
+
 @dataclass(slots=True)
 class SandboxCommandExecutor:
     """Execute argv through the local Codex command sandbox, never a model call."""
@@ -1927,4 +1933,5 @@ __all__ = [
     "SandboxStateProvider",
     "SubprocessConfiguredTestRunner",
     "extract_acceptance_criteria",
+    "sandbox_preflight_command",
 ]

@@ -38,7 +38,7 @@ from .private_paths import (
     _windows_descriptor,
     prepare_private_directory,
 )
-from .requirement_flow import SandboxCommandExecutor
+from .requirement_flow import SandboxCommandExecutor, sandbox_preflight_command
 from .setup_models import SetupModel, SetupValidationError
 
 
@@ -572,7 +572,7 @@ class ManagedProfileCatalog:
                     executor = self.executor_factory(name)
                     try:
                         completed = executor(
-                            ["git", "status", "--short"],
+                            sandbox_preflight_command(),
                             cwd=probe_root,
                             env=_clean_doctor_environment(),
                             timeout=remaining,
