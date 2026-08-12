@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import ipaddress
 from pathlib import Path
 import re
 from types import MappingProxyType
@@ -11,7 +12,15 @@ from typing import Any, Literal, Mapping
 import unicodedata
 from urllib.parse import urlsplit
 
-from pydantic import ConfigDict, Field, StrictInt, StrictStr, field_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .config import DeveloperWorkflowConfig, PublishingConfig
 from .contracts import RepositoryGroupMapping, RepositoryMapping, WorkflowModel
@@ -48,6 +57,62 @@ _BIDI_CONTROLS = {
 _BIDI_CONTROL_CHARACTERS = {"\u061c", "\u200e", "\u200f"}
 
 
+def _sanitized_validation_error(
+    model: type[WorkflowModel], error: ValidationError
+) -> ValidationError:
+    safe_errors = [
+        {
+            "type": "value_error",
+            "loc": item["loc"],
+            "input": "<redacted>",
+            "ctx": {"error": ValueError("input is invalid")},
+        }
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    ]
+    return ValidationError.from_exception_data(model.__name__, safe_errors)
+
+
+class SetupModel(WorkflowModel):
+    """Workflow model whose public validation failures never echo input values."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        validate_assignment=True,
+        hide_input_in_errors=True,
+    )
+
+    def __init__(self, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as error:
+            raise _sanitized_validation_error(type(self), error) from None
+
+    @classmethod
+    def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().model_validate(obj, *args, **kwargs)
+        except ValidationError as error:
+            raise _sanitized_validation_error(cls, error) from None
+
+    @classmethod
+    def model_validate_json(cls, json_data: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().model_validate_json(json_data, *args, **kwargs)
+        except ValidationError as error:
+            raise _sanitized_validation_error(cls, error) from None
+
+    @classmethod
+    def model_validate_strings(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().model_validate_strings(obj, *args, **kwargs)
+        except ValidationError as error:
+            raise _sanitized_validation_error(cls, error) from None
+
+
 def _validated_text(value: str, field_name: str, *, maximum: int = 4096) -> str:
     if not value or value != value.strip():
         raise ValueError(f"{field_name} is invalid")
@@ -69,40 +134,52 @@ def _validated_text(value: str, field_name: str, *, maximum: int = 4096) -> str:
     return value
 
 
-def _validated_https_url(value: str, field_name: str) -> str:
+def _validated_url(
+    value: str, field_name: str, *, schemes: frozenset[str]
+) -> str:
     _validated_text(value, field_name)
     if any(character.isspace() for character in value) or "\\" in value:
-        raise ValueError(f"{field_name} must be a credential-free HTTPS URL")
+        raise ValueError(f"{field_name} must be a safe credential-free URL")
     parsed = urlsplit(value)
     try:
         port = parsed.port
     except ValueError:
-        raise ValueError(f"{field_name} must be a credential-free HTTPS URL") from None
+        raise ValueError(f"{field_name} must be a safe credential-free URL") from None
     if (
-        parsed.scheme != "https"
-        or not _is_valid_dns_hostname(parsed.hostname)
+        parsed.scheme not in schemes
+        or _canonical_host(parsed.hostname) is None
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
         or parsed.fragment
         or port is not None and not 1 <= port <= 65535
     ):
-        raise ValueError(f"{field_name} must be a credential-free HTTPS URL")
+        raise ValueError(f"{field_name} must be a safe credential-free URL")
     return value
 
 
-def _is_valid_dns_hostname(value: str | None, *, canonical: bool = False) -> bool:
-    if value is None or not value or len(value) > 253 or value.endswith("."):
-        return False
-    if canonical and value != value.casefold():
-        return False
-    labels = value.casefold().split(".")
-    return all(
+def _canonical_host(value: str | None) -> str | None:
+    if value is None or not value:
+        return None
+    try:
+        return ipaddress.ip_address(value).compressed.casefold()
+    except ValueError:
+        pass
+    try:
+        ascii_value = value.encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        return None
+    if len(ascii_value) > 253 or ascii_value.endswith("."):
+        return None
+    labels = ascii_value.split(".")
+    if not all(
         len(label) <= 63
         and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
         is not None
         for label in labels
-    )
+    ):
+        return None
+    return ascii_value
 
 
 def _validated_absolute_path(value: Path | None, field_name: str) -> Path | None:
@@ -113,8 +190,8 @@ def _validated_absolute_path(value: Path | None, field_name: str) -> Path | None
     return value
 
 
-class RuntimePublicConfig(WorkflowModel):
-    model_config = ConfigDict(extra="forbid", frozen=True)
+class RuntimePublicConfig(SetupModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     ones_base_url: StrictStr
     ones_team_id: StrictStr
@@ -136,16 +213,29 @@ class RuntimePublicConfig(WorkflowModel):
     def validate_plain_text(cls, value: str, info: Any) -> str:
         return _validated_text(value, info.field_name, maximum=320)
 
-    @field_validator("ones_base_url", "provider_api_url")
+    @field_validator("ones_base_url")
     @classmethod
-    def validate_https_urls(cls, value: str, info: Any) -> str:
-        return _validated_https_url(value, info.field_name)
+    def validate_ones_url(cls, value: str) -> str:
+        return _validated_url(
+            value,
+            "ones_base_url",
+            schemes=frozenset({"http", "https"}),
+        )
+
+    @field_validator("provider_api_url")
+    @classmethod
+    def validate_provider_url(cls, value: str) -> str:
+        return _validated_url(
+            value,
+            "provider_api_url",
+            schemes=frozenset({"https"}),
+        )
 
     @field_validator("provider_host")
     @classmethod
     def validate_provider_host(cls, value: str) -> str:
         _validated_text(value, "provider_host", maximum=253)
-        if not _is_valid_dns_hostname(value, canonical=True):
+        if _canonical_host(value) != value:
             raise ValueError("provider_host must be a bare host name")
         return value
 
@@ -185,9 +275,18 @@ class RuntimePublicConfig(WorkflowModel):
     def validate_codex_home(cls, value: Path | None) -> Path | None:
         return _validated_absolute_path(value, "codex_home")
 
+    @model_validator(mode="after")
+    def validate_provider_host_binding(self) -> RuntimePublicConfig:
+        provider_url = urlsplit(self.provider_api_url)
+        if _canonical_host(provider_url.hostname) != self.provider_host:
+            raise ValueError("provider_api_url host must match provider_host")
+        return self
 
-class WorkflowDraft(WorkflowModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+class WorkflowDraft(SetupModel):
+    model_config = ConfigDict(
+        extra="forbid", validate_assignment=True, hide_input_in_errors=True
+    )
 
     run_root: Path | None = None
     mirror_root: Path | None = None
@@ -212,20 +311,55 @@ class WorkflowDraft(WorkflowModel):
         return DeveloperWorkflowConfig.validate_sandbox_permission_profile(value)
 
 
-class SetupDraft(WorkflowModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+class SetupDraft(SetupModel):
+    model_config = ConfigDict(
+        extra="forbid", validate_assignment=True, hide_input_in_errors=True
+    )
 
     runtime: RuntimePublicConfig | None = None
     workflow: WorkflowDraft = Field(default_factory=WorkflowDraft)
     detected_secret_kinds: tuple[SecretKind, ...] = Field(default_factory=tuple)
 
 
-class ActiveSetup(WorkflowModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+class _CommittedRepositoryMapping(RepositoryMapping):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+
+class _CommittedRepositoryGroupMapping(RepositoryGroupMapping):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    repositories: tuple[_CommittedRepositoryMapping, ...] = Field(min_length=1)
+
+
+class _CommittedPublishingConfig(PublishingConfig):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+
+class _CommittedDeveloperWorkflowConfig(DeveloperWorkflowConfig):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    max_codex_attempts: StrictInt = Field(ge=1, le=10)
+    tui_max_concurrency: StrictInt = Field(default=3, ge=1, le=8)
+    repositories: tuple[_CommittedRepositoryMapping, ...] = Field(default_factory=tuple)
+    repository_groups: tuple[_CommittedRepositoryGroupMapping, ...] = Field(
+        default_factory=tuple
+    )
+    publishing: _CommittedPublishingConfig
+
+    @field_validator("run_root", "mirror_root", "worktree_root")
+    @classmethod
+    def validate_committed_paths(cls, value: Path, info: Any) -> Path:
+        validated = _validated_absolute_path(value, info.field_name)
+        assert validated is not None
+        return validated
+
+
+class ActiveSetup(SetupModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     generation: StrictStr
     runtime: RuntimePublicConfig
-    workflow: DeveloperWorkflowConfig
+    workflow: _CommittedDeveloperWorkflowConfig
     credential_kinds: tuple[SecretKind, ...]
 
     @field_validator("generation")
@@ -236,9 +370,16 @@ class ActiveSetup(WorkflowModel):
             raise ValueError("generation must be 32 lowercase hexadecimal characters")
         return value
 
+    @field_validator("workflow", mode="before")
+    @classmethod
+    def copy_workflow_for_commit(cls, value: object) -> object:
+        if isinstance(value, DeveloperWorkflowConfig):
+            return value.model_dump(mode="python", round_trip=True)
+        return value
 
-class SetupDocument(WorkflowModel):
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+
+class SetupDocument(SetupModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     schema_version: Literal[1] = 1
     profile_id: StrictStr

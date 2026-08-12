@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import json
 from pathlib import Path
 
 import pytest
@@ -70,6 +71,26 @@ def _workflow_config(tmp_path: Path) -> DeveloperWorkflowConfig:
     )
 
 
+def _active_payload(**workflow_overrides: object) -> dict[str, object]:
+    workflow: dict[str, object] = {
+        "run_root": "C:/runs",
+        "worktree_root": "C:/worktrees",
+        "mirror_root": "C:/mirrors",
+        "sandbox_permission_profile": "ones-worktree-tests",
+        "max_codex_attempts": 3,
+        "tui_max_concurrency": 3,
+        "repositories": (_repository().model_dump(mode="json"),),
+        "publishing": PublishingConfig(provider="local_fake").model_dump(mode="json"),
+    }
+    workflow.update(workflow_overrides)
+    return {
+        "generation": "a" * 32,
+        "runtime": _public_config().model_dump(mode="json"),
+        "workflow": workflow,
+        "credential_kinds": (),
+    }
+
+
 def test_setup_document_never_accepts_secret_fields() -> None:
     payload = {
         "schema_version": 1,
@@ -78,6 +99,41 @@ def test_setup_document_never_accepts_secret_fields() -> None:
     }
     with pytest.raises(ValidationError):
         SetupDocument.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "schema_version": 1,
+            "profile_id": "default",
+            "draft": {"ones_password": "TOKEN-SECRET"},
+        },
+        {
+            "schema_version": 1,
+            "profile_id": "default",
+            "draft": {
+                "runtime": {
+                    **_public_config().model_dump(mode="json"),
+                    "provider_api_url": (
+                        "https://user:TOKEN-SECRET@github.example.invalid/api"
+                    ),
+                }
+            },
+        },
+    ],
+)
+def test_setup_validation_errors_never_echo_rejected_secret_input(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        SetupDocument.model_validate(payload)
+
+    error = captured.value
+    assert "TOKEN-SECRET" not in str(error)
+    assert "TOKEN-SECRET" not in repr(error)
+    assert "TOKEN-SECRET" not in repr(error.errors())
+    assert all(item.get("input") == "<redacted>" for item in error.errors())
 
 
 def test_runtime_inputs_keep_secrets_out_of_model_dump() -> None:
@@ -137,7 +193,7 @@ def test_runtime_public_config_rejects_control_and_format_characters(
 @pytest.mark.parametrize(
     ("field_name", "value"),
     [
-        ("ones_base_url", "http://ones.example.invalid"),
+        ("ones_base_url", "ftp://ones.example.invalid"),
         ("ones_base_url", "https://user:password@ones.example.invalid"),
         ("provider_api_url", "ftp://github.example.invalid/api"),
         ("provider_api_url", "https://github.example.invalid/api?token=value"),
@@ -151,6 +207,37 @@ def test_runtime_public_config_rejects_unsafe_urls_and_hosts(
 ) -> None:
     with pytest.raises(ValidationError):
         _public_config(**{field_name: value})
+
+
+def test_runtime_public_validation_errors_hide_userinfo() -> None:
+    with pytest.raises(ValidationError) as captured:
+        RuntimePublicConfig.model_validate(
+            {
+                **_public_config().model_dump(mode="json"),
+                "provider_api_url": (
+                    "https://user:TOKEN-SECRET@github.example.invalid/api"
+                ),
+            }
+        )
+
+    assert "TOKEN-SECRET" not in repr(captured.value.errors())
+
+
+def test_setup_validation_entry_points_all_redact_inputs() -> None:
+    payload = {
+        **_public_config().model_dump(mode="json"),
+        "provider_api_url": "https://user:TOKEN-SECRET@github.example.invalid/api",
+    }
+    entry_points = (
+        lambda: RuntimePublicConfig(**payload),
+        lambda: RuntimePublicConfig.model_validate_json(json.dumps(payload)),
+    )
+
+    for validate in entry_points:
+        with pytest.raises(ValidationError) as captured:
+            validate()
+        assert "TOKEN-SECRET" not in str(captured.value)
+        assert "TOKEN-SECRET" not in repr(captured.value.errors())
 
 
 @pytest.mark.parametrize("field_name", ["ones_base_url", "provider_api_url"])
@@ -190,6 +277,32 @@ def test_runtime_urls_reject_ambiguous_hosts_and_paths(
 def test_provider_host_must_be_a_canonical_hostname(host: str) -> None:
     with pytest.raises(ValidationError):
         _public_config(provider_host=host)
+
+
+def test_provider_url_host_must_match_the_canonical_provider_host() -> None:
+    with pytest.raises(ValidationError):
+        _public_config(provider_api_url="https://attacker.example.invalid/api")
+
+
+def test_ones_http_and_ipv6_urls_remain_supported() -> None:
+    internal = _public_config(ones_base_url="http://ones.internal:8088")
+    ipv6 = _public_config(
+        ones_base_url="http://[2001:db8::1]:8088",
+        provider_host="2001:db8::2",
+        provider_api_url="https://[2001:db8::2]/api",
+    )
+
+    assert internal.ones_base_url == "http://ones.internal:8088"
+    assert ipv6.provider_host == "2001:db8::2"
+
+
+def test_provider_url_supports_idna_via_canonical_ascii_host() -> None:
+    config = _public_config(
+        provider_host="xn--bcher-kva.example",
+        provider_api_url="https://bücher.example/api",
+    )
+
+    assert config.provider_host == "xn--bcher-kva.example"
 
 
 @pytest.mark.parametrize(
@@ -296,6 +409,47 @@ def test_active_setup_holds_complete_workflow_and_credential_kinds(
         "ones_email",
         "ones_password",
     ]
+
+
+@pytest.mark.parametrize(
+    "workflow_update",
+    [
+        {"run_root": "relative/runs"},
+        {"mirror_root": "relative/mirrors"},
+        {"worktree_root": "relative/worktrees"},
+        {"max_codex_attempts": True},
+        {"max_codex_attempts": "3"},
+        {"tui_max_concurrency": True},
+        {"tui_max_concurrency": "3"},
+    ],
+)
+def test_active_setup_revalidates_strict_committed_workflow_constraints(
+    workflow_update: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        ActiveSetup.model_validate(_active_payload(**workflow_update))
+
+
+def test_committed_setup_is_deeply_immutable() -> None:
+    document = SetupDocument.model_validate(
+        {"schema_version": 1, "profile_id": "default", "active": _active_payload()}
+    )
+    assert document.active is not None
+
+    with pytest.raises(ValidationError):
+        document.active = None  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        document.active.generation = "b" * 32  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        document.active.workflow.run_root = Path("C:/changed")  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        document.active.workflow.sandbox_permission_profile = "changed"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        document.active.workflow.max_codex_attempts = 4  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        document.active.workflow.repositories[0].key = "changed"  # type: ignore[misc]
+    with pytest.raises(ValidationError):
+        document.active.workflow.publishing.provider = "github"  # type: ignore[misc]
 
 
 def test_setup_document_round_trips_its_json_form(tmp_path: Path) -> None:
