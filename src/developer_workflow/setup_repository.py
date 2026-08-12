@@ -98,6 +98,34 @@ def _source_owned_by_current_user(path: Path) -> bool:
         return False
 
 
+def _initial_source_identity(path: Path) -> tuple[Path, tuple[int, int]]:
+    """Validate one lexical directory and retain its no-follow filesystem identity."""
+
+    try:
+        lexical = path.absolute()
+        initial = lexical.lstat()
+        identity = (initial.st_dev, initial.st_ino)
+        resolved = lexical.resolve(strict=True)
+        if (
+            resolved != lexical
+            or not stat.S_ISDIR(initial.st_mode)
+            or _has_link_or_reparse_ancestor(lexical)
+            or _is_link_or_reparse(lexical)
+            or not _source_owned_by_current_user(lexical)
+        ):
+            raise ValueError
+        final = lexical.lstat()
+        if (
+            (final.st_dev, final.st_ino) != identity
+            or final.st_mode != initial.st_mode
+            or resolved != lexical.resolve(strict=True)
+        ):
+            raise ValueError
+        return resolved, identity
+    except (OSError, TypeError, ValueError):
+        raise SetupValidationError("repository source is invalid") from None
+
+
 def _read_origin(source: Path, inspector: ReadOnlyRepositoryInspector) -> str:
     try:
         git_entry = source / ".git"
@@ -166,17 +194,10 @@ def _validate_source(
     if mapping.source_path is None:
         return
     try:
-        lexical = mapping.source_path.absolute()
-        source = mapping.source_path.resolve(strict=True)
-        if (
-            source != lexical
-            or not source.is_dir()
-            or _has_link_or_reparse_ancestor(source)
-            or _is_link_or_reparse(source)
-            or not _source_owned_by_current_user(source)
-        ):
-            raise ValueError
+        source, initial_identity = _initial_source_identity(mapping.source_path)
         before = inspector.snapshot(source, timeout=float(timeout_seconds))
+        if getattr(before, "root_identity", None) != initial_identity:
+            raise ValueError
         origin = _read_origin(source, inspector)
         if WorktreeRepository._normalized_url(origin) != WorktreeRepository._normalized_url(
             mapping.repo_url
@@ -213,7 +234,11 @@ def build_repository(
     repository_inspector: ReadOnlyRepositoryInspector | None = None,
     timeout_seconds: int = 10,
 ) -> RepositoryMapping:
-    """Build the existing repository contract after strict setup validation."""
+    """Build the existing contract through a deliberately narrower setup boundary.
+
+    Setup accepts only canonical ASCII ONES identifiers and mapping keys even though
+    the persistence contract can load broader legacy opaque identifiers.
+    """
 
     try:
         key = _strict_string(key, key=True)
@@ -256,7 +281,12 @@ def build_repository(
 
 
 class RepositoryGroupDraftBuilder:
-    """Accumulate immutable repository snapshots and build the existing group contract."""
+    """Accumulate repository drafts and build the existing group contract.
+
+    ``primary`` is the authoritative role selection: roles on added drafts are input
+    hints only, and each build emits exactly one primary plus dependency roles for all
+    other members.  Group and repository keys occupy separate namespaces and may match.
+    """
 
     def __init__(
         self,
@@ -302,8 +332,6 @@ class RepositoryGroupDraftBuilder:
             project_id = self._project_id or first.project_id
             iteration_id = self._iteration_id or first.iteration_id
             key = self._key or primary
-            if key in self._repositories:
-                raise ValueError
             repositories: list[RepositoryMapping] = []
             for repository in self._repositories.values():
                 copied = RepositoryMapping.model_validate(repository.model_dump(round_trip=True))

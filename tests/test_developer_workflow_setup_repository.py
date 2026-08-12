@@ -163,6 +163,36 @@ def test_source_race_between_snapshots_fails_closed(tmp_path: Path) -> None:
         )
 
 
+def test_source_replacement_before_first_snapshot_fails_closed(tmp_path: Path) -> None:
+    source, remote = _source_and_remote(tmp_path, "source")
+    replacement, _ = _source_and_remote(tmp_path, "replacement")
+    _git("remote", "set-url", "origin", str(remote), cwd=replacement)
+    displaced = tmp_path / "displaced"
+
+    class ReplacingInspector(ReadOnlyRepositoryInspector):
+        replaced = False
+
+        def snapshot(self, path: Path, *, timeout: float = 10.0):
+            if not self.replaced:
+                self.replaced = True
+                source.rename(displaced)
+                replacement.rename(source)
+            return super().snapshot(path, timeout=timeout)
+
+    try:
+        with pytest.raises(SetupValidationError, match="repository source is invalid"):
+            build_repository(
+                key="app", project_id="project", iteration_id="iteration",
+                repo_url=str(remote), repo_name="app", source_path=source,
+                repository_inspector=ReplacingInspector(),
+            )
+    finally:
+        if source.exists():
+            source.rename(replacement)
+        if displaced.exists():
+            displaced.rename(source)
+
+
 def test_group_builder_rejects_cycle_missing_self_and_duplicate_keys() -> None:
     cases = (
         (_repo("app", depends_on=("sdk",)), _repo("sdk", depends_on=("app",))),
@@ -203,6 +233,30 @@ def test_group_build_is_deterministic_deep_copied_and_orders_integration_last() 
     )
     assert second.repositories[0].test_commands == ("pytest tests/app",)
     assert second.integration_test_commands == ("pytest tests/integration",)
+
+
+def test_group_builder_defaults_to_primary_key_and_normalizes_draft_roles() -> None:
+    builder = RepositoryGroupDraftBuilder()
+    builder.add(_repo("sdk"))
+    builder.add(_repo("app", depends_on=("sdk",)))
+
+    result = builder.build(primary="app")
+
+    assert result.key == "app"
+    assert result.primary_repository == "app"
+    assert tuple((item.key, item.role) for item in result.repositories) == (
+        ("sdk", RepositoryRole.DEPENDENCY),
+        ("app", RepositoryRole.PRIMARY),
+    )
+
+
+def test_group_key_may_explicitly_equal_repository_key() -> None:
+    builder = RepositoryGroupDraftBuilder(
+        key="app", project_id="project", iteration_id="iteration"
+    )
+    builder.add(_repo("app"))
+
+    assert builder.build(primary="app").key == "app"
 
 
 def test_inputs_are_strict_and_builder_copies_mutable_sequences() -> None:
