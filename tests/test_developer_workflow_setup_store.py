@@ -4,6 +4,7 @@ import json
 import multiprocessing
 import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -51,6 +52,58 @@ class FakeCredentials:
         return tuple(sorted(g for p, g in self.data if p == profile_id))
 
 
+class SharedCredentials:
+    """Credential protocol backed by multiprocessing manager proxies."""
+
+    def __init__(self, data: object, lock: object) -> None:
+        self.data = data
+        self.lock = lock
+
+    def write_generation(
+        self, profile_id: str, generation: str, secrets: RuntimeSecrets
+    ) -> None:
+        with self.lock:  # type: ignore[attr-defined]
+            existing = tuple(
+                key
+                for key in self.data.keys()  # type: ignore[attr-defined]
+                if key[:2] == (profile_id, generation)
+            )
+            if existing:
+                raise CredentialStoreError("credential operation failed")
+            for kind, value in secrets.values.items():
+                self.data[(profile_id, generation, kind.value)] = value  # type: ignore[index]
+
+    def read_generation(
+        self, profile_id: str, generation: str, kinds: tuple[SecretKind, ...]
+    ) -> RuntimeSecrets:
+        try:
+            return RuntimeSecrets(
+                {
+                    kind: self.data[(profile_id, generation, kind.value)]  # type: ignore[index]
+                    for kind in kinds
+                }
+            )
+        except KeyError:
+            raise CredentialStoreError("credential operation failed") from None
+
+    def delete_generation(self, profile_id: str, generation: str) -> None:
+        with self.lock:  # type: ignore[attr-defined]
+            for key in tuple(self.data.keys()):  # type: ignore[attr-defined]
+                if key[:2] == (profile_id, generation):
+                    del self.data[key]  # type: ignore[index]
+
+    def list_generations(self, profile_id: str) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    key[1]
+                    for key in self.data.keys()  # type: ignore[attr-defined]
+                    if key[0] == profile_id
+                }
+            )
+        )
+
+
 def _candidate(tmp_path: Path, generation: str) -> ActiveSetup:
     return ActiveSetup(
         generation=generation,
@@ -93,10 +146,14 @@ def _secrets(value: str = "TOKEN-SECRET") -> RuntimeSecrets:
 
 
 def _commit_process(
-    config_path: str, root: str, generation: str, ready: object, start: object
+    config_path: str,
+    root: str,
+    generation: str,
+    credentials: object,
+    ready: object,
+    start: object,
 ) -> None:
-    credentials = FakeCredentials()
-    setup = SetupStore(credentials, config_path=Path(config_path))
+    setup = SetupStore(credentials, config_path=Path(config_path))  # type: ignore[arg-type]
     ready.put(True)  # type: ignore[attr-defined]
     start.wait(10)  # type: ignore[attr-defined]
     setup.commit(
@@ -200,13 +257,10 @@ def test_exception_after_replace_keeps_new_credentials_recoverable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     setup, credentials, path = store
-    original = os.replace
-
-    def replace_then_fail(source: Path, destination: Path) -> None:
-        original(source, destination)
-        raise OSError("TOKEN-SECRET path")
-
-    monkeypatch.setattr("src.developer_workflow.setup_store.os.replace", replace_then_fail)
+    monkeypatch.setattr(
+        "src.developer_workflow.setup_store._fsync_directory",
+        lambda _path: (_ for _ in ()).throw(OSError("TOKEN-SECRET path")),
+    )
     with pytest.raises(SetupStoreError, match="^configuration save failed$"):
         setup.commit("profile-1", _candidate(tmp_path, "e" * 32), _secrets("new"))
 
@@ -215,42 +269,172 @@ def test_exception_after_replace_keeps_new_credentials_recoverable(
     assert ("profile-1", "e" * 32) in credentials.data
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through replacement")
+def test_windows_atomic_write_flushes_file_then_replaces_write_through(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, _, _ = store
+    events: list[tuple[str, int]] = []
+    original_flush = module._flush_file_descriptor
+
+    def flush(descriptor: int) -> None:
+        events.append(("flush", descriptor))
+        original_flush(descriptor)
+
+    def move(source: str, destination: str, flags: int) -> None:
+        del source, destination
+        events.append(("move", flags))
+
+    monkeypatch.setattr(module, "_flush_file_descriptor", flush)
+    monkeypatch.setattr(module, "_move_file_ex", move)
+
+    with pytest.raises(SetupStoreError, match="^configuration save failed$"):
+        setup.commit("profile-1", _candidate(tmp_path, "1" * 32), _secrets())
+
+    assert [event[0] for event in events] == ["flush", "move"]
+    assert events[1][1] == (
+        module._MOVEFILE_REPLACE_EXISTING | module._MOVEFILE_WRITE_THROUGH
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows write-through replacement")
+def test_windows_replace_failure_closes_temp_handle_and_cleans_temp_file(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, credentials, path = store
+    monkeypatch.setattr(
+        module,
+        "_move_file_ex",
+        lambda *_args: (_ for _ in ()).throw(OSError("TOKEN-SECRET move")),
+    )
+
+    with pytest.raises(SetupStoreError, match="^configuration save failed$"):
+        setup.commit("profile-1", _candidate(tmp_path, "2" * 32), _secrets())
+
+    assert not path.exists()
+    assert not tuple(path.parent.glob(".config-*.tmp"))
+    assert ("profile-1", "2" * 32) not in credentials.data
+    renamed = path.parent.with_name("renamed-private")
+    path.parent.rename(renamed)
+    renamed.rename(path.parent)
+
+
+@pytest.mark.parametrize("failure", ("regular", "directory", "fsync"))
+def test_post_replace_failure_is_monotonic_even_when_confirmation_load_fails(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, credentials, path = store
+    candidate = _candidate(tmp_path, "f" * 32)
+    original_regular = module._validate_regular_file
+    original_directory = setup._validate_directory
+
+    def fail_post_replace_regular(
+        checked: Path, *, descriptor: int | None = None
+    ) -> tuple[int, int]:
+        if checked == path and descriptor is None and path.exists():
+            raise OSError("TOKEN-SECRET post replace")
+        return original_regular(checked, descriptor=descriptor)
+
+    def fail_post_replace_directory() -> None:
+        if path.exists():
+            raise SetupStoreError("configuration path is unsafe")
+        original_directory()
+
+    with monkeypatch.context() as faults:
+        if failure == "regular":
+            faults.setattr(module, "_validate_regular_file", fail_post_replace_regular)
+        elif failure == "directory":
+            faults.setattr(setup, "_validate_directory", fail_post_replace_directory)
+        else:
+            faults.setattr(
+                module,
+                "_fsync_directory",
+                lambda _path: (_ for _ in ()).throw(OSError("TOKEN-SECRET fsync")),
+            )
+        faults.setattr(
+            setup,
+            "_load_unlocked",
+            lambda: (_ for _ in ()).throw(
+                SetupStoreError("configuration path is unsafe")
+            ),
+        )
+        with pytest.raises(SetupStoreError, match="^configuration save failed$"):
+            setup.commit("profile-1", candidate, _secrets("new"))
+
+    recovered = SetupStore(credentials, config_path=path).load()
+    assert recovered.active == candidate
+    assert ("profile-1", "f" * 32) in credentials.data
+
+
 def test_two_process_commits_are_serialized_without_mixed_document(
     store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
 ) -> None:
-    setup, _, path = store
-    setup.load_or_empty(profile_id="profile-1")
+    _, _, path = store
     context = multiprocessing.get_context("spawn")
-    ready = context.Queue()
-    start = context.Event()
-    generations = ("a" * 32, "b" * 32)
-    processes = [
-        context.Process(
-            target=_commit_process,
-            args=(str(path), str(tmp_path), generation, ready, start),
-        )
-        for generation in generations
-    ]
-    try:
-        for process in processes:
-            process.start()
-        for _ in processes:
-            assert ready.get(timeout=10) is True
-        start.set()
-        for process in processes:
-            process.join(timeout=20)
-            assert process.exitcode == 0
-        document = setup.load()
-        assert document.active is not None and document.previous is not None
-        assert {
-            document.active.generation,
-            document.previous.generation,
-        } == set(generations)
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
+    with context.Manager() as manager:
+        credentials = SharedCredentials(manager.dict(), manager.RLock())
+        setup = SetupStore(credentials, config_path=path)  # stale parent instance
+        ready = context.Queue()
+        start = context.Event()
+        generations = ("a" * 32, "b" * 32)
+        processes = [
+            context.Process(
+                target=_commit_process,
+                args=(
+                    str(path),
+                    str(tmp_path),
+                    generation,
+                    credentials,
+                    ready,
+                    start,
+                ),
+            )
+            for generation in generations
+        ]
+        try:
+            for process in processes:
+                process.start()
+            for _ in processes:
+                assert ready.get(timeout=10) is True
+            start.set()
+            for process in processes:
+                process.join(timeout=20)
+                assert process.exitcode == 0
+            document = setup.load()
+            assert document.active is not None and document.previous is not None
+            assert {
+                document.active.generation,
+                document.previous.generation,
+            } == set(generations)
+            assert setup.read_active_secrets(document).require(
+                SecretKind.ONES_PASSWORD
+            ) == document.active.generation
+            assert credentials.read_generation(
+                "profile-1",
+                document.previous.generation,
+                document.previous.credential_kinds,
+            ).require(SecretKind.ONES_PASSWORD) == document.previous.generation
+            assert credentials.list_generations("profile-1") == tuple(
+                sorted(generations)
+            )
+        finally:
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
 
 
 def test_restore_finalize_and_orphan_cleanup_are_pointer_safe(
@@ -296,6 +480,9 @@ def test_load_rejects_corrupt_unsafe_or_oversize_data_without_leaks(
     setup, _, path = store
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    _protect_private_file(path)
 
     with pytest.raises(SetupStoreError, match="^stored configuration is corrupted$") as captured:
         setup.load()
@@ -317,3 +504,258 @@ def test_load_rejects_final_symlink_without_disclosing_target(
     with pytest.raises(SetupStoreError, match="^configuration path is unsafe$") as captured:
         setup.load()
     assert "TOKEN-SECRET" not in repr(captured.value)
+
+
+def test_load_rejects_nonregular_final_and_lock_paths(
+    store: tuple[SetupStore, FakeCredentials, Path]
+) -> None:
+    setup, _, path = store
+    path.mkdir()
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load()
+    path.rmdir()
+    lock = path.parent / ".config.lock"
+    lock.unlink()
+    lock.mkdir()
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load_or_empty(profile_id="profile-1")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock reparse contract")
+def test_load_rejects_real_windows_lock_symlink_without_touching_target(
+    store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
+) -> None:
+    setup, _, path = store
+    target = tmp_path / "TOKEN-SECRET-lock-target"
+    target.write_bytes(b"guard")
+    lock = path.parent / ".config.lock"
+    try:
+        lock.symlink_to(target)
+    except OSError:
+        pytest.skip("file symlinks are unavailable")
+
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$") as captured:
+        setup.load_or_empty(profile_id="profile-1")
+    assert target.read_bytes() == b"guard"
+    assert "TOKEN-SECRET" not in repr(captured.value)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction/reparse contract")
+def test_setup_directory_rejects_real_windows_junction(tmp_path: Path) -> None:
+    target = tmp_path / "TOKEN-SECRET-target"
+    target.mkdir()
+    junction = tmp_path / "junction"
+    completed = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(junction), str(target)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("directory junctions are unavailable")
+    try:
+        with pytest.raises(
+            SetupStoreError, match="^configuration path is unsafe$"
+        ) as captured:
+            SetupStore(FakeCredentials(), config_path=junction / "config.json")
+        assert "TOKEN-SECRET" not in repr(captured.value)
+    finally:
+        junction.rmdir()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows DACL contract")
+@pytest.mark.parametrize("target", ("directory", "file"))
+def test_setup_rejects_real_windows_dacl_with_extra_principal(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    target: str,
+) -> None:
+    setup, _, path = store
+    setup.commit("profile-1", _candidate(tmp_path, "3" * 32), _secrets())
+    changed = path.parent if target == "directory" else path
+    grant = "*S-1-1-0:(OI)(CI)RX" if target == "directory" else "*S-1-1-0:R"
+    completed = subprocess.run(
+        ["icacls", str(changed), "/grant", grant, "/q"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("DACL mutation is unavailable")
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock DACL contract")
+def test_setup_rejects_existing_lock_dacl_with_extra_principal(
+    store: tuple[SetupStore, FakeCredentials, Path]
+) -> None:
+    setup, _, path = store
+    setup.load_or_empty(profile_id="profile-1")
+    lock = path.parent / ".config.lock"
+    completed = subprocess.run(
+        ["icacls", str(lock), "/grant", "*S-1-1-0:R", "/q"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("DACL mutation is unavailable")
+
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load_or_empty(profile_id="profile-1")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows lock DACL contract")
+def test_setup_rejects_existing_lock_with_inherited_dacl(
+    store: tuple[SetupStore, FakeCredentials, Path]
+) -> None:
+    setup, _, path = store
+    setup.load_or_empty(profile_id="profile-1")
+    lock = path.parent / ".config.lock"
+    completed = subprocess.run(
+        ["icacls", str(lock), "/inheritance:e", "/q"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("DACL mutation is unavailable")
+
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load_or_empty(profile_id="profile-1")
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows child-file DACL contract")
+def test_windows_temp_final_and_lock_have_protected_noninherited_dacl(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import private_paths
+    from src.developer_workflow import setup_store as module
+
+    setup, _, path = store
+    observed_temp: list[tuple[str, tuple[tuple[str, int, int, int], ...], bool]] = []
+    original_replace = module._replace_atomic
+
+    def inspect_then_replace(source: Path, destination: Path) -> None:
+        observed_temp.append(private_paths._windows_descriptor(source))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(module, "_replace_atomic", inspect_then_replace)
+    setup.commit("profile-1", _candidate(tmp_path, "5" * 32), _secrets())
+
+    descriptors = (
+        observed_temp[0],
+        private_paths._windows_descriptor(path),
+        private_paths._windows_descriptor(path.parent / ".config.lock"),
+    )
+    user_sid = private_paths._current_user_sid()
+    trusted = {user_sid, "S-1-5-18", "S-1-5-32-544"}
+    for owner, entries, protected in descriptors:
+        assert owner == user_sid
+        assert protected is True
+        assert {sid for sid, *_ in entries} <= trusted
+        assert all(
+            mask & 0x001F01FF == 0x001F01FF
+            and flags & 0x10 == 0
+            and ace_type == 0
+            for _, mask, flags, ace_type in entries
+        )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows child-file owner contract")
+def test_windows_config_file_owner_mismatch_fails_closed(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, _, path = store
+    setup.commit("profile-1", _candidate(tmp_path, "6" * 32), _secrets())
+    original = module._windows_descriptor
+
+    def wrong_owner(checked: Path):
+        owner, entries, protected = original(checked)
+        if checked == path:
+            owner = "S-1-1-0"
+        return owner, entries, protected
+
+    monkeypatch.setattr(module, "_windows_descriptor", wrong_owner)
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows final-path identity contract")
+@pytest.mark.parametrize("replacement_point", ("before_open", "after_handle"))
+def test_windows_repeated_config_replacement_race_fails_closed(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_point: str,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, _, path = store
+    setup.commit("profile-1", _candidate(tmp_path, "4" * 32), _secrets())
+    original_open = module._open_windows
+    original_validate = module._validate_regular_file
+    validation_calls = 0
+
+    def replace_file() -> None:
+        raw = path.read_bytes()
+        replacement = path.with_suffix(".replacement")
+        replacement.write_bytes(raw)
+        os.replace(replacement, path)
+
+    def racing_open(checked: Path) -> int:
+        replace_file()
+        return original_open(checked)
+
+    def racing_validation(
+        checked: Path, *, descriptor: int | None = None
+    ) -> tuple[int, int]:
+        nonlocal validation_calls
+        if checked == path and descriptor is None:
+            validation_calls += 1
+            if validation_calls % 2 == 0:
+                replace_file()
+        return original_validate(checked, descriptor=descriptor)
+
+    if replacement_point == "before_open":
+        monkeypatch.setattr(module, "_open_windows", racing_open)
+    else:
+        monkeypatch.setattr(module, "_validate_regular_file", racing_validation)
+
+    with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
+        setup.load()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point open contract")
+def test_windows_config_and_lock_handles_use_open_reparse_point(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, _, _ = store
+    setup.commit("profile-1", _candidate(tmp_path, "7" * 32), _secrets())
+    original = module._kernel32.CreateFileW
+    flags: list[int] = []
+
+    def capture(*args: object):
+        flags.append(int(args[5]))
+        return original(*args)
+
+    monkeypatch.setattr(module._kernel32, "CreateFileW", capture)
+    setup.load()
+
+    assert len(flags) >= 2
+    assert all(value & 0x00200000 for value in flags)

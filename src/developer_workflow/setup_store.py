@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import tempfile
 import time
 from typing import Iterator
@@ -52,6 +53,14 @@ if os.name == "nt":
         wintypes.DWORD,
     ]
     _kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    _kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    _kernel32.FlushFileBuffers.restype = wintypes.BOOL
+    _kernel32.MoveFileExW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+    ]
+    _kernel32.MoveFileExW.restype = wintypes.BOOL
 else:
     import fcntl
 
@@ -63,11 +72,21 @@ class SetupStoreError(RuntimeError):
 _MAX_CONFIGURATION_BYTES = 1024 * 1024
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _READ_ATTEMPTS = 3
+_MOVEFILE_REPLACE_EXISTING = 0x00000001
+_MOVEFILE_WRITE_THROUGH = 0x00000008
 logger = logging.getLogger(__name__)
 
 
 class _Replaced(RuntimeError):
     pass
+
+
+class _AtomicWriteError(RuntimeError):
+    """Internal monotonic outcome from one atomic replacement attempt."""
+
+    def __init__(self, *, replaced: bool) -> None:
+        super().__init__("atomic configuration write failed")
+        self.replaced = replaced
 
 
 class SetupStore:
@@ -131,6 +150,15 @@ class SetupStore:
             )
             try:
                 self._atomic_write(document)
+            except _AtomicWriteError as error:
+                if not error.replaced:
+                    try:
+                        self._credentials.delete_generation(
+                            profile_id, candidate.generation
+                        )
+                    except CredentialStoreError:
+                        pass
+                raise SetupStoreError("configuration save failed") from None
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
                     raise
@@ -320,8 +348,10 @@ class SetupStore:
             prefix=".config-", suffix=".tmp", dir=self._directory
         )
         temp_path = Path(raw_path)
+        replaced = False
         try:
             os.chmod(temp_path, 0o600)
+            _protect_private_file(temp_path)
             _validate_regular_file(temp_path, descriptor=descriptor)
             self._validate_directory()
             view = memoryview(payload)
@@ -330,15 +360,18 @@ class SetupStore:
                 if written <= 0:
                     raise OSError("configuration write failed")
                 view = view[written:]
-            os.fsync(descriptor)
+            _flush_file_descriptor(descriptor)
             os.close(descriptor)
             descriptor = -1
             _validate_regular_file(temp_path)
             self._validate_directory()
-            os.replace(temp_path, self._config_path)
+            _replace_atomic(temp_path, self._config_path)
+            replaced = True
             _validate_regular_file(self._config_path)
             self._validate_directory()
             _fsync_directory(self._directory)
+        except Exception as error:
+            raise _AtomicWriteError(replaced=replaced) from error
         finally:
             if descriptor >= 0:
                 try:
@@ -347,7 +380,7 @@ class SetupStore:
                     pass
             try:
                 temp_path.unlink()
-            except FileNotFoundError:
+            except OSError:
                 pass
 
     def _validate_directory(self) -> None:
@@ -371,11 +404,22 @@ class SetupStore:
     def _locked(self) -> Iterator[None]:
         self._validate_directory()
         lock_path = self._directory / ".config.lock"
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
-        descriptor = os.open(lock_path, flags, 0o600)
+        descriptor = -1
         acquired = False
         try:
-            _validate_regular_file(lock_path, descriptor=descriptor)
+            if _is_link_or_reparse(lock_path):
+                raise OSError("unsafe lock file")
+            descriptor, created = _open_lock_nofollow(lock_path)
+            if created:
+                _protect_private_file(lock_path)
+                _validate_regular_file(lock_path, descriptor=descriptor)
+            else:
+                _validate_existing_lock(
+                    lock_path,
+                    descriptor,
+                    timeout=min(self._lock_timeout, 1.0),
+                    poll_interval=self._lock_poll_interval,
+                )
             if os.fstat(descriptor).st_size == 0:
                 os.write(descriptor, b"\0")
                 os.fsync(descriptor)
@@ -401,10 +445,11 @@ class SetupStore:
                     _unlock(descriptor)
                 except OSError:
                     pass
-            try:
-                os.close(descriptor)
-            except OSError:
-                pass
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
 
 def _has_unsafe_ancestor(path: Path) -> bool:
@@ -450,16 +495,20 @@ def _validate_regular_file(path: Path, *, descriptor: int | None = None) -> tupl
         ):
             raise OSError("unsafe file")
     if os.name == "nt":
-        owner, entries, _protected = _windows_descriptor(path)
+        owner, entries, protected = _windows_descriptor(path)
         user = _current_user_sid()
         trusted = {user, _SYSTEM_SID, _ADMINISTRATORS_SID}
         full_control = 0x001F01FF
         if (
             owner != user
+            or not protected
             or not entries
             or any(
-                sid not in trusted or ace_type != 0 or mask & full_control != full_control
-                for sid, mask, _flags, ace_type in entries
+                sid not in trusted
+                or ace_type != 0
+                or flags & 0x10
+                or mask & full_control != full_control
+                for sid, mask, flags, ace_type in entries
             )
         ):
             raise OSError("unsafe file")
@@ -507,18 +556,107 @@ def _read_nofollow(path: Path) -> str:
         raise ValueError("invalid UTF-8") from None
 
 
+def _protect_private_file(path: Path) -> None:
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+        return
+    try:
+        user_sid = _current_user_sid()
+    except OSError:
+        raise OSError("private file ACL is unavailable") from None
+    completed = subprocess.run(
+        [
+            "icacls",
+            str(path),
+            "/inheritance:r",
+            "/grant:r",
+            f"*{user_sid}:F",
+            f"*{_SYSTEM_SID}:F",
+            f"*{_ADMINISTRATORS_SID}:F",
+            "/q",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise OSError("private file ACL is unavailable")
+
+
 def _open_windows(path: Path) -> int:
+    return _open_windows_descriptor(
+        path,
+        desired_access=0x80000000,
+        creation_disposition=3,
+        os_flags=os.O_RDONLY | getattr(os, "O_BINARY", 0),
+    )
+
+
+def _open_lock_nofollow(path: Path) -> tuple[int, bool]:
+    if os.name == "nt":
+        arguments = {
+            "desired_access": 0x80000000 | 0x40000000,
+            "os_flags": os.O_RDWR | getattr(os, "O_BINARY", 0),
+        }
+        try:
+            return (
+                _open_windows_descriptor(
+                    path, creation_disposition=1, **arguments
+                ),
+                True,
+            )
+        except OSError as error:
+            if getattr(error, "winerror", None) not in {80, 183}:
+                raise
+        return (
+            _open_windows_descriptor(path, creation_disposition=3, **arguments),
+            False,
+        )
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(path, flags | os.O_CREAT | os.O_EXCL, 0o600), True
+    except FileExistsError:
+        return os.open(path, flags), False
+
+
+def _validate_existing_lock(
+    path: Path,
+    descriptor: int,
+    *,
+    timeout: float,
+    poll_interval: float,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            _validate_regular_file(path, descriptor=descriptor)
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(poll_interval)
+
+
+def _open_windows_descriptor(
+    path: Path,
+    *,
+    desired_access: int,
+    creation_disposition: int,
+    os_flags: int,
+) -> int:
     handle = _kernel32.CreateFileW(  # type: ignore[name-defined]
         str(path),
-        0x80000000,
+        desired_access,
         0x00000001 | 0x00000002 | 0x00000004,
         None,
-        3,
+        creation_disposition,
         0x00200000,
         None,
     )
     if handle == ctypes.c_void_p(-1).value:
-        raise OSError("unsafe file")
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
         buffer = ctypes.create_unicode_buffer(32768)
         length = _kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)  # type: ignore[name-defined]
@@ -532,7 +670,7 @@ def _open_windows(path: Path) -> int:
         if os.path.normcase(os.path.abspath(final)) != os.path.normcase(os.path.abspath(path)):
             raise OSError("unsafe file")
         return msvcrt.open_osfhandle(  # type: ignore[name-defined]
-            int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
+            int(handle), os_flags
         )
     except BaseException:
         _kernel32.CloseHandle(handle)  # type: ignore[name-defined]
@@ -557,12 +695,40 @@ def _unlock(descriptor: int) -> None:
 
 def _fsync_directory(path: Path) -> None:
     if os.name == "nt":
+        # MoveFileExW(MOVEFILE_WRITE_THROUGH) is the Windows durability boundary.
         return
     descriptor = os.open(path, os.O_RDONLY)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _flush_file_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        handle = msvcrt.get_osfhandle(descriptor)  # type: ignore[name-defined]
+        if handle == -1 or not _kernel32.FlushFileBuffers(handle):  # type: ignore[name-defined]
+            raise ctypes.WinError(ctypes.get_last_error())
+        return
+    os.fsync(descriptor)
+
+
+def _move_file_ex(source: str, destination: str, flags: int) -> None:
+    if os.name != "nt":
+        raise OSError("Windows replacement API is unavailable")
+    if not _kernel32.MoveFileExW(source, destination, flags):  # type: ignore[name-defined]
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _replace_atomic(source: Path, destination: Path) -> None:
+    if os.name == "nt":
+        _move_file_ex(
+            str(source),
+            str(destination),
+            _MOVEFILE_REPLACE_EXISTING | _MOVEFILE_WRITE_THROUGH,
+        )
+        return
+    os.replace(source, destination)
 
 
 __all__ = ["SetupStore", "SetupStoreError"]
