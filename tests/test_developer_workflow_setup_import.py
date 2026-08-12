@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -15,16 +16,25 @@ from src.developer_workflow.setup_import import (
 from src.developer_workflow.setup_models import RuntimeSecrets, SecretKind
 
 
+def _write_private(path: Path, payload: str | bytes) -> None:
+    if isinstance(payload, bytes):
+        path.write_bytes(payload)
+    else:
+        path.write_text(payload, encoding="utf-8")
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    _protect_private_file(path)
+
+
 def test_detection_reports_allowlisted_names_only_without_secret_values(
     tmp_path: Path,
 ) -> None:
     dotenv = tmp_path / ".env"
-    dotenv.write_text(
+    _write_private(dotenv,
         "ONES_PASSWORD=DOTENV-TOKEN\nONES_DEV_PROVIDER_TOKEN=provider-secret\n",
-        encoding="utf-8",
     )
     template = tmp_path / "template.json"
-    template.write_text("{}", encoding="utf-8")
+    _write_private(template, "{}")
 
     detection = detect_import_sources(
         template_config_path=template,
@@ -107,10 +117,9 @@ def test_parse_dotenv_accepts_simple_utf8_values_and_whole_line_comments(
     tmp_path: Path,
 ) -> None:
     dotenv = tmp_path / ".env"
-    dotenv.write_text(
+    _write_private(dotenv,
         "# bootstrap credentials\nONES_EMAIL=dev@example.invalid\n"
         "ONES_PASSWORD=a safe:/._-+@% value\n",
-        encoding="utf-8",
     )
     before = (dotenv.read_bytes(), dotenv.stat().st_mtime_ns)
     values = parse_dotenv(dotenv)
@@ -154,7 +163,7 @@ def test_parse_dotenv_rejects_shell_and_ambiguous_syntax(
     tmp_path: Path, payload: str
 ) -> None:
     dotenv = tmp_path / ".env"
-    dotenv.write_bytes(payload.encode("utf-8"))
+    _write_private(dotenv, payload.encode("utf-8"))
     with pytest.raises(SetupImportError) as caught:
         parse_dotenv(dotenv)
     assert str(caught.value) == "dotenv file is invalid"
@@ -164,7 +173,7 @@ def test_parse_dotenv_rejects_shell_and_ambiguous_syntax(
 
 def test_parse_dotenv_rejects_invalid_utf8(tmp_path: Path) -> None:
     dotenv = tmp_path / ".env"
-    dotenv.write_bytes(b"ONES_PASSWORD=\xff\n")
+    _write_private(dotenv, b"ONES_PASSWORD=\xff\n")
     with pytest.raises(SetupImportError, match="^dotenv file is invalid$"):
         parse_dotenv(dotenv)
 
@@ -178,7 +187,7 @@ def test_parse_dotenv_enforces_file_line_count_and_line_length_bounds(
         ("many-lines", b"# x\n" * 4097),
     ):
         dotenv = tmp_path / name
-        dotenv.write_bytes(payload)
+        _write_private(dotenv, payload)
         with pytest.raises(SetupImportError, match="^dotenv file is invalid$"):
             parse_dotenv(dotenv)
 
@@ -191,7 +200,7 @@ def test_missing_dotenv_is_empty_but_non_regular_and_symlink_fail_closed(
         parse_dotenv(tmp_path)
 
     target = tmp_path / "target"
-    target.write_text("ONES_PASSWORD=TOKEN\n", encoding="utf-8")
+    _write_private(target, "ONES_PASSWORD=TOKEN\n")
     link = tmp_path / "link"
     try:
         link.symlink_to(target)
@@ -207,7 +216,7 @@ def test_parse_dotenv_rejects_identity_or_metadata_race(
     from src.developer_workflow import setup_import
 
     dotenv = tmp_path / ".env"
-    dotenv.write_text("ONES_PASSWORD=TOKEN\n", encoding="utf-8")
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
     original = setup_import._descriptor_identity
     calls = 0
 
@@ -230,7 +239,7 @@ def test_parse_dotenv_deletion_after_initial_identity_is_unsafe(
     from src.developer_workflow import setup_import
 
     dotenv = tmp_path / ".env"
-    dotenv.write_text("ONES_PASSWORD=TOKEN\n", encoding="utf-8")
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
     original = setup_import._path_identity
     calls = 0
 
@@ -257,7 +266,7 @@ def test_template_missing_is_false_but_corrupt_or_unsafe_fails_closed(
     assert missing.template_available is False
 
     corrupt = tmp_path / "corrupt.json"
-    corrupt.write_text('{"a": 1, "a": 2}', encoding="utf-8")
+    _write_private(corrupt, '{"a": 1, "a": 2}')
     with pytest.raises(SetupImportError, match="^template config is invalid$"):
         detect_import_sources(
             template_config_path=corrupt,
@@ -268,7 +277,7 @@ def test_template_missing_is_false_but_corrupt_or_unsafe_fails_closed(
 
 def test_deep_template_json_has_sanitized_failure(tmp_path: Path) -> None:
     template = tmp_path / "deep.json"
-    template.write_text("[" * 2000 + "]" * 2000, encoding="utf-8")
+    _write_private(template, "[" * 2000 + "]" * 2000)
     with pytest.raises(SetupImportError, match="^template config is invalid$") as caught:
         detect_import_sources(
             template_config_path=template,
@@ -368,6 +377,148 @@ def test_import_does_not_mutate_sources() -> None:
     )
     assert environment == environment_copy
     assert dotenv == dotenv_copy
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ssh -o StrictHostKeyChecking=yes;calc",
+        "ssh & calc",
+        "ssh | calc",
+        "ssh > output",
+        "cmd /c calc",
+        "ssh (calc)",
+        "ssh.exe -oBatchMode=yes",
+        '"C:\\Program Files\\ssh.exe"',
+    ],
+)
+def test_git_command_import_rejects_commands_and_shell_grammar(value: str) -> None:
+    with pytest.raises(SetupImportError, match="^selected credential is invalid$"):
+        import_selected(
+            {"ONES_DEV_GIT_SSH_COMMAND": value},
+            {},
+            (SecretKind.GIT_SSH_COMMAND,),
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "name"),
+    [
+        (SecretKind.GIT_ASKPASS, "ONES_DEV_GIT_ASKPASS"),
+        (SecretKind.GIT_SSH, "ONES_DEV_GIT_SSH"),
+        (SecretKind.GIT_SSH_COMMAND, "ONES_DEV_GIT_SSH_COMMAND"),
+        (SecretKind.SSH_ASKPASS, "ONES_DEV_SSH_ASKPASS"),
+    ],
+)
+def test_git_executable_import_accepts_only_existing_absolute_regular_path(
+    kind: SecretKind, name: str
+) -> None:
+    executable = str(Path(sys.executable).resolve())
+    imported = import_selected({name: executable}, {}, (kind,))
+    assert imported.require(kind) == executable
+    with pytest.raises(SetupImportError, match="^selected credential is invalid$"):
+        import_selected({name: "relative-helper"}, {}, (kind,))
+
+
+def test_ssh_auth_sock_import_requires_absolute_safe_path(tmp_path: Path) -> None:
+    imported = import_selected(
+        {"ONES_DEV_SSH_AUTH_SOCK": str(tmp_path.resolve() / "agent.sock")},
+        {},
+        (SecretKind.SSH_AUTH_SOCK,),
+    )
+    assert imported.require(SecretKind.SSH_AUTH_SOCK).endswith("agent.sock")
+    with pytest.raises(SetupImportError, match="^selected credential is invalid$"):
+        import_selected(
+            {"ONES_DEV_SSH_AUTH_SOCK": "relative.sock"},
+            {},
+            (SecretKind.SSH_AUTH_SOCK,),
+        )
+
+
+def test_read_bounded_zeroes_content_when_postread_identity_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / ".env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+    original_identity = setup_import._descriptor_identity
+    identities = 0
+    zeroed: list[bytes] = []
+    original_zero = setup_import._zero_buffer
+
+    def changed(descriptor: int) -> tuple[int, int, int, int]:
+        nonlocal identities
+        identities += 1
+        result = original_identity(descriptor)
+        if identities > 1:
+            return result[0], result[1], result[2], result[3] + 1
+        return result
+
+    def observe(value: bytearray) -> None:
+        original_zero(value)
+        zeroed.append(bytes(value))
+
+    monkeypatch.setattr(setup_import, "_descriptor_identity", changed)
+    monkeypatch.setattr(setup_import, "_zero_buffer", observe)
+    with pytest.raises(SetupImportError, match="^dotenv path is unsafe$"):
+        parse_dotenv(dotenv)
+    assert zeroed
+    assert all(set(item) <= {0} for item in zeroed)
+
+
+def test_parse_error_zeroes_returned_source_buffer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / ".env"
+    _write_private(dotenv, "ONES_PASSWORD=$HOME\n")
+    zeroed: list[bytes] = []
+    original_zero = setup_import._zero_buffer
+
+    def observe(value: bytearray) -> None:
+        original_zero(value)
+        zeroed.append(bytes(value))
+
+    monkeypatch.setattr(setup_import, "_zero_buffer", observe)
+    with pytest.raises(SetupImportError, match="^dotenv file is invalid$"):
+        parse_dotenv(dotenv)
+    assert zeroed and all(set(item) <= {0} for item in zeroed)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing semantics")
+def test_windows_source_read_handle_blocks_write_and_delete(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / ".env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+    descriptor = setup_import._open_source_readonly(dotenv)
+    try:
+        with pytest.raises(OSError):
+            os.open(dotenv, os.O_WRONLY)
+        with pytest.raises(OSError):
+            dotenv.unlink()
+    finally:
+        os.close(descriptor)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL semantics")
+def test_windows_source_with_inherited_writable_acl_is_rejected(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.private_paths import _windows_descriptor
+
+    dotenv = tmp_path / "inherited.env"
+    with open(dotenv, "w", encoding="utf-8") as stream:
+        stream.write("ONES_PASSWORD=TOKEN\n")
+    _owner, _entries, protected = _windows_descriptor(dotenv)
+    if protected:
+        pytest.skip("test filesystem creates protected files by default")
+    with pytest.raises(SetupImportError, match="^dotenv path is unsafe$"):
+        parse_dotenv(dotenv)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point coverage")
