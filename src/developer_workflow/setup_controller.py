@@ -57,7 +57,12 @@ class _CloseOnce:
                 return
             self._claimed = True
             self.started.set()
-        _close_handle(self._handle)
+            handle = self._handle
+        try:
+            _close_handle(handle)
+        finally:
+            with self._lock:
+                self._handle = None
 
 
 class _BuildAttempt:
@@ -229,7 +234,7 @@ class SetupController:
         self._operation_task: asyncio.Task[Any] | None = None
         self._activation_error: str | None = None
         self._finalizing = False
-        self._background_close_tasks: set[asyncio.Task[None]] = set()
+        self._background_close_tasks: set[asyncio.Future[None]] = set()
         self._abandoned_build_tasks: set[asyncio.Task[object]] = set()
 
     @property
@@ -800,16 +805,39 @@ class SetupController:
             if close_task in done:
                 self._consume_close_task(close_task)
 
-    def _schedule_background_close(self, handle: object) -> asyncio.Task[None]:
+    def _schedule_background_close(self, handle: object) -> asyncio.Future[None]:
         """Schedule exactly one observed close without running it on the event loop."""
 
         return self._schedule_close_once(_CloseOnce(handle))
 
-    def _schedule_close_once(self, closer: _CloseOnce) -> asyncio.Task[None]:
-        close_task = asyncio.create_task(asyncio.to_thread(closer.run))
-        self._background_close_tasks.add(close_task)
-        close_task.add_done_callback(self._consume_close_task)
-        return close_task
+    def _schedule_close_once(self, closer: _CloseOnce) -> asyncio.Future[None]:
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future[None] = loop.create_future()
+        self._background_close_tasks.add(completion)
+        completion.add_done_callback(self._consume_close_task)
+
+        def finish_on_loop() -> None:
+            if not completion.done():
+                completion.set_result(None)
+
+        def worker() -> None:
+            try:
+                closer.run()
+            except BaseException:
+                pass
+            finally:
+                self._background_close_tasks.discard(completion)
+                try:
+                    loop.call_soon_threadsafe(finish_on_loop)
+                except RuntimeError:
+                    pass
+
+        Thread(
+            target=worker,
+            name="ones-setup-runtime-close",
+            daemon=True,
+        ).start()
+        return completion
 
     def _handoff_abandoned_handle(
         self, loop: asyncio.AbstractEventLoop, handle: object
@@ -838,7 +866,7 @@ class SetupController:
         fallback_thread.start()
         fallback_thread.join(self._cleanup_timeout)
 
-    def _consume_close_task(self, task: asyncio.Task[None]) -> None:
+    def _consume_close_task(self, task: asyncio.Future[None]) -> None:
         """Consume a detached close outcome and release its lifecycle reference."""
 
         self._background_close_tasks.discard(task)

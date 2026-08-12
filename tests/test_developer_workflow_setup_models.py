@@ -498,6 +498,7 @@ def test_setup_document_rejects_shared_active_previous_generation(
             profile_id="default",
             active=active,
             previous=active,
+            activation_owner_generation="a" * 32,
         )
 
 
@@ -556,6 +557,61 @@ def test_setup_document_round_trips_its_json_form(tmp_path: Path) -> None:
     restored = SetupDocument.model_validate(document.model_dump(mode="json"))
 
     assert restored == document
+
+
+def test_setup_document_round_trips_pending_activation_owner(tmp_path: Path) -> None:
+    active = ActiveSetup(
+        generation="b" * 32,
+        runtime=_public_config(),
+        workflow=_workflow_config(tmp_path),
+        credential_kinds=(SecretKind.ONES_PASSWORD,),
+    )
+    previous = active.validated_update(generation="a" * 32)
+    document = SetupDocument(
+        profile_id="default",
+        active=active,
+        previous=previous,
+        activation_owner_generation="b" * 32,
+    )
+
+    restored = SetupDocument.model_validate(document.model_dump(mode="json"))
+
+    assert restored == document
+
+
+def test_legacy_document_without_activation_owner_is_stable(tmp_path: Path) -> None:
+    payload = SetupDocument(
+        profile_id="default",
+        active=ActiveSetup(
+            generation="b" * 32,
+            runtime=_public_config(),
+            workflow=_workflow_config(tmp_path),
+            credential_kinds=(SecretKind.ONES_PASSWORD,),
+        ),
+    ).model_dump(mode="json")
+    payload.pop("activation_owner_generation")
+    payload["previous"] = {**payload["active"], "generation": "a" * 32}
+
+    restored = SetupDocument.model_validate(payload)
+
+    assert restored.active is not None
+    assert restored.active.generation == "b" * 32
+    assert restored.previous is None
+    assert restored.activation_owner_generation is None
+
+
+def test_pending_activation_owner_must_match_active_generation(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError):
+        SetupDocument(
+            profile_id="default",
+            active=ActiveSetup(
+                generation="b" * 32,
+                runtime=_public_config(),
+                workflow=_workflow_config(tmp_path),
+                credential_kinds=(SecretKind.ONES_PASSWORD,),
+            ),
+            activation_owner_generation="c" * 32,
+        )
 
 
 def test_runtime_secrets_are_read_only_frozen_and_do_not_leak() -> None:

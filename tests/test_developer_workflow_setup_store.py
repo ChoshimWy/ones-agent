@@ -19,6 +19,7 @@ from src.developer_workflow.setup_models import (
     RuntimePublicConfig,
     RuntimeSecrets,
     SecretKind,
+    SetupDocument,
 )
 from src.developer_workflow.setup_store import SetupStore, SetupStoreError
 
@@ -235,9 +236,13 @@ def _commit_process(
     setup = SetupStore(credentials, config_path=Path(config_path))  # type: ignore[arg-type]
     ready.put(True)  # type: ignore[attr-defined]
     start.wait(10)  # type: ignore[attr-defined]
-    setup.commit(
-        "profile-1", _candidate(Path(root), generation), _secrets(generation)
-    )
+    try:
+        setup.commit(
+            "profile-1", _candidate(Path(root), generation), _secrets(generation)
+        )
+    except SetupStoreError as error:
+        if str(error) != "configuration activation is already pending":
+            raise
 
 
 def _fresh_claim_process(
@@ -302,6 +307,7 @@ def test_commit_switches_generation_and_reads_only_active_kinds(
 ) -> None:
     setup, _, _ = store
     first = setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.finalize_activation("profile-1", "a" * 32)
     second = setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
 
     assert setup.load() == second
@@ -378,12 +384,12 @@ def test_commit_rejects_referenced_generation_before_any_mutation(
     path = tmp_path / "local" / "ones-dev" / "config.json"
     setup = SetupStore(credentials, config_path=path)
     first = setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
-    setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
-    generation = (
-        setup.load().active.generation
-        if referenced == "active"
-        else setup.load().previous.generation
-    )
+    setup.finalize_activation("profile-1", "a" * 32)
+    if referenced == "active":
+        generation = "a" * 32
+    else:
+        setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
+        generation = "a" * 32
     credentials.writes.clear()
     credentials.deletes.clear()
     atomic_calls = 0
@@ -395,13 +401,19 @@ def test_commit_rejects_referenced_generation_before_any_mutation(
         original(document)  # type: ignore[arg-type]
 
     monkeypatch.setattr(setup, "_atomic_write", count_write)
-    with pytest.raises(SetupStoreError, match="^configuration generation is unavailable$"):
+    expected = (
+        "configuration generation is unavailable"
+        if referenced == "active"
+        else "configuration activation is already pending"
+    )
+    with pytest.raises(SetupStoreError, match=f"^{expected}$"):
         setup.commit("profile-1", _candidate(tmp_path, generation), _secrets("old"))
 
     assert credentials.writes == []
     assert credentials.deletes == []
     assert atomic_calls == 0
-    assert setup.load().previous == first.active
+    if referenced == "previous":
+        assert setup.load().previous == first.active
 
 
 def test_preexisting_orphan_generation_is_never_deleted_on_write_failure(
@@ -529,6 +541,7 @@ def test_json_failure_rolls_back_new_credentials_and_preserves_old_document(
 ) -> None:
     setup, credentials, _ = store
     before = setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    before = setup.finalize_activation("profile-1", "a" * 32)
 
     def fail_write(*args: object, **kwargs: object) -> None:
         raise OSError("TOKEN-SECRET target path")
@@ -814,21 +827,14 @@ def test_two_process_commits_are_serialized_without_mixed_document(
                 process.join(timeout=20)
                 assert process.exitcode == 0
             document = setup.load()
-            assert document.active is not None and document.previous is not None
-            assert {
-                document.active.generation,
-                document.previous.generation,
-            } == set(generations)
+            assert document.active is not None and document.previous is None
+            assert document.active.generation in generations
+            assert document.activation_owner_generation == document.active.generation
             assert setup.read_active_secrets(document).require(
                 SecretKind.ONES_PASSWORD
             ) == document.active.generation
-            assert credentials.read_generation(
-                "profile-1",
-                document.previous.generation,
-                document.previous.credential_kinds,
-            ).require(SecretKind.ONES_PASSWORD) == document.previous.generation
-            assert credentials.list_generations("profile-1") == tuple(
-                sorted(generations)
+            assert credentials.list_generations("profile-1") == (
+                document.active.generation,
             )
         finally:
             for process in processes:
@@ -940,6 +946,7 @@ def test_restore_finalize_and_orphan_cleanup_are_pointer_safe(
 ) -> None:
     setup, credentials, _ = store
     setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.finalize_activation("profile-1", "a" * 32)
     setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
     credentials.data[("profile-1", "c" * 32)] = _secrets("orphan")
 
@@ -957,6 +964,7 @@ def test_finalize_keeps_new_active_when_old_credential_delete_fails(
 ) -> None:
     setup, credentials, _ = store
     setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.finalize_activation("profile-1", "a" * 32)
     setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
     credentials.fail_delete = True
 
@@ -974,6 +982,7 @@ def test_finalize_post_replace_failure_is_monotonic_success(
 ) -> None:
     setup, credentials, _ = store
     setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.finalize_activation("profile-1", "a" * 32)
     setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("new"))
     monkeypatch.setattr(
         "src.developer_workflow.setup_store._fsync_directory",
@@ -996,7 +1005,9 @@ def test_generation_cas_rejects_superseded_controller_without_mutation(
 ) -> None:
     setup, credentials, _ = store
     setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("old"))
+    setup.finalize_activation("profile-1", "a" * 32)
     setup.commit("profile-1", _candidate(tmp_path, "b" * 32), _secrets("first"))
+    setup.finalize_activation("profile-1", "b" * 32)
     current = setup.commit(
         "profile-1", _candidate(tmp_path, "c" * 32), _secrets("second")
     )
@@ -1016,6 +1027,47 @@ def test_generation_cas_rejects_superseded_controller_without_mutation(
     assert credentials.deletes == []
     assert ("profile-1", "b" * 32) in credentials.data
     assert ("profile-1", "c" * 32) in credentials.data
+
+
+def test_commit_rejects_nested_pending_activation_before_credential_mutation(
+    store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
+) -> None:
+    setup, credentials, _ = store
+    setup.commit("profile-1", _candidate(tmp_path, "a" * 32), _secrets("stable"))
+    setup.finalize_activation("profile-1", "a" * 32)
+    pending = setup.commit(
+        "profile-1", _candidate(tmp_path, "b" * 32), _secrets("pending")
+    )
+    credentials.writes.clear()
+
+    with pytest.raises(
+        SetupStoreError, match="^configuration activation is already pending$"
+    ) as error:
+        setup.commit("profile-1", _candidate(tmp_path, "c" * 32), _secrets("nested"))
+
+    assert error.value.__cause__ is None
+    assert error.value.__context__ is None
+    assert setup.load() == pending
+    assert credentials.writes == []
+    assert ("profile-1", "c" * 32) not in credentials.data
+
+
+def test_first_setup_pending_survives_restart_and_can_be_restored(
+    store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
+) -> None:
+    setup, credentials, path = store
+    pending = setup.commit(
+        "profile-1", _candidate(tmp_path, "b" * 32), _secrets("pending")
+    )
+    restarted = SetupStore(credentials, config_path=path)
+
+    assert pending.activation_owner_generation == "b" * 32
+    assert restarted.load() == pending
+
+    restored = restarted.restore_previous("profile-1", "b" * 32)
+
+    assert restored == SetupDocument(profile_id="profile-1")
+    assert credentials.list_generations("profile-1") == ()
 
 
 @pytest.mark.parametrize(

@@ -414,7 +414,18 @@ class SetupDocument(SetupModel):
     profile_id: StrictStr
     active: ActiveSetup | None = None
     previous: ActiveSetup | None = None
+    activation_owner_generation: StrictStr | None = None
     draft: SetupDraft = Field(default_factory=SetupDraft)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_legacy_stable_document(cls, value: object) -> object:
+        if isinstance(value, dict) and "activation_owner_generation" not in value:
+            normalized = dict(value)
+            normalized["previous"] = None
+            normalized["activation_owner_generation"] = None
+            return normalized
+        return value
 
     @field_validator("schema_version", mode="before")
     @classmethod
@@ -431,6 +442,18 @@ class SetupDocument(SetupModel):
             raise ValueError("profile_id is invalid")
         return value
 
+    @field_validator("activation_owner_generation")
+    @classmethod
+    def validate_activation_owner_generation(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        _validated_text(value, "activation_owner_generation", maximum=32)
+        if re.fullmatch(r"[0-9a-f]{32}", value) is None:
+            raise ValueError(
+                "activation_owner_generation must be 32 lowercase hexadecimal characters"
+            )
+        return value
+
     @model_validator(mode="after")
     def validate_distinct_generations(self) -> SetupDocument:
         if (
@@ -439,6 +462,14 @@ class SetupDocument(SetupModel):
             and self.active.generation == self.previous.generation
         ):
             raise ValueError("active and previous generations must differ")
+        if self.activation_owner_generation is None:
+            if self.previous is not None:
+                raise ValueError("stable configuration cannot retain previous activation")
+        elif (
+            self.active is None
+            or self.active.generation != self.activation_owner_generation
+        ):
+            raise ValueError("activation owner must match active generation")
         return self
 
 

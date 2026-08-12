@@ -145,6 +145,8 @@ class SetupStore:
                 or set(candidate.credential_kinds) != set(secrets.values)
             ):
                 raise SetupStoreError("configuration credentials are invalid")
+            if current.activation_owner_generation is not None:
+                raise SetupStoreError("configuration activation is already pending")
             referenced = {
                 setup.generation
                 for setup in (current.active, current.previous)
@@ -161,7 +163,9 @@ class SetupStore:
             if fresh_generation is not True:
                 raise SetupStoreError("configuration generation is unavailable")
             document = current.validated_update(
-                active=candidate, previous=current.active
+                active=candidate,
+                previous=current.active,
+                activation_owner_generation=candidate.generation,
             )
             write_failure: _AtomicWriteError | None = None
             try:
@@ -218,7 +222,9 @@ class SetupStore:
             if failed is None:
                 raise SetupStoreError("previous configuration is unavailable")
             restored = current.validated_update(
-                active=current.previous, previous=None
+                active=current.previous,
+                previous=None,
+                activation_owner_generation=None,
             )
             loaded = self._write_confirmed_monotonic(restored)
             if failed is not None:
@@ -237,7 +243,9 @@ class SetupStore:
             current = self._load_unlocked_for_profile(profile_id)
             self._require_active_generation(current, expected_generation)
             obsolete = current.previous
-            finalized = current.validated_update(previous=None)
+            finalized = current.validated_update(
+                previous=None, activation_owner_generation=None
+            )
             loaded = self._write_confirmed_monotonic(finalized)
             if obsolete is not None:
                 try:
@@ -257,6 +265,7 @@ class SetupStore:
             or _GENERATION.fullmatch(expected_generation) is None
             or document.active is None
             or document.active.generation != expected_generation
+            or document.activation_owner_generation != expected_generation
         ):
             raise SetupStoreError("configuration generation is superseded")
 

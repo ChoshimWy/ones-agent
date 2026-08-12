@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+import subprocess
+import sys
 from threading import Event
 import time
 from types import MappingProxyType
@@ -156,7 +158,9 @@ class FakeStore:
         assert set(candidate.credential_kinds) == set(secrets.values)
         self.commits += 1
         self.document = self.document.validated_update(
-            active=candidate, previous=self.document.active
+            active=candidate,
+            previous=self.document.active,
+            activation_owner_generation=candidate.generation,
         )
         return self.document
 
@@ -175,11 +179,14 @@ class FakeStore:
         if (
             self.document.active is None
             or self.document.active.generation != expected_generation
+            or self.document.activation_owner_generation != expected_generation
         ):
             raise SetupStoreError("configuration generation is superseded")
         self.restores += 1
         self.document = self.document.validated_update(
-            active=self.document.previous, previous=None
+            active=self.document.previous,
+            previous=None,
+            activation_owner_generation=None,
         )
         return self.document
 
@@ -190,12 +197,15 @@ class FakeStore:
         if (
             self.document.active is None
             or self.document.active.generation != expected_generation
+            or self.document.activation_owner_generation != expected_generation
         ):
             raise SetupStoreError("configuration generation is superseded")
         self.finalizes += 1
         if self.finalize_error is not None:
             raise self.finalize_error
-        self.document = self.document.validated_update(previous=None)
+        self.document = self.document.validated_update(
+            previous=None, activation_owner_generation=None
+        )
         return self.document
 
 
@@ -1181,3 +1191,53 @@ async def test_aclose_drains_background_tasks_only_to_cleanup_deadline(
         await asyncio.sleep(0.01)
     assert controller._background_close_tasks == set()
     assert handle.close_calls == 1
+
+
+def test_asyncio_run_does_not_wait_for_permanently_blocked_handle_close() -> None:
+    script = r'''
+import asyncio
+from pathlib import Path
+from threading import Event
+import tempfile
+import sys
+
+sys.path.insert(0, "tests")
+import test_developer_workflow_setup_controller as support
+from src.developer_workflow.setup_controller import SetupActionError
+from src.developer_workflow.setup_store import SetupStoreError
+
+class BlockingHandle:
+    def close(self):
+        Event().wait()
+
+class Builder(support.FakeRuntimeBuilder):
+    def __init__(self):
+        super().__init__()
+        self.handle = BlockingHandle()
+
+async def scenario():
+    store = support.FakeStore()
+    store.finalize_error = SetupStoreError("TOKEN-SECRET")
+    controller, _, _, _ = support._controller(
+        Path(tempfile.mkdtemp()), store=store, builder=Builder()
+    )
+    await support._pass_all(controller)
+    try:
+        await controller.save_and_activate(confirmed=True)
+    except SetupActionError:
+        pass
+    await controller.aclose()
+
+asyncio.run(scenario())
+'''
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
