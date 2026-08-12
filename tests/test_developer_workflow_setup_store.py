@@ -5,6 +5,8 @@ import multiprocessing
 import os
 from pathlib import Path
 import subprocess
+import ctypes
+from ctypes import wintypes
 
 import pytest
 
@@ -143,6 +145,22 @@ def _candidate(tmp_path: Path, generation: str) -> ActiveSetup:
 
 def _secrets(value: str = "TOKEN-SECRET") -> RuntimeSecrets:
     return RuntimeSecrets({SecretKind.ONES_PASSWORD: value})
+
+
+def _exception_chain(error: BaseException) -> tuple[BaseException, ...]:
+    pending = [error]
+    seen: set[int] = set()
+    result: list[BaseException] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        result.append(current)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+    return tuple(result)
 
 
 def _commit_process(
@@ -377,6 +395,89 @@ def test_post_replace_failure_is_monotonic_even_when_confirmation_load_fails(
     recovered = SetupStore(credentials, config_path=path).load()
     assert recovered.active == candidate
     assert ("profile-1", "f" * 32) in credentials.data
+
+
+@pytest.mark.parametrize(
+    ("fault_point", "replacement"),
+    (
+        ("temp-regular", False),
+        ("file-flush", False),
+        ("replace-api", False),
+        ("final-regular", True),
+        ("post-directory", True),
+        ("durability-flush", True),
+    ),
+)
+def test_atomic_fault_chain_is_sanitized_without_changing_replace_outcome(
+    store: tuple[SetupStore, FakeCredentials, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_point: str,
+    replacement: bool,
+) -> None:
+    from src.developer_workflow import setup_store as module
+
+    setup, credentials, path = store
+    generation = "8" * 32
+    fault = "TOKEN-SECRET target-path"
+    original_regular = module._validate_regular_file
+    original_directory = setup._validate_directory
+
+    def fail_regular(
+        checked: Path, *, descriptor: int | None = None
+    ) -> tuple[int, int]:
+        is_target = (
+            checked.name.startswith(".config-")
+            if fault_point == "temp-regular"
+            else checked == path and path.exists()
+        )
+        if is_target:
+            raise OSError(fault)
+        return original_regular(checked, descriptor=descriptor)
+
+    def fail_post_directory() -> None:
+        if path.exists():
+            raise OSError(fault)
+        original_directory()
+
+    if fault_point in {"temp-regular", "final-regular"}:
+        monkeypatch.setattr(module, "_validate_regular_file", fail_regular)
+    elif fault_point == "file-flush":
+        monkeypatch.setattr(
+            module,
+            "_flush_file_descriptor",
+            lambda _descriptor: (_ for _ in ()).throw(OSError(fault)),
+        )
+    elif fault_point == "replace-api":
+        monkeypatch.setattr(
+            module,
+            "_replace_atomic",
+            lambda *_paths: (_ for _ in ()).throw(OSError(fault)),
+        )
+    elif fault_point == "post-directory":
+        monkeypatch.setattr(setup, "_validate_directory", fail_post_directory)
+    else:
+        monkeypatch.setattr(
+            module,
+            "_fsync_directory",
+            lambda _path: (_ for _ in ()).throw(OSError(fault)),
+        )
+
+    with pytest.raises(SetupStoreError, match="^configuration save failed$") as captured:
+        setup.commit("profile-1", _candidate(tmp_path, generation), _secrets())
+
+    chain = _exception_chain(captured.value)
+    assert all(fault not in str(error) and fault not in repr(error) for error in chain)
+    assert all(not isinstance(error, OSError) for error in chain)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    monkeypatch.undo()
+    if replacement:
+        assert SetupStore(credentials, config_path=path).load().active is not None
+        assert ("profile-1", generation) in credentials.data
+    else:
+        assert not path.exists()
+        assert ("profile-1", generation) not in credentials.data
 
 
 def test_two_process_commits_are_serialized_without_mixed_document(
@@ -690,6 +791,70 @@ def test_windows_config_file_owner_mismatch_fails_closed(
     monkeypatch.setattr(module, "_windows_descriptor", wrong_owner)
     with pytest.raises(SetupStoreError, match="^configuration path is unsafe$"):
         setup.load()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows real owner contract")
+def test_windows_config_file_real_owner_mismatch_fails_closed(
+    store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
+) -> None:
+    from src.developer_workflow import private_paths
+
+    setup, _, path = store
+    setup.commit("profile-1", _candidate(tmp_path, "9" * 32), _secrets())
+    current_owner = private_paths._current_user_sid()
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi.ConvertStringSidToSidW.argtypes = [
+        wintypes.LPCWSTR,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    advapi.ConvertStringSidToSidW.restype = wintypes.BOOL
+    advapi.SetNamedSecurityInfoW.argtypes = [
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    advapi.SetNamedSecurityInfoW.restype = wintypes.DWORD
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+
+    def set_owner(sid_text: str) -> None:
+        sid = ctypes.c_void_p()
+        if not advapi.ConvertStringSidToSidW(sid_text, ctypes.byref(sid)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            result = advapi.SetNamedSecurityInfoW(
+                str(path), 1, 0x00000001, sid, None, None, None
+            )
+            if result:
+                raise ctypes.WinError(result)
+        finally:
+            kernel.LocalFree(sid)
+
+    changed_owner: str | None = None
+    for candidate_owner in ("S-1-1-0", "S-1-5-32-544"):
+        try:
+            set_owner(candidate_owner)
+        except OSError:
+            continue
+        changed_owner = candidate_owner
+        break
+    if changed_owner is None:
+        pytest.skip("no assignable non-current owner SID is available")
+    try:
+        actual_owner, _, _ = private_paths._windows_descriptor(path)
+        assert actual_owner == changed_owner
+        assert actual_owner != current_owner
+        with pytest.raises(
+            SetupStoreError, match="^configuration path is unsafe$"
+        ):
+            setup.load()
+    finally:
+        set_owner(current_owner)
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows final-path identity contract")

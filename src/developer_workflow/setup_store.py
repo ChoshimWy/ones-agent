@@ -148,17 +148,11 @@ class SetupStore:
             document = current.validated_update(
                 active=candidate, previous=current.active
             )
+            write_failure: _AtomicWriteError | None = None
             try:
                 self._atomic_write(document)
             except _AtomicWriteError as error:
-                if not error.replaced:
-                    try:
-                        self._credentials.delete_generation(
-                            profile_id, candidate.generation
-                        )
-                    except CredentialStoreError:
-                        pass
-                raise SetupStoreError("configuration save failed") from None
+                write_failure = error
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
                     raise
@@ -167,18 +161,23 @@ class SetupStore:
                     replaced = self._load_unlocked() == document
                 except SetupStoreError:
                     pass
-                if not replaced:
+                write_failure = _AtomicWriteError(replaced=replaced)
+            if write_failure is not None:
+                if not write_failure.replaced:
                     try:
                         self._credentials.delete_generation(
                             profile_id, candidate.generation
                         )
                     except CredentialStoreError:
                         pass
-                raise SetupStoreError("configuration save failed") from None
+                raise SetupStoreError("configuration save failed")
+            confirmation_failed = False
             try:
                 loaded = self._load_unlocked()
             except SetupStoreError:
-                raise SetupStoreError("configuration save failed") from None
+                confirmation_failed = True
+            if confirmation_failed:
+                raise SetupStoreError("configuration save failed")
             if loaded != document:
                 raise SetupStoreError("configuration save failed")
             return loaded
@@ -326,12 +325,15 @@ class SetupStore:
         raise SetupStoreError("configuration path is unsafe")
 
     def _write_or_fail(self, document: SetupDocument) -> None:
+        failed = False
         try:
             self._atomic_write(document)
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
                 raise
-            raise SetupStoreError("configuration save failed") from None
+            failed = True
+        if failed:
+            raise SetupStoreError("configuration save failed")
 
     def _atomic_write(self, document: SetupDocument) -> None:
         self._validate_directory()
@@ -349,6 +351,7 @@ class SetupStore:
         )
         temp_path = Path(raw_path)
         replaced = False
+        failure: _AtomicWriteError | None = None
         try:
             os.chmod(temp_path, 0o600)
             _protect_private_file(temp_path)
@@ -370,8 +373,8 @@ class SetupStore:
             _validate_regular_file(self._config_path)
             self._validate_directory()
             _fsync_directory(self._directory)
-        except Exception as error:
-            raise _AtomicWriteError(replaced=replaced) from error
+        except Exception:
+            failure = _AtomicWriteError(replaced=replaced)
         finally:
             if descriptor >= 0:
                 try:
@@ -382,6 +385,8 @@ class SetupStore:
                 temp_path.unlink()
             except OSError:
                 pass
+        if failure is not None:
+            raise failure
 
     def _validate_directory(self) -> None:
         try:
