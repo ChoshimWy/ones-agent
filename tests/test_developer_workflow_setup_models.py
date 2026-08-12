@@ -91,6 +91,20 @@ def _active_payload(**workflow_overrides: object) -> dict[str, object]:
     }
 
 
+def _assert_validation_error_is_sanitized(
+    error: ValidationError, secret: str
+) -> None:
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert secret not in repr(error.errors())
+    assert all(item.get("input") == "<redacted>" for item in error.errors())
+    assert all(
+        item["loc"] == ("<redacted>",)
+        or all(secret not in str(part) for part in item["loc"])
+        for item in error.errors()
+    )
+
+
 def test_setup_document_never_accepts_secret_fields() -> None:
     payload = {
         "schema_version": 1,
@@ -238,6 +252,44 @@ def test_setup_validation_entry_points_all_redact_inputs() -> None:
             validate()
         assert "TOKEN-SECRET" not in str(captured.value)
         assert "TOKEN-SECRET" not in repr(captured.value.errors())
+
+
+def test_frozen_runtime_assignment_uses_safe_validation_details() -> None:
+    runtime = _public_config()
+
+    with pytest.raises(ValidationError) as captured:
+        runtime.provider_api_url = (  # type: ignore[misc]
+            "https://user:TOKEN-SECRET@github.example.invalid/api"
+        )
+
+    _assert_validation_error_is_sanitized(captured.value, "TOKEN-SECRET")
+    assert captured.value.errors()[0]["loc"] == ("provider_api_url",)
+
+
+def test_mutable_workflow_assignment_uses_safe_validation_details() -> None:
+    draft = WorkflowDraft()
+    draft.max_codex_attempts = 4
+    assert draft.max_codex_attempts == 4
+
+    with pytest.raises(ValidationError) as captured:
+        draft.sandbox_permission_profile = "TOKEN-SECRET\x00"
+
+    _assert_validation_error_is_sanitized(captured.value, "TOKEN-SECRET")
+    assert captured.value.errors()[0]["loc"] == ("sandbox_permission_profile",)
+
+
+def test_extra_field_name_is_redacted_from_validation_location() -> None:
+    with pytest.raises(ValidationError) as captured:
+        SetupDocument.model_validate(
+            {
+                "schema_version": 1,
+                "profile_id": "default",
+                "TOKEN-SECRET": "value",
+            }
+        )
+
+    _assert_validation_error_is_sanitized(captured.value, "TOKEN-SECRET")
+    assert captured.value.errors()[0]["loc"] == ("<redacted>",)
 
 
 @pytest.mark.parametrize("field_name", ["ones_base_url", "provider_api_url"])

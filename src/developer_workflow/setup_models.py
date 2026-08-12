@@ -60,10 +60,17 @@ _BIDI_CONTROL_CHARACTERS = {"\u061c", "\u200e", "\u200f"}
 def _sanitized_validation_error(
     model: type[WorkflowModel], error: ValidationError
 ) -> ValidationError:
+    known_fields = set(model.model_fields)
     safe_errors = [
         {
             "type": "value_error",
-            "loc": item["loc"],
+            "loc": (
+                (item["loc"][0],)
+                if item["loc"]
+                and isinstance(item["loc"][0], str)
+                and item["loc"][0] in known_fields
+                else ("<redacted>",)
+            ),
             "input": "<redacted>",
             "ctx": {"error": ValueError("input is invalid")},
         }
@@ -88,6 +95,12 @@ class SetupModel(WorkflowModel):
     def __init__(self, **data: Any) -> None:
         try:
             super().__init__(**data)
+        except ValidationError as error:
+            raise _sanitized_validation_error(type(self), error) from None
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        try:
+            super().__setattr__(name, value)
         except ValidationError as error:
             raise _sanitized_validation_error(type(self), error) from None
 
