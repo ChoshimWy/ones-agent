@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
+import hashlib
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from threading import RLock
-from typing import Protocol, runtime_checkable
+from typing import ContextManager, Protocol, TypeVar, cast, runtime_checkable
 import unicodedata
 
 from .setup_models import RuntimeSecrets, SecretKind
@@ -24,6 +26,14 @@ _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}")
 _PROFILE_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 _ERROR_MESSAGE = "credential operation failed"
 _GENERATION_WRITE_LOCK = RLock()
+_WAIT_OBJECT_0 = 0
+_WAIT_ABANDONED = 0x80
+_WAIT_TIMEOUT = 0x102
+_WAIT_FAILED = 0xFFFFFFFF
+_MUTEX_TIMEOUT_MILLISECONDS = 30_000
+
+_T = TypeVar("_T")
+_GenerationLockFactory = Callable[[str, str], ContextManager[None]]
 
 
 class CredentialStoreError(RuntimeError):
@@ -128,24 +138,61 @@ def _zero(value: bytearray) -> None:
         value[index] = 0
 
 
-def _safe_backend_call(operation: Callable[[], object]) -> object:
+def _safe_backend_call(operation: Callable[[], _T]) -> _T:
+    failed = False
+    result: _T | None = None
     try:
-        return operation()
+        result = operation()
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
             raise
-        raise _fail() from None
+        failed = True
+    if failed:
+        # Raising outside the handler prevents the sensitive backend exception from
+        # surviving in either __cause__ or __context__.
+        raise _fail()
+    return cast(_T, result)
+
+
+def _mutex_cleanup_succeeded(operation: Callable[[], object]) -> bool:
+    failed = False
+    result = False
+    try:
+        result = bool(operation())
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        failed = True
+    return not failed and result
+
+
+def _in_process_generation_lock(
+    profile_id: str, generation: str
+) -> ContextManager[None]:
+    del profile_id, generation
+    return nullcontext()
 
 
 class WindowsCredentialStore:
     """Store secrets under app-owned Windows generic-credential targets."""
 
-    __slots__ = ("_backend",)
+    __slots__ = ("_backend", "_lock_factory")
 
-    def __init__(self, backend: _CredentialBackend | None = None) -> None:
-        self._backend = (
-            backend if backend is not None else _CtypesWindowsCredentialBackend()
-        )
+    def __init__(
+        self,
+        backend: _CredentialBackend | None = None,
+        *,
+        lock_factory: _GenerationLockFactory | None = None,
+    ) -> None:
+        if backend is None:
+            self._backend = cast(
+                _CredentialBackend,
+                _safe_backend_call(_CtypesWindowsCredentialBackend),
+            )
+            self._lock_factory = lock_factory or _windows_generation_lock
+        else:
+            self._backend = backend
+            self._lock_factory = lock_factory or _in_process_generation_lock
 
     def write(
         self, profile_id: str, generation: str, kind: SecretKind, value: str
@@ -218,33 +265,34 @@ class WindowsCredentialStore:
             for kind, value in entries
         }
         with _GENERATION_WRITE_LOCK:
-            targets = _safe_backend_call(
-                lambda: self._backend.list_generic_targets(prefix)
-            )
-            if type(targets) is not tuple:
-                raise _fail()
-            if targets:
-                if len(targets) != len(expected_targets) or set(targets) != set(
-                    expected_targets
-                ):
+            with self._lock_factory(profile, canonical_generation):
+                targets = _safe_backend_call(
+                    lambda: self._backend.list_generic_targets(prefix)
+                )
+                if type(targets) is not tuple:
                     raise _fail()
-                for kind, value in expected_targets.values():
-                    if self.read(profile, canonical_generation, kind) != value:
+                if targets:
+                    if len(targets) != len(expected_targets) or set(targets) != set(
+                        expected_targets
+                    ):
                         raise _fail()
-                return
+                    for kind, value in expected_targets.values():
+                        if self.read(profile, canonical_generation, kind) != value:
+                            raise _fail()
+                    return
 
-            written: list[SecretKind] = []
-            try:
-                for kind, value in entries:
-                    self.write(profile, canonical_generation, kind, value)
-                    written.append(kind)
-            except BaseException:
-                for kind in written:
-                    try:
-                        self.delete(profile, canonical_generation, kind)
-                    except CredentialStoreError:
-                        pass
-                raise
+                written: list[SecretKind] = []
+                try:
+                    for kind, value in entries:
+                        self.write(profile, canonical_generation, kind, value)
+                        written.append(kind)
+                except BaseException:
+                    for kind in written:
+                        try:
+                            self.delete(profile, canonical_generation, kind)
+                        except CredentialStoreError:
+                            pass
+                    raise
 
     def read_generation(
         self, profile_id: str, generation: str, kinds: tuple[SecretKind, ...]
@@ -264,15 +312,19 @@ class WindowsCredentialStore:
         profile = _validate_profile(profile_id)
         canonical_generation = _validate_generation(generation)
         prefix = f"{_TARGET_PREFIX}/{profile}/{canonical_generation}/"
-        targets = _safe_backend_call(lambda: self._backend.list_generic_targets(prefix))
-        if type(targets) is not tuple:
-            raise _fail()
-        for target in targets:
-            parsed = _parse_target(target, expected_profile=profile)
-            if parsed is not None and parsed[0] == canonical_generation:
-                _safe_backend_call(
-                    lambda target=target: self._backend.delete_generic(target)
+        with _GENERATION_WRITE_LOCK:
+            with self._lock_factory(profile, canonical_generation):
+                targets = _safe_backend_call(
+                    lambda: self._backend.list_generic_targets(prefix)
                 )
+                if type(targets) is not tuple:
+                    raise _fail()
+                for target in targets:
+                    parsed = _parse_target(target, expected_profile=profile)
+                    if parsed is not None and parsed[0] == canonical_generation:
+                        _safe_backend_call(
+                            lambda target=target: self._backend.delete_generic(target)
+                        )
 
     def list_generations(self, profile_id: str) -> tuple[str, ...]:
         profile = _validate_profile(profile_id)
@@ -327,6 +379,70 @@ class _CREDENTIALW(ctypes.Structure):
 
 
 _PCREDENTIALW = ctypes.POINTER(_CREDENTIALW)
+
+
+@contextmanager
+def _windows_generation_lock(
+    profile_id: str, generation: str
+) -> Iterator[None]:
+    if os.name != "nt":
+        raise _fail()
+    digest = hashlib.sha256(
+        f"{profile_id}\x00{generation}".encode("ascii", errors="strict")
+    ).hexdigest()
+    name = f"Local\\ONESDevCredentialGeneration-{digest}"
+
+    def load_kernel32() -> object:
+        kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)  # type: ignore[attr-defined]
+        kernel32.CreateMutexW.argtypes = [
+            ctypes.c_void_p,
+            wintypes.BOOL,
+            wintypes.LPCWSTR,
+        ]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.ReleaseMutex.argtypes = [wintypes.HANDLE]
+        kernel32.ReleaseMutex.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        return kernel32
+
+    kernel32 = _safe_backend_call(load_kernel32)
+    handle = _safe_backend_call(lambda: kernel32.CreateMutexW(None, False, name))
+    if not handle:
+        raise _fail()
+    acquired = False
+    release_failed = False
+    close_failed = False
+    try:
+        wait_result = int(
+            _safe_backend_call(
+                lambda: kernel32.WaitForSingleObject(
+                    handle, _MUTEX_TIMEOUT_MILLISECONDS
+                )
+            )
+        )
+        if wait_result in {_WAIT_OBJECT_0, _WAIT_ABANDONED}:
+            # An abandoned mutex transfers ownership. The caller always performs
+            # a strict enumerate/read recheck while holding it before mutation.
+            acquired = True
+        elif wait_result in {_WAIT_TIMEOUT, _WAIT_FAILED}:
+            raise _fail()
+        else:
+            raise _fail()
+        yield
+    finally:
+        try:
+            if acquired and not _mutex_cleanup_succeeded(
+                lambda: kernel32.ReleaseMutex(handle)
+            ):
+                release_failed = True
+        finally:
+            if not _mutex_cleanup_succeeded(lambda: kernel32.CloseHandle(handle)):
+                close_failed = True
+    if release_failed or close_failed:
+        raise _fail()
 
 
 class _CtypesWindowsCredentialBackend:

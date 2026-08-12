@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+import multiprocessing
 import os
 import secrets
 from threading import Barrier, BrokenBarrierError, Lock
+from typing import Iterator
 
 import pytest
 
+import src.developer_workflow.credential_store as credential_store_module
 from src.developer_workflow.credential_store import (
     CRED_TYPE_GENERIC,
     CredentialStore,
@@ -65,6 +69,50 @@ class FakeWinCred:
 @pytest.fixture
 def fake_wincred() -> FakeWinCred:
     return FakeWinCred()
+
+
+def _exception_graph_text(error: BaseException) -> str:
+    pending: list[BaseException] = [error]
+    visited: set[int] = set()
+    rendered: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        rendered.extend((str(current), repr(current)))
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return " ".join(rendered)
+
+
+def _multiprocess_generation_writer(
+    profile: str,
+    generation: str,
+    email: str,
+    password: str,
+    start: object,
+    results: object,
+) -> None:
+    start.wait()  # type: ignore[attr-defined]
+    store = WindowsCredentialStore()
+    try:
+        store.write_generation(
+            profile,
+            generation,
+            RuntimeSecrets(
+                {
+                    SecretKind.ONES_EMAIL: email,
+                    SecretKind.ONES_PASSWORD: password,
+                }
+            ),
+        )
+    except CredentialStoreError:
+        results.put(False)  # type: ignore[attr-defined]
+    else:
+        results.put(True)  # type: ignore[attr-defined]
 
 
 def test_protocol_and_fake_backend_roundtrip(fake_wincred: FakeWinCred) -> None:
@@ -213,6 +261,36 @@ def test_store_never_exposes_backend_error_target_or_secret(
     assert "TOKEN-SECRET" not in repr(store)
 
 
+def test_backend_exception_is_removed_from_the_exception_graph(
+    fake_wincred: FakeWinCred,
+) -> None:
+    fake_wincred.fail_on_write = 1
+    with pytest.raises(CredentialStoreError) as captured:
+        WindowsCredentialStore(fake_wincred).write(
+            "profile-1", "a" * 32, SecretKind.ONES_PASSWORD, "TOKEN-SECRET"
+        )
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "TOKEN-SECRET" not in _exception_graph_text(captured.value)
+
+
+def test_constructor_exception_is_removed_from_the_exception_graph(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FailingBackend:
+        def __init__(self) -> None:
+            raise RuntimeError("TOKEN-SECRET constructor detail")
+
+    monkeypatch.setattr(
+        credential_store_module, "_CtypesWindowsCredentialBackend", FailingBackend
+    )
+    with pytest.raises(CredentialStoreError) as captured:
+        WindowsCredentialStore()
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    assert "TOKEN-SECRET" not in _exception_graph_text(captured.value)
+
+
 def test_generation_roundtrip_overwrite_list_and_delete(
     fake_wincred: FakeWinCred,
 ) -> None:
@@ -342,6 +420,61 @@ def test_generation_write_is_idempotent_only_for_the_same_complete_values(
     assert fake_wincred.write_count == writes_after_first_call
 
 
+def test_generation_lock_covers_write_compare_and_delete(
+    fake_wincred: FakeWinCred,
+) -> None:
+    lock_depth = 0
+    lock_keys: list[tuple[str, str]] = []
+
+    @contextmanager
+    def lock_factory(profile: str, generation: str) -> Iterator[None]:
+        nonlocal lock_depth
+        lock_keys.append((profile, generation))
+        lock_depth += 1
+        try:
+            yield
+        finally:
+            lock_depth -= 1
+
+    original_list = fake_wincred.list_generic_targets
+    original_write = fake_wincred.write_generic
+    original_delete = fake_wincred.delete_generic
+
+    def checked_list(prefix: str) -> tuple[str, ...]:
+        assert lock_depth == 1
+        return original_list(prefix)
+
+    def checked_write(target: str, value: bytearray, *, persist: str) -> None:
+        assert lock_depth == 1
+        original_write(target, value, persist=persist)
+
+    def checked_delete(target: str) -> bool:
+        assert lock_depth == 1
+        return original_delete(target)
+
+    fake_wincred.list_generic_targets = checked_list  # type: ignore[method-assign]
+    fake_wincred.write_generic = checked_write  # type: ignore[method-assign]
+    fake_wincred.delete_generic = checked_delete  # type: ignore[method-assign]
+    store = WindowsCredentialStore(fake_wincred, lock_factory=lock_factory)
+    generation = "a" * 32
+    store.write_generation(
+        "profile-1",
+        generation,
+        RuntimeSecrets({SecretKind.ONES_PASSWORD: "password"}),
+    )
+    store.write_generation(
+        "profile-1",
+        generation,
+        RuntimeSecrets({SecretKind.ONES_PASSWORD: "password"}),
+    )
+    store.delete_generation("profile-1", generation)
+    assert lock_keys == [
+        ("profile-1", generation),
+        ("profile-1", generation),
+        ("profile-1", generation),
+    ]
+
+
 def test_two_store_instances_cannot_create_a_mixed_generation() -> None:
     class RacingWinCred(FakeWinCred):
         def __init__(self) -> None:
@@ -468,3 +601,48 @@ def test_real_windows_roundtrip_and_repeated_overwrite() -> None:
         assert generation in store.list_generations(profile)
     finally:
         store.delete(profile, generation, SecretKind.PROVIDER_TOKEN)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Credential Manager")
+def test_real_windows_multiprocess_generation_write_is_not_mixed() -> None:
+    profile = "pytest-mutex-" + secrets.token_hex(8)
+    generation = secrets.token_hex(16)
+    store = WindowsCredentialStore()
+    context = multiprocessing.get_context("spawn")
+    start = context.Event()
+    results = context.Queue()
+    candidates = (
+        ("first@example.invalid", "first-password"),
+        ("second@example.invalid", "second-password"),
+    )
+    processes = [
+        context.Process(
+            target=_multiprocess_generation_writer,
+            args=(profile, generation, email, password, start, results),
+        )
+        for email, password in candidates
+    ]
+    try:
+        for process in processes:
+            process.start()
+        start.set()
+        for process in processes:
+            process.join(timeout=15)
+            assert process.exitcode == 0
+        outcomes = tuple(results.get(timeout=2) for _ in processes)
+        assert sum(outcomes) == 1
+        loaded = store.read_generation(
+            profile,
+            generation,
+            (SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD),
+        )
+        assert (
+            loaded.require(SecretKind.ONES_EMAIL),
+            loaded.require(SecretKind.ONES_PASSWORD),
+        ) in candidates
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+        store.delete_generation(profile, generation)
