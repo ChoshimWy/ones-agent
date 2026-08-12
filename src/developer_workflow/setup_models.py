@@ -71,6 +71,8 @@ def _validated_text(value: str, field_name: str, *, maximum: int = 4096) -> str:
 
 def _validated_https_url(value: str, field_name: str) -> str:
     _validated_text(value, field_name)
+    if any(character.isspace() for character in value) or "\\" in value:
+        raise ValueError(f"{field_name} must be a credential-free HTTPS URL")
     parsed = urlsplit(value)
     try:
         port = parsed.port
@@ -78,7 +80,7 @@ def _validated_https_url(value: str, field_name: str) -> str:
         raise ValueError(f"{field_name} must be a credential-free HTTPS URL") from None
     if (
         parsed.scheme != "https"
-        or not parsed.hostname
+        or not _is_valid_dns_hostname(parsed.hostname)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -87,6 +89,20 @@ def _validated_https_url(value: str, field_name: str) -> str:
     ):
         raise ValueError(f"{field_name} must be a credential-free HTTPS URL")
     return value
+
+
+def _is_valid_dns_hostname(value: str | None, *, canonical: bool = False) -> bool:
+    if value is None or not value or len(value) > 253 or value.endswith("."):
+        return False
+    if canonical and value != value.casefold():
+        return False
+    labels = value.casefold().split(".")
+    return all(
+        len(label) <= 63
+        and re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        is not None
+        for label in labels
+    )
 
 
 def _validated_absolute_path(value: Path | None, field_name: str) -> Path | None:
@@ -129,16 +145,7 @@ class RuntimePublicConfig(WorkflowModel):
     @classmethod
     def validate_provider_host(cls, value: str) -> str:
         _validated_text(value, "provider_host", maximum=253)
-        parsed = urlsplit(f"//{value}")
-        if (
-            parsed.hostname != value
-            or parsed.username is not None
-            or parsed.password is not None
-            or parsed.port is not None
-            or parsed.path
-            or parsed.query
-            or parsed.fragment
-        ):
+        if not _is_valid_dns_hostname(value, canonical=True):
             raise ValueError("provider_host must be a bare host name")
         return value
 
@@ -150,10 +157,17 @@ class RuntimePublicConfig(WorkflowModel):
         if (
             not value.startswith("/")
             or value.startswith("//")
+            or any(character.isspace() for character in value)
+            or "\\" in value
             or parsed.scheme
             or parsed.netloc
             or parsed.query
             or parsed.fragment
+            or any(part in {"", ".", ".."} for part in value[1:].split("/"))
+            or set(re.findall(r"\{([^{}]+)\}", value))
+            != {"team_id", "item_id"}
+            or re.sub(r"\{(?:team_id|item_id)\}", "", value).find("{") != -1
+            or re.sub(r"\{(?:team_id|item_id)\}", "", value).find("}") != -1
         ):
             raise ValueError("ones_comment_list_path_template must be an absolute URL path")
         return value
@@ -271,6 +285,12 @@ class RuntimeSecrets:
 class RuntimeInputs:
     public: RuntimePublicConfig
     secrets: RuntimeSecrets = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.public) is not RuntimePublicConfig:
+            raise TypeError("public must be RuntimePublicConfig")
+        if type(self.secrets) is not RuntimeSecrets:
+            raise TypeError("secrets must be RuntimeSecrets")
 
 
 __all__ = [

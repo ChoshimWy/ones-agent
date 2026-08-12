@@ -25,7 +25,9 @@ def _public_config(**overrides: object) -> RuntimePublicConfig:
         "ones_base_url": "https://ones.example.invalid",
         "ones_team_id": "team-1",
         "ones_issue_type_id": "issue-type-1",
-        "ones_comment_list_path_template": "/team/{team_id}/comments",
+        "ones_comment_list_path_template": (
+            "/project/api/project/team/{team_id}/task/{item_id}/comment"
+        ),
         "provider_host": "github.example.invalid",
         "provider_api_url": "https://github.example.invalid/api/v3",
         "git_author_name": "ONES Agent",
@@ -149,6 +151,64 @@ def test_runtime_public_config_rejects_unsafe_urls_and_hosts(
 ) -> None:
     with pytest.raises(ValidationError):
         _public_config(**{field_name: value})
+
+
+@pytest.mark.parametrize("field_name", ["ones_base_url", "provider_api_url"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://exa mple.invalid/api",
+        "https://example.invalid/bad path",
+        "https://example.invalid\\api",
+        "https://-bad.example.invalid/api",
+        "https://bad-.example.invalid/api",
+        "https://bad_name.example.invalid/api",
+        "https://bad..example.invalid/api",
+    ],
+)
+def test_runtime_urls_reject_ambiguous_hosts_and_paths(
+    field_name: str, value: str
+) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(**{field_name: value})
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "GitHub.example.invalid",
+        "-github.example.invalid",
+        "github-.example.invalid",
+        "git_hub.example.invalid",
+        "github..example.invalid",
+        "github.example.invalid.",
+        "github.example.invalid/path",
+        "github.example.invalid\\path",
+        "github.example.invalid bad",
+    ],
+)
+def test_provider_host_must_be_a_canonical_hostname(host: str) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(provider_host=host)
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "/project/{team_id}/bad path/{item_id}",
+        "/project/{team_id}\\task/{item_id}",
+        "/project/{team_id}//task/{item_id}",
+        "/project/{team_id}/../task/{item_id}",
+        "/project/{team_id}/task/{unknown}",
+        "/project/{team_id}/comments",
+        "/project/{team_id}/task/{item_id}?page=1",
+    ],
+)
+def test_comment_path_template_keeps_the_existing_placeholder_contract(
+    template: str,
+) -> None:
+    with pytest.raises(ValidationError):
+        _public_config(ones_comment_list_path_template=template)
 
 
 @pytest.mark.parametrize(
@@ -281,6 +341,24 @@ def test_runtime_inputs_are_frozen() -> None:
         inputs.public = _public_config()  # type: ignore[misc]
     with pytest.raises(ValidationError):
         inputs.public.ones_team_id = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("public", "secrets"),
+    [
+        ({}, _secret_bundle()),
+        (None, _secret_bundle()),
+        ("public", _secret_bundle()),
+        (_public_config(), {}),
+        (_public_config(), None),
+        (_public_config(), "secrets"),
+    ],
+)
+def test_runtime_inputs_reject_mutable_or_untyped_injection(
+    public: object, secrets: object
+) -> None:
+    with pytest.raises(TypeError):
+        RuntimeInputs(public=public, secrets=secrets)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("generation", ["x", "../escape", "profile/generation", "A" * 32])
