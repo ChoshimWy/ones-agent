@@ -7,9 +7,10 @@ transport, process, credential and filesystem errors never cross its boundary.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 import inspect
+import hashlib
 import json
 import math
 import os
@@ -17,13 +18,15 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import tempfile
+import time
 import tomllib
 from typing import Any, Callable, Literal, Mapping, Protocol
 from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, Field, StrictStr, field_validator, model_validator
 
-from .codex_runner import _bounded_subprocess
+from .codex_runner import _bounded_subprocess, validate_codex_auth_source
 from .contracts import WorkflowModel
 from .private_paths import (
     _ADMINISTRATORS_SID,
@@ -33,6 +36,7 @@ from .private_paths import (
     _is_link_or_reparse,
     _validate_shape,
     _windows_descriptor,
+    prepare_private_directory,
 )
 from .requirement_flow import SandboxCommandExecutor
 from .setup_models import SetupModel, SetupValidationError
@@ -40,6 +44,25 @@ from .setup_models import SetupModel, SetupValidationError
 
 PROFILE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _MAX_DOCUMENT_BYTES = 1024 * 1024
+_BUILTIN_PARENTS = frozenset({":read-only", ":workspace"})
+_DOCTOR_CONFIG_DETAIL_KEYS = frozenset(
+    {
+        "CODEX_HOME",
+        "config.toml",
+        "config.toml parse",
+        "cwd",
+        "enabled feature flags",
+        "feature flag overrides",
+        "feature flags enabled",
+        "log dir",
+        "mcp servers",
+        "model",
+        "model provider",
+        "sqlite home",
+    }
+)
+_PRODUCTION_CONSTRUCTION = object()
+_TEST_CONSTRUCTION = object()
 _CATEGORIES = Literal[
     "ok",
     "authentication",
@@ -201,6 +224,42 @@ class CodexAuthMetadata(Protocol):
     def metadata(self) -> Mapping[str, object]: ...
 
 
+@dataclass(frozen=True, slots=True)
+class SubprocessDoctorRunner:
+    """Production doctor adapter with bounded process-tree cleanup."""
+
+    def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        return _default_doctor_runner(argv, **kwargs)
+
+
+@dataclass(slots=True)
+class ManagedSandboxExecutorFactory:
+    """Production-only construction of the existing capability-probing executor."""
+
+    backend_executor: Callable[..., subprocess.CompletedProcess[str]] = field(
+        default_factory=lambda: _bounded_subprocess, repr=False
+    )
+
+    def __call__(self, profile: str) -> SandboxCommandExecutor:
+        return SandboxCommandExecutor(
+            permission_profile=profile, backend_executor=self.backend_executor
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CodexAuthSourceChecker:
+    """Expose only auth presence metadata through the existing validated contract."""
+
+    def metadata(self) -> Mapping[str, object]:
+        environment = dict(os.environ)
+        home = validate_codex_auth_source(environment)
+        credential = any(
+            bool(environment.get(name))
+            for name in ("CODEX_API_KEY", "CODEX_AUTH_TOKEN", "OPENAI_API_KEY")
+        )
+        return {"configured": True, "mode": "credential" if credential and home is None else "file"}
+
+
 def _default_doctor_runner(
     argv: list[str],
     *,
@@ -295,20 +354,191 @@ def _read_secure_bytes(path: Path, *, admin: bool, security: Callable[[Path, boo
         raise SetupValidationError("managed profile source is unsafe") from None
 
 
+def _is_string_map(value: object, allowed_values: frozenset[str]) -> bool:
+    return type(value) is dict and all(
+        type(key) is str and type(item) is str and item in allowed_values
+        for key, item in value.items()
+    )
+
+
+def _is_string_list(value: object) -> bool:
+    return type(value) is list and all(type(item) is str for item in value)
+
+
+def _validate_mitm(value: object) -> None:
+    if type(value) is not dict or not set(value) <= {"hooks", "actions"}:
+        raise ValueError
+    actions = value.get("actions", {})
+    if type(actions) is not dict:
+        raise ValueError
+    for action in actions.values():
+        if type(action) is not dict or not set(action) <= {
+            "strip_request_headers", "inject_request_headers"
+        }:
+            raise ValueError
+        strips = action.get("strip_request_headers", [])
+        injections = action.get("inject_request_headers", [])
+        if not _is_string_list(strips) or type(injections) is not list:
+            raise ValueError
+        for injection in injections:
+            if type(injection) is not dict or not set(injection) <= {
+                "name", "secret_env_var", "secret_file", "prefix"
+            } or type(injection.get("name")) is not str or any(
+                item is not None and type(item) is not str
+                for key in ("secret_env_var", "secret_file", "prefix")
+                if (item := injection.get(key)) is not None
+            ):
+                raise ValueError
+    hooks = value.get("hooks", {})
+    if type(hooks) is not dict:
+        raise ValueError
+    for hook in hooks.values():
+        required = {"host", "methods", "path_prefixes", "action"}
+        if type(hook) is not dict or not required <= set(hook) or not set(hook) <= {
+            *required, "query", "headers", "body"
+        } or type(hook["host"]) is not str or any(
+            not _is_string_list(hook[key]) for key in ("methods", "path_prefixes", "action")
+        ):
+            raise ValueError
+        for key in ("query", "headers"):
+            mapping = hook.get(key, {})
+            if type(mapping) is not dict or any(
+                type(name) is not str or not _is_string_list(items)
+                for name, items in mapping.items()
+            ):
+                raise ValueError
+
+
+def _validate_network(value: object) -> None:
+    allowed = {
+        "enabled", "proxy_url", "enable_socks5", "socks_url", "enable_socks5_udp",
+        "allow_upstream_proxy", "dangerously_allow_non_loopback_proxy",
+        "dangerously_allow_all_unix_sockets", "mode", "domains", "unix_sockets",
+        "allow_local_binding", "mitm",
+    }
+    if type(value) is not dict or not set(value) <= allowed:
+        raise ValueError
+    boolean_keys = {
+        "enabled", "enable_socks5", "enable_socks5_udp", "allow_upstream_proxy",
+        "dangerously_allow_non_loopback_proxy", "dangerously_allow_all_unix_sockets",
+        "allow_local_binding",
+    }
+    string_keys = {"proxy_url", "socks_url"}
+    if any(key in value and type(value[key]) is not bool for key in boolean_keys) or any(
+        key in value and type(value[key]) is not str for key in string_keys
+    ):
+        raise ValueError
+    if "mode" in value and value["mode"] not in {"limited", "full"}:
+        raise ValueError
+    for key in ("domains", "unix_sockets"):
+        if key in value and not _is_string_map(value[key], frozenset({"allow", "deny"})):
+            raise ValueError
+    if "mitm" in value:
+        _validate_mitm(value["mitm"])
+
+
+def _validate_permission_profile(
+    name: str, profile: object, known_profiles: frozenset[str]
+) -> None:
+    allowed = {"description", "extends", "workspace_roots", "filesystem", "network"}
+    if PROFILE_RE.fullmatch(name) is None or type(profile) is not dict or not set(profile) <= allowed:
+        raise ValueError
+    if "description" in profile and type(profile["description"]) is not str:
+        raise ValueError
+    if "extends" in profile:
+        parent = profile["extends"]
+        if type(parent) is not str or parent not in _BUILTIN_PARENTS | known_profiles:
+            raise ValueError
+    roots = profile.get("workspace_roots")
+    if roots is not None and (
+        type(roots) is not dict
+        or any(type(path) is not str or type(enabled) is not bool for path, enabled in roots.items())
+    ):
+        raise ValueError
+    filesystem = profile.get("filesystem")
+    if filesystem is not None:
+        if type(filesystem) is not dict:
+            raise ValueError
+        for path, permission in filesystem.items():
+            if type(path) is not str:
+                raise ValueError
+            if path == "glob_scan_max_depth":
+                if type(permission) is not int or permission < 1:
+                    raise ValueError
+            elif type(permission) is str:
+                if permission not in {"read", "write", "deny"}:
+                    raise ValueError
+            elif not _is_string_map(permission, frozenset({"read", "write", "deny"})):
+                raise ValueError
+    if "network" in profile:
+        _validate_network(profile["network"])
+
+
+def _validate_doctor_checks(checks: object) -> None:
+    base_keys = {"id", "category", "status", "summary", "details", "remediation", "durationMs"}
+    issue_keys = {"severity", "cause", "measured", "expected", "remedy", "fields"}
+    if type(checks) is not dict:
+        raise ValueError
+    for check_id, check in checks.items():
+        if type(check_id) is not str or type(check) is not dict or frozenset(check) not in {
+            frozenset(base_keys), frozenset({*base_keys, "issues"})
+        }:
+            raise ValueError
+        if (
+            check.get("id") != check_id
+            or type(check.get("category")) is not str
+            or check.get("status") not in {"ok", "warning", "fail"}
+            or type(check.get("summary")) is not str
+            or type(check.get("details")) is not dict
+            or any(type(key) is not str or type(value) is not str for key, value in check["details"].items())
+            or check.get("remediation") is not None and type(check.get("remediation")) is not str
+            or type(check.get("durationMs")) is not int
+            or check["durationMs"] < 0
+        ):
+            raise ValueError
+        if "issues" in check:
+            issues = check["issues"]
+            if type(issues) is not list:
+                raise ValueError
+            for issue in issues:
+                if type(issue) is not dict or set(issue) != issue_keys or any(
+                    type(issue[key]) is not str for key in ("severity", "cause", "measured", "expected")
+                ) or issue["remedy"] is not None and type(issue["remedy"]) is not str or not _is_string_list(issue["fields"]):
+                    raise ValueError
+
+
 @dataclass(slots=True)
 class ManagedProfileCatalog:
     """Discover only configured profiles that pass the real sandbox probe."""
 
-    codex_doctor: DoctorRunner = _default_doctor_runner
+    codex_doctor: DoctorRunner = field(default_factory=SubprocessDoctorRunner)
     trusted_admin_catalog: Path | None = None
     probe_worktree: Path | None = None
-    executor_factory: SandboxExecutorFactory = SandboxCommandExecutor
+    executor_factory: SandboxExecutorFactory = field(default_factory=ManagedSandboxExecutorFactory)
     file_security: Callable[[Path, bool], bool] = _default_file_security
     timeout_seconds: float = 20.0
     max_output_bytes: int = 1024 * 1024
+    _construction_token: object | None = field(default=None, repr=False)
+
+    @classmethod
+    def production(cls, *, probe_parent: Path | None = None) -> ManagedProfileCatalog:
+        return cls(
+            codex_doctor=SubprocessDoctorRunner(),
+            probe_worktree=probe_parent,
+            executor_factory=ManagedSandboxExecutorFactory(),
+            file_security=_default_file_security,
+            _construction_token=_PRODUCTION_CONSTRUCTION,
+        )
+
+    @classmethod
+    def _testing(cls, *args: Any, **kwargs: Any) -> ManagedProfileCatalog:
+        kwargs["_construction_token"] = _TEST_CONSTRUCTION
+        return cls(*args, **kwargs)
 
     def __post_init__(self) -> None:
         if (
+            self._construction_token not in {_PRODUCTION_CONSTRUCTION, _TEST_CONSTRUCTION}
+            or
             not callable(self.codex_doctor)
             or not callable(self.executor_factory)
             or not callable(self.file_security)
@@ -318,8 +548,12 @@ class ManagedProfileCatalog:
         ):
             raise SetupValidationError("managed profile catalog is invalid")
 
-    def list_profiles(self) -> tuple[str, ...]:
-        config_path = self._config_path_from_doctor()
+    def list_profiles(self, *, timeout_seconds: float | None = None) -> tuple[str, ...]:
+        total = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        if not isinstance(total, (int, float)) or not math.isfinite(total) or total <= 0:
+            raise SetupValidationError("managed profile timeout is invalid")
+        deadline = time.monotonic() + total
+        config_path = self._config_path_from_doctor(timeout_seconds=total)
         user_profiles = self._read_user_profiles(config_path)
         admin_profiles = self._read_admin_profiles()
         if len(user_profiles) != len(set(user_profiles)) or len(admin_profiles) != len(set(admin_profiles)):
@@ -327,41 +561,50 @@ class ManagedProfileCatalog:
         if set(user_profiles) & set(admin_profiles):
             raise SetupValidationError("managed profile catalog conflicts")
         candidates = tuple(sorted((*user_profiles, *admin_profiles)))
-        worktree = (self.probe_worktree or Path.cwd()).resolve(strict=True)
-        if not worktree.is_dir():
-            raise SetupValidationError("managed profile worktree is unavailable")
         available: list[str] = []
-        for name in candidates:
-            try:
-                executor = self.executor_factory(name)
-                completed = executor(
-                    ["git", "status", "--short"],
-                    cwd=worktree,
-                    env=_clean_doctor_environment(),
-                    timeout=self.timeout_seconds,
-                    max_output_bytes=64 * 1024,
-                )
-                if completed.returncode != 0:
-                    raise RuntimeError
-            except Exception:
-                continue
-            available.append(name)
+        try:
+            with tempfile.TemporaryDirectory(prefix="ones-profile-probe-") as raw_root:
+                probe_root = prepare_private_directory(Path(raw_root) / "private")
+                for name in candidates:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    executor = self.executor_factory(name)
+                    try:
+                        completed = executor(
+                            ["git", "status", "--short"],
+                            cwd=probe_root,
+                            env=_clean_doctor_environment(),
+                            timeout=remaining,
+                            max_output_bytes=64 * 1024,
+                        )
+                        if completed.returncode != 0:
+                            raise RuntimeError
+                    except Exception:
+                        continue
+                    available.append(name)
+        except SetupValidationError:
+            raise
+        except Exception:
+            raise SetupValidationError("managed profile capability root is unavailable") from None
         return tuple(available)
 
-    def require_selected(self, selected: str) -> str:
+    def require_selected(
+        self, selected: str, *, timeout_seconds: float | None = None
+    ) -> str:
         if type(selected) is not str or PROFILE_RE.fullmatch(selected) is None:
             raise SetupValidationError("managed profile selection is invalid")
-        if selected not in self.list_profiles():
+        if selected not in self.list_profiles(timeout_seconds=timeout_seconds):
             raise SetupValidationError("managed profile is unavailable")
         return selected
 
-    def _config_path_from_doctor(self) -> Path:
+    def _config_path_from_doctor(self, *, timeout_seconds: float) -> Path:
         try:
             completed = self.codex_doctor(
                 ["codex", "doctor", "--json"],
                 cwd=(self.probe_worktree or Path.cwd()).resolve(strict=True),
                 env=_clean_doctor_environment(),
-                timeout=self.timeout_seconds,
+                timeout=timeout_seconds,
                 max_output_bytes=self.max_output_bytes,
                 shell=False,
             )
@@ -374,17 +617,31 @@ class ManagedProfileCatalog:
             ):
                 raise ValueError
             document = json.loads(completed.stdout)
-            if type(document) is not dict or set(document) != {
-                "schemaVersion", "generatedAt", "overallStatus", "codexVersion", "checks"
-            } or document["schemaVersion"] != 1 or type(document["checks"]) is not dict:
+            if (
+                type(document) is not dict
+                or set(document) != {
+                    "schemaVersion", "generatedAt", "overallStatus", "codexVersion", "checks"
+                }
+                or type(document["schemaVersion"]) is not int
+                or document["schemaVersion"] != 1
+                or type(document["generatedAt"]) is not str
+                or document["overallStatus"] not in {"ok", "warning", "fail"}
+                or type(document["codexVersion"]) is not str
+                or type(document["checks"]) is not dict
+            ):
                 raise ValueError
+            _validate_doctor_checks(document["checks"])
             check = document["checks"].get("config.load")
-            if type(check) is not dict or not {
+            if type(check) is not dict or set(check) != {
                 "id", "category", "status", "summary", "details", "remediation", "durationMs"
-            }.issubset(check) or check.get("id") != "config.load" or check.get("status") != "ok":
+            } or check.get("id") != "config.load" or check.get("status") != "ok":
                 raise ValueError
             details = check["details"]
-            if type(details) is not dict or details.get("config.toml parse") != "ok":
+            if (
+                type(details) is not dict
+                or set(details) != _DOCTOR_CONFIG_DETAIL_KEYS
+                or details.get("config.toml parse") != "ok"
+            ):
                 raise ValueError
             home = Path(details["CODEX_HOME"]).resolve(strict=True)
             config = Path(details["config.toml"]).resolve(strict=True)
@@ -404,11 +661,21 @@ class ManagedProfileCatalog:
             if type(permissions) is not dict:
                 raise ValueError
             names: list[str] = []
-            allowed = {"description", "extends", "workspace_roots", "filesystem", "network"}
+            known = frozenset(permissions)
             for name, profile in permissions.items():
-                if PROFILE_RE.fullmatch(name) is None or type(profile) is not dict or not set(profile) <= allowed:
-                    raise ValueError
+                _validate_permission_profile(name, profile, known)
                 names.append(name)
+            for name in names:
+                seen: set[str] = set()
+                current = name
+                while current not in _BUILTIN_PARENTS:
+                    if current in seen:
+                        raise ValueError
+                    seen.add(current)
+                    parent = permissions[current].get("extends")
+                    if parent is None:
+                        break
+                    current = parent
             return tuple(names)
         except (UnicodeError, tomllib.TOMLDecodeError, TypeError, ValueError):
             raise SetupValidationError("Codex permissions table is invalid") from None
@@ -446,6 +713,123 @@ async def _await_call(call: Any) -> Any:
     return await call if inspect.isawaitable(call) else call
 
 
+async def _to_thread_cleanup(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    task = asyncio.create_task(asyncio.to_thread(method, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
+
+
+async def _invoke(method: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if inspect.iscoroutinefunction(method):
+        return await method(*args, **kwargs)
+    return await _to_thread_cleanup(method, *args, **kwargs)
+
+
+@dataclass(frozen=True, slots=True)
+class _RepositoryReadSnapshot:
+    root_identity: tuple[int, int]
+    git_identity: tuple[int, int, int]
+    head: str
+    index: str
+    tracked_patch_sha256: str
+    untracked_hashes: tuple[tuple[str, str], ...]
+
+
+@dataclass(slots=True)
+class ReadOnlyRepositoryInspector:
+    """Git source adapter using only plumbing reads with optional locks disabled."""
+
+    max_output_bytes: int = 10 * 1024 * 1024
+
+    def _environment(self) -> dict[str, str]:
+        environment = _clean_doctor_environment()
+        environment.update(
+            {
+                "HOME": os.devnull,
+                "USERPROFILE": os.devnull,
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
+                "GIT_CONFIG_SYSTEM": os.devnull,
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_TERMINAL_PROMPT": "0",
+                "GCM_INTERACTIVE": "Never",
+            }
+        )
+        return environment
+
+    def _run(self, argv: list[str], *, cwd: Path, timeout: float) -> str:
+        completed = _bounded_subprocess(
+            argv,
+            cwd=cwd,
+            env=self._environment(),
+            timeout=timeout,
+            max_output_bytes=self.max_output_bytes,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError("read-only Git probe failed")
+        return completed.stdout
+
+    def snapshot(self, path: Path, *, timeout: float = 10.0) -> _RepositoryReadSnapshot:
+        root = path.resolve(strict=True)
+        root_stat = root.stat()
+        git_entry = root / ".git"
+        git_stat = git_entry.lstat()
+        deadline = time.monotonic() + timeout
+
+        def read(arguments: list[str]) -> str:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            return self._run(["git", "-C", str(root), *arguments], cwd=root, timeout=remaining)
+
+        tracked_patch = read(["diff", "--binary", "--no-ext-diff", "HEAD", "--"])
+        untracked = read(["ls-files", "--others", "--exclude-standard", "-z"])
+        hashes: list[tuple[str, str]] = []
+        for relative in sorted(item for item in untracked.split("\0") if item):
+            candidate = root.joinpath(*Path(relative).parts)
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_relative_to(root) or _is_link_or_reparse(candidate):
+                raise RuntimeError("repository source path is unsafe")
+            metadata = candidate.stat()
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > self.max_output_bytes:
+                raise RuntimeError("repository source path is unsafe")
+            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(candidate, flags)
+            digest = hashlib.sha256()
+            try:
+                opened = os.fstat(descriptor)
+                if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                    metadata.st_dev, metadata.st_ino, metadata.st_size
+                ):
+                    raise RuntimeError("repository source identity changed")
+                while chunk := os.read(descriptor, 64 * 1024):
+                    digest.update(chunk)
+            finally:
+                os.close(descriptor)
+            final = candidate.stat()
+            if (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns) != (
+                metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
+            ):
+                raise RuntimeError("repository source identity changed")
+            hashes.append((relative, digest.hexdigest()))
+        return _RepositoryReadSnapshot(
+            root_identity=(root_stat.st_dev, root_stat.st_ino),
+            git_identity=(git_stat.st_dev, git_stat.st_ino, git_stat.st_mode),
+            head=read(["rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"]),
+            index=read(["ls-files", "--stage", "-z"]),
+            tracked_patch_sha256=hashlib.sha256(tracked_patch.encode("utf-8", "surrogateescape")).hexdigest(),
+            untracked_hashes=tuple(hashes),
+        )
+
+    def ls_remote(self, path: Path, url: str, *, timeout: float) -> None:
+        self._run(["git", "ls-remote", "--refs", url], cwd=path, timeout=timeout)
+
+
 def _result(step: SetupStep, category: _CATEGORIES = "ok") -> ConnectionTestResult:
     return ConnectionTestResult(
         step=step,
@@ -475,13 +859,43 @@ class SetupValidator:
     ones_transport: Any = None
     provider_transport: ProviderTransport | None = None
     git_runner: GitReadOnlyRunner | None = None
+    repository_inspector: Any = None
     command_executor: Any = None
     codex_auth_metadata: CodexAuthMetadata | Callable[[], Mapping[str, object]] | None = None
     profile_catalog: Any = None
     timeout_seconds: float = 10.0
+    _construction_token: object | None = field(default=None, repr=False)
+
+    @classmethod
+    def production(
+        cls,
+        *,
+        profile_catalog: ManagedProfileCatalog,
+        ones_gateway: Any = None,
+        provider_transport: ProviderTransport | None = None,
+    ) -> SetupValidator:
+        if not isinstance(profile_catalog, ManagedProfileCatalog):
+            raise SetupValidationError("production profile catalog is invalid")
+        return cls(
+            ones_gateway=ones_gateway,
+            provider_transport=provider_transport,
+            repository_inspector=ReadOnlyRepositoryInspector(),
+            codex_auth_metadata=CodexAuthSourceChecker(),
+            profile_catalog=profile_catalog,
+            _construction_token=_PRODUCTION_CONSTRUCTION,
+        )
+
+    @classmethod
+    def _testing(cls, **kwargs: Any) -> SetupValidator:
+        kwargs["_construction_token"] = _TEST_CONSTRUCTION
+        return cls(**kwargs)
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+        if (
+            self._construction_token not in {_PRODUCTION_CONSTRUCTION, _TEST_CONSTRUCTION}
+            or not math.isfinite(self.timeout_seconds)
+            or self.timeout_seconds <= 0
+        ):
             raise SetupValidationError("setup validator timeout is invalid")
 
     async def probe_ones(self, probe: OnesProbeInput) -> ConnectionTestResult:
@@ -495,24 +909,26 @@ class SetupValidator:
                 if configured_team != probe.team_id:
                     return _result(SetupStep.ONES, "invalid_field")
                 if hasattr(gateway, "authenticate"):
-                    await _await_call(gateway.authenticate())
+                    await _invoke(gateway.authenticate)
                 if hasattr(gateway, "get_team"):
-                    await _await_call(gateway.get_team(probe.team_id))
+                    await _invoke(gateway.get_team, probe.team_id)
                 if hasattr(gateway, "get_project"):
-                    await _await_call(gateway.get_project(probe.project_id))
+                    await _invoke(gateway.get_project, probe.project_id)
                 else:
-                    projects = await _await_call(gateway.list_projects(include_archived=False))
+                    projects = await _invoke(gateway.list_projects, include_archived=False)
                     if not any(str(item.get("uuid", item.get("id", ""))) == probe.project_id for item in projects):
                         raise ValueError
                 if hasattr(gateway, "get_status"):
-                    await _await_call(gateway.get_status(probe.status_id))
+                    await _invoke(gateway.get_status, probe.status_id)
                 else:
-                    statuses = await _await_call(
-                        gateway.list_defect_statuses(probe.project_id, probe.issue_type_id or probe.status_id)
+                    statuses = await _invoke(
+                        gateway.list_defect_statuses,
+                        probe.project_id,
+                        probe.issue_type_id or probe.status_id,
                     )
                     if not any(str(getattr(item, "id", "")) == probe.status_id for item in statuses):
                         raise ValueError
-                await _await_call(gateway.list_comments(probe.item_id, page_size=1))
+                await _invoke(gateway.list_comments, probe.item_id, page_size=1)
             return _result(SetupStep.ONES)
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
@@ -524,8 +940,10 @@ class SetupValidator:
             return _result(SetupStep.PROVIDER, "invalid_field")
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                response = await _await_call(
-                    self.provider_transport.get(probe.api_url, timeout=self.timeout_seconds)
+                response = await _invoke(
+                    self.provider_transport.get,
+                    probe.api_url,
+                    timeout=self.timeout_seconds,
                 )
             status = response if type(response) is int else getattr(response, "status_code", None)
             if status in {401, 403}:
@@ -539,38 +957,31 @@ class SetupValidator:
             return _result(SetupStep.PROVIDER, _failure_category(error))
 
     async def probe_repository(self, probe: RepositoryProbeInput) -> ConnectionTestResult:
-        if self.git_runner is None:
+        inspector = self.repository_inspector
+        if inspector is None and self.git_runner is not None:
+            return _result(SetupStep.REPOSITORIES, "incompatible")
+        if inspector is None:
             return _result(SetupStep.REPOSITORIES, "invalid_field")
         try:
-            root = probe.path.resolve(strict=True)
-            if not root.is_dir() or _has_link_or_reparse_ancestor(root):
-                return _result(SetupStep.REPOSITORIES, "unsafe_path")
-            identity = root.stat()
-
-            async def run(arguments: tuple[str, ...]) -> str:
-                call = self.git_runner.run(arguments, cwd=root, timeout=self.timeout_seconds)
-                completed = await _await_call(call)
-                if isinstance(completed, subprocess.CompletedProcess):
-                    if completed.returncode != 0:
-                        raise RuntimeError
-                    return completed.stdout
-                if type(completed) is not str:
-                    raise RuntimeError
-                return completed
-
-            before = (
-                await run(("git", "rev-parse", "HEAD")),
-                await run(("git", "status", "--porcelain=v1", "--untracked-files=all")),
-                await run(("git", "diff", "--cached", "--binary", "--no-ext-diff")),
-            )
-            await run(("git", "ls-remote", "--refs", probe.remote_url))
-            after = (
-                await run(("git", "rev-parse", "HEAD")),
-                await run(("git", "status", "--porcelain=v1", "--untracked-files=all")),
-                await run(("git", "diff", "--cached", "--binary", "--no-ext-diff")),
-            )
-            final = root.stat()
-            if before != after or (identity.st_dev, identity.st_ino) != (final.st_dev, final.st_ino):
+            async with asyncio.timeout(self.timeout_seconds):
+                root = probe.path.resolve(strict=True)
+                if not root.is_dir() or _has_link_or_reparse_ancestor(root):
+                    return _result(SetupStep.REPOSITORIES, "unsafe_path")
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self.timeout_seconds
+                before = await _invoke(
+                    inspector.snapshot, root, timeout=max(0.001, deadline - loop.time())
+                )
+                await _invoke(
+                    inspector.ls_remote,
+                    root,
+                    probe.remote_url,
+                    timeout=max(0.001, deadline - loop.time()),
+                )
+                after = await _invoke(
+                    inspector.snapshot, root, timeout=max(0.001, deadline - loop.time())
+                )
+            if before != after:
                 return _result(SetupStep.REPOSITORIES, "unsafe_path")
             return _result(SetupStep.REPOSITORIES)
         except BaseException as error:
@@ -580,24 +991,25 @@ class SetupValidator:
 
     async def probe_codex(self, probe: CodexProbeInput) -> ConnectionTestResult:
         try:
-            metadata_source = self.codex_auth_metadata
-            metadata = metadata_source.metadata() if hasattr(metadata_source, "metadata") else metadata_source()
-            metadata = await _await_call(metadata)
-            if type(metadata) is not dict or metadata.get("configured") is not True or set(metadata) - {"configured", "mode"}:
-                return _result(SetupStep.CODEX, "authentication")
-            if self.profile_catalog is None:
-                return _result(SetupStep.CODEX, "sandbox")
-            self.profile_catalog.require_selected(probe.profile)
-            executor = self.command_executor or SandboxCommandExecutor(permission_profile=probe.profile)
-            completed = executor(
-                ["git", "status", "--short"],
-                cwd=probe.worktree,
-                env={},
-                timeout=self.timeout_seconds,
-                max_output_bytes=64 * 1024,
-            )
-            if completed.returncode != 0:
-                return _result(SetupStep.CODEX, "sandbox")
+            async with asyncio.timeout(self.timeout_seconds):
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + self.timeout_seconds
+                metadata_source = self.codex_auth_metadata
+                method = metadata_source.metadata if hasattr(metadata_source, "metadata") else metadata_source
+                metadata = await _invoke(method)
+                if type(metadata) is not dict or metadata.get("configured") is not True or set(metadata) - {"configured", "mode"}:
+                    return _result(SetupStep.CODEX, "authentication")
+                if self.profile_catalog is None:
+                    return _result(SetupStep.CODEX, "sandbox")
+                remaining = max(0.001, deadline - loop.time())
+                if isinstance(self.profile_catalog, ManagedProfileCatalog):
+                    await _to_thread_cleanup(
+                        self.profile_catalog.require_selected,
+                        probe.profile,
+                        timeout_seconds=remaining,
+                    )
+                else:
+                    await _invoke(self.profile_catalog.require_selected, probe.profile)
             return _result(SetupStep.CODEX)
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
@@ -623,19 +1035,60 @@ class SetupValidator:
             return _result(SetupStep.PRIVATE_PATHS, "unsafe_path")
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class RuntimeBootstrapper:
+    """Production validation composition; dependency substitution stays test-private."""
+
+    catalog: ManagedProfileCatalog
+    validator: SetupValidator
+
+    def __init__(
+        self,
+        catalog: ManagedProfileCatalog,
+        validator: SetupValidator,
+        *,
+        _construction_token: object,
+    ) -> None:
+        if _construction_token not in {_PRODUCTION_CONSTRUCTION, _TEST_CONSTRUCTION}:
+            raise SetupValidationError("runtime bootstrap construction is private")
+        object.__setattr__(self, "catalog", catalog)
+        object.__setattr__(self, "validator", validator)
+
+    @classmethod
+    def production(
+        cls,
+        *,
+        probe_parent: Path | None = None,
+        ones_gateway: Any = None,
+        provider_transport: ProviderTransport | None = None,
+    ) -> RuntimeBootstrapper:
+        catalog = ManagedProfileCatalog.production(probe_parent=probe_parent)
+        validator = SetupValidator.production(
+            profile_catalog=catalog,
+            ones_gateway=ones_gateway,
+            provider_transport=provider_transport,
+        )
+        return cls(catalog, validator, _construction_token=_PRODUCTION_CONSTRUCTION)
+
+
 __all__ = [
+    "CodexAuthSourceChecker",
     "CodexProbeInput",
     "CodexAuthMetadata",
     "ConnectionTestResult",
     "ManagedProfileCatalog",
+    "ManagedSandboxExecutorFactory",
     "OnesProbeInput",
     "PrivatePathsProbeInput",
     "PROFILE_RE",
     "ProviderProbeInput",
     "ProviderTransport",
+    "ReadOnlyRepositoryInspector",
     "GitReadOnlyRunner",
     "RepositoryProbeInput",
     "SetupStep",
     "SetupValidator",
+    "RuntimeBootstrapper",
+    "SubprocessDoctorRunner",
     "ValidationStatus",
 ]

@@ -4,6 +4,10 @@ import json
 from pathlib import Path
 import subprocess
 from dataclasses import FrozenInstanceError
+import asyncio
+import threading
+import time
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -19,6 +23,11 @@ from src.developer_workflow.setup_validation import (
     RepositoryProbeInput,
     SetupStep,
     SetupValidator,
+    RuntimeBootstrapper,
+    SubprocessDoctorRunner,
+    CodexAuthSourceChecker,
+    ManagedSandboxExecutorFactory,
+    ReadOnlyRepositoryInspector,
     ValidationStatus,
 )
 
@@ -46,6 +55,15 @@ def _doctor(config: Path):
                                 "CODEX_HOME": str(config.parent),
                                 "config.toml": str(config),
                                 "config.toml parse": "ok",
+                                "cwd": str(config.parent),
+                                "enabled feature flags": "<redacted>",
+                                "feature flag overrides": "none",
+                                "feature flags enabled": "0",
+                                "log dir": str(config.parent / "log"),
+                                "mcp servers": "0",
+                                "model": "gpt-test",
+                                "model provider": "openai",
+                                "sqlite home": str(config.parent),
                             },
                             "remediation": None,
                             "durationMs": 0,
@@ -102,8 +120,8 @@ def test_profile_catalog_uses_exact_permissions_table_and_rechecks_selection(
 ) -> None:
     config = tmp_path / "config.toml"
     config.write_text(
-        '[permissions."managed-b"]\nextends = ":workspace-write"\n'
-        '[permissions."managed-a"]\nextends = ":workspace-write"\n',
+        '[permissions."managed-b"]\nextends = ":workspace"\n'
+        '[permissions."managed-a"]\nextends = ":workspace"\n',
         encoding="utf-8",
     )
     executors: list[_CapabilityExecutor] = []
@@ -113,7 +131,7 @@ def test_profile_catalog_uses_exact_permissions_table_and_rechecks_selection(
         executors.append(executor)
         return executor
 
-    catalog = ManagedProfileCatalog(
+    catalog = ManagedProfileCatalog._testing(
         _doctor(config),
         trusted_admin_catalog=None,
         probe_worktree=tmp_path,
@@ -121,9 +139,11 @@ def test_profile_catalog_uses_exact_permissions_table_and_rechecks_selection(
         file_security=lambda path, admin: True,
     )
     assert catalog.list_profiles() == ("managed-a", "managed-b")
-    assert all(executor.calls == [(('git', 'status', '--short'), tmp_path)] for executor in executors)
+    probe_roots = [executor.calls[0][1] for executor in executors]
+    assert all(executor.calls[0][0] == ("git", "status", "--short") for executor in executors)
+    assert all(root != tmp_path and not root.exists() for root in probe_roots)
     assert catalog.require_selected("managed-a") == "managed-a"
-    config.write_text('[permissions."managed-b"]\nextends = ":workspace-write"\n', encoding="utf-8")
+    config.write_text('[permissions."managed-b"]\nextends = ":workspace"\n', encoding="utf-8")
     with pytest.raises(SetupValidationError, match="unavailable"):
         catalog.require_selected("managed-a")
     with pytest.raises(SetupValidationError, match="invalid"):
@@ -142,7 +162,7 @@ def test_profile_catalog_uses_exact_permissions_table_and_rechecks_selection(
 def test_profile_catalog_fails_closed_on_wrong_schema(tmp_path: Path, document: str) -> None:
     config = tmp_path / "config.toml"
     config.write_text(document, encoding="utf-8")
-    catalog = ManagedProfileCatalog(
+    catalog = ManagedProfileCatalog._testing(
         _doctor(config),
         trusted_admin_catalog=None,
         probe_worktree=tmp_path,
@@ -155,7 +175,7 @@ def test_profile_catalog_fails_closed_on_wrong_schema(tmp_path: Path, document: 
 
 def test_profile_catalog_rejects_doctor_path_outside_reported_home(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
-    config.write_text('[permissions.managed]\nextends=":workspace-write"\n', encoding="utf-8")
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
     other = tmp_path / "other"
     other.mkdir()
     runner = _doctor(config)
@@ -166,7 +186,7 @@ def test_profile_catalog_rejects_doctor_path_outside_reported_home(tmp_path: Pat
         report["checks"]["config.load"]["details"]["CODEX_HOME"] = str(other)
         return subprocess.CompletedProcess(argv, 0, json.dumps(report), "")
 
-    catalog = ManagedProfileCatalog(
+    catalog = ManagedProfileCatalog._testing(
         attacked,
         trusted_admin_catalog=None,
         probe_worktree=tmp_path,
@@ -181,13 +201,13 @@ def test_profile_catalog_rejects_admin_duplicates_conflicts_and_untrusted_acl(
     tmp_path: Path,
 ) -> None:
     config = tmp_path / "config.toml"
-    config.write_text('[permissions.managed]\nextends=":workspace-write"\n', encoding="utf-8")
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
     admin = tmp_path / "managed-sandbox-profiles.json"
     admin.write_text(
         json.dumps({"schema_version": 1, "profiles": ["admin", "admin"]}),
         encoding="utf-8",
     )
-    catalog = ManagedProfileCatalog(
+    catalog = ManagedProfileCatalog._testing(
         _doctor(config),
         trusted_admin_catalog=admin,
         probe_worktree=tmp_path,
@@ -203,7 +223,7 @@ def test_profile_catalog_rejects_admin_duplicates_conflicts_and_untrusted_acl(
     with pytest.raises(SetupValidationError, match="conflicts"):
         catalog.list_profiles()
 
-    untrusted = ManagedProfileCatalog(
+    untrusted = ManagedProfileCatalog._testing(
         _doctor(config),
         trusted_admin_catalog=admin,
         probe_worktree=tmp_path,
@@ -219,8 +239,8 @@ def test_profile_catalog_excludes_candidates_that_fail_full_executor_probe(
 ) -> None:
     config = tmp_path / "config.toml"
     config.write_text(
-        '[permissions.good]\nextends=":workspace-write"\n'
-        '[permissions.bad]\nextends=":workspace-write"\n',
+        '[permissions.good]\nextends=":workspace"\n'
+        '[permissions.bad]\nextends=":workspace"\n',
         encoding="utf-8",
     )
 
@@ -230,7 +250,7 @@ def test_profile_catalog_excludes_candidates_that_fail_full_executor_probe(
                 raise RuntimeError("outside write was allowed: TOKEN-SECRET C:/private")
             return super().__call__(command, **kwargs)
 
-    catalog = ManagedProfileCatalog(
+    catalog = ManagedProfileCatalog._testing(
         _doctor(config),
         trusted_admin_catalog=None,
         probe_worktree=tmp_path,
@@ -238,6 +258,236 @@ def test_profile_catalog_excludes_candidates_that_fail_full_executor_probe(
         file_security=lambda path, admin: True,
     )
     assert catalog.list_profiles() == ("good",)
+
+
+def test_profile_probe_uses_private_directory_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    config = tmp_path / "config.toml"
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
+    prepared: list[Path] = []
+
+    def prepare(path: Path) -> Path:
+        path.mkdir()
+        prepared.append(path)
+        return path.resolve(strict=True)
+
+    monkeypatch.setattr(validation_module, "prepare_private_directory", prepare)
+    catalog = ManagedProfileCatalog._testing(
+        _doctor(config), trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor, file_security=lambda path, admin: True,
+    )
+    assert catalog.list_profiles() == ("managed",)
+    assert len(prepared) == 1
+    assert not prepared[0].exists()
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        'extends = ":workspace-write"',
+        'extends = [":workspace"]',
+        'unknown = true',
+        '[permissions.managed.workspace_roots]\n"." = "true"',
+        '[permissions.managed.filesystem]\nglob_scan_max_depth = 0',
+        '[permissions.managed.filesystem]\n"**/.env" = "execute"',
+        '[permissions.managed.filesystem]\nroot = { child = "execute" }',
+        '[permissions.managed.network]\nmode = "unknown"',
+        '[permissions.managed.network]\nenabled = "yes"',
+        '[permissions.managed.network.domains]\n"example.com" = "maybe"',
+        '[permissions.managed.network]\nextra = false',
+    ],
+)
+def test_permissions_profile_exact_0147_schema_rejects_invalid_nested_values(
+    tmp_path: Path, profile: str
+) -> None:
+    config = tmp_path / "config.toml"
+    prefix = "[permissions.managed]\n" if not profile.startswith("[permissions") else ""
+    config.write_text(prefix + profile + "\n", encoding="utf-8")
+    catalog = ManagedProfileCatalog._testing(
+        _doctor(config),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor,
+        file_security=lambda path, admin: True,
+    )
+    with pytest.raises(SetupValidationError, match="permissions table"):
+        catalog.list_profiles()
+
+
+def test_permissions_profile_accepts_exact_0147_nested_schema(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[permissions.managed]\ndescription = "ONES managed"\nextends = ":workspace"\n'
+        '[permissions.managed.workspace_roots]\n"." = true\n'
+        '[permissions.managed.filesystem]\nglob_scan_max_depth = 4\n'
+        '"**/.env" = "deny"\nroot = { child = "read" }\n'
+        '[permissions.managed.network]\nenabled = false\nmode = "limited"\n'
+        '[permissions.managed.network.domains]\n"example.invalid" = "deny"\n',
+        encoding="utf-8",
+    )
+    catalog = ManagedProfileCatalog._testing(
+        _doctor(config), trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor, file_security=lambda path, admin: True,
+    )
+    assert catalog.list_profiles() == ("managed",)
+
+
+def test_permissions_profile_inheritance_cycle_fails_closed(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[permissions.a]\nextends="b"\n[permissions.b]\nextends="a"\n',
+        encoding="utf-8",
+    )
+    catalog = ManagedProfileCatalog._testing(
+        _doctor(config), trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor, file_security=lambda path, admin: True,
+    )
+    with pytest.raises(SetupValidationError, match="permissions table"):
+        catalog.list_profiles()
+
+
+def test_doctor_config_load_schema_is_exact_for_0147(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
+    base = _doctor(config)
+
+    def attacked(argv, **kwargs):
+        completed = base(argv, **kwargs)
+        report = json.loads(completed.stdout)
+        report["checks"]["config.load"]["details"]["unexpected"] = "value"
+        return subprocess.CompletedProcess(argv, 0, json.dumps(report), "")
+
+    catalog = ManagedProfileCatalog._testing(
+        attacked, trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor, file_security=lambda path, admin: True,
+    )
+    with pytest.raises(SetupValidationError, match="unavailable"):
+        catalog.list_profiles()
+
+
+def test_doctor_rejects_unknown_fields_in_any_check(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
+    base = _doctor(config)
+
+    def attacked(argv, **kwargs):
+        completed = base(argv, **kwargs)
+        report = json.loads(completed.stdout)
+        report["checks"]["other"] = {
+            "id": "other", "category": "system", "status": "ok", "summary": "ok",
+            "details": {}, "remediation": None, "durationMs": 0, "unexpected": True,
+        }
+        return subprocess.CompletedProcess(argv, 0, json.dumps(report), "")
+
+    catalog = ManagedProfileCatalog._testing(
+        attacked, trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor, file_security=lambda path, admin: True,
+    )
+    with pytest.raises(SetupValidationError, match="unavailable"):
+        catalog.list_profiles()
+
+
+def test_profile_catalog_has_one_total_capability_budget(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[permissions.a]\nextends=":workspace"\n[permissions.b]\nextends=":workspace"\n',
+        encoding="utf-8",
+    )
+    observed: list[float] = []
+
+    class SlowExecutor(_CapabilityExecutor):
+        def __call__(self, command, *, timeout, **kwargs):
+            observed.append(timeout)
+            time.sleep(min(timeout, 0.04))
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+    catalog = ManagedProfileCatalog._testing(
+        _doctor(config), trusted_admin_catalog=None, probe_worktree=tmp_path,
+        executor_factory=SlowExecutor, file_security=lambda path, admin: True,
+        timeout_seconds=0.05,
+    )
+    started = time.monotonic()
+    assert catalog.list_profiles() == ()
+    # Windows protected-DACL preparation has fixed overhead outside the command budget.
+    assert time.monotonic() - started < 0.20
+    assert sum(observed) <= 0.07
+
+
+def test_production_runtime_wires_only_real_policy_boundaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    config = tmp_path / "config.toml"
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
+    calls: list[tuple[list[str], Path]] = []
+
+    def os_command(command, *, cwd, env, timeout, max_output_bytes, stdin=None):
+        calls.append((command, cwd))
+        if command == ["codex", "doctor", "--json"]:
+            return _doctor(config)(command, cwd=cwd, env=env, timeout=timeout,
+                                   max_output_bytes=max_output_bytes, shell=False)
+        child = command[command.index("--") + 1 :]
+        if any("outside-write.txt" in item for item in child):
+            return subprocess.CompletedProcess(command, 13, "", "denied")
+        if any("s.connect" in item for item in child):
+            return subprocess.CompletedProcess(command, 23, "", "denied")
+        if any("inside-write.txt" in item for item in child):
+            completed = subprocess.run(child, cwd=cwd, env=env, capture_output=True, check=False)
+            return subprocess.CompletedProcess(
+                command, completed.returncode, completed.stdout.decode(), completed.stderr.decode()
+            )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(validation_module, "_bounded_subprocess", os_command)
+    monkeypatch.setattr(validation_module, "_default_file_security", lambda path, admin: True)
+    runtime = RuntimeBootstrapper.production(probe_parent=tmp_path)
+    assert isinstance(runtime.catalog.codex_doctor, SubprocessDoctorRunner)
+    assert isinstance(runtime.catalog.executor_factory, ManagedSandboxExecutorFactory)
+    assert isinstance(runtime.validator.codex_auth_metadata, CodexAuthSourceChecker)
+    assert isinstance(runtime.validator.repository_inspector, ReadOnlyRepositoryInspector)
+    assert runtime.validator.profile_catalog is runtime.catalog
+    assert runtime.catalog.require_selected("managed") == "managed"
+    assert any(call[0][:2] == ["codex", "sandbox"] for call in calls)
+    assert all(cwd != tmp_path for command, cwd in calls if command[:2] == ["codex", "sandbox"])
+
+
+def test_read_only_repository_inspector_preserves_source_index_and_status(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    subprocess.run(["git", "init", "-q", str(source)], check=True)
+    (source / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(source), "add", "tracked.txt"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "-c", "user.name=Test", "-c",
+         "user.email=test@example.invalid", "commit", "-qm", "initial"], check=True,
+    )
+    (source / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    status_before = subprocess.run(
+        ["git", "-C", str(source), "status", "--porcelain=v1"],
+        capture_output=True, check=True,
+    ).stdout
+    index = source / ".git" / "index"
+    index_before = index.stat()
+
+    inspector = ReadOnlyRepositoryInspector()
+    before = inspector.snapshot(source, timeout=10)
+    inspector.ls_remote(source, str(source), timeout=10)
+    after = inspector.snapshot(source, timeout=10)
+
+    index_after = index.stat()
+    status_after = subprocess.run(
+        ["git", "-C", str(source), "status", "--porcelain=v1"],
+        capture_output=True, check=True,
+    ).stdout
+    assert before == after
+    assert status_before == status_after
+    assert (index_before.st_size, index_before.st_mtime_ns) == (
+        index_after.st_size, index_after.st_mtime_ns
+    )
 
 
 class _OnesGateway:
@@ -257,13 +507,12 @@ class _Provider:
     async def get(self, url, *, timeout): self.calls.append(("GET", url, timeout)); return 200
 
 
-class _Git:
-    def __init__(self): self.calls = []
-    async def run(self, argv, *, cwd, timeout):
-        self.calls.append(tuple(argv))
-        if argv[-2:] == ("rev-parse", "HEAD"):
-            return "a" * 40
-        return ""
+class _Inspector:
+    def __init__(self): self.calls = []; self.value = ("snapshot", "a" * 40)
+    def snapshot(self, path, *, timeout):
+        self.calls.append(("snapshot", path, timeout)); return self.value
+    def ls_remote(self, path, url, *, timeout):
+        self.calls.append(("ls_remote", path, url, timeout)); return None
 
 
 class _Auth:
@@ -274,11 +523,11 @@ class _Auth:
 async def test_setup_validator_probes_are_read_only_and_private_paths_are_not_created(
     tmp_path: Path,
 ) -> None:
-    gateway, provider, git = _OnesGateway(), _Provider(), _Git()
-    validator = SetupValidator(
+    gateway, provider, inspector = _OnesGateway(), _Provider(), _Inspector()
+    validator = SetupValidator._testing(
         ones_gateway=gateway,
         provider_transport=provider,
-        git_runner=git,
+        repository_inspector=inspector,
         codex_auth_metadata=_Auth(),
         profile_catalog=object(),
     )
@@ -301,7 +550,7 @@ async def test_setup_validator_probes_are_read_only_and_private_paths_are_not_cr
         RepositoryProbeInput(path=repo, remote_url="https://git.example.invalid/o/r.git")
     )
     assert result.category == "ok"
-    assert all("clone" not in call and "fetch" not in call for call in git.calls)
+    assert [call[0] for call in inspector.calls] == ["snapshot", "ls_remote", "snapshot"]
 
     missing = tmp_path / "future" / "runs"
     private = await validator.probe_private_paths(
@@ -318,7 +567,7 @@ async def test_probe_errors_are_fixed_and_sanitized() -> None:
     class Broken:
         async def authenticate(self): raise RuntimeError(secret)
 
-    validator = SetupValidator(ones_gateway=Broken())
+    validator = SetupValidator._testing(ones_gateway=Broken())
     result = await validator.probe_ones(
         OnesProbeInput(team_id="T", project_id="P", status_id="S", item_id="I")
     )
@@ -328,3 +577,56 @@ async def test_probe_errors_are_fixed_and_sanitized() -> None:
         category="unreachable",
     )
     assert secret not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_sync_codex_probe_does_not_block_event_loop_and_times_out_cleanly(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    finished = threading.Event()
+
+    class BlockingCatalog:
+        def require_selected(self, selected):
+            started.set()
+            time.sleep(0.12)
+            finished.set()
+            return selected
+
+    validator = SetupValidator._testing(
+        codex_auth_metadata=_Auth(), profile_catalog=BlockingCatalog(), timeout_seconds=0.04
+    )
+    ticks = 0
+
+    async def ticker():
+        nonlocal ticks
+        while not finished.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    result = await validator.probe_codex(CodexProbeInput(profile="managed", worktree=tmp_path))
+    assert started.is_set()
+    assert result.category == "timeout"
+    assert ticks >= 3
+    assert finished.is_set()
+    await ticker_task
+
+
+@pytest.mark.asyncio
+async def test_codex_probe_never_runs_capability_executor_in_source(tmp_path: Path) -> None:
+    class Catalog:
+        def require_selected(self, selected): return selected
+
+    def reject_source_execution(*args, **kwargs):
+        raise AssertionError("catalog already performed the capability probe in a temp root")
+
+    validator = SetupValidator._testing(
+        codex_auth_metadata=_Auth(),
+        profile_catalog=Catalog(),
+        command_executor=reject_source_execution,
+    )
+    result = await validator.probe_codex(
+        CodexProbeInput(profile="managed", worktree=tmp_path)
+    )
+    assert result.category == "ok"
