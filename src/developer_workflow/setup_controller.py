@@ -487,6 +487,9 @@ class SetupController:
                 document = await asyncio.to_thread(
                     self._store.load_or_empty, profile_id=self._profile_id
                 )
+                if document.activation_owner_generation is not None:
+                    self._activation_error = "activation recovery required"
+                    return None
                 if document.active is None:
                     return None
                 secrets = await asyncio.to_thread(

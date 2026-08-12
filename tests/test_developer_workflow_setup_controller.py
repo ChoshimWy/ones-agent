@@ -11,7 +11,11 @@ from typing import Any
 
 import pytest
 
-from src.developer_workflow.config import PublishingConfig, PublishingProvider
+from src.developer_workflow.config import (
+    DeveloperWorkflowConfig,
+    PublishingConfig,
+    PublishingProvider,
+)
 from src.developer_workflow.contracts import RepositoryMapping
 from src.developer_workflow.credential_store import CredentialStoreError
 from src.developer_workflow.setup_controller import SetupActionError, SetupController
@@ -65,6 +69,26 @@ def _workflow(tmp_path: Path) -> WorkflowDraft:
             provider=PublishingProvider.GITHUB,
             default_target_branch="main",
         ),
+    )
+
+
+def _candidate_for_store(tmp_path: Path, generation: str) -> ActiveSetup:
+    return ActiveSetup(
+        generation=generation,
+        runtime=_runtime(),
+        workflow=DeveloperWorkflowConfig.model_validate(
+            _workflow(tmp_path).model_dump(mode="python", round_trip=True)
+        ),
+        credential_kinds=(SecretKind.ONES_PASSWORD, SecretKind.PROVIDER_TOKEN),
+    )
+
+
+def _persisted_secrets() -> RuntimeSecrets:
+    return RuntimeSecrets(
+        {
+            SecretKind.ONES_PASSWORD: "persisted-password",
+            SecretKind.PROVIDER_TOKEN: "persisted-provider",
+        }
     )
 
 
@@ -212,6 +236,7 @@ class FakeStore:
 class IntegrationCredentials:
     def __init__(self) -> None:
         self.data: dict[tuple[str, str], RuntimeSecrets] = {}
+        self.reads = 0
 
     def write_fresh_generation(
         self, profile_id: str, generation: str, secrets: RuntimeSecrets
@@ -225,6 +250,7 @@ class IntegrationCredentials:
     def read_generation(
         self, profile_id: str, generation: str, kinds: tuple[SecretKind, ...]
     ) -> RuntimeSecrets:
+        self.reads += 1
         try:
             values = self.data[(profile_id, generation)]
             return RuntimeSecrets({kind: values.require(kind) for kind in kinds})
@@ -509,6 +535,53 @@ async def test_first_activation_failure_with_real_store_restores_empty_document(
     assert loaded.active is None
     assert loaded.previous is None
     assert store.orphan_generations() == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_stable", (False, True), ids=("first", "existing"))
+async def test_activate_existing_refuses_crash_recovery_pending_before_secret_read(
+    tmp_path: Path, has_stable: bool
+) -> None:
+    credentials = IntegrationCredentials()
+    path = tmp_path / "pending-restart" / "config.json"
+    store = SetupStore(credentials, config_path=path)  # type: ignore[arg-type]
+    if has_stable:
+        stable = _candidate_for_store(tmp_path, "a" * 32)
+        store.commit("managed-profile", stable, _persisted_secrets())
+        store.finalize_activation("managed-profile", stable.generation)
+    pending = _candidate_for_store(tmp_path, "b" * 32)
+    before = store.commit("managed-profile", pending, _persisted_secrets())
+    reads_before = credentials.reads
+    restarted = SetupStore(credentials, config_path=path)  # type: ignore[arg-type]
+    builder = FakeRuntimeBuilder()
+    loader, _, _, _ = _controller(
+        tmp_path, store=restarted, builder=builder  # type: ignore[arg-type]
+    )
+
+    assert await loader.activate_existing() is None
+
+    assert loader.activation_error == "activation recovery required"
+    assert "persisted-password" not in repr(loader.state)
+    assert "persisted-provider" not in repr(loader.state)
+    assert builder.calls == []
+    assert credentials.reads == reads_before
+    assert restarted.load() == before
+
+    restored = restarted.restore_previous("managed-profile", pending.generation)
+    recovery_builder = FakeRuntimeBuilder()
+    recovered, _, _, _ = _controller(
+        tmp_path, store=restarted, builder=recovery_builder  # type: ignore[arg-type]
+    )
+    handle = await recovered.activate_existing()
+    if has_stable:
+        assert handle is recovery_builder.handle
+        assert len(recovery_builder.calls) == 1
+        assert restored.active is not None
+        assert restored.active.generation == "a" * 32
+    else:
+        assert handle is None
+        assert recovery_builder.calls == []
+        assert restored.active is None
 
 
 @pytest.mark.asyncio
