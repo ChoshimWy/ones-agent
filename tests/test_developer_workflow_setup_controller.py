@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from threading import Event
 from types import MappingProxyType
 from typing import Any
 
@@ -511,3 +512,115 @@ async def test_commit_post_replace_failure_is_detected_and_rolled_back(
     assert builder.calls == []
     assert store.load().active is None
     assert store.orphan_generations() == ()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_finalize_harvests_success_without_rollback(
+    tmp_path: Path,
+) -> None:
+    class BlockingFinalizeStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalize_started = Event()
+            self.finalize_release = Event()
+
+        def finalize_activation(self, profile_id: str) -> SetupDocument:
+            self.finalize_started.set()
+            assert self.finalize_release.wait(2)
+            return super().finalize_activation(profile_id)
+
+    store = BlockingFinalizeStore()
+    controller, _, builder, _ = _controller(tmp_path, store=store)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(store.finalize_started.wait, 2)
+
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    store.finalize_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.finalizes == 1
+    assert store.restores == 0
+    assert store.document.active is not None
+    assert store.document.previous is None
+    assert builder.handle.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_diff_cannot_be_hidden_by_later_changed_step(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _ = _controller(tmp_path)
+    await _pass_all(controller)
+    changed = _runtime().model_copy(
+        update={"ones_team_id": "team-2"}, deep=True
+    )
+
+    controller.apply_runtime(changed, changed_step=SetupStep.PRIVATE_PATHS)
+
+    assert controller.current_step is SetupStep.ONES
+    assert controller.result_for(SetupStep.ONES).status is ValidationStatus.NOT_CONFIGURED
+
+
+@pytest.mark.asyncio
+async def test_workflow_diff_cannot_be_hidden_by_later_changed_step(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _ = _controller(tmp_path)
+    await _pass_all(controller)
+    changed = _workflow(tmp_path)
+    changed.max_codex_attempts = 4
+
+    controller.apply_workflow(changed, changed_step=SetupStep.PRIVATE_PATHS)
+
+    assert controller.current_step is SetupStep.CODEX
+    assert controller.result_for(SetupStep.CODEX).status is ValidationStatus.NOT_CONFIGURED
+
+
+class BlockingMutationBuilder(FakeRuntimeBuilder):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = Event()
+        self.release = Event()
+
+    def build(self, active: ActiveSetup, secrets: RuntimeSecrets) -> Handle:
+        self.calls.append((active, secrets))
+        self.started.set()
+        assert self.release.wait(2)
+        return self.handle
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ("draft", "secret"))
+async def test_mutation_during_save_rejects_stale_candidate_and_stays_editable(
+    tmp_path: Path, mutation: str
+) -> None:
+    old_controller, store, _, _ = _controller(tmp_path)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    builder = BlockingMutationBuilder()
+    controller, _, _, _ = _controller(tmp_path, store=store, builder=builder)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(builder.started.wait, 2)
+
+    if mutation == "draft":
+        changed = _workflow(tmp_path)
+        changed.max_codex_attempts = 4
+        controller.apply_workflow(changed, changed_step=SetupStep.PRIVATE_PATHS)
+    else:
+        controller.set_secret(SecretKind.ONES_PASSWORD, "NEW-TOKEN-SECRET")
+    builder.release.set()
+
+    with pytest.raises(SetupActionError, match="^configuration changed$"):
+        await task
+    assert builder.handle.closed == 1
+    assert store.restores == 1
+    assert store.finalizes == 1  # only the old activation was finalized
+    assert controller.closed is False
+    assert store.document.active is not None
+    controller.set_secret(SecretKind.ONES_PASSWORD, "REENTERED-TOKEN")
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is True

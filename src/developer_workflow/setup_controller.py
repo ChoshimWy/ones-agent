@@ -34,6 +34,10 @@ class SetupActionError(RuntimeError):
     """A fixed, non-sensitive setup action failure."""
 
 
+class _ConfigurationChanged(RuntimeError):
+    """Internal CAS failure without draft or credential details."""
+
+
 class RuntimeBuilder(Protocol):
     """Synchronous production runtime construction boundary."""
 
@@ -145,6 +149,7 @@ class SetupController:
         self._operation_lock = asyncio.Lock()
         self._operation_task: asyncio.Task[Any] | None = None
         self._activation_error: str | None = None
+        self._finalizing = False
 
     @property
     def closed(self) -> bool:
@@ -192,11 +197,14 @@ class SetupController:
         *,
         changed_step: SetupStep = SetupStep.ONES,
     ) -> None:
-        self._ensure_open()
+        self._ensure_mutable()
         if type(runtime) is not RuntimePublicConfig:
             raise SetupActionError("public configuration is invalid")
+        invalidation_step = self._runtime_invalidation_step(
+            self._draft.runtime, runtime, changed_step
+        )
         self._draft.runtime = runtime.model_copy(deep=True)
-        self._changed(changed_step)
+        self._changed(invalidation_step)
 
     def apply_workflow(
         self,
@@ -204,16 +212,19 @@ class SetupController:
         *,
         changed_step: SetupStep = SetupStep.REPOSITORIES,
     ) -> None:
-        self._ensure_open()
+        self._ensure_mutable()
         if type(workflow) is not WorkflowDraft:
             raise SetupActionError("workflow configuration is invalid")
+        invalidation_step = self._workflow_invalidation_step(
+            self._draft.workflow, workflow, changed_step
+        )
         self._draft.workflow = workflow.model_copy(deep=True)
-        self._changed(changed_step)
+        self._changed(invalidation_step)
 
     def add_repository(self, **fields: object) -> RepositoryMapping:
         """Build a strict repository draft through the setup repository boundary."""
 
-        self._ensure_open()
+        self._ensure_mutable()
         try:
             repository = build_repository(**fields)
         except BaseException as error:
@@ -231,7 +242,7 @@ class SetupController:
         *,
         primary: str,
     ) -> RepositoryGroupMapping:
-        self._ensure_open()
+        self._ensure_mutable()
         if not isinstance(builder, RepositoryGroupDraftBuilder):
             raise SetupActionError("repository group is invalid")
         try:
@@ -246,7 +257,7 @@ class SetupController:
         return group.model_copy(deep=True)
 
     def set_secret(self, kind: SecretKind, value: str) -> None:
-        self._ensure_open()
+        self._ensure_mutable()
         if type(kind) is not SecretKind or type(value) is not str or not value:
             raise SetupActionError("credential is invalid")
         try:
@@ -276,7 +287,7 @@ class SetupController:
     ) -> None:
         """Import only an explicitly selected subset of previously detected kinds."""
 
-        self._ensure_open()
+        self._ensure_mutable()
         detected = set(detection.environment) | set(detection.dotenv)
         if any(kind not in detected for kind in selected):
             raise SetupActionError("credential selection is invalid")
@@ -426,12 +437,14 @@ class SetupController:
                 self._operation_task = None
                 raise SetupActionError("review confirmation is required")
             committed = False
+            finalized = False
             handle: object | None = None
             failure_message: str | None = None
             candidate: ActiveSetup | None = None
             profile_id = self._profile_id
             try:
                 candidate, secrets = self._build_candidate()
+                revision = self._revision
                 commit_task = asyncio.create_task(
                     asyncio.to_thread(
                         self._store.commit, profile_id, candidate, secrets
@@ -447,13 +460,31 @@ class SetupController:
                     committed = True
                     raise
                 committed = True
+                self._require_revision(revision)
                 if document.active is None:
                     raise SetupStoreError("active configuration is unavailable")
                 persisted = await asyncio.to_thread(
                     self._store.read_active_secrets, document
                 )
+                self._require_revision(revision)
                 handle = await self._bounded_build(document.active, persisted)
-                await asyncio.to_thread(self._store.finalize_activation, profile_id)
+                self._require_revision(revision)
+                # Once finalization starts, synchronous form mutations are rejected.
+                # This closes the only gap between the last revision check and the
+                # irreversible cleanup of the previous generation.
+                self._finalizing = True
+                self._require_revision(revision)
+                finalize_task = asyncio.create_task(
+                    asyncio.to_thread(self._store.finalize_activation, profile_id)
+                )
+                try:
+                    await asyncio.shield(finalize_task)
+                    finalized = True
+                except asyncio.CancelledError:
+                    finalized = await self._harvest_finalize(finalize_task)
+                    raise
+                finally:
+                    self._finalizing = False
                 self._activation_error = None
                 self._clear_transient_secrets()
                 self._closed = True
@@ -461,7 +492,7 @@ class SetupController:
             except asyncio.CancelledError:
                 if handle is not None:
                     await asyncio.to_thread(_close_handle, handle)
-                if committed:
+                if committed and not finalized:
                     await self._rollback(profile_id)
                 self._clear_transient_secrets()
                 raise
@@ -474,14 +505,17 @@ class SetupController:
                         await asyncio.to_thread(_close_handle, handle)
                     except BaseException:
                         pass
-                if committed:
+                if committed and not finalized:
                     await self._rollback(profile_id)
                 self._clear_transient_secrets()
-                self._activation_error = (
-                    "runtime validation failed"
-                    if committed
-                    else "configuration save failed"
-                )
+                if isinstance(error, _ConfigurationChanged):
+                    self._activation_error = "configuration changed"
+                else:
+                    self._activation_error = (
+                        "runtime validation failed"
+                        if committed
+                        else "configuration save failed"
+                    )
                 self._review_confirmed = False
                 self._results[SetupStep.REVIEW] = _fixed_result(
                     SetupStep.REVIEW,
@@ -492,6 +526,7 @@ class SetupController:
                     raise
                 failure_message = self._activation_error
             finally:
+                self._finalizing = False
                 self._operation_task = None
             if failure_message is not None:
                 # Raise outside the raw exception handler so neither __cause__ nor
@@ -578,6 +613,24 @@ class SetupController:
             task.add_done_callback(self._close_late_build)
             raise
 
+    async def _harvest_finalize(self, task: asyncio.Task[object]) -> bool:
+        """Observe a non-cancellable store finalize despite repeated cancellation."""
+
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                return False
+        try:
+            task.result()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            return False
+        return True
+
     @staticmethod
     def _close_late_build(task: asyncio.Task[object]) -> None:
         if task.cancelled():
@@ -611,6 +664,74 @@ class SetupController:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             return False
+
+    def _require_revision(self, expected: int) -> None:
+        if self._revision != expected:
+            raise _ConfigurationChanged("configuration changed")
+
+    def _runtime_invalidation_step(
+        self,
+        previous: RuntimePublicConfig | None,
+        current: RuntimePublicConfig,
+        requested: SetupStep,
+    ) -> SetupStep:
+        self._require_step(requested)
+        detected: list[SetupStep] = []
+        field_steps = {
+            SetupStep.ONES: (
+                "ones_base_url",
+                "ones_team_id",
+                "ones_issue_type_id",
+                "ones_comment_list_path_template",
+            ),
+            SetupStep.PROVIDER: (
+                "provider_host",
+                "provider_api_url",
+                "git_author_name",
+                "git_author_email",
+            ),
+            SetupStep.CODEX: ("codex_auth_mode", "codex_home"),
+        }
+        for step, fields in field_steps.items():
+            if previous is None or any(
+                getattr(previous, field_name) != getattr(current, field_name)
+                for field_name in fields
+            ):
+                detected.append(step)
+        return self._earliest_step(requested, *detected)
+
+    def _workflow_invalidation_step(
+        self,
+        previous: WorkflowDraft,
+        current: WorkflowDraft,
+        requested: SetupStep,
+    ) -> SetupStep:
+        self._require_step(requested)
+        field_steps = {
+            "sandbox_permission_profile": SetupStep.PROFILE,
+            "repositories": SetupStep.REPOSITORIES,
+            "repository_groups": SetupStep.REPOSITORIES,
+            "publishing": SetupStep.PROVIDER,
+            "max_codex_attempts": SetupStep.CODEX,
+            "tui_max_concurrency": SetupStep.CODEX,
+            "run_root": SetupStep.PRIVATE_PATHS,
+            "mirror_root": SetupStep.PRIVATE_PATHS,
+            "worktree_root": SetupStep.PRIVATE_PATHS,
+        }
+        detected = tuple(
+            step
+            for field_name, step in field_steps.items()
+            if getattr(previous, field_name) != getattr(current, field_name)
+        )
+        return self._earliest_step(requested, *detected)
+
+    def _earliest_step(
+        self, requested: SetupStep, *detected: SetupStep
+    ) -> SetupStep:
+        return min(
+            (requested, *detected),
+            key=self.STEPS.index,
+        )
 
     def _changed(self, step: SetupStep) -> None:
         self._require_step(step)
@@ -651,6 +772,11 @@ class SetupController:
     def _ensure_open(self) -> None:
         if self._closed:
             raise SetupActionError("setup is closed")
+
+    def _ensure_mutable(self) -> None:
+        self._ensure_open()
+        if self._finalizing:
+            raise SetupActionError("setup operation is in progress")
 
     def _require_step(self, step: SetupStep) -> None:
         if type(step) is not SetupStep or step not in self.STEPS:
