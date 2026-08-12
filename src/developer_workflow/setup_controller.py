@@ -453,11 +453,18 @@ class SetupController:
                 try:
                     document = await asyncio.shield(commit_task)
                 except asyncio.CancelledError:
-                    # The synchronous store transaction cannot be interrupted.  Learn
-                    # whether it committed before propagating cancellation so the new
-                    # generation is never left active accidentally.
-                    document = await asyncio.shield(commit_task)
-                    committed = True
+                    succeeded, harvested, _ = await self._harvest_task(commit_task)
+                    if succeeded:
+                        document = harvested
+                        committed = True
+                    elif candidate is not None:
+                        detection_task = asyncio.create_task(
+                            self._candidate_is_active(candidate.generation)
+                        )
+                        detected, active, _ = await self._harvest_task(
+                            detection_task
+                        )
+                        committed = bool(detected and active)
                     raise
                 committed = True
                 self._require_revision(revision)
@@ -481,7 +488,7 @@ class SetupController:
                     await asyncio.shield(finalize_task)
                     finalized = True
                 except asyncio.CancelledError:
-                    finalized = await self._harvest_finalize(finalize_task)
+                    finalized, _, _ = await self._harvest_task(finalize_task)
                     raise
                 finally:
                     self._finalizing = False
@@ -490,24 +497,36 @@ class SetupController:
                 self._closed = True
                 return handle
             except asyncio.CancelledError:
-                if handle is not None:
-                    await asyncio.to_thread(_close_handle, handle)
-                if committed and not finalized:
-                    await self._rollback(profile_id)
-                self._clear_transient_secrets()
+                cleanup_task = asyncio.create_task(
+                    self._cleanup_save(
+                        handle,
+                        profile_id=profile_id,
+                        rollback=committed and not finalized,
+                    )
+                )
+                await self._harvest_task(cleanup_task)
                 raise
             except BaseException as error:
                 control_flow = isinstance(error, (KeyboardInterrupt, SystemExit))
+                cleanup_cancelled = False
                 if not committed and candidate is not None:
-                    committed = await self._candidate_is_active(candidate.generation)
-                if handle is not None:
-                    try:
-                        await asyncio.to_thread(_close_handle, handle)
-                    except BaseException:
-                        pass
-                if committed and not finalized:
-                    await self._rollback(profile_id)
-                self._clear_transient_secrets()
+                    detection_task = asyncio.create_task(
+                        self._candidate_is_active(candidate.generation)
+                    )
+                    detected, active, interrupted = await self._harvest_task(
+                        detection_task
+                    )
+                    cleanup_cancelled = cleanup_cancelled or interrupted
+                    committed = bool(detected and active)
+                cleanup_task = asyncio.create_task(
+                    self._cleanup_save(
+                        handle,
+                        profile_id=profile_id,
+                        rollback=committed and not finalized,
+                    )
+                )
+                _, _, interrupted = await self._harvest_task(cleanup_task)
+                cleanup_cancelled = cleanup_cancelled or interrupted
                 if isinstance(error, _ConfigurationChanged):
                     self._activation_error = "configuration changed"
                 else:
@@ -524,7 +543,10 @@ class SetupController:
                 )
                 if control_flow:
                     raise
-                failure_message = self._activation_error
+                if cleanup_cancelled:
+                    failure_message = None
+                else:
+                    failure_message = self._activation_error
             finally:
                 self._finalizing = False
                 self._operation_task = None
@@ -532,7 +554,7 @@ class SetupController:
                 # Raise outside the raw exception handler so neither __cause__ nor
                 # __context__ retains a backend exception that could carry a secret.
                 raise SetupActionError(failure_message) from None
-            raise SetupActionError("runtime validation failed") from None
+            raise asyncio.CancelledError from None
 
     def close(self) -> None:
         if self._closed:
@@ -613,23 +635,43 @@ class SetupController:
             task.add_done_callback(self._close_late_build)
             raise
 
-    async def _harvest_finalize(self, task: asyncio.Task[object]) -> bool:
-        """Observe a non-cancellable store finalize despite repeated cancellation."""
+    async def _harvest_task(
+        self, task: asyncio.Task[Any]
+    ) -> tuple[bool, Any | None, bool]:
+        """Wait for one owned task to become terminal despite repeated cancellation."""
 
+        interrupted = False
         while not task.done():
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
+                interrupted = True
                 continue
             except BaseException:
-                return False
+                break
         try:
-            task.result()
+            return True, task.result(), interrupted
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
-            return False
-        return True
+            return False, None, interrupted
+
+    async def _cleanup_save(
+        self,
+        handle: object | None,
+        *,
+        profile_id: str,
+        rollback: bool,
+    ) -> None:
+        """Run all failure cleanup in one child task protected from parent cancellation."""
+
+        try:
+            if handle is not None:
+                await asyncio.to_thread(_close_handle, handle)
+            if rollback:
+                await self._rollback(profile_id)
+        finally:
+            self._clear_transient_secrets()
 
     @staticmethod
     def _close_late_build(task: asyncio.Task[object]) -> None:

@@ -536,8 +536,9 @@ async def test_cancel_during_finalize_harvests_success_without_rollback(
     assert await asyncio.to_thread(store.finalize_started.wait, 2)
 
     task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        task.cancel()
     store.finalize_release.set()
 
     with pytest.raises(asyncio.CancelledError):
@@ -624,3 +625,190 @@ async def test_mutation_during_save_rejects_stale_candidate_and_stays_editable(
     assert store.document.active is not None
     controller.set_secret(SecretKind.ONES_PASSWORD, "REENTERED-TOKEN")
     assert controller.secret_presence(SecretKind.ONES_PASSWORD) is True
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_commit_harvests_and_rolls_back(
+    tmp_path: Path,
+) -> None:
+    class BlockingCommitStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.commit_started = Event()
+            self.commit_release = Event()
+
+        def commit(
+            self, profile_id: str, candidate: ActiveSetup, secrets: RuntimeSecrets
+        ) -> SetupDocument:
+            self.commit_started.set()
+            assert self.commit_release.wait(2)
+            return super().commit(profile_id, candidate, secrets)
+
+    store = BlockingCommitStore()
+    store.commit_release.set()
+    old_controller, _, _, _ = _controller(tmp_path, store=store)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    old_active = store.document.active
+    controller, _, _, _ = _controller(tmp_path, store=store)
+    await _pass_all(controller)
+    store.commit_started.clear()
+    store.commit_release.clear()
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(store.commit_started.wait, 2)
+
+    task.cancel()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        task.cancel()
+    store.commit_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.restores == 1
+    assert store.document.active == old_active
+    assert store.document.previous is None
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_commit_error_after_pointer_write_is_still_rolled_back(
+    tmp_path: Path,
+) -> None:
+    class PostWriteFailingCommitStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.block = False
+            self.commit_started = Event()
+            self.commit_release = Event()
+
+        def commit(
+            self, profile_id: str, candidate: ActiveSetup, secrets: RuntimeSecrets
+        ) -> SetupDocument:
+            if self.block:
+                self.commit_started.set()
+                assert self.commit_release.wait(2)
+            document = super().commit(profile_id, candidate, secrets)
+            if self.block:
+                raise SetupStoreError("configuration save failed")
+            return document
+
+    store = PostWriteFailingCommitStore()
+    old_controller, _, _, _ = _controller(tmp_path, store=store)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    old_active = store.document.active
+    store.block = True
+    controller, _, _, _ = _controller(tmp_path, store=store)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(store.commit_started.wait, 2)
+
+    task.cancel()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        task.cancel()
+    store.commit_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.restores == 1
+    assert store.document.active == old_active
+    assert store.document.previous is None
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_after_finalize_completes_all_cleanup(
+    tmp_path: Path,
+) -> None:
+    class BlockingCloseHandle(Handle):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = Event()
+            self.close_release = Event()
+
+        def close(self) -> None:
+            self.close_started.set()
+            assert self.close_release.wait(2)
+            super().close()
+
+    class BlockingFinalizeStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.finalize_started = Event()
+            self.finalize_release = Event()
+
+        def finalize_activation(self, profile_id: str) -> SetupDocument:
+            self.finalize_started.set()
+            assert self.finalize_release.wait(2)
+            return super().finalize_activation(profile_id)
+
+    store = BlockingFinalizeStore()
+    builder = FakeRuntimeBuilder()
+    builder.handle = BlockingCloseHandle()
+    controller, _, _, _ = _controller(tmp_path, store=store, builder=builder)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(store.finalize_started.wait, 2)
+    task.cancel()
+    store.finalize_release.set()
+    assert await asyncio.to_thread(builder.handle.close_started.wait, 2)
+
+    task.cancel()
+    for _ in range(8):
+        await asyncio.sleep(0)
+        task.cancel()
+    builder.handle.close_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.finalizes == 1
+    assert store.restores == 0
+    assert store.document.active is not None
+    assert store.document.previous is None
+    assert builder.handle.closed == 1
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancel_during_rollback_waits_for_pointer_restoration(
+    tmp_path: Path,
+) -> None:
+    class BlockingRestoreStore(FakeStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.restore_started = Event()
+            self.restore_release = Event()
+
+        def restore_previous(self, profile_id: str) -> SetupDocument:
+            self.restore_started.set()
+            assert self.restore_release.wait(2)
+            return super().restore_previous(profile_id)
+
+    store = BlockingRestoreStore()
+    old_controller, _, _, _ = _controller(tmp_path, store=store)
+    await _pass_all(old_controller)
+    await old_controller.save_and_activate(confirmed=True)
+    old_active = store.document.active
+    builder = BlockingMutationBuilder()
+    controller, _, _, _ = _controller(tmp_path, store=store, builder=builder)
+    await _pass_all(controller)
+    task = asyncio.create_task(controller.save_and_activate(confirmed=True))
+    assert await asyncio.to_thread(builder.started.wait, 2)
+    task.cancel()
+    assert await asyncio.to_thread(store.restore_started.wait, 2)
+
+    for _ in range(8):
+        task.cancel()
+        await asyncio.sleep(0)
+    store.restore_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert store.document.active == old_active
+    assert store.document.previous is None
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD) is False
+    builder.release.set()
+    await asyncio.sleep(0.05)
+    assert builder.handle.closed == 1
