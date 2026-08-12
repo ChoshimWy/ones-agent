@@ -13,7 +13,7 @@ import subprocess
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -1044,6 +1044,9 @@ class CodexRunner:
     run_root: Path
     repository: RepositoryGuard | WorktreeRepository
     command_executor: CommandExecutor = field(default=_bounded_subprocess, repr=False)
+    environment_provider: Callable[[], Mapping[str, str]] = field(
+        default=lambda: os.environ, repr=False
+    )
     schema_path: Path = field(
         default_factory=lambda: Path(__file__).with_name("schemas") / "workflow-result.schema.json",
         init=False,
@@ -1062,6 +1065,8 @@ class CodexRunner:
         for value in (self.max_prompt_bytes, self.max_output_bytes):
             if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
                 raise ValueError("Codex size limits must be positive integers")
+        if not callable(self.environment_provider):
+            raise ValueError("Codex environment provider is invalid")
         try:
             schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
             Draft202012Validator.check_schema(schema)
@@ -1235,11 +1240,22 @@ class CodexRunner:
         prompt_bytes = prompt.encode("utf-8", "strict")
         if not prompt.strip() or len(prompt_bytes) > self.max_prompt_bytes or "\x00" in prompt:
             raise UnsafeCodexRunError("prompt is empty, invalid, or exceeds its size limit")
-        codex_home = _resolve_codex_home(os.environ)
+        try:
+            source = self.environment_provider()
+            if not isinstance(source, Mapping) or any(
+                type(key) is not str or type(value) is not str
+                for key, value in source.items()
+            ):
+                raise TypeError
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            raise UnsafeCodexRunError("Codex environment is unavailable") from None
+        codex_home = _resolve_codex_home(source)
         run_directory = self._prepare_run_directory(run_id)
         effective_cwd = cwd or run_directory
         isolation_root = self._prepare_isolation_directory(run_directory)
-        safe_env, removed_secrets = _safe_environment(os.environ, isolation_root, codex_home)
+        safe_env, removed_secrets = _safe_environment(source, isolation_root, codex_home)
         if any(secret in prompt for secret in removed_secrets):
             raise UnsafeCodexRunError("prompt contains credential material")
         self._write_prompt(run_directory / "codex-prompt.txt", prompt_bytes)

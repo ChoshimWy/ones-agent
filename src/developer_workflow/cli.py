@@ -524,136 +524,21 @@ def build_production_orchestrator(
     ),
 ) -> DeveloperWorkflowOrchestrator:
     """Build the real local service graph from config plus explicit secret env vars."""
-
     from config.settings import OnesSettings
-    from src.services.ones_gateway import OnesGateway
 
-    from .approval_rebuilder import WorkflowApprovalRebuilder
-    from .codex_runner import CodexRunner, validate_codex_auth_source
-    from .defect_flow import DefectCandidateService, DefectFlow
-    from .ones_comment import OnesCommenter
-    from .pr_provider import HttpPullRequestClient, parse_repository_identity
-    from .publisher import Publisher
-    from .private_paths import prepare_private_roots
-    from .repository import WorktreeRepository, validate_git_identity_environment
-    from .repository_group import RepositoryGroupWorkspace
-    from .requirement_flow import RequirementFlow, SandboxCommandExecutor
-    from .state_store import FileRunStore
+    from .runtime_bootstrap import RuntimeBootstrapper, legacy_runtime_inputs
 
-    settings = OnesSettings()
-    provider_token = os.environ.get("ONES_DEV_PROVIDER_TOKEN", "")
-    provider_host = os.environ.get("ONES_DEV_PROVIDER_HOST", "").casefold()
-    provider_api = os.environ.get("ONES_DEV_PROVIDER_API_URL", "")
-    author_name = os.environ.get("ONES_DEV_GIT_AUTHOR_NAME", "")
-    author_email = os.environ.get("ONES_DEV_GIT_AUTHOR_EMAIL", "")
-    try:
-        provider_url = urlsplit(provider_api.rstrip("/"))
-        ones_url = urlsplit(settings.base_url.rstrip("/"))
-    except ValueError:
-        provider_url = ones_url = urlsplit("")
-    credential_names = ("GIT_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "SSH_ASKPASS", "SSH_AUTH_SOCK")
-    git_credential_values = {
-        name: value
-        for name in credential_names
-        if (value := os.environ.get(f"ONES_DEV_{name}", ""))
-    }
-    if not (
-        ones_url.scheme in {"http", "https"}
-        and ones_url.hostname is not None
-        and ones_url.username is None
-        and ones_url.password is None
-        and not ones_url.query
-        and not ones_url.fragment
-        and settings.team_id
-        and settings.issue_type_id
-        and _valid_runtime_text(settings.email)
-        and _valid_runtime_text(settings.password)
-        and _valid_comment_path_template(settings.comment_list_path_template)
-        and _valid_runtime_text(provider_token)
-        and _valid_runtime_text(provider_host)
-        and provider_url.scheme == "https"
-        and provider_url.hostname is not None
-        and provider_url.hostname.casefold() == provider_host
-        and provider_url.username is None
-        and provider_url.password is None
-        and not provider_url.query
-        and not provider_url.fragment
-        and _valid_runtime_text(author_name)
-        and _valid_runtime_text(author_email)
-        and all(_valid_runtime_text(value) for value in git_credential_values.values())
-        and config.publishing.provider.value in {"github", "gitlab"}
-    ):
-        raise RuntimeError("production runtime configuration is incomplete")
-    for mapping in (
-        *config.repositories,
-        *(repository for group in config.repository_groups for repository in group.repositories),
-    ):
-        parse_repository_identity(mapping.repo_url, provider_host)
-
-    identity_values = {
-        "GIT_AUTHOR_NAME": author_name,
-        "GIT_AUTHOR_EMAIL": author_email,
-        "GIT_COMMITTER_NAME": author_name,
-        "GIT_COMMITTER_EMAIL": author_email,
-    }
-    try:
-        validate_git_identity_environment(identity_values)
-        validate_codex_auth_source(os.environ)
-        sandbox_profile_validator(config.sandbox_permission_profile)
-    except Exception:
-        raise RuntimeError("production runtime configuration is incomplete") from None
-
-    run_root, mirror_root, worktree_root = prepare_private_roots(
-        (config.run_root, config.mirror_root, config.worktree_root)
+    environment = dict(os.environ)
+    active, secrets = legacy_runtime_inputs(
+        config, environment, ones_settings=OnesSettings()
     )
-
-    def git_credentials() -> dict[str, str]:
-        return dict(git_credential_values)
-
-    def git_identity() -> dict[str, str]:
-        return dict(identity_values)
-
-    store = FileRunStore(run_root)
-    repository = WorktreeRepository(
-        mirror_root,
-        worktree_root,
-        credential_env_provider=git_credentials,
-        identity_env_provider=git_identity,
+    bootstrapper = RuntimeBootstrapper(
+        ambient_environment=lambda: environment,
+        sandbox_profile_validator=lambda profile, runtime_environment: (
+            sandbox_profile_validator(profile)
+        ),
     )
-    gateway = OnesGateway(settings=settings)
-    codex = CodexRunner(run_root, repository)
-    test_runner = SandboxCommandExecutor(
-        permission_profile=config.sandbox_permission_profile
-    )
-    group_workspace = RepositoryGroupWorkspace(repository)
-    requirement_flow = RequirementFlow(
-        store, gateway, config, repository, codex, test_runner,
-        group_workspace=group_workspace,
-    )
-    defect_flow = DefectFlow(
-        store, config, repository, codex, test_runner,
-        group_workspace=group_workspace,
-    )
-    candidates = DefectCandidateService(gateway, settings.issue_type_id)
-    pr_client = HttpPullRequestClient(
-        provider=config.publishing.provider.value,
-        provider_host=provider_host,
-        api_base_url=provider_api,
-        token_provider=lambda: os.environ.get("ONES_DEV_PROVIDER_TOKEN", ""),
-    )
-    commenter = OnesCommenter(gateway, store)
-    publisher = Publisher(
-        store,
-        repository,
-        WorkflowApprovalRebuilder(gateway, repository),
-        pr_client,
-        commenter,
-        config.publishing.provider.value,
-        provider_host,
-    )
-    return DeveloperWorkflowOrchestrator(
-        store, requirement_flow, defect_flow, publisher, config, candidates
-    )
+    return bootstrapper.build(active, secrets).orchestrator
 
 
 class _ProductionDefectListClient:

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -829,6 +830,42 @@ def test_production_factory_builds_the_real_service_graph_without_network(
     assert isinstance(orchestrator.publisher, Publisher)
     assert orchestrator.requirement_flow.store is orchestrator.store
     assert orchestrator.defect_flow.repository is orchestrator.requirement_flow.repository
+
+
+def test_production_factory_delegates_legacy_environment_to_runtime_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.cli import build_production_orchestrator
+    from src.developer_workflow import runtime_bootstrap
+
+    _set_complete_non_ones_runtime(monkeypatch)
+    monkeypatch.setenv("ONES_EMAIL", "developer@example.invalid")
+    monkeypatch.setenv("ONES_PASSWORD", "runtime-password")
+    monkeypatch.setenv(
+        "ONES_COMMENT_LIST_PATH_TEMPLATE",
+        "/project/api/project/team/{team_id}/task/{item_id}/comments",
+    )
+    expected = object()
+    calls: list[tuple[object, object]] = []
+
+    class RecordingBootstrapper:
+        def __init__(self, **kwargs: object) -> None:
+            assert "sandbox_profile_validator" in kwargs
+            assert "ambient_environment" in kwargs
+
+        def build(self, active: object, secrets: object) -> object:
+            calls.append((active, secrets))
+            return SimpleNamespace(orchestrator=expected)
+
+    monkeypatch.setattr(runtime_bootstrap, "RuntimeBootstrapper", RecordingBootstrapper)
+
+    result = build_production_orchestrator(
+        DeveloperWorkflowConfig.load(_config_file(tmp_path)),
+        sandbox_profile_validator=lambda profile: None,
+    )
+
+    assert result is expected
+    assert len(calls) == 1
 
 
 def test_production_factory_rejects_invalid_git_email_before_creating_roots(
