@@ -7,6 +7,7 @@ import os
 import re
 import stat
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from pydantic import ValidationError
@@ -28,6 +29,13 @@ from .setup_validation import ReadOnlyRepositoryInspector
 _KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _MAX_GIT_CONFIG_BYTES = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _SourceVerificationToken:
+    source: Path
+    identity: tuple[int, int]
+    snapshot: object
 
 
 def _fail(message: str) -> None:
@@ -190,9 +198,9 @@ def _validate_source(
     *,
     inspector: ReadOnlyRepositoryInspector,
     timeout_seconds: int,
-) -> None:
+) -> _SourceVerificationToken | None:
     if mapping.source_path is None:
-        return
+        return None
     try:
         source, initial_identity = _initial_source_identity(mapping.source_path)
         before = inspector.snapshot(source, timeout=float(timeout_seconds))
@@ -208,7 +216,46 @@ def _validate_source(
         else:
             inspector.ls_remote(source, mapping.repo_url, timeout=float(timeout_seconds))
         after = inspector.snapshot(source, timeout=float(timeout_seconds))
-        if before != after or source != mapping.source_path.resolve(strict=True):
+        final_source, final_identity = _initial_source_identity(mapping.source_path)
+        if (
+            before != after
+            or final_source != source
+            or final_identity != initial_identity
+            or getattr(after, "root_identity", None) != initial_identity
+        ):
+            raise ValueError
+        return _SourceVerificationToken(source, initial_identity, after)
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        raise SetupValidationError("repository source is invalid") from None
+
+
+def _revalidate_source(
+    mapping: RepositoryMapping,
+    token: _SourceVerificationToken | None,
+    *,
+    inspector: ReadOnlyRepositoryInspector,
+    timeout_seconds: int,
+) -> None:
+    if mapping.source_path is None:
+        if token is not None:
+            raise SetupValidationError("repository source is invalid")
+        return
+    if token is None:
+        raise SetupValidationError("repository source is invalid")
+    try:
+        source, identity = _initial_source_identity(mapping.source_path)
+        if source != token.source or identity != token.identity:
+            raise ValueError
+        snapshot = inspector.snapshot(source, timeout=float(timeout_seconds))
+        final_source, final_identity = _initial_source_identity(mapping.source_path)
+        if (
+            snapshot != token.snapshot
+            or final_source != token.source
+            or final_identity != token.identity
+            or getattr(snapshot, "root_identity", None) != token.identity
+        ):
             raise ValueError
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -333,6 +380,7 @@ class RepositoryGroupDraftBuilder:
             iteration_id = self._iteration_id or first.iteration_id
             key = self._key or primary
             repositories: list[RepositoryMapping] = []
+            tokens: list[_SourceVerificationToken | None] = []
             for repository in self._repositories.values():
                 copied = RepositoryMapping.model_validate(repository.model_dump(round_trip=True))
                 copied = copied.validated_update(
@@ -342,12 +390,21 @@ class RepositoryGroupDraftBuilder:
                         else RepositoryRole.DEPENDENCY
                     )
                 )
-                _validate_source(
-                    copied,
+                tokens.append(
+                    _validate_source(
+                        copied,
+                        inspector=self._inspector,
+                        timeout_seconds=self._timeout_seconds,
+                    )
+                )
+                repositories.append(copied)
+            for repository, token in zip(repositories, tokens, strict=True):
+                _revalidate_source(
+                    repository,
+                    token,
                     inspector=self._inspector,
                     timeout_seconds=self._timeout_seconds,
                 )
-                repositories.append(copied)
             group = RepositoryGroupMapping.model_validate(
                 {
                     "key": key, "project_id": project_id, "iteration_id": iteration_id,

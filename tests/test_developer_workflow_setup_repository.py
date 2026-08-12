@@ -193,6 +193,37 @@ def test_source_replacement_before_first_snapshot_fails_closed(tmp_path: Path) -
             displaced.rename(source)
 
 
+def test_source_replacement_after_second_snapshot_fails_closed(tmp_path: Path) -> None:
+    source, remote = _source_and_remote(tmp_path, "source")
+    replacement, _ = _source_and_remote(tmp_path, "replacement")
+    _git("remote", "set-url", "origin", str(remote), cwd=replacement)
+    displaced = tmp_path / "displaced"
+
+    class LateReplacingInspector(ReadOnlyRepositoryInspector):
+        snapshots = 0
+
+        def snapshot(self, path: Path, *, timeout: float = 10.0):
+            result = super().snapshot(path, timeout=timeout)
+            self.snapshots += 1
+            if self.snapshots == 2:
+                source.rename(displaced)
+                replacement.rename(source)
+            return result
+
+    try:
+        with pytest.raises(SetupValidationError, match="repository source is invalid"):
+            build_repository(
+                key="app", project_id="project", iteration_id="iteration",
+                repo_url=str(remote), repo_name="app", source_path=source,
+                repository_inspector=LateReplacingInspector(),
+            )
+    finally:
+        if source.exists():
+            source.rename(replacement)
+        if displaced.exists():
+            displaced.rename(source)
+
+
 def test_group_builder_rejects_cycle_missing_self_and_duplicate_keys() -> None:
     cases = (
         (_repo("app", depends_on=("sdk",)), _repo("sdk", depends_on=("app",))),
@@ -257,6 +288,39 @@ def test_group_key_may_explicitly_equal_repository_key() -> None:
     builder.add(_repo("app"))
 
     assert builder.build(primary="app").key == "app"
+
+
+def test_group_revalidates_earlier_sources_after_all_repository_probes(
+    tmp_path: Path,
+) -> None:
+    sdk, sdk_remote = _source_and_remote(tmp_path, "sdk")
+    app, app_remote = _source_and_remote(tmp_path, "app")
+
+    class MutatingLaterInspector(ReadOnlyRepositoryInspector):
+        mutated = False
+
+        def snapshot(self, path: Path, *, timeout: float = 10.0):
+            if path == app and not self.mutated:
+                self.mutated = True
+                (sdk / "tracked.txt").write_text("changed-later\n", encoding="utf-8")
+            return super().snapshot(path, timeout=timeout)
+
+    builder = RepositoryGroupDraftBuilder(
+        key="suite", repository_inspector=MutatingLaterInspector()
+    )
+    builder.add(RepositoryMapping(
+        key="sdk", project_id="project", iteration_id="iteration",
+        repo_url=str(sdk_remote), repo_name="sdk", source_path=sdk,
+        role=RepositoryRole.DEPENDENCY,
+    ))
+    builder.add(RepositoryMapping(
+        key="app", project_id="project", iteration_id="iteration",
+        repo_url=str(app_remote), repo_name="app", source_path=app,
+        role=RepositoryRole.PRIMARY, depends_on=("sdk",),
+    ))
+
+    with pytest.raises(SetupValidationError, match="repository source is invalid"):
+        builder.build(primary="app")
 
 
 def test_inputs_are_strict_and_builder_copies_mutable_sequences() -> None:
