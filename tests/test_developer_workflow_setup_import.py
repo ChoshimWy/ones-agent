@@ -521,6 +521,112 @@ def test_windows_source_with_inherited_writable_acl_is_rejected(
         parse_dotenv(dotenv)
 
 
+def test_buffer_allocation_failure_closes_open_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / "allocation.env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+    opened: list[int] = []
+    original_open = setup_import._open_source_readonly
+
+    def capture(path: Path) -> int:
+        descriptor = original_open(path)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_allocation(_size: int) -> bytearray:
+        raise MemoryError("TOKEN-ALLOCATION")
+
+    monkeypatch.setattr(setup_import, "_open_source_readonly", capture)
+    monkeypatch.setattr(setup_import, "_allocate_buffer", fail_allocation)
+    with pytest.raises(SetupImportError, match="^dotenv path is unsafe$") as caught:
+        parse_dotenv(dotenv)
+    assert caught.value.__cause__ is None
+    assert "TOKEN" not in repr(caught.value.__context__)
+    assert len(opened) == 1
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_close_failure_still_zeroes_content_and_closes_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / "close.env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+    opened: list[int] = []
+    zeroed: list[bytes] = []
+    original_open = setup_import._open_source_readonly
+    original_zero = setup_import._zero_buffer
+
+    def capture(path: Path) -> int:
+        descriptor = original_open(path)
+        opened.append(descriptor)
+        return descriptor
+
+    def close_then_fail(descriptor: int) -> None:
+        os.close(descriptor)
+        raise OSError("TOKEN-CLOSE")
+
+    def observe(value: bytearray) -> None:
+        original_zero(value)
+        zeroed.append(bytes(value))
+
+    monkeypatch.setattr(setup_import, "_open_source_readonly", capture)
+    monkeypatch.setattr(setup_import, "_close_descriptor", close_then_fail)
+    monkeypatch.setattr(setup_import, "_zero_buffer", observe)
+    with pytest.raises(SetupImportError, match="^dotenv path is unsafe$") as caught:
+        parse_dotenv(dotenv)
+    assert "TOKEN" not in repr(caught.value.__context__)
+    assert zeroed and all(set(item) <= {0} for item in zeroed)
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
+def test_read_error_precedes_close_error_without_sensitive_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / "read-close.env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+
+    def fail_read(_reader: object, _target: memoryview) -> int:
+        raise ValueError("TOKEN-READ")
+
+    def close_then_fail(descriptor: int) -> None:
+        os.close(descriptor)
+        raise OSError("TOKEN-CLOSE")
+
+    monkeypatch.setattr(setup_import, "_read_into", fail_read)
+    monkeypatch.setattr(setup_import, "_close_descriptor", close_then_fail)
+    with pytest.raises(SetupImportError, match="^dotenv file is invalid$") as caught:
+        parse_dotenv(dotenv)
+    assert caught.value.__cause__ is None
+    assert "TOKEN" not in repr(caught.value.__context__)
+
+
+def test_successful_read_closes_descriptor_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / "success.env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+    closes: list[int] = []
+
+    def close_once(descriptor: int) -> None:
+        closes.append(descriptor)
+        os.close(descriptor)
+
+    monkeypatch.setattr(setup_import, "_close_descriptor", close_once)
+    assert parse_dotenv(dotenv) == {"ONES_PASSWORD": "TOKEN"}
+    assert len(closes) == 1
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows reparse-point coverage")
 def test_windows_reparse_dotenv_is_rejected(tmp_path: Path) -> None:
     target = tmp_path / "target"

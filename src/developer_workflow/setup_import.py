@@ -400,40 +400,65 @@ def _read_bounded(path: Path, *, missing_ok: bool) -> bytearray | None:
         descriptor = _open_source_readonly(candidate)
     except FileNotFoundError:
         raise OSError from None
-    content = bytearray()
-    scratch = bytearray(_READ_CHUNK)
-    succeeded = False
+    content: bytearray | None = None
+    scratch: bytearray | None = None
+    failure: BaseException | None = None
     try:
-        opened = _descriptor_identity(descriptor)
-        if opened[:2] != expected[:2]:
-            raise OSError
-        if opened[2] > _MAX_SOURCE_BYTES:
-            raise ValueError
-        total = 0
-        reader = io.FileIO(descriptor, mode="rb", closefd=False)
         try:
-            while True:
-                limit = min(_READ_CHUNK, _MAX_SOURCE_BYTES + 1 - total)
-                count = reader.readinto(memoryview(scratch)[:limit])
-                if not count:
-                    break
-                content.extend(memoryview(scratch)[:count])
-                total += count
-                _zero_buffer(scratch)
-                if total > _MAX_SOURCE_BYTES:
-                    raise ValueError
-        finally:
-            reader.close()
-        final = _descriptor_identity(descriptor)
-        if final != opened or total != opened[2]:
-            raise OSError
-        succeeded = True
-    except BaseException:
-        _zero_buffer(content)
-        raise
+            content = _allocate_buffer(0)
+            scratch = _allocate_buffer(_READ_CHUNK)
+            opened = _descriptor_identity(descriptor)
+            if opened[:2] != expected[:2]:
+                raise OSError
+            if opened[2] > _MAX_SOURCE_BYTES:
+                raise ValueError
+            total = 0
+            reader = io.FileIO(descriptor, mode="rb", closefd=False)
+            reader_failure: BaseException | None = None
+            try:
+                while True:
+                    limit = min(_READ_CHUNK, _MAX_SOURCE_BYTES + 1 - total)
+                    count = _read_into(reader, memoryview(scratch)[:limit])
+                    if not count:
+                        break
+                    content.extend(memoryview(scratch)[:count])
+                    total += count
+                    _zero_buffer(scratch)
+                    if total > _MAX_SOURCE_BYTES:
+                        raise ValueError
+            except BaseException as error:
+                reader_failure = error
+            try:
+                reader.close()
+            except BaseException as error:
+                if reader_failure is None:
+                    reader_failure = error
+            if reader_failure is not None:
+                raise reader_failure
+            final = _descriptor_identity(descriptor)
+            if final != opened or total != opened[2]:
+                raise OSError
+        except BaseException as error:
+            failure = error
     finally:
-        _zero_buffer(scratch)
-        os.close(descriptor)
+        if scratch is not None:
+            _zero_buffer(scratch)
+        if failure is not None and content is not None:
+            _zero_buffer(content)
+        try:
+            _close_descriptor(descriptor)
+        except BaseException as error:
+            if content is not None:
+                _zero_buffer(content)
+            if failure is None:
+                failure = error
+    if failure is not None:
+        if isinstance(failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise failure
+        if isinstance(failure, ValueError):
+            raise ValueError("source data is invalid") from None
+        raise OSError("source path is unsafe") from None
+    assert content is not None
     try:
         if _path_identity(candidate) != expected:
             raise OSError
@@ -443,10 +468,19 @@ def _read_bounded(path: Path, *, missing_ok: bool) -> bytearray | None:
     except BaseException:
         _zero_buffer(content)
         raise
-    if not succeeded:
-        _zero_buffer(content)
-        raise OSError
     return content
+
+
+def _allocate_buffer(size: int) -> bytearray:
+    return bytearray(size)
+
+
+def _read_into(reader: io.FileIO, target: memoryview) -> int:
+    return reader.readinto(target)
+
+
+def _close_descriptor(descriptor: int) -> None:
+    os.close(descriptor)
 
 
 def _open_source_readonly(path: Path) -> int:
