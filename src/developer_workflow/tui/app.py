@@ -207,6 +207,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                 activation_callback=self._activate_setup_candidate,
                 cancel_callback=self._cancel_setup,
                 import_context=self._setup_import,
+                import_discard_callback=self._discard_setup_import,
             )
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -214,6 +215,12 @@ class DeveloperWorkflowTuiApp(App[None]):
             screen = SetupRootScreen(self.setup_controller)
         self._setup_screen = screen
         await self.push_screen(screen, self._setup_done)
+
+    def _discard_setup_import(self) -> None:
+        context = self._setup_import
+        self._setup_import = None
+        if context is not None:
+            context.discard()
 
     async def _show_recovery(self, recovery_state: object) -> None:
         assert self.setup_controller is not None

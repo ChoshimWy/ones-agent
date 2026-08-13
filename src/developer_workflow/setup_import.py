@@ -96,11 +96,10 @@ def detect_import_sources(
 
     if environment is None:
         raise SetupImportError("import source is invalid")
-    environment_values = _copy_string_mapping(environment)
     dotenv_values = {} if dotenv_path is None else parse_dotenv(dotenv_path)
     template_available = _validate_template(template_config_path)
     return ImportDetection(
-        environment=_detected_kinds(environment_values),
+        environment=_detected_environment_kinds(environment),
         dotenv=_detected_kinds(dotenv_values),
         template_available=template_available,
     )
@@ -231,6 +230,31 @@ def import_selected(
         raise SetupImportError("import source is invalid") from None
 
 
+def selected_environment_values(
+    selected: tuple[SecretKind, ...],
+    environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Read only the explicitly selected allowlisted environment names."""
+
+    source = os.environ if environment is None else environment
+    if type(selected) is not tuple or any(type(kind) is not SecretKind for kind in selected):
+        raise SetupImportError("credential selection is invalid")
+    result: dict[str, str] = {}
+    try:
+        for kind in selected:
+            name = _name_for_kind(kind)
+            value = source.get(name, "")
+            if type(value) is not str:
+                raise SetupImportError("import source is invalid")
+            result[name] = value
+        return result
+    except SetupImportError:
+        for name in tuple(result):
+            result[name] = ""
+        result.clear()
+        raise
+
+
 def _copy_string_mapping(values: Mapping[str, str]) -> dict[str, str]:
     if not isinstance(values, Mapping):
         raise SetupImportError("import source is invalid")
@@ -282,6 +306,26 @@ def _detected_kinds(values: Mapping[str, str]) -> tuple[SecretKind, ...]:
         for name, kind in _ENVIRONMENT_SECRET_KINDS.items()
         if bool(values.get(name, ""))
     )
+
+
+def _detected_environment_kinds(values: Mapping[str, str]) -> tuple[SecretKind, ...]:
+    if not isinstance(values, Mapping):
+        raise SetupImportError("import source is invalid")
+    detected: list[SecretKind] = []
+    try:
+        for name, kind in _ENVIRONMENT_SECRET_KINDS.items():
+            value = values.get(name, "")
+            if type(value) is not str:
+                raise SetupImportError("import source is invalid")
+            if value:
+                detected.append(kind)
+    except SetupImportError:
+        raise
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        raise SetupImportError("import source is invalid") from None
+    return tuple(detected)
 
 
 def _name_for_kind(kind: SecretKind) -> str:
@@ -653,4 +697,5 @@ __all__ = [
     "import_selected",
     "load_template_workflow",
     "parse_dotenv",
+    "selected_environment_values",
 ]

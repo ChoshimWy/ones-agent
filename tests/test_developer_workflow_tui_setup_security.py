@@ -373,8 +373,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         runtime_bootstrapper=object(),
         setup_import=SetupImportContext(
             detection=ImportDetection((), (), True),
-            environment={},
-            dotenv_values={},
+            dotenv_path=None,
             template_workflow=WorkflowDraft.model_validate(
                 original.config.model_dump(mode="python", round_trip=True)
             ),
@@ -410,6 +409,8 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         app.screen.query_one("#confirm-import", Button).focus()
         await pilot.press("enter")
         assert isinstance(app.screen, SetupWizardScreen)
+        assert app._setup_import is None
+        assert app.screen._import_context is None
         assert setup.draft.workflow.repository_groups == original.config.repository_groups
 
         await _set_inputs(app, {"sandbox-profile": profile})
@@ -696,16 +697,19 @@ async def test_setup_surface_auditor_detects_a_deliberate_raw_and_rich_leak() ->
 
 
 @pytest.mark.asyncio
-async def test_setup_import_requires_visible_selection_and_confirmation() -> None:
+async def test_setup_import_requires_visible_selection_and_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
+    monkeypatch.setenv("ONES_EMAIL", SECRETS["email"])
+    monkeypatch.setenv("ONES_PASSWORD", SECRETS["ones"])
     context = SetupImportContext(
         detection=ImportDetection(
             environment=(SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD),
             dotenv=(SecretKind.ONES_PASSWORD, SecretKind.PROVIDER_TOKEN),
             template_available=True,
         ),
-        environment={"ONES_EMAIL": SECRETS["email"], "ONES_PASSWORD": SECRETS["ones"]},
-        dotenv_values={"ONES_PASSWORD": "dotenv-secret", "ONES_DEV_PROVIDER_TOKEN": SECRETS["provider"]},
+        dotenv_path=None,
         template_workflow=WorkflowDraft(sandbox_permission_profile="managed-template"),
     )
     app = DeveloperWorkflowTuiApp(
@@ -716,6 +720,9 @@ async def test_setup_import_requires_visible_selection_and_confirmation() -> Non
     )
     async with app.run_test(size=(140, 40)) as pilot:
         assert setup.import_calls == []
+        assert not hasattr(context, "environment")
+        assert not hasattr(context, "dotenv_values")
+        assert not any(secret in repr(context) + repr(app) for secret in SECRETS.values())
         await pilot.click("#review-imports")
         assert app.screen.id == "setup-import"
         rendered = str(app.screen.query_one("#import-summary").render())
@@ -730,12 +737,70 @@ async def test_setup_import_requires_visible_selection_and_confirmation() -> Non
         call = setup.import_calls[0]
         assert call["selected"] == (SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD)
         assert set(call["source_choice"].values()) == {"environment"}
+        assert context.consumed is True
+        assert app._setup_import is None
+        assert app.screen._import_context is None
+        assert call["environment"] == {}
+        with pytest.raises(RuntimeError, match="import source is unavailable"):
+            context.import_into(setup, "environment")
 
 
 def test_repository_command_input_supports_multiple_safe_entries() -> None:
     assert SetupWizardScreen._command_values(
         "uv run ruff check .;;uv run pytest -q"
     ) == ("uv run ruff check .", "uv run pytest -q")
+
+
+@pytest.mark.asyncio
+async def test_setup_import_cancel_discards_descriptor_without_reading_plaintext(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(f"ONES_PASSWORD={SECRETS['ones']}\n", encoding="utf-8")
+    context = SetupImportContext(
+        detection=ImportDetection((), (SecretKind.ONES_PASSWORD,), False),
+        dotenv_path=dotenv,
+    )
+    reads: list[Path] = []
+    monkeypatch.setattr(
+        "src.developer_workflow.tui.setup_screens.parse_dotenv",
+        lambda path: reads.append(path) or {},
+    )
+    setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        setup_import=context,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert SECRETS["ones"] not in repr(context) + repr(app)
+        await pilot.click("#review-imports")
+        await pilot.press("escape")
+        assert reads == []
+        assert context.consumed is True
+        assert context.dotenv_path is None
+        assert app._setup_import is None
+
+
+@pytest.mark.asyncio
+async def test_setup_wizard_unmount_discards_unconsumed_import_context() -> None:
+    context = SetupImportContext(
+        detection=ImportDetection((), (), False),
+        dotenv_path=Path("unopened.env"),
+    )
+    setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        setup_import=context,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(120, 32)):
+        assert context.consumed is False
+    assert context.consumed is True
+    assert context.dotenv_path is None
+    assert app._setup_import is None
 
 
 def test_setup_release_policy_declares_resources_and_private_exclusions() -> None:

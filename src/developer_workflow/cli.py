@@ -615,7 +615,6 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
         ImportDetection,
         detect_import_sources,
         load_template_workflow,
-        parse_dotenv,
     )
     from .setup_models import WorkflowDraft
     from .setup_store import SetupStore
@@ -630,7 +629,6 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
         dotenv_path=dotenv_path,
         environment=environment,
     )
-    dotenv_values = parse_dotenv(dotenv_path)
     template = load_template_workflow(template_path)
     detection = ImportDetection(
         environment=detected.environment,
@@ -639,8 +637,7 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     )
     import_context = SetupImportContext(
         detection=detection,
-        environment=environment,
-        dotenv_values=dotenv_values,
+        dotenv_path=dotenv_path,
         template_workflow=(
             None
             if template is None

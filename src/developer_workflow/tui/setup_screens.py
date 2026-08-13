@@ -26,7 +26,11 @@ from ..setup_models import (
     WorkflowDraft,
 )
 from ..setup_controller import SetupStepTransaction
-from ..setup_import import ImportDetection
+from ..setup_import import (
+    ImportDetection,
+    parse_dotenv,
+    selected_environment_values,
+)
 from ..setup_repository import RepositoryGroupDraftBuilder, build_repository
 from ..setup_validation import SetupStep, ValidationStatus
 from .setup_models import build_setup_step_view, setup_step_label
@@ -45,21 +49,75 @@ _RESULT_TEXT = {
 }
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(slots=True, repr=False)
 class SetupImportContext:
     """Host-owned import material; only metadata is ever rendered."""
 
     detection: ImportDetection
-    environment: Mapping[str, str]
-    dotenv_values: Mapping[str, str]
+    dotenv_path: Path | None
     template_workflow: WorkflowDraft | None = None
+    _consumed: bool = False
 
     def __repr__(self) -> str:
         return "SetupImportContext(<redacted>)"
 
+    @property
+    def consumed(self) -> bool:
+        return self._consumed
+
+    def discard(self) -> None:
+        self._consumed = True
+        self.dotenv_path = None
+        self.template_workflow = None
+
+    def import_into(self, controller: object, source: str) -> None:
+        if self._consumed:
+            raise RuntimeError("import source is unavailable")
+        self._consumed = True
+        environment: dict[str, str] = {}
+        dotenv: dict[str, str] = {}
+        try:
+            if source == "template":
+                if self.template_workflow is None:
+                    raise RuntimeError("import source is unavailable")
+                controller.apply_workflow(
+                    self.template_workflow.model_copy(deep=True),
+                    changed_step=SetupStep.PROFILE,
+                )
+                return
+            kinds = (
+                self.detection.environment
+                if source == "environment"
+                else self.detection.dotenv if source == "dotenv" else ()
+            )
+            if not kinds:
+                raise RuntimeError("import source is unavailable")
+            if source == "environment":
+                environment = selected_environment_values(kinds)
+            else:
+                if self.dotenv_path is None:
+                    raise RuntimeError("import source is unavailable")
+                dotenv = parse_dotenv(self.dotenv_path)
+            controller.import_secrets(
+                detection=self.detection,
+                environment=environment,
+                dotenv_values=dotenv,
+                selected=kinds,
+                source_choice={kind: source for kind in kinds},
+            )
+        finally:
+            for values in (environment, dotenv):
+                for name in tuple(values):
+                    values[name] = ""
+                values.clear()
+            self.dotenv_path = None
+            self.template_workflow = None
+
 
 class SetupImportScreen(ModalScreen[str | None]):
     """Require an explicit source choice followed by a separate confirmation."""
+
+    BINDINGS = [Binding("escape", "cancel_import", "Cancel import")]
 
     def __init__(self, context: SetupImportContext) -> None:
         super().__init__(id="setup-import")
@@ -108,6 +166,9 @@ class SetupImportScreen(ModalScreen[str | None]):
 
     @on(Button.Pressed, "#cancel-import")
     def _cancel(self) -> None:
+        self.dismiss(None)
+
+    def action_cancel_import(self) -> None:
         self.dismiss(None)
 
 _STEP_IDS = {
@@ -257,12 +318,14 @@ class SetupWizardScreen(SetupRootScreen):
         activation_callback: Callable[[], Awaitable[object | None]] | None = None,
         cancel_callback: Callable[[], Awaitable[None]] | None = None,
         import_context: SetupImportContext | None = None,
+        import_discard_callback: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(controller, screen_id="setup-wizard")
         self.current_step = self._controller_step()
         self._activation_callback = activation_callback
         self._cancel_callback = cancel_callback
         self._import_context = import_context
+        self._import_discard_callback = import_discard_callback
         self._supervisor = _SetupReadOnlySupervisor()
         self._generation = 0
         self._transients_cleared = False
@@ -445,36 +508,29 @@ class SetupWizardScreen(SetupRootScreen):
 
     def _import_finished(self, source: str | None) -> None:
         context = self._import_context
-        if source is None or context is None or not self.is_attached:
+        if context is None:
             return
         try:
-            if source == "template":
-                if context.template_workflow is None:
-                    raise ValueError
-                self.controller.apply_workflow(
-                    context.template_workflow.model_copy(deep=True),
-                    changed_step=SetupStep.PROFILE,
-                )
-                self._populate_public_draft()
+            if source is None or not self.is_attached:
+                context.discard()
             else:
-                kinds = (
-                    context.detection.environment
-                    if source == "environment"
-                    else context.detection.dotenv
-                )
-                self.controller.import_secrets(
-                    detection=context.detection,
-                    environment=context.environment,
-                    dotenv_values=context.dotenv_values,
-                    selected=kinds,
-                    source_choice={kind: source for kind in kinds},
-                )
-            self.query_one("#setup-notice", Static).update("Import completed")
+                context.import_into(self.controller, source)
+            if source == "template" and self.is_attached:
+                self._populate_public_draft()
+            if self.is_attached:
+                self.query_one("#setup-notice", Static).update("Import completed")
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
-            self.query_one("#setup-notice", Static).update("Import failed safely")
-        self._render_state()
+            if self.is_attached:
+                self.query_one("#setup-notice", Static).update("Import failed safely")
+        finally:
+            self._import_context = None
+            callback = self._import_discard_callback
+            if callback is not None:
+                callback()
+        if self.is_attached:
+            self._render_state()
 
     def _apply_layout(self, width: int) -> None:
         self.remove_class("one", "two", "three")
@@ -1112,6 +1168,13 @@ class SetupWizardScreen(SetupRootScreen):
         task = self._test_task
         if task is not None and not task.done():
             task.cancel()
+        context = self._import_context
+        if context is not None:
+            context.discard()
+            self._import_context = None
+        callback = self._import_discard_callback
+        if callback is not None:
+            callback()
         self._clear_inputs()
         self._clear_controller_transients_once()
 
