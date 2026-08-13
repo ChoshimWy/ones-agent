@@ -165,12 +165,24 @@ def parse_dotenv(path: Path) -> dict[str, str]:
         raise SetupImportSourceUnavailable("dotenv path is unsafe")
     if raw is None:
         return {}
+    decode_failure: BaseException | None = None
     try:
         text = raw.decode("utf-8", errors="strict")
-    except UnicodeError:
-        raise SetupImportSourceUnavailable("dotenv file is invalid") from None
-    finally:
-        _zero_buffer(raw)
+    except BaseException as error:
+        decode_failure = error
+    zero_failure = _zero_buffer_failure(raw)
+    if isinstance(decode_failure, UnicodeError):
+        decode_failure = _SourceDataRejected()
+    if zero_failure is not None:
+        decode_failure = _prefer_cleanup_failure(decode_failure, zero_failure)
+    if decode_failure is not None:
+        if isinstance(decode_failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise decode_failure
+        if isinstance(decode_failure, MemoryError):
+            raise decode_failure
+        if isinstance(decode_failure, _SourceDataRejected):
+            raise SetupImportSourceUnavailable("dotenv file is invalid")
+        raise SetupImportError("source read failed") from None
     try:
         _validate_unicode_text(text)
         lines = text.splitlines()
@@ -574,7 +586,16 @@ def _read_bounded(
             try:
                 while True:
                     limit = min(_READ_CHUNK, _MAX_SOURCE_BYTES + 1 - total)
-                    count = _read_into(reader, memoryview(scratch)[:limit])
+                    read_access_rejected = False
+                    try:
+                        count = _read_into(reader, memoryview(scratch)[:limit])
+                    except OSError as error:
+                        if _is_source_access_error(error):
+                            read_access_rejected = True
+                        else:
+                            raise
+                    if read_access_rejected:
+                        raise _SourcePathRejected
                     if not count:
                         break
                     content.extend(memoryview(scratch)[:count])
@@ -584,8 +605,6 @@ def _read_bounded(
                         raise _SourceDataRejected
             except BaseException as error:
                 reader_failure = error
-            if isinstance(reader_failure, OSError) and _is_source_access_error(reader_failure):
-                reader_failure = _SourcePathRejected()
             try:
                 reader.close()
             except BaseException as error:
@@ -639,32 +658,33 @@ def _read_bounded(
             raise failure
         raise SetupImportError("source read failed") from None
     assert content is not None
-    post_read_rejection: _SourcePathRejected | _SourceDataRejected | None = None
-    post_read_fatal = False
+    post_read_failure: BaseException | None = None
     try:
         if _path_identity(candidate) != expected:
             raise _SourcePathRejected
     except FileNotFoundError:
-        _zero_buffer(content)
-        post_read_rejection = _SourcePathRejected()
+        post_read_failure = _SourcePathRejected()
     except OSError as error:
-        _zero_buffer(content)
         if _is_source_access_error(error):
-            post_read_rejection = _SourcePathRejected()
+            post_read_failure = _SourcePathRejected()
         else:
-            post_read_fatal = True
+            post_read_failure = error
     except BaseException as error:
-        _zero_buffer(content)
-        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
-            raise
         if isinstance(error, (_SourcePathRejected, _SourceDataRejected)):
-            post_read_rejection = error
+            post_read_failure = error
         else:
-            post_read_fatal = True
-    if post_read_rejection is not None:
-        raise post_read_rejection
-    if post_read_fatal:
-        raise SetupImportError("source read failed")
+            post_read_failure = error
+    if post_read_failure is not None:
+        zero_failure = _zero_buffer_failure(content)
+        if zero_failure is not None:
+            post_read_failure = _prefer_cleanup_failure(post_read_failure, zero_failure)
+        if isinstance(post_read_failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise post_read_failure
+        if isinstance(post_read_failure, MemoryError):
+            raise post_read_failure
+        if isinstance(post_read_failure, (_SourcePathRejected, _SourceDataRejected)):
+            raise post_read_failure
+        raise SetupImportError("source read failed") from None
     return content
 
 
@@ -678,6 +698,14 @@ def _read_into(reader: io.FileIO, target: memoryview) -> int:
 
 def _close_descriptor(descriptor: int) -> None:
     os.close(descriptor)
+
+
+def _zero_buffer_failure(value: bytearray) -> BaseException | None:
+    try:
+        _zero_buffer(value)
+    except BaseException as error:
+        return error
+    return None
 
 
 def _prefer_cleanup_failure(

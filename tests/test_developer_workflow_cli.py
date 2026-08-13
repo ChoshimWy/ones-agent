@@ -655,6 +655,94 @@ def test_tui_internal_access_errors_are_fatal_not_optional(
         os.fstat(opened[0])
 
 
+def test_tui_content_extend_access_error_is_fatal_not_optional(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+
+    class FailingContent(bytearray):
+        def extend(self, _value: object) -> None:
+            raise PermissionError(errno.EACCES, "TOKEN-EXTEND")
+
+    original_allocate = setup_import._allocate_buffer
+    monkeypatch.setattr(
+        setup_import,
+        "_allocate_buffer",
+        lambda size: FailingContent() if size == 0 else original_allocate(size),
+    )
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "TOKEN-EXTEND" not in repr(caught.value)
+
+
+@pytest.mark.parametrize("stage", ["raw", "post-read"])
+@pytest.mark.parametrize("failure_kind", ["access", "runtime"])
+def test_tui_late_dotenv_buffer_zero_failure_is_fatal_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, failure_kind: str
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-LATE-ZERO-{stage}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    original_open = setup_import._open_source_readonly
+    original_zero = setup_import._zero_buffer
+    opened: list[int] = []
+
+    def capture_open(path: Path, **kwargs: object) -> int:
+        descriptor = original_open(path, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    zero_calls = 0
+
+    def fail_late_zero(value: bytearray) -> None:
+        nonlocal zero_calls
+        zero_calls += 1
+        original_zero(value)
+        if zero_calls == 3:
+            if failure_kind == "access":
+                raise PermissionError(errno.EACCES, canary)
+            raise RuntimeError(canary)
+
+    monkeypatch.setattr(setup_import, "_open_source_readonly", capture_open)
+    monkeypatch.setattr(setup_import, "_zero_buffer", fail_late_zero)
+    if stage == "post-read":
+        original_identity = setup_import._path_identity
+        identity_calls = 0
+
+        def reject_post_read(path: Path) -> tuple[int, int, int, int]:
+            nonlocal identity_calls
+            identity_calls += 1
+            if identity_calls == 2:
+                raise setup_import._SourcePathRejected()
+            return original_identity(path)
+
+        monkeypatch.setattr(setup_import, "_path_identity", reject_post_read)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert canary not in repr(caught.value)
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
 def test_tui_access_errors_are_optional_without_exception_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
