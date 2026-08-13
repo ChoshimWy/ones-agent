@@ -609,6 +609,36 @@ def test_runtime_read_failure_is_fatal_and_sanitized(
     assert "TOKEN" not in repr(caught.value)
 
 
+def test_zero_failure_still_closes_descriptor_and_is_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / "zero.env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+    opened: list[int] = []
+    original_open = setup_import._open_source_readonly
+    original_zero = setup_import._zero_buffer
+
+    def capture(path: Path) -> int:
+        descriptor = original_open(path)
+        opened.append(descriptor)
+        return descriptor
+
+    def fail_zero(value: bytearray) -> None:
+        original_zero(value)
+        raise RuntimeError("TOKEN-ZERO")
+
+    monkeypatch.setattr(setup_import, "_open_source_readonly", capture)
+    monkeypatch.setattr(setup_import, "_zero_buffer", fail_zero)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        parse_dotenv(dotenv)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert "TOKEN" not in repr(caught.value)
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
 def test_dotenv_source_rejection_has_specific_unavailable_class(tmp_path: Path) -> None:
     unsafe = tmp_path / "unsafe.env"
     unsafe.mkdir()

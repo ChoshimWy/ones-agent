@@ -599,16 +599,28 @@ def _read_bounded(
                 else error
             )
     finally:
+        cleanup_failure: BaseException | None = None
         if scratch is not None:
-            _zero_buffer(scratch)
-        if failure is not None and content is not None:
-            _zero_buffer(content)
+            try:
+                _zero_buffer(scratch)
+            except BaseException as error:
+                cleanup_failure = _prefer_cleanup_failure(cleanup_failure, error)
+        if content is not None and failure is not None:
+            try:
+                _zero_buffer(content)
+            except BaseException as error:
+                cleanup_failure = _prefer_cleanup_failure(cleanup_failure, error)
         try:
             _close_descriptor(descriptor)
         except BaseException as error:
             if content is not None:
-                _zero_buffer(content)
-            failure = _prefer_cleanup_failure(failure, error)
+                try:
+                    _zero_buffer(content)
+                except BaseException as zero_error:
+                    cleanup_failure = _prefer_cleanup_failure(cleanup_failure, zero_error)
+            cleanup_failure = _prefer_cleanup_failure(cleanup_failure, error)
+        if cleanup_failure is not None:
+            failure = _prefer_cleanup_failure(failure, cleanup_failure)
     if failure is not None:
         if isinstance(failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
             raise failure
