@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+import weakref
 from pathlib import Path
 
 import pytest
@@ -451,6 +452,34 @@ def test_runtime_handle_close_replays_one_sanitized_failure_to_all_waiters() -> 
     assert all(error.__cause__ is None for error in (*errors, later.value))
 
 
+def test_runtime_handle_close_releases_sensitive_runtime_graph() -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeHandle
+
+    class Sensitive:
+        pass
+
+    orchestrator = Sensitive()
+    gateway = Sensitive()
+    callback_owner = Sensitive()
+    orchestrator_ref = weakref.ref(orchestrator)
+    gateway_ref = weakref.ref(gateway)
+    callback_ref = weakref.ref(callback_owner)
+
+    def cleanup(owner=callback_owner) -> None:
+        del owner
+
+    handle = RuntimeHandle(orchestrator, gateway, cleanup)
+    del orchestrator, gateway, callback_owner, cleanup
+    handle.close()
+    import gc
+    gc.collect()
+
+    assert orchestrator_ref() is None
+    assert gateway_ref() is None
+    assert callback_ref() is None
+    assert repr(handle) == "RuntimeHandle(<redacted>)"
+
+
 def test_runtime_handle_and_reachable_runtime_repr_never_expose_secrets(
     tmp_path: Path,
 ) -> None:
@@ -525,11 +554,13 @@ def test_runtime_handle_closes_gateway_exactly_once(tmp_path: Path) -> None:
         gateway_close=lambda gateway: closed.append(gateway),
     )
     handle = bootstrapper.build(_active(tmp_path), _secrets())
+    gateway = handle.gateway
 
     handle.close()
     handle.close()
 
-    assert closed == [handle.gateway]
+    assert closed == [gateway]
+    assert handle.gateway is None
 
 
 def test_bootstrap_rejects_control_characters_in_explicit_transport_secrets(

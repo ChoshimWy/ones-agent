@@ -53,6 +53,11 @@ class TuiRuntimeSession:
         self._close_task: asyncio.Task[_CloseOutcome] | None = None
         self._closed = False
 
+    @property
+    def close_complete(self) -> bool:
+        task = self._close_task
+        return task is not None and task.done() and not task.cancelled()
+
     @classmethod
     def from_handle(
         cls,
@@ -182,12 +187,17 @@ class TuiRuntimeSession:
         while not done.is_set():
             await asyncio.sleep(min(0.01, self._close_timeout))
         worker_fatal = outcome[0]
-        return _CloseOutcome(
+        result = _CloseOutcome(
             fatal=fatal or (
                 worker_fatal if isinstance(worker_fatal, BaseException) else None
             ),
             failed=failed or start_failed or bool(outcome[1]),
         )
+        self.handle = None
+        self.controller = None
+        self.run_index = None
+        self.supervisor = None
+        return result
 
 
 __all__ = ["TuiRuntimeCloseError", "TuiRuntimeSession"]

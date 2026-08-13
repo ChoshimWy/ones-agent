@@ -30,6 +30,9 @@ class _WizardSetupController:
             for step in SetupStep
         }
 
+    async def list_managed_profiles(self) -> tuple[str, ...]:
+        return ("managed-profile", "restricted-profile")
+
     @property
     def state(self) -> object:
         return SimpleNamespace(
@@ -404,6 +407,75 @@ async def test_setup_profile_and_repository_use_controller_builders() -> None:
 
 
 @pytest.mark.asyncio
+async def test_setup_remote_only_repository_preserves_absent_source_path() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.REPOSITORIES
+    for step in (SetupStep.PROFILE, SetupStep.ONES):
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        for widget_id, value in {
+            "#repository-key": "remote",
+            "#repository-project-id": "project-1",
+            "#repository-iteration-id": "iteration-1",
+            "#repository-name": "remote",
+            "#repository-path": "   ",
+            "#repository-url": "https://git.example.invalid/team/remote.git",
+            "#repository-branch": "main",
+        }.items():
+            screen.query_one(widget_id).value = value
+
+        await screen.action_test_connection()
+        await pilot.pause()
+
+        assert controller.repository_calls[0]["source_path"] is None
+
+
+@pytest.mark.asyncio
+async def test_setup_profiles_are_catalog_backed_and_shared_between_steps() -> None:
+    from textual.widgets import Select
+
+    controller = _WizardSetupController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        profile = screen.query_one("#sandbox-profile", Select)
+        codex = screen.query_one("#codex-profile", Select)
+
+        assert tuple(value for _, value in profile._options if type(value) is str) == (
+            "managed-profile",
+            "restricted-profile",
+        )
+        profile.value = "restricted-profile"
+        await pilot.pause()
+        assert codex.value == "restricted-profile"
+
+
+@pytest.mark.asyncio
+async def test_setup_rejects_stale_draft_profile_and_blocks_empty_catalog() -> None:
+    from src.developer_workflow.setup_models import SetupDraft, WorkflowDraft
+    from textual.widgets import Button, Select
+
+    class EmptyCatalogController(_WizardSetupController):
+        draft = SetupDraft(
+            workflow=WorkflowDraft(sandbox_permission_profile="removed-profile")
+        )
+
+        async def list_managed_profiles(self) -> tuple[str, ...]:
+            return ()
+
+    async with _wizard_app(EmptyCatalogController()).run_test() as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert screen.query_one("#sandbox-profile", Select).disabled
+        assert screen.query_one("#test-connection", Button).disabled
+
+
+@pytest.mark.asyncio
 async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
     from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
 
@@ -502,6 +574,7 @@ async def test_test_button_handler_returns_before_blocking_builder_and_escape_ca
                 "#repository-path": "C:/safe/repository",
                 "#repository-url": "https://git.example.invalid/team/primary.git",
                 "#repository-branch": "main",
+                "#repository-role": "primary",
             }.items():
                 screen.query_one(widget_id).value = value
             click = asyncio.create_task(pilot.click("#test-connection"))
@@ -575,6 +648,7 @@ async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_
             "#repository-path": "C:/safe/repository",
             "#repository-url": "https://git.example.invalid/team/primary.git",
             "#repository-branch": "main",
+            "#repository-role": "primary",
         }
         for widget_id, value in values.items():
             screen.query_one(widget_id).value = value
@@ -1644,6 +1718,55 @@ async def test_concurrent_activation_callback_builds_one_runtime(
     await asyncio.gather(app._setup_done(object()), app._setup_done(object()))
 
     assert len(builds) == 1
+    assert app._activation_handles == set()
+
+
+@pytest.mark.asyncio
+async def test_app_close_timeout_retains_runtime_owner_until_retry_completes() -> None:
+    import asyncio
+    from threading import Event
+
+    from src.developer_workflow.tui.app import (
+        DeveloperWorkflowTuiApp,
+        TuiAppCloseError,
+    )
+    from src.developer_workflow.tui.runtime_session import TuiRuntimeSession
+
+    entered, release = Event(), Event()
+
+    def close_controller() -> None:
+        entered.set()
+        release.wait(2)
+
+    session = TuiRuntimeSession(
+        handle=SimpleNamespace(close=lambda: None),
+        controller=SimpleNamespace(close=close_controller),
+        run_index=object(),
+        supervisor=SimpleNamespace(close=_async_noop),
+        event_sink=lambda event: None,
+        close_timeout=0.03,
+    )
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=_SetupController(None),
+        runtime_bootstrapper=object(),
+        close_timeout=0.08,
+    )
+    app.runtime_session = session
+    app.supervisor = session.supervisor
+
+    with pytest.raises(TuiAppCloseError, match="TUI close timed out"):
+        await app._close_ui()
+    assert entered.is_set()
+    assert app.runtime_session is session
+    assert not app._close_complete.is_set()
+
+    release.set()
+    await asyncio.sleep(0.05)
+    await app._close_ui()
+    assert app.runtime_session is None
+    assert app._close_complete.is_set()
+    assert session.handle is None
+    assert session.controller is None
 
 
 @pytest.mark.asyncio

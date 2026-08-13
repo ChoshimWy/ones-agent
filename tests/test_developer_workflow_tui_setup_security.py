@@ -8,7 +8,7 @@ from types import MappingProxyType, SimpleNamespace
 from uuid import uuid4
 
 import pytest
-from textual.widgets import Button, Input, Static
+from textual.widgets import Button, Input, Select, Static
 
 from src.developer_workflow.setup_models import SetupDraft
 from src.developer_workflow.setup_models import SecretKind, WorkflowDraft
@@ -164,6 +164,9 @@ class _SetupHarness:
     async def activate_existing(self) -> None:
         return None
 
+    async def list_managed_profiles(self) -> tuple[str, ...]:
+        return ("managed-profile",)
+
     def apply_step_transaction(
         self, step, transaction, *, expected_revision, secrets
     ) -> None:
@@ -243,7 +246,9 @@ class _SetupHarness:
 
 async def _set_inputs(app: DeveloperWorkflowTuiApp, values: dict[str, str]) -> None:
     for widget_id, value in values.items():
-        app.screen.query_one(f"#{widget_id}", Input).value = value
+        widget = app.screen.query_one(f"#{widget_id}")
+        if isinstance(widget, (Input, Select)):
+            widget.value = value
 
 
 async def _test_current_step(
@@ -332,6 +337,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
     )
     bootstrap = FakeBootstrap()
     bootstrap.catalog = SimpleNamespace(
+        list_profiles=lambda: (profile,),
         require_selected=lambda selected: selected
         if selected == profile
         else (_ for _ in ()).throw(ValueError("profile unavailable"))
@@ -370,7 +376,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             runtime_bootstrap=bootstrap,
             activation_timeout=10,
         ),
-        runtime_bootstrapper=object(),
+        runtime_bootstrapper=runtime_builder,
         setup_import=SetupImportContext(
             detection=ImportDetection((), (), True),
             dotenv_path=None,
@@ -673,7 +679,7 @@ async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() ->
         # validator boundary.  The screen must retain only its fixed category.
         app.screen.current_step = SetupStep.PROFILE
         app.screen._render_state()
-        app.screen.query_one("#sandbox-profile", Input).value = "managed-profile"
+        app.screen.query_one("#sandbox-profile", Select).value = "managed-profile"
         setup.probe_failure = RuntimeError(
             f"{SECRETS['path']} {SECRETS['control']} {SECRETS['codex']}"
         )

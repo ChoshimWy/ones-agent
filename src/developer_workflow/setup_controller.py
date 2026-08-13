@@ -307,6 +307,23 @@ class SetupController:
 
         return MappingProxyType(dict(self._runtime_fields))
 
+    async def list_managed_profiles(self) -> tuple[str, ...]:
+        """Return a detached trusted catalog snapshot without blocking the UI loop."""
+
+        self._ensure_mutable()
+        try:
+            profiles = tuple(await asyncio.to_thread(self._profile_catalog.list_profiles))
+            if (
+                any(type(profile) is not str or not profile for profile in profiles)
+                or len(profiles) != len(set(profiles))
+            ):
+                raise ValueError
+            return profiles
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise SetupActionError("managed profiles are unavailable") from None
+
     def apply_step_transaction(
         self,
         step: SetupStep,

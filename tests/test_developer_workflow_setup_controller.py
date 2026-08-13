@@ -101,6 +101,9 @@ def _result(step: SetupStep, passed: bool = True) -> ConnectionTestResult:
 
 
 class FakeCatalog:
+    def list_profiles(self) -> tuple[str, ...]:
+        return ("managed-profile",)
+
     def require_selected(self, profile: str) -> str:
         if profile != "managed-profile":
             raise ValueError("SECRET profile")
@@ -141,6 +144,36 @@ class FakeBootstrap:
     def __init__(self) -> None:
         self.catalog = FakeCatalog()
         self.validator = FakeValidator()
+
+
+@pytest.mark.asyncio
+async def test_managed_profile_snapshot_is_frozen_and_loaded_off_loop() -> None:
+    import threading
+
+    class Catalog(FakeCatalog):
+        def __init__(self) -> None:
+            self.thread_id: int | None = None
+
+        def list_profiles(self) -> tuple[str, ...]:
+            self.thread_id = threading.get_ident()
+            return ("restricted", "managed-profile")
+
+    catalog = Catalog()
+    bootstrap = FakeBootstrap()
+    bootstrap.catalog = catalog
+    controller = SetupController(
+        profile_id="managed-profile",
+        store=FakeStore(),
+        runtime_builder=FakeRuntimeBuilder(),
+        runtime_bootstrap=bootstrap,
+    )
+    loop_thread = threading.get_ident()
+
+    profiles = await controller.list_managed_profiles()
+
+    assert profiles == ("restricted", "managed-profile")
+    assert type(profiles) is tuple
+    assert catalog.thread_id != loop_thread
 
 
 class Handle:

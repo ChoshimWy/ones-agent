@@ -15,7 +15,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Input, Label, Select, Static
 
 from ..config import PublishingConfig, PublishingProvider
 from ..contracts import RepositoryRole
@@ -330,6 +330,9 @@ class SetupWizardScreen(SetupRootScreen):
         self._generation = 0
         self._transients_cleared = False
         self._test_task: asyncio.Task[None] | None = None
+        self._managed_profiles: tuple[str, ...] = ()
+        self._profile_catalog_ready = False
+        self._syncing_profile = False
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="setup-shell"):
@@ -366,7 +369,7 @@ class SetupWizardScreen(SetupRootScreen):
     def _profile_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.PROFILE], classes="setup-step"):
             yield Label("Workflow permission profile")
-            yield Input(placeholder="Permission profile", id="sandbox-profile")
+            yield Select([], prompt="Select managed profile", id="sandbox-profile", disabled=True)
             yield Button("Review import sources", id="review-imports")
 
     def _ones_fields(self) -> ComposeResult:
@@ -415,7 +418,7 @@ class SetupWizardScreen(SetupRootScreen):
         with Vertical(id=_STEP_IDS[SetupStep.CODEX], classes="setup-step"):
             yield Label("Codex runtime")
             yield Input(placeholder="Auth mode: credential or file", id="codex-auth-mode")
-            yield Input(placeholder="Sandbox profile", id="codex-profile")
+            yield Select([], prompt="Select managed profile", id="codex-profile", disabled=True)
             yield Input(placeholder="Probe worktree", id="codex-worktree")
             yield Input(placeholder="Codex home", id="codex-home")
             yield Input(placeholder="Codex API key", id="codex-api-key", password=True)
@@ -428,9 +431,53 @@ class SetupWizardScreen(SetupRootScreen):
             yield Input(placeholder="Mirror root", id="mirror-root")
             yield Input(placeholder="Worktree root", id="worktree-root")
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self._apply_layout(self.size.width)
+        await self._refresh_managed_profiles()
         self._populate_public_draft()
+        self._render_state()
+
+    async def _refresh_managed_profiles(self) -> None:
+        loader = getattr(self.controller, "list_managed_profiles", None)
+        if not callable(loader):
+            self._profile_catalog_ready = True
+            self.query_one("#setup-notice", Static).update(
+                "Managed profiles are unavailable"
+            )
+            return
+        try:
+            profiles = tuple(await loader())
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            profiles = ()
+            self.query_one("#setup-notice", Static).update(
+                "Managed profiles are unavailable"
+            )
+        self._managed_profiles = profiles
+        self._profile_catalog_ready = True
+        options = tuple((profile, profile) for profile in profiles)
+        for widget_id in ("sandbox-profile", "codex-profile"):
+            widget = self.query_one(f"#{widget_id}", Select)
+            widget.set_options(options)
+            widget.disabled = not profiles
+        if not profiles:
+            self.query_one("#setup-notice", Static).update(
+                "No managed profiles are available"
+            )
+
+    @on(Select.Changed, "#sandbox-profile, #codex-profile")
+    def _profile_changed(self, event: Select.Changed) -> None:
+        if self._syncing_profile or type(event.value) is not str:
+            return
+        self._syncing_profile = True
+        try:
+            for widget_id in ("sandbox-profile", "codex-profile"):
+                widget = self.query_one(f"#{widget_id}", Select)
+                if widget.value != event.value:
+                    widget.value = event.value
+        finally:
+            self._syncing_profile = False
         self._render_state()
 
     def _populate_public_draft(self) -> None:
@@ -491,6 +538,10 @@ class SetupWizardScreen(SetupRootScreen):
             if groups:
                 values["repository-group-key"] = groups[0].key
                 values["repository-primary"] = groups[0].primary_repository
+        selected_profile = values.pop("sandbox-profile", "")
+        if selected_profile in self._managed_profiles:
+            for widget_id in ("sandbox-profile", "codex-profile"):
+                self.query_one(f"#{widget_id}", Select).value = selected_profile
         for widget_id, value in values.items():
             self.query_one(f"#{widget_id}", Input).value = value
 
@@ -558,10 +609,42 @@ class SetupWizardScreen(SetupRootScreen):
             build_setup_step_view(self._state(), step).can_continue
             for step in tuple(SetupStep)[:-1]
         )
+        if self.current_step in {SetupStep.PROFILE, SetupStep.CODEX} and not self._selected_profile():
+            self.query_one("#test-connection", Button).disabled = True
+            self.query_one("#next-step", Button).disabled = True
+
+    def _selected_profile(self) -> str:
+        if not self._profile_catalog_ready:
+            return ""
+        selected = {
+            value
+            for widget_id in ("sandbox-profile", "codex-profile")
+            if type(
+                value := self.query_one(f"#{widget_id}", Select).value
+            ) is str
+            and value in self._managed_profiles
+        }
+        if len(selected) != 1:
+            return ""
+        value = selected.pop()
+        self._syncing_profile = True
+        try:
+            for widget_id in ("sandbox-profile", "codex-profile"):
+                widget = self.query_one(f"#{widget_id}", Select)
+                if type(widget.value) is not str:
+                    widget.value = value
+        finally:
+            self._syncing_profile = False
+        return value
+
+    def _field_value(self, field_name: str) -> str:
+        if field_name in {"sandbox-profile", "codex-profile"}:
+            return self._selected_profile()
+        return self.query_one(f"#{field_name}", Input).value
 
     def _snapshot_fields(self) -> Mapping[str, str]:
         values = {
-            field_name: self.query_one(f"#{field_name}", Input).value
+            field_name: self._field_value(field_name)
             for field_name in _PROBE_FIELDS[self.current_step]
         }
         return MappingProxyType(values)
@@ -571,7 +654,7 @@ class SetupWizardScreen(SetupRootScreen):
 
         return MappingProxyType(
             {
-                field_name: self.query_one(f"#{field_name}", Input).value
+                field_name: self._field_value(field_name)
                 for field_name in _CONFIG_FIELDS[self.current_step]
             }
         )
@@ -682,7 +765,11 @@ class SetupWizardScreen(SetupRootScreen):
                     repo_url=fields["repository-url"],
                     repo_name=fields["repository-name"],
                     base_branch=fields["repository-branch"],
-                    source_path=Path(fields["repository-path"]),
+                    source_path=(
+                        Path(fields["repository-path"])
+                        if fields["repository-path"].strip()
+                        else None
+                    ),
                 )
             group_key = fields["repository-group-key"]
             primary = fields["repository-primary"]
@@ -790,7 +877,11 @@ class SetupWizardScreen(SetupRootScreen):
                 repo_url=fields["repository-url"],
                 repo_name=fields["repository-name"],
                 base_branch=fields["repository-branch"],
-                source_path=Path(fields["repository-path"]),
+                source_path=(
+                    Path(fields["repository-path"])
+                    if fields["repository-path"].strip()
+                    else None
+                ),
                 role=RepositoryRole(fields["repository-role"]),
                 depends_on=self._comma_values(fields["repository-depends-on"]),
                 allowed_paths=self._comma_values(fields["repository-allowed-paths"]),
@@ -979,7 +1070,11 @@ class SetupWizardScreen(SetupRootScreen):
         if self._supervisor.busy or self.current_step is SetupStep.REVIEW:
             return
         button = self.query_one("#test-connection", Button)
-        if button.disabled:
+        profile_ready = (
+            self.current_step in {SetupStep.PROFILE, SetupStep.CODEX}
+            and bool(self._selected_profile())
+        )
+        if button.disabled and not profile_ready:
             return
         self._transients_cleared = False
         self._generation += 1

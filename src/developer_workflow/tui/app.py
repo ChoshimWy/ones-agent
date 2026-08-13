@@ -100,7 +100,13 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._setup_controller_factory = setup_controller_factory
         if self.setup_controller is None and self._setup_controller_factory is not None:
             self.setup_controller = self._new_setup_controller()
-        self.runtime_bootstrapper = runtime_bootstrapper
+        configured_builder = getattr(self.setup_controller, "_runtime_builder", None)
+        if (
+            runtime_bootstrapper is not None
+            and configured_builder is not None
+            and configured_builder is not runtime_bootstrapper
+        ):
+            raise ValueError("TUI bootstrap configuration is invalid")
         self._setup_import = setup_import
         self.runtime_session: TuiRuntimeSession | None = None
         self.controller: TuiController | None = None
@@ -121,7 +127,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._close_task: asyncio.Task[_AppCloseOutcome] | None = None
         self._closing_setup_controller: object | None = None
         self._transition_lock = asyncio.Lock()
-        self._activation_handles: list[object] = []
+        self._activation_handles: set[int] = set()
         self._poll_timer: Timer | None = None
         self._reconfiguring = False
         app_ref = weakref.ref(self)
@@ -441,36 +447,47 @@ class DeveloperWorkflowTuiApp(App[None]):
 
     async def _setup_done(self, handle: object | None) -> None:
         async with self._transition_lock:
+            identity: int | None = None
             if handle is not None:
-                if any(handle is owned for owned in self._activation_handles):
+                identity = id(handle)
+                if identity in self._activation_handles:
                     return
-                self._activation_handles.append(handle)
-            if handle is None or self._ui_closed or self.runtime_session is not None:
-                if handle is not None and (
-                    self._ui_closed or self.runtime_session is not None
-                ):
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(handle.close), timeout=5.0
-                        )
-                    except BaseException:
-                        pass
-                return
-            removed = False
+                self._activation_handles.add(identity)
             try:
-                removed = await self._remove_setup_screen()
-            except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                if handle is None or self._ui_closed or self.runtime_session is not None:
+                    already_owned = (
+                        handle is not None
+                        and self.runtime_session is not None
+                        and getattr(self.runtime_session, "handle", None) is handle
+                    )
+                    if handle is not None and not already_owned and (
+                        self._ui_closed or self.runtime_session is not None
+                    ):
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(handle.close), timeout=5.0
+                            )
+                        except BaseException:
+                            pass
+                    return
+                removed = False
+                try:
+                    removed = await self._remove_setup_screen()
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        await self._discard_runtime(handle=handle, session=None)
+                        await self._discard_setup_controller()
+                        raise
+                if not removed:
+                    await self._recover_setup_removal_failure(handle)
+                    return
+                if self._ui_closed:
                     await self._discard_runtime(handle=handle, session=None)
-                    await self._discard_setup_controller()
-                    raise
-            if not removed:
-                await self._recover_setup_removal_failure(handle)
-                return
-            if self._ui_closed:
-                await self._discard_runtime(handle=handle, session=None)
-                return
-            await self._finish_setup(handle)
+                    return
+                await self._finish_setup(handle)
+            finally:
+                if identity is not None:
+                    self._activation_handles.discard(identity)
 
     async def _finish_setup(self, handle: object) -> None:
         try:
@@ -841,6 +858,8 @@ class DeveloperWorkflowTuiApp(App[None]):
                         error, (KeyboardInterrupt, SystemExit)
                     ):
                         fatal = error
+                    if not getattr(self.runtime_session, "close_complete", True):
+                        runtime_incomplete = True
                 if runtime_incomplete:
                     return _AppCloseOutcome(fatal=fatal, complete=False)
                 self.runtime_session = None

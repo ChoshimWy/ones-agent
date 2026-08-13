@@ -194,9 +194,9 @@ def _run_gateway_close(gateway: OnesGateway) -> None:
 
 @dataclass(slots=True, repr=False)
 class RuntimeHandle:
-    orchestrator: DeveloperWorkflowOrchestrator
-    gateway: OnesGateway
-    close_callback: Callable[[], None] = field(repr=False)
+    orchestrator: DeveloperWorkflowOrchestrator | None
+    gateway: OnesGateway | None
+    close_callback: Callable[[], None] | None = field(repr=False)
     _condition: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
     )
@@ -220,7 +220,9 @@ class RuntimeHandle:
         failed = False
         fatal: BaseException | None = None
         try:
-            self.close_callback()
+            callback = self.close_callback
+            if callback is not None:
+                callback()
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
                 fatal = error
@@ -233,6 +235,9 @@ class RuntimeHandle:
                 else:
                     self._close_failed = failed
                     self._state = "closed"
+                    self.close_callback = None
+                    self.orchestrator = None
+                    self.gateway = None
                 self._condition.notify_all()
         if fatal is not None:
             raise fatal
