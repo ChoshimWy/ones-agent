@@ -43,6 +43,7 @@ def run_tui(setup_controller: object, runtime_bootstrapper: object) -> None:
     DeveloperWorkflowTuiApp(
         setup_controller_factory=setup_controller,
         runtime_bootstrapper=runtime_bootstrapper,
+        setup_import=getattr(setup_controller, "import_context", None),
     ).run()
 
 __all__ = [

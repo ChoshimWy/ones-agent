@@ -1,5 +1,9 @@
 # ONES 开发工作流 CLI 运维指南
 
+> TUI 导入说明：`--config` 是可选的只读公共配置模板。文件不存在时仍会进入首次配置；文件存在时必须通过安全解析，非法 JSON、符号链接/重解析路径、宽松权限或包含凭据字段都会以固定错误拒绝。向导的“Review import sources”仅显示 environment、`.env`、template 的可用项数量和冲突数量，不显示值或路径。环境变量和 `.env` 只做元数据检测，不会自动导入；用户必须先选择一个来源，再单独确认，之后才调用凭据导入。公共模板也必须经相同的选择和确认入口，且原文件永远不会被改写。
+
+> 仓库向导说明：每个仓库可逐条填写 `role`、`depends_on`、`allowed_paths`、lint/build/test commands；仓库组同时填写 group key、primary repository 和 integration commands。依赖项与路径使用英文逗号分隔，多条命令使用 `;;` 分隔。分隔符只用于形成独立命令，不会交给 shell。所有命令会按安全 argv 规则解析并经过凭据参数门禁，不能解析或含危险凭据参数时连接测试会固定失败，不会执行输入命令。
+
 ## 全屏终端界面
 
 使用与非交互 CLI 相同的生产装配启动全屏 Textual 控制台：

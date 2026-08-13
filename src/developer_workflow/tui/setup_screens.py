@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 import inspect
 from pathlib import Path
 from types import MappingProxyType
@@ -17,6 +18,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Input, Label, Static
 
 from ..config import PublishingConfig, PublishingProvider
+from ..contracts import RepositoryRole
 from ..setup_models import (
     DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
     RuntimePublicConfig,
@@ -24,6 +26,7 @@ from ..setup_models import (
     WorkflowDraft,
 )
 from ..setup_controller import SetupStepTransaction
+from ..setup_import import ImportDetection
 from ..setup_repository import RepositoryGroupDraftBuilder, build_repository
 from ..setup_validation import SetupStep, ValidationStatus
 from .setup_models import build_setup_step_view, setup_step_label
@@ -40,6 +43,72 @@ _RESULT_TEXT = {
     "sandbox": "Sandbox validation failed",
     "invalid_field": "Configuration fields are incomplete",
 }
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class SetupImportContext:
+    """Host-owned import material; only metadata is ever rendered."""
+
+    detection: ImportDetection
+    environment: Mapping[str, str]
+    dotenv_values: Mapping[str, str]
+    template_workflow: WorkflowDraft | None = None
+
+    def __repr__(self) -> str:
+        return "SetupImportContext(<redacted>)"
+
+
+class SetupImportScreen(ModalScreen[str | None]):
+    """Require an explicit source choice followed by a separate confirmation."""
+
+    def __init__(self, context: SetupImportContext) -> None:
+        super().__init__(id="setup-import")
+        self._import_context = context
+        self._selected: str | None = None
+
+    def compose(self) -> ComposeResult:
+        detection = self._import_context.detection
+        conflicts = set(detection.environment) & set(detection.dotenv)
+        summary = (
+            f"environment: {len(detection.environment)} kinds; "
+            f"dotenv: {len(detection.dotenv)} kinds; "
+            f"conflicts: {len(conflicts)}; "
+            f"template: {'available' if detection.template_available else 'missing'}"
+        )
+        with Vertical(id="import-dialog"):
+            yield Static(summary, id="import-summary")
+            yield Button("Select environment", id="import-environment")
+            yield Button("Select dotenv", id="import-dotenv")
+            yield Button("Select public template", id="import-template")
+            yield Button("Confirm import", id="confirm-import", disabled=True)
+            yield Button("Cancel", id="cancel-import")
+
+    @on(Button.Pressed, "#import-environment, #import-dotenv, #import-template")
+    def _select(self, event: Button.Pressed) -> None:
+        source = {
+            "import-environment": "environment",
+            "import-dotenv": "dotenv",
+            "import-template": "template",
+        }.get(event.button.id or "")
+        detection = self._import_context.detection
+        available = (
+            bool(detection.environment) if source == "environment"
+            else bool(detection.dotenv) if source == "dotenv"
+            else detection.template_available and self._import_context.template_workflow is not None
+        )
+        if source is None or not available:
+            return
+        self._selected = source
+        self.query_one("#confirm-import", Button).disabled = False
+
+    @on(Button.Pressed, "#confirm-import")
+    def _confirm(self) -> None:
+        if self._selected is not None:
+            self.dismiss(self._selected)
+
+    @on(Button.Pressed, "#cancel-import")
+    def _cancel(self) -> None:
+        self.dismiss(None)
 
 _STEP_IDS = {
     SetupStep.PROFILE: "profile-step",
@@ -95,8 +164,15 @@ _CONFIG_FIELDS = {
         "repository-path",
         "repository-url",
         "repository-branch",
+        "repository-role",
+        "repository-depends-on",
+        "repository-allowed-paths",
+        "repository-lint-commands",
+        "repository-build-commands",
+        "repository-test-commands",
         "repository-group-key",
         "repository-primary",
+        "repository-integration-commands",
     ),
     SetupStep.PROVIDER: (
         "provider-host",
@@ -180,11 +256,13 @@ class SetupWizardScreen(SetupRootScreen):
         *,
         activation_callback: Callable[[], Awaitable[object | None]] | None = None,
         cancel_callback: Callable[[], Awaitable[None]] | None = None,
+        import_context: SetupImportContext | None = None,
     ) -> None:
         super().__init__(controller, screen_id="setup-wizard")
         self.current_step = self._controller_step()
         self._activation_callback = activation_callback
         self._cancel_callback = cancel_callback
+        self._import_context = import_context
         self._supervisor = _SetupReadOnlySupervisor()
         self._generation = 0
         self._transients_cleared = False
@@ -226,6 +304,7 @@ class SetupWizardScreen(SetupRootScreen):
         with Vertical(id=_STEP_IDS[SetupStep.PROFILE], classes="setup-step"):
             yield Label("Workflow permission profile")
             yield Input(placeholder="Permission profile", id="sandbox-profile")
+            yield Button("Review import sources", id="review-imports")
 
     def _ones_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.ONES], classes="setup-step"):
@@ -249,8 +328,15 @@ class SetupWizardScreen(SetupRootScreen):
             yield Input(placeholder="Local absolute path", id="repository-path")
             yield Input(placeholder="Credential-free remote URL", id="repository-url")
             yield Input(placeholder="Base branch", id="repository-branch")
+            yield Input(placeholder="Role: primary or dependency", id="repository-role")
+            yield Input(placeholder="Depends on keys (comma separated)", id="repository-depends-on")
+            yield Input(placeholder="Allowed paths (comma separated)", id="repository-allowed-paths")
+            yield Input(placeholder="Lint commands (separate with ;;)", id="repository-lint-commands")
+            yield Input(placeholder="Build commands (separate with ;;)", id="repository-build-commands")
+            yield Input(placeholder="Test commands (separate with ;;)", id="repository-test-commands")
             yield Input(placeholder="Group key", id="repository-group-key")
             yield Input(placeholder="Primary repository key", id="repository-primary")
+            yield Input(placeholder="Integration commands (separate with ;;)", id="repository-integration-commands")
 
     def _provider_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.PROVIDER], classes="setup-step"):
@@ -330,6 +416,12 @@ class SetupWizardScreen(SetupRootScreen):
                         "repository-path": str(repository.source_path or ""),
                         "repository-url": repository.repo_url,
                         "repository-branch": repository.base_branch,
+                        "repository-role": repository.role.value,
+                        "repository-depends-on": ",".join(repository.depends_on),
+                        "repository-allowed-paths": ",".join(repository.allowed_paths),
+                        "repository-lint-commands": "\n".join(repository.lint_commands),
+                        "repository-build-commands": "\n".join(repository.build_commands),
+                        "repository-test-commands": "\n".join(repository.test_commands),
                     }
                 )
             groups = tuple(workflow.repository_groups)
@@ -341,6 +433,48 @@ class SetupWizardScreen(SetupRootScreen):
 
     def on_resize(self, event: Resize) -> None:
         self._apply_layout(event.size.width)
+
+    @on(Button.Pressed, "#review-imports")
+    def _review_imports(self) -> None:
+        if self._import_context is None:
+            self.query_one("#setup-notice", Static).update("No import sources available")
+            return
+        self.app.push_screen(
+            SetupImportScreen(self._import_context), self._import_finished
+        )
+
+    def _import_finished(self, source: str | None) -> None:
+        context = self._import_context
+        if source is None or context is None or not self.is_attached:
+            return
+        try:
+            if source == "template":
+                if context.template_workflow is None:
+                    raise ValueError
+                self.controller.apply_workflow(
+                    context.template_workflow.model_copy(deep=True),
+                    changed_step=SetupStep.PROFILE,
+                )
+                self._populate_public_draft()
+            else:
+                kinds = (
+                    context.detection.environment
+                    if source == "environment"
+                    else context.detection.dotenv
+                )
+                self.controller.import_secrets(
+                    detection=context.detection,
+                    environment=context.environment,
+                    dotenv_values=context.dotenv_values,
+                    selected=kinds,
+                    source_choice={kind: source for kind in kinds},
+                )
+            self.query_one("#setup-notice", Static).update("Import completed")
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            self.query_one("#setup-notice", Static).update("Import failed safely")
+        self._render_state()
 
     def _apply_layout(self, width: int) -> None:
         self.remove_class("one", "two", "three")
@@ -601,6 +735,12 @@ class SetupWizardScreen(SetupRootScreen):
                 repo_name=fields["repository-name"],
                 base_branch=fields["repository-branch"],
                 source_path=Path(fields["repository-path"]),
+                role=RepositoryRole(fields["repository-role"]),
+                depends_on=self._comma_values(fields["repository-depends-on"]),
+                allowed_paths=self._comma_values(fields["repository-allowed-paths"]),
+                lint_commands=self._command_values(fields["repository-lint-commands"]),
+                build_commands=self._command_values(fields["repository-build-commands"]),
+                test_commands=self._command_values(fields["repository-test-commands"]),
             )
             group_key = fields["repository-group-key"]
             primary = fields["repository-primary"]
@@ -633,6 +773,9 @@ class SetupWizardScreen(SetupRootScreen):
                 key=group_key,
                 project_id=repository.project_id,
                 iteration_id=repository.iteration_id,
+                integration_test_commands=self._command_values(
+                    fields["repository-integration-commands"]
+                ),
             )
             for member in members:
                 builder.add(member)
@@ -680,6 +823,19 @@ class SetupWizardScreen(SetupRootScreen):
             workflow.worktree_root = Path(fields["worktree-root"])
             return SetupStepTransaction(workflow=workflow)
         return SetupStepTransaction()
+
+    @staticmethod
+    def _comma_values(value: str) -> tuple[str, ...]:
+        if "\n" in value or "\r" in value:
+            raise ValueError("repository policy is invalid")
+        return tuple(item.strip() for item in value.split(",") if item.strip())
+
+    @staticmethod
+    def _command_values(value: str) -> tuple[str, ...]:
+        if "\r" in value:
+            raise ValueError("repository command is invalid")
+        normalized = value.replace("\n", ";;")
+        return tuple(item.strip() for item in normalized.split(";;") if item.strip())
 
     def _commit_step_candidate(
         self,
@@ -1119,4 +1275,9 @@ class _RecoveryConfirmation(_ExplicitConfirmation):
         self.dismiss(False)
 
 
-__all__ = ["SetupRecoveryScreen", "SetupRootScreen", "SetupWizardScreen"]
+__all__ = [
+    "SetupImportContext",
+    "SetupRecoveryScreen",
+    "SetupRootScreen",
+    "SetupWizardScreen",
+]

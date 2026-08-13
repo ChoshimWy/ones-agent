@@ -310,6 +310,40 @@ def test_tui_parser_accepts_custom_config_path() -> None:
     assert args.config == "custom.json"
 
 
+def test_tui_missing_optional_template_still_builds_setup_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.cli import build_production_tui_host
+
+    monkeypatch.chdir(tmp_path)
+    factory, runtime = build_production_tui_host(tmp_path / "missing.json")
+    context = factory.import_context  # type: ignore[attr-defined]
+    assert context.detection.template_available is False
+    assert context.template_workflow is None
+    assert runtime is not None
+
+
+def test_tui_unsafe_template_reports_only_fixed_failure(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.cli import main
+
+    template = tmp_path / "invalid.json"
+    template.write_text("not-json SECRET-MUST-NOT-ECHO", encoding="utf-8")
+    from src.developer_workflow.setup_store import _protect_private_file
+    _protect_private_file(template)
+    output, error = Terminal(tty=False), Terminal(tty=False)
+    code = main(
+        ["tui", "--config", str(template)],
+        tui_runner=lambda first, second: None,
+        stdout=output,
+        stderr=error,
+    )
+    assert code == 1
+    assert error.getvalue() == "error: command failed safely\n"
+    assert "SECRET-MUST-NOT-ECHO" not in output.getvalue() + error.getvalue()
+
+
 def test_tui_help_has_no_configuration_factory_or_runner_side_effects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

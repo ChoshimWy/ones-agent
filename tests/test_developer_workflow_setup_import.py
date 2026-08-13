@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import sys
 
@@ -11,8 +12,48 @@ from src.developer_workflow.setup_import import (
     SetupImportError,
     detect_import_sources,
     import_selected,
+    load_template_workflow,
     parse_dotenv,
 )
+
+
+def test_load_template_workflow_is_read_only_and_resolves_private_roots(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "template.json"
+    path.write_text(
+        json.dumps(
+            {
+                "run_root": "runs",
+                "mirror_root": "mirrors",
+                "worktree_root": "worktrees",
+                "sandbox_permission_profile": "managed-dev",
+                "max_codex_attempts": 3,
+                "repositories": [{
+                    "key": "repo", "project_id": "P", "iteration_id": "I",
+                    "repo_url": "https://git.example.invalid/o/repo.git",
+                    "repo_name": "repo", "base_branch": "main",
+                }],
+                "publishing": {"provider": "github"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = path.read_bytes()
+    workflow = load_template_workflow(path)
+    assert workflow is not None
+    assert workflow.run_root == (tmp_path / "runs").absolute()
+    assert path.read_bytes() == before
+
+
+def test_load_template_workflow_allows_missing_but_rejects_secret_keys(
+    tmp_path: Path,
+) -> None:
+    assert load_template_workflow(tmp_path / "missing.json") is None
+    unsafe = tmp_path / "unsafe.json"
+    _write_private(unsafe, '{"provider_token":"must-not-load"}')
+    with pytest.raises(SetupImportError, match="template config is invalid"):
+        load_template_workflow(unsafe)
 from src.developer_workflow.setup_models import RuntimeSecrets, SecretKind
 
 

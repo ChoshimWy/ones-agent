@@ -11,6 +11,8 @@ import pytest
 from textual.widgets import Button, Input, Static
 
 from src.developer_workflow.setup_models import SetupDraft
+from src.developer_workflow.setup_models import SecretKind, WorkflowDraft
+from src.developer_workflow.setup_import import ImportDetection
 from src.developer_workflow.setup_controller import SetupController
 from src.developer_workflow.setup_store import SetupStore
 from src.developer_workflow.runtime_bootstrap import (
@@ -33,7 +35,7 @@ from src.developer_workflow.tui.app import TuiTaskMessage
 from src.developer_workflow.tui.models import RunActivity
 from src.developer_workflow.tui.supervisor import TaskEvent
 from src.developer_workflow.tui.screens import DashboardScreen
-from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+from src.developer_workflow.tui.setup_screens import SetupImportContext, SetupWizardScreen
 from tests.test_developer_workflow_tui_integration import (
     _EffectRepository,
     _MultiRemoteRunner,
@@ -54,12 +56,67 @@ def real_windows_credentials():
         assert credentials.list_generations(profile) == ()
     except CredentialStoreError:
         pytest.skip("Windows Credential Manager is unavailable")
+    known_generations: set[str] = set()
     try:
-        yield credentials, profile
+        yield credentials, profile, known_generations
     finally:
-        for generation in credentials.list_generations(profile):
+        _cleanup_profile_generations(credentials, profile, known_generations)
+
+
+def _cleanup_profile_generations(credentials, profile: str, known: set[str]) -> None:
+    candidates = set(known)
+    failures: list[str] = []
+    try:
+        candidates.update(credentials.list_generations(profile))
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        failures.append("list")
+    for generation in sorted(candidates):
+        try:
             credentials.delete_generation(profile, generation)
-        assert credentials.list_generations(profile) == ()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            failures.append("delete")
+    try:
+        remaining = credentials.list_generations(profile)
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            raise
+        failures.append("verify")
+        remaining = ("unknown",)
+    if failures or remaining:
+        raise AssertionError(
+            f"credential cleanup failed safely ({len(failures)} operations)"
+        )
+
+
+def test_credential_cleanup_attempts_later_generation_after_first_delete_fails() -> None:
+    class FaultyCredentials:
+        def __init__(self) -> None:
+            self.list_calls = 0
+            self.deleted: list[str] = []
+
+        def list_generations(self, profile: str):
+            self.list_calls += 1
+            if self.list_calls == 1:
+                raise OSError("target-must-not-escape")
+            return ("a" * 32,)
+
+        def delete_generation(self, profile: str, generation: str):
+            self.deleted.append(generation)
+            if generation == "a" * 32:
+                raise OSError("target-must-not-escape")
+
+    credentials = FaultyCredentials()
+    with pytest.raises(AssertionError, match=r"credential cleanup failed safely \(2 operations\)") as caught:
+        _cleanup_profile_generations(
+            credentials, "profile-must-not-escape", {"a" * 32, "b" * 32}
+        )
+    assert credentials.deleted == ["a" * 32, "b" * 32]
+    assert "target" not in str(caught.value)
+    assert "profile-must-not-escape" not in str(caught.value)
 
 
 class _SetupHarness:
@@ -77,6 +134,7 @@ class _SetupHarness:
         self.closed = False
         self.probe_effects: list[str] = []
         self.probe_failure: BaseException | None = None
+        self.import_calls: list[object] = []
 
     @property
     def revision(self) -> int:
@@ -176,6 +234,12 @@ class _SetupHarness:
     async def aclose(self) -> None:
         self.closed = True
 
+    def import_secrets(self, **kwargs) -> None:
+        self.import_calls.append(kwargs)
+
+    def apply_workflow(self, workflow, *, changed_step) -> None:
+        self.draft.workflow = workflow.model_copy(deep=True)
+
 
 async def _set_inputs(app: DeveloperWorkflowTuiApp, values: dict[str, str]) -> None:
     for widget_id, value in values.items():
@@ -226,7 +290,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         remotes,
         commenter,
     ) = _group_ui_runtime(tmp_path)
-    credentials, profile = real_windows_credentials
+    credentials, profile, known_generations = real_windows_credentials
     setup_store = SetupStore(
         credentials,
         config_path=tmp_path / "private-config" / "config.json",
@@ -307,6 +371,14 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             activation_timeout=10,
         ),
         runtime_bootstrapper=object(),
+        setup_import=SetupImportContext(
+            detection=ImportDetection((), (), True),
+            environment={},
+            dotenv_values={},
+            template_workflow=WorkflowDraft.model_validate(
+                original.config.model_dump(mode="python", round_trip=True)
+            ),
+        ),
         poll_interval=10,
     )
     source_before = {key: _source_facts(path) for key, path in sources.items()}
@@ -331,6 +403,14 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         assert isinstance(app.screen, SetupWizardScreen)
         assert fixture_store.list_run_ids() == ()
         assert effects == []
+
+        await pilot.click("#review-imports")
+        app.screen.query_one("#import-template", Button).focus()
+        await pilot.press("enter")
+        app.screen.query_one("#confirm-import", Button).focus()
+        await pilot.press("enter")
+        assert isinstance(app.screen, SetupWizardScreen)
+        assert setup.draft.workflow.repository_groups == original.config.repository_groups
 
         await _set_inputs(app, {"sandbox-profile": profile})
         await _test_current_step(pilot, app, SetupStep.PROFILE)
@@ -362,8 +442,15 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
                 "repository-path": str(sources["dependency"].resolve()),
                 "repository-url": "https://git.example.invalid/team/dependency.git",
                 "repository-branch": "main",
+                "repository-role": "dependency",
+                "repository-depends-on": "",
+                "repository-allowed-paths": "src",
+                "repository-lint-commands": "",
+                "repository-build-commands": "",
+                "repository-test-commands": "python -m compileall src",
                 "repository-group-key": "",
                 "repository-primary": "",
+                "repository-integration-commands": "",
             },
         )
         await _test_current_step(pilot, app, SetupStep.REPOSITORIES)
@@ -378,8 +465,15 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
                 "repository-path": str(sources["primary"].resolve()),
                 "repository-url": "https://git.example.invalid/team/primary.git",
                 "repository-branch": "main",
+                "repository-role": "primary",
+                "repository-depends-on": "dependency",
+                "repository-allowed-paths": "src",
+                "repository-lint-commands": "",
+                "repository-build-commands": "",
+                "repository-test-commands": "python -m compileall src/value.py",
                 "repository-group-key": "suite",
                 "repository-primary": "primary",
+                "repository-integration-commands": "python -m compileall .",
             },
         )
         await _test_current_step(pilot, app, SetupStep.REPOSITORIES)
@@ -387,16 +481,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             item.key
             for item in setup.draft.workflow.repository_groups[0].repositories
         ) == ("dependency", "primary")
-        # Commands/dependency metadata are non-secret deployment policy not yet
-        # editable as free text in the wizard.  Apply them through the real
-        # controller API, then re-run the repository capability gate.
-        workflow = setup.draft.workflow.model_copy(deep=True)
-        workflow.repository_groups = original.config.repository_groups
-        setup.apply_workflow(workflow, changed_step=SetupStep.REPOSITORIES)
-        await setup.test_step(
-            SetupStep.REPOSITORIES, app.screen._snapshot_fields()
-        )
-        app.screen._render_state()
+        assert setup.draft.workflow.repository_groups == original.config.repository_groups
         await _next_step(pilot, app)
 
         await _set_inputs(
@@ -477,6 +562,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         assert persisted.active is not None
         assert persisted.activation_owner_generation is None
         generation = persisted.active.generation
+        known_generations.add(generation)
         assert credentials.list_generations(profile) == (generation,)
         persisted_secrets = credentials.read_generation(
             profile, generation, persisted.active.credential_kinds
@@ -607,6 +693,49 @@ async def test_setup_surface_auditor_detects_a_deliberate_raw_and_rich_leak() ->
         await app.screen.mount(Static(SECRETS["control"], id="deliberate-leak"))
         with pytest.raises(AssertionError, match="setup-negative-control"):
             _audit(app, "setup-negative-control")
+
+
+@pytest.mark.asyncio
+async def test_setup_import_requires_visible_selection_and_confirmation() -> None:
+    setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
+    context = SetupImportContext(
+        detection=ImportDetection(
+            environment=(SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD),
+            dotenv=(SecretKind.ONES_PASSWORD, SecretKind.PROVIDER_TOKEN),
+            template_available=True,
+        ),
+        environment={"ONES_EMAIL": SECRETS["email"], "ONES_PASSWORD": SECRETS["ones"]},
+        dotenv_values={"ONES_PASSWORD": "dotenv-secret", "ONES_DEV_PROVIDER_TOKEN": SECRETS["provider"]},
+        template_workflow=WorkflowDraft(sandbox_permission_profile="managed-template"),
+    )
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        setup_import=context,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert setup.import_calls == []
+        await pilot.click("#review-imports")
+        assert app.screen.id == "setup-import"
+        rendered = str(app.screen.query_one("#import-summary").render())
+        assert "environment" in rendered and "dotenv" in rendered and "conflict" in rendered
+        assert not any(secret in rendered for secret in SECRETS.values())
+        app.screen.query_one("#import-environment", Button).focus()
+        await pilot.press("enter")
+        assert setup.import_calls == []
+        app.screen.query_one("#confirm-import", Button).focus()
+        await pilot.press("enter")
+        assert len(setup.import_calls) == 1
+        call = setup.import_calls[0]
+        assert call["selected"] == (SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD)
+        assert set(call["source_choice"].values()) == {"environment"}
+
+
+def test_repository_command_input_supports_multiple_safe_entries() -> None:
+    assert SetupWizardScreen._command_values(
+        "uv run ruff check .;;uv run pytest -q"
+    ) == ("uv run ruff check .", "uv run pytest -q")
 
 
 def test_setup_release_policy_declares_resources_and_private_exclusions() -> None:

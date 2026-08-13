@@ -611,12 +611,44 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     from .credential_store import WindowsCredentialStore
     from .runtime_bootstrap import RuntimeBootstrapper as WorkflowRuntimeBootstrapper
     from .setup_controller import SetupController
+    from .setup_import import (
+        ImportDetection,
+        detect_import_sources,
+        load_template_workflow,
+        parse_dotenv,
+    )
+    from .setup_models import WorkflowDraft
     from .setup_store import SetupStore
+    from .tui.setup_screens import SetupImportContext
     from .setup_validation import RuntimeBootstrapper as ValidationBootstrapper
 
-    # Task 10 imports this optional template explicitly. It is deliberately not
-    # parsed as the authoritative legacy workflow configuration at host startup.
-    _ = Path(template_path)
+    template_path = Path(template_path)
+    environment = dict(os.environ)
+    dotenv_path = Path.cwd() / ".env"
+    detected = detect_import_sources(
+        template_config_path=None,
+        dotenv_path=dotenv_path,
+        environment=environment,
+    )
+    dotenv_values = parse_dotenv(dotenv_path)
+    template = load_template_workflow(template_path)
+    detection = ImportDetection(
+        environment=detected.environment,
+        dotenv=detected.dotenv,
+        template_available=template is not None,
+    )
+    import_context = SetupImportContext(
+        detection=detection,
+        environment=environment,
+        dotenv_values=dotenv_values,
+        template_workflow=(
+            None
+            if template is None
+            else WorkflowDraft.model_validate(
+                template.model_dump(mode="python", round_trip=True)
+            )
+        ),
+    )
     runtime_builder = WorkflowRuntimeBootstrapper()
     validation = ValidationBootstrapper.production()
     store = SetupStore(WindowsCredentialStore())
@@ -628,6 +660,8 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
             runtime_builder=runtime_builder,
             runtime_bootstrap=validation,
         )
+
+    new_setup_controller.import_context = import_context  # type: ignore[attr-defined]
 
     return new_setup_controller, runtime_builder
 

@@ -29,6 +29,7 @@ from .private_paths import (
     _windows_descriptor,
 )
 from .setup_models import RuntimeSecrets, SecretKind
+from .config import DeveloperWorkflowConfig, _reject_secret_keys
 
 
 class SetupImportError(RuntimeError):
@@ -103,6 +104,30 @@ def detect_import_sources(
         dotenv=_detected_kinds(dotenv_values),
         template_available=template_available,
     )
+
+
+def load_template_workflow(path: Path | None) -> DeveloperWorkflowConfig | None:
+    """Safely load one optional, secret-free public workflow template."""
+
+    value = _read_template_object(path)
+    if value is None:
+        return None
+    try:
+        _reject_secret_keys(value)
+        assert path is not None
+        for field_name in ("run_root", "mirror_root", "worktree_root"):
+            raw = value.get(field_name)
+            if type(raw) is not str:
+                raise ValueError
+            candidate = Path(raw)
+            if not candidate.is_absolute():
+                candidate = path.absolute().parent / candidate
+            value[field_name] = candidate.absolute()
+        return DeveloperWorkflowConfig.model_validate(value)
+    except BaseException as error:
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+            raise
+        raise SetupImportError("template config is invalid") from None
 
 
 def parse_dotenv(path: Path) -> dict[str, str]:
@@ -340,18 +365,22 @@ def _validate_unicode_text(value: str) -> None:
 
 
 def _validate_template(path: Path | None) -> bool:
+    return _read_template_object(path) is not None
+
+
+def _read_template_object(path: Path | None) -> dict[str, object] | None:
     if path is None:
-        return False
+        return None
     try:
-        raw = _read_bounded(path, missing_ok=True)
+        raw = _read_bounded(path, missing_ok=True, require_private=False)
     except FileNotFoundError:
-        return False
+        return None
     except ValueError:
         raise SetupImportError("template config is invalid") from None
     except (OSError, TypeError):
         raise SetupImportError("template config path is unsafe") from None
     if raw is None:
-        return False
+        return None
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeError:
@@ -368,7 +397,7 @@ def _validate_template(path: Path | None) -> bool:
             raise ValueError
     except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
         raise SetupImportError("template config is invalid") from None
-    return True
+    return value
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -384,7 +413,9 @@ def _invalid_json() -> None:
     raise ValueError
 
 
-def _read_bounded(path: Path, *, missing_ok: bool) -> bytearray | None:
+def _read_bounded(
+    path: Path, *, missing_ok: bool, require_private: bool = True
+) -> bytearray | None:
     if not isinstance(path, Path):
         raise TypeError
     candidate = path.absolute()
@@ -397,7 +428,11 @@ def _read_bounded(path: Path, *, missing_ok: bool) -> bytearray | None:
             return None
         raise
     try:
-        descriptor = _open_source_readonly(candidate)
+        descriptor = (
+            _open_source_readonly(candidate)
+            if require_private
+            else _open_source_readonly(candidate, require_private=False)
+        )
     except FileNotFoundError:
         raise OSError from None
     content: bytearray | None = None
@@ -483,13 +518,15 @@ def _close_descriptor(descriptor: int) -> None:
     os.close(descriptor)
 
 
-def _open_source_readonly(path: Path) -> int:
+def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
     """Open without following links; Windows denies concurrent write/delete access."""
 
     if os.name != "nt":
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
         info = os.fstat(descriptor)
-        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+        if require_private and (
+            info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077
+        ):
             os.close(descriptor)
             raise OSError
         try:
@@ -549,23 +586,24 @@ def _open_source_readonly(path: Path) -> int:
             os.path.abspath(path)
         ):
             raise OSError
-        owner, entries, protected = _windows_descriptor(path)
-        user = _current_user_sid()
-        trusted = {user, _SYSTEM_SID, _ADMINISTRATORS_SID}
-        full_control = 0x001F01FF
-        if (
-            owner != user
-            or not protected
-            or not entries
-            or any(
-                sid not in trusted
-                or ace_type != 0
-                or flags & 0x10
-                or mask & full_control != full_control
-                for sid, mask, flags, ace_type in entries
-            )
-        ):
-            raise OSError
+        if require_private:
+            owner, entries, protected = _windows_descriptor(path)
+            user = _current_user_sid()
+            trusted = {user, _SYSTEM_SID, _ADMINISTRATORS_SID}
+            full_control = 0x001F01FF
+            if (
+                owner != user
+                or not protected
+                or not entries
+                or any(
+                    sid not in trusted
+                    or ace_type != 0
+                    or flags & 0x10
+                    or mask & full_control != full_control
+                    for sid, mask, flags, ace_type in entries
+                )
+            ):
+                raise OSError
         return msvcrt.open_osfhandle(
             int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
@@ -613,5 +651,6 @@ __all__ = [
     "SetupImportError",
     "detect_import_sources",
     "import_selected",
+    "load_template_workflow",
     "parse_dotenv",
 ]

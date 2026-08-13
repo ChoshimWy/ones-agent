@@ -18,7 +18,12 @@ from .controller import TuiController
 from .models import RunActivity
 from .screens import DashboardScreen, HelpScreen, SettingsView
 from .runtime_session import TuiRuntimeSession
-from .setup_screens import SetupRecoveryScreen, SetupRootScreen, SetupWizardScreen
+from .setup_screens import (
+    SetupImportContext,
+    SetupRecoveryScreen,
+    SetupRootScreen,
+    SetupWizardScreen,
+)
 from .supervisor import TaskEvent
 
 
@@ -68,6 +73,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         setup_controller: object | None = None,
         setup_controller_factory: Callable[[], object] | None = None,
         runtime_bootstrapper: object | None = None,
+        setup_import: SetupImportContext | None = None,
         provider_type: str = "configured",
         sandbox_configured: bool = True,
         poll_interval: float = 2.0,
@@ -95,6 +101,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         if self.setup_controller is None and self._setup_controller_factory is not None:
             self.setup_controller = self._new_setup_controller()
         self.runtime_bootstrapper = runtime_bootstrapper
+        self._setup_import = setup_import
         self.runtime_session: TuiRuntimeSession | None = None
         self.controller: TuiController | None = None
         self.supervisor: object | None = None
@@ -199,6 +206,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                 self.setup_controller,
                 activation_callback=self._activate_setup_candidate,
                 cancel_callback=self._cancel_setup,
+                import_context=self._setup_import,
             )
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
