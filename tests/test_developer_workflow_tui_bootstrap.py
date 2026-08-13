@@ -1770,6 +1770,36 @@ async def test_app_close_timeout_retains_runtime_owner_until_retry_completes() -
 
 
 @pytest.mark.asyncio
+async def test_reconfigure_pending_close_keeps_owner_and_does_not_open_setup() -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.runtime_session import TuiRuntimeCloseError
+
+    class PendingSession:
+        close_complete = False
+
+        async def close(self) -> None:
+            raise TuiRuntimeCloseError("TUI runtime close failed")
+
+    created: list[object] = []
+    session = PendingSession()
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=_SetupController(None),
+        setup_controller_factory=lambda: created.append(object()) or object(),
+        runtime_bootstrapper=object(),
+        close_timeout=0.03,
+    )
+    app.runtime_session = session  # type: ignore[assignment]
+    app.controller = object()  # type: ignore[assignment]
+    app.supervisor = object()
+
+    await app._begin_reconfigure()
+
+    assert app.runtime_session is session
+    assert app.controller is not None
+    assert created == []
+
+
+@pytest.mark.asyncio
 async def test_runtime_session_close_is_ordered_idempotent_and_clears_sink() -> None:
     from src.developer_workflow.tui.runtime_session import TuiRuntimeSession
 

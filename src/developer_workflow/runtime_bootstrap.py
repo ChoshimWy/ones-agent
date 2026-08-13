@@ -206,6 +206,11 @@ class RuntimeHandle:
     def __repr__(self) -> str:
         return "RuntimeHandle(<redacted>)"
 
+    @property
+    def close_complete(self) -> bool:
+        with self._condition:
+            return self._state == "closed"
+
     def close(self) -> None:
         with self._condition:
             while self._state == "closing":

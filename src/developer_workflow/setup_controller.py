@@ -288,6 +288,8 @@ class SetupController:
         self._finalizing = False
         self._background_close_tasks: set[asyncio.Future[None]] = set()
         self._abandoned_build_tasks: set[asyncio.Task[object]] = set()
+        self._catalog_tasks: set[asyncio.Task[tuple[str, ...]]] = set()
+        self._catalog_owner_task: asyncio.Task[Any] | None = None
 
     @property
     def closed(self) -> bool:
@@ -310,9 +312,30 @@ class SetupController:
     async def list_managed_profiles(self) -> tuple[str, ...]:
         """Return a detached trusted catalog snapshot without blocking the UI loop."""
 
-        self._ensure_mutable()
+        async with self._operation_lock:
+            self._ensure_mutable()
+            owner = asyncio.current_task()
+            self._operation_task = owner
+            self._catalog_owner_task = owner
+            task = asyncio.create_task(
+                asyncio.to_thread(self._profile_catalog.list_profiles)
+            )
+            try:
+                profiles = tuple(await asyncio.shield(task))
+            except asyncio.CancelledError:
+                self._catalog_tasks.add(task)
+                task.add_done_callback(self._finish_catalog_task)
+                raise
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise SetupActionError("managed profiles are unavailable") from None
+            finally:
+                if self._operation_task is owner:
+                    self._operation_task = None
+                if self._catalog_owner_task is owner:
+                    self._catalog_owner_task = None
         try:
-            profiles = tuple(await asyncio.to_thread(self._profile_catalog.list_profiles))
             if (
                 any(type(profile) is not str or not profile for profile in profiles)
                 or len(profiles) != len(set(profiles))
@@ -320,9 +343,18 @@ class SetupController:
                 raise ValueError
             return profiles
         except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+            if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
                 raise
             raise SetupActionError("managed profiles are unavailable") from None
+
+    def _finish_catalog_task(self, task: asyncio.Task[tuple[str, ...]]) -> None:
+        self._catalog_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except BaseException:
+            pass
 
     def apply_step_transaction(
         self,
@@ -1157,6 +1189,9 @@ class SetupController:
             return
         self._closing = True
         task = self._operation_task
+        catalog_owner = self._catalog_owner_task
+        if catalog_owner is not None and not catalog_owner.done():
+            catalog_owner.cancel()
         if task is None or task.done():
             self._closed = True
             self._clear_transient_secrets()
@@ -1177,6 +1212,7 @@ class SetupController:
         tasks: set[asyncio.Task[Any]] = {
             *self._background_close_tasks,
             *self._abandoned_build_tasks,
+            *self._catalog_tasks,
         }
         if not tasks:
             return

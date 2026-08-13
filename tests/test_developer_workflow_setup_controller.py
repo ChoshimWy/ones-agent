@@ -176,6 +176,38 @@ async def test_managed_profile_snapshot_is_frozen_and_loaded_off_loop() -> None:
     assert catalog.thread_id != loop_thread
 
 
+@pytest.mark.asyncio
+async def test_managed_profile_cancel_is_propagated_and_worker_is_owned() -> None:
+    import threading
+
+    entered, release = threading.Event(), threading.Event()
+
+    class Catalog(FakeCatalog):
+        def list_profiles(self) -> tuple[str, ...]:
+            entered.set()
+            release.wait(2)
+            return ("managed-profile",)
+
+    bootstrap = FakeBootstrap()
+    bootstrap.catalog = Catalog()
+    controller = SetupController(
+        profile_id="managed-profile",
+        store=FakeStore(),
+        runtime_builder=FakeRuntimeBuilder(),
+        runtime_bootstrap=bootstrap,
+        cleanup_timeout=0.1,
+    )
+    task = asyncio.create_task(controller.list_managed_profiles())
+    assert await asyncio.to_thread(entered.wait, 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert controller._catalog_tasks
+    release.set()
+    await controller.aclose()
+    assert controller._catalog_tasks == set()
+
+
 class Handle:
     def __init__(self) -> None:
         self.closed = 0

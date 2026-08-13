@@ -439,11 +439,13 @@ class SetupWizardScreen(SetupRootScreen):
 
     async def _refresh_managed_profiles(self) -> None:
         loader = getattr(self.controller, "list_managed_profiles", None)
+        notice: str | None = None
         if not callable(loader):
             self._profile_catalog_ready = True
-            self.query_one("#setup-notice", Static).update(
-                "Managed profiles are unavailable"
-            )
+            if self.is_attached:
+                self.query_one("#setup-notice", Static).update(
+                    "Managed profiles are unavailable"
+                )
             return
         try:
             profiles = tuple(await loader())
@@ -451,9 +453,9 @@ class SetupWizardScreen(SetupRootScreen):
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             profiles = ()
-            self.query_one("#setup-notice", Static).update(
-                "Managed profiles are unavailable"
-            )
+            notice = "Managed profiles are unavailable"
+        if not self.is_attached:
+            return
         self._managed_profiles = profiles
         self._profile_catalog_ready = True
         options = tuple((profile, profile) for profile in profiles)
@@ -463,7 +465,7 @@ class SetupWizardScreen(SetupRootScreen):
             widget.disabled = not profiles
         if not profiles:
             self.query_one("#setup-notice", Static).update(
-                "No managed profiles are available"
+                notice or "No managed profiles are available"
             )
 
     @on(Select.Changed, "#sandbox-profile, #codex-profile")

@@ -128,6 +128,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._closing_setup_controller: object | None = None
         self._transition_lock = asyncio.Lock()
         self._activation_handles: set[int] = set()
+        self._pending_runtime_handle: object | None = None
         self._poll_timer: Timer | None = None
         self._reconfiguring = False
         app_ref = weakref.ref(self)
@@ -504,10 +505,15 @@ class DeveloperWorkflowTuiApp(App[None]):
         await self._replace_with_runtime(handle)
 
     async def _recover_setup_removal_failure(self, handle: object) -> None:
+        closed = False
         try:
             await asyncio.wait_for(asyncio.to_thread(handle.close), timeout=5.0)
+            closed = bool(getattr(handle, "close_complete", True))
         except BaseException:
-            pass
+            closed = bool(getattr(handle, "close_complete", False))
+        if not closed:
+            self._pending_runtime_handle = handle
+            return
         await self._discard_setup_controller()
         if self._ui_closed:
             return
@@ -531,8 +537,8 @@ class DeveloperWorkflowTuiApp(App[None]):
         handle: object,
         session: TuiRuntimeSession | None = None,
     ) -> None:
-        await self._discard_runtime(handle=handle, session=session)
-        if not self._ui_closed:
+        closed = await self._discard_runtime(handle=handle, session=session)
+        if closed and not self._ui_closed:
             await self._discard_setup_controller()
             self.setup_controller = self._new_setup_controller()
             await self._show_setup()
@@ -542,7 +548,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         *,
         handle: object,
         session: TuiRuntimeSession | None,
-    ) -> None:
+    ) -> bool:
         dashboard = self._dashboard
         if dashboard is not None:
             try:
@@ -563,16 +569,36 @@ class DeveloperWorkflowTuiApp(App[None]):
             try:
                 await session.close()
             except BaseException:
-                pass
+                if not getattr(session, "close_complete", False):
+                    self._notify_runtime_close_pending()
+                    return False
         else:
             try:
                 await asyncio.wait_for(asyncio.to_thread(handle.close), timeout=5.0)
             except BaseException:
-                pass
+                if not getattr(handle, "close_complete", False):
+                    self._pending_runtime_handle = handle
+                    self._notify_runtime_close_pending()
+                    return False
+        if session is not None and not getattr(session, "close_complete", True):
+            return False
+        if session is None and not getattr(handle, "close_complete", True):
+            self._pending_runtime_handle = handle
+            self._notify_runtime_close_pending()
+            return False
         self.runtime_session = None
         self.controller = None
         self.supervisor = None
         self._dashboard = None
+        if self._pending_runtime_handle is handle:
+            self._pending_runtime_handle = None
+        return True
+
+    def _notify_runtime_close_pending(self) -> None:
+        try:
+            self.notify("Runtime shutdown is still pending", severity="warning")
+        except BaseException:
+            pass
 
     @on(Button.Pressed, "#configure-runtime")
     async def _pressed_configure_runtime(self) -> None:
@@ -591,13 +617,18 @@ class DeveloperWorkflowTuiApp(App[None]):
             dashboard = self._dashboard
             if dashboard is not None:
                 dashboard.begin_teardown()
+            close_failed = False
             try:
                 await self.runtime_session.close()
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
                 safe_exit = True
-            finally:
+                close_failed = True
+            if not getattr(self.runtime_session, "close_complete", not close_failed):
+                self._notify_runtime_close_pending()
+                return
+            else:
                 self.runtime_session = None
                 self.controller = None
                 self.supervisor = None
@@ -864,6 +895,23 @@ class DeveloperWorkflowTuiApp(App[None]):
                     return _AppCloseOutcome(fatal=fatal, complete=False)
                 self.runtime_session = None
             else:
+                pending = self._pending_runtime_handle
+                if pending is not None:
+                    pending_incomplete = False
+                    try:
+                        await self._await_owned(asyncio.to_thread(pending.close))
+                    except _OwnedCloseCancelled:
+                        pending_incomplete = True
+                    except BaseException as error:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            fatal = error
+                        if not getattr(pending, "close_complete", True):
+                            pending_incomplete = True
+                    if not getattr(pending, "close_complete", not pending_incomplete):
+                        pending_incomplete = True
+                    if pending_incomplete:
+                        return _AppCloseOutcome(fatal=fatal, complete=False)
+                    self._pending_runtime_handle = None
                 controller = (
                     self.setup_controller or self._closing_setup_controller
                 )
