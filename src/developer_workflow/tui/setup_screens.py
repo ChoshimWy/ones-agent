@@ -75,6 +75,44 @@ _PROBE_FIELDS = {
     SetupStep.PRIVATE_PATHS: ("run-root", "mirror-root", "worktree-root"),
     SetupStep.REVIEW: (),
 }
+_CONFIG_FIELDS = {
+    SetupStep.PROFILE: ("sandbox-profile",),
+    SetupStep.ONES: (
+        "ones-base-url",
+        "ones-team-id",
+        "ones-issue-type-id",
+        "ones-project-id",
+        "ones-status-id",
+        "ones-item-id",
+    ),
+    SetupStep.REPOSITORIES: (
+        "repository-key",
+        "repository-project-id",
+        "repository-iteration-id",
+        "repository-name",
+        "repository-path",
+        "repository-url",
+        "repository-branch",
+        "repository-group-key",
+        "repository-primary",
+    ),
+    SetupStep.PROVIDER: (
+        "provider-host",
+        "provider-api-url",
+        "git-author-name",
+        "git-author-email",
+        "provider-type",
+        "repository-branch",
+    ),
+    SetupStep.CODEX: (
+        "codex-auth-mode",
+        "codex-profile",
+        "codex-worktree",
+        "codex-home",
+    ),
+    SetupStep.PRIVATE_PATHS: ("run-root", "mirror-root", "worktree-root"),
+    SetupStep.REVIEW: (),
+}
 
 
 class _SetupReadOnlySupervisor:
@@ -277,12 +315,13 @@ class SetupWizardScreen(SetupRootScreen):
         }
         return MappingProxyType(values)
 
-    def _snapshot_all_public_fields(self) -> Mapping[str, str]:
+    def _snapshot_config_fields(self) -> Mapping[str, str]:
+        """Copy only the public fields owned by the current setup step."""
+
         return MappingProxyType(
             {
-                widget.id: widget.value
-                for widget in self.query(Input)
-                if widget.id is not None and not widget.password
+                field_name: self.query_one(f"#{field_name}", Input).value
+                for field_name in _CONFIG_FIELDS[self.current_step]
             }
         )
 
@@ -306,7 +345,11 @@ class SetupWizardScreen(SetupRootScreen):
             finally:
                 item[1] = ""
 
-    def _apply_current_public_fields(self, fields: Mapping[str, str]) -> None:
+    def _apply_current_public_fields(
+        self,
+        fields: Mapping[str, str],
+        saved_runtime_fields: Mapping[str, str] = MappingProxyType({}),
+    ) -> None:
         apply_runtime_fields = getattr(
             self.controller, "apply_runtime_fields", None
         )
@@ -449,23 +492,26 @@ class SetupWizardScreen(SetupRootScreen):
             raise RuntimeError("runtime input is unavailable")
         codex_home = fields["codex-home"]
         runtime = RuntimePublicConfig(
-            ones_base_url=fields["ones-base-url"],
-            ones_team_id=fields["ones-team-id"],
-            ones_issue_type_id=fields["ones-issue-type-id"],
+            ones_base_url=saved_runtime_fields["ones_base_url"],
+            ones_team_id=saved_runtime_fields["ones_team_id"],
+            ones_issue_type_id=saved_runtime_fields["ones_issue_type_id"],
             ones_comment_list_path_template=(
                 DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
             ),
-            provider_host=fields["provider-host"],
-            provider_api_url=fields["provider-api-url"],
-            git_author_name=fields["git-author-name"],
-            git_author_email=fields["git-author-email"],
+            provider_host=saved_runtime_fields["provider_host"],
+            provider_api_url=saved_runtime_fields["provider_api_url"],
+            git_author_name=saved_runtime_fields["git_author_name"],
+            git_author_email=saved_runtime_fields["git_author_email"],
             codex_auth_mode=fields["codex-auth-mode"],
             codex_home=Path(codex_home) if codex_home else None,
         )
         apply_runtime(runtime, changed_step=SetupStep.CODEX)
 
     def _build_step_transaction(
-        self, fields: Mapping[str, str], draft: object | None
+        self,
+        fields: Mapping[str, str],
+        draft: object | None,
+        saved_runtime_fields: Mapping[str, str] = MappingProxyType({}),
     ) -> SetupStepTransaction:
         workflow = (
             draft.workflow.model_copy(deep=True)
@@ -553,16 +599,16 @@ class SetupWizardScreen(SetupRootScreen):
             codex_home = fields["codex-home"]
             return SetupStepTransaction(
                 runtime=RuntimePublicConfig(
-                    ones_base_url=fields["ones-base-url"],
-                    ones_team_id=fields["ones-team-id"],
-                    ones_issue_type_id=fields["ones-issue-type-id"],
+                    ones_base_url=saved_runtime_fields["ones_base_url"],
+                    ones_team_id=saved_runtime_fields["ones_team_id"],
+                    ones_issue_type_id=saved_runtime_fields["ones_issue_type_id"],
                     ones_comment_list_path_template=(
                         DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
                     ),
-                    provider_host=fields["provider-host"],
-                    provider_api_url=fields["provider-api-url"],
-                    git_author_name=fields["git-author-name"],
-                    git_author_email=fields["git-author-email"],
+                    provider_host=saved_runtime_fields["provider_host"],
+                    provider_api_url=saved_runtime_fields["provider_api_url"],
+                    git_author_name=saved_runtime_fields["git_author_name"],
+                    git_author_email=saved_runtime_fields["git_author_email"],
                     codex_auth_mode=fields["codex-auth-mode"],
                     codex_home=Path(codex_home) if codex_home else None,
                 )
@@ -580,6 +626,7 @@ class SetupWizardScreen(SetupRootScreen):
         secret_values: list[list[object]],
         expected_revision: int | None,
         fields: Mapping[str, str],
+        saved_runtime_fields: Mapping[str, str],
     ) -> None:
         apply_transaction = getattr(
             self.controller, "apply_step_transaction", None
@@ -600,7 +647,7 @@ class SetupWizardScreen(SetupRootScreen):
                     item[1] = ""
             return
         self._consume_step_secrets(secret_values)
-        self._apply_current_public_fields(fields)
+        self._apply_current_public_fields(fields, saved_runtime_fields)
 
     def _belongs_to_current_step(self, widget: Input) -> bool:
         target = _STEP_IDS[self.current_step]
@@ -635,23 +682,33 @@ class SetupWizardScreen(SetupRootScreen):
         self._generation += 1
         generation = self._generation
         fields = self._snapshot_fields()
-        public_fields = self._snapshot_all_public_fields()
+        public_fields = self._snapshot_config_fields()
         secret_values = self._take_step_secrets()
         expected_revision = getattr(self.controller, "revision", None)
         draft = getattr(self.controller, "draft", None)
+        saved_runtime_fields = getattr(
+            self.controller, "runtime_public_fields", MappingProxyType({})
+        )
         button.disabled = True
         self.query_one("#setup-notice", Static).update("Testing connection")
         async def prepare_and_probe() -> object:
             if callable(getattr(self.controller, "apply_step_transaction", None)):
                 transaction = await asyncio.to_thread(
-                    self._build_step_transaction, public_fields, draft
+                    self._build_step_transaction,
+                    public_fields,
+                    draft,
+                    saved_runtime_fields,
                 )
             else:
                 transaction = SetupStepTransaction()
             if generation != self._generation or not self.is_attached:
                 raise asyncio.CancelledError
             self._commit_step_candidate(
-                transaction, secret_values, expected_revision, public_fields
+                transaction,
+                secret_values,
+                expected_revision,
+                public_fields,
+                saved_runtime_fields,
             )
             if generation != self._generation or not self.is_attached:
                 raise asyncio.CancelledError
@@ -672,6 +729,8 @@ class SetupWizardScreen(SetupRootScreen):
             return
         finally:
             self._clear_inputs()
+            if generation == self._generation and self.is_attached:
+                self._render_state()
         if generation != self._generation or not self.is_attached:
             return
         category = getattr(result, "category", "incompatible")
@@ -690,6 +749,7 @@ class SetupWizardScreen(SetupRootScreen):
         self._supervisor = _SetupReadOnlySupervisor()
         if self.is_attached:
             self.query_one("#setup-notice", Static).update("Setup edit cancelled")
+            self._render_state()
 
     @on(Button.Pressed, "#test-connection")
     async def _pressed_test(self) -> None:

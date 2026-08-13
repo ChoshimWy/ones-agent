@@ -327,6 +327,18 @@ async def test_setup_codex_applies_complete_public_runtime() -> None:
     from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
 
     controller = _WizardSetupController()
+    controller.runtime_public_fields = MappingProxyType(
+        {
+            "ones_base_url": "https://ones.example.invalid",
+            "ones_team_id": "team-1",
+            "ones_issue_type_id": "defect-1",
+            "provider_host": "git.example.invalid",
+            "provider_api_url": "https://git.example.invalid/api",
+            "git_author_name": "ONES Developer",
+            "git_author_email": "developer@example.invalid",
+            "provider": "github",
+        }
+    )
     controller.current_step = SetupStep.CODEX
     for step in tuple(SetupStep)[:4]:
         controller._results[step] = controller._results[step].model_copy(
@@ -335,13 +347,6 @@ async def test_setup_codex_applies_complete_public_runtime() -> None:
     async with _wizard_app(controller).run_test() as pilot:
         screen = pilot.app.screen
         values = {
-            "#ones-base-url": "https://ones.example.invalid",
-            "#ones-team-id": "team-1",
-            "#ones-issue-type-id": "defect-1",
-            "#provider-host": "git.example.invalid",
-            "#provider-api-url": "https://git.example.invalid/api",
-            "#git-author-name": "ONES Developer",
-            "#git-author-email": "developer@example.invalid",
             "#codex-auth-mode": "credential",
             "#codex-profile": "managed-profile",
             "#codex-worktree": "C:/safe/probe",
@@ -491,6 +496,92 @@ async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_
         assert ticked
         assert controller.calls == []
         assert commits == []
+
+
+@pytest.mark.asyncio
+async def test_each_step_candidate_receives_only_its_exact_config_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+
+    expected = {
+        SetupStep.PROFILE: {"sandbox-profile"},
+        SetupStep.ONES: {
+            "ones-base-url", "ones-team-id", "ones-issue-type-id",
+            "ones-project-id", "ones-status-id", "ones-item-id",
+        },
+        SetupStep.REPOSITORIES: {
+            "repository-key", "repository-project-id", "repository-iteration-id",
+            "repository-name", "repository-path", "repository-url",
+            "repository-branch", "repository-group-key", "repository-primary",
+        },
+        SetupStep.PROVIDER: {
+            "provider-host", "provider-api-url", "git-author-name",
+            "git-author-email", "provider-type", "repository-branch",
+        },
+        SetupStep.CODEX: {
+            "codex-auth-mode", "codex-profile", "codex-worktree", "codex-home",
+        },
+        SetupStep.PRIVATE_PATHS: {"run-root", "mirror-root", "worktree-root"},
+    }
+    captured: list[tuple[SetupStep, set[str]]] = []
+    original = SetupWizardScreen._build_step_transaction
+
+    def capture(
+        self: SetupWizardScreen,
+        fields: object,
+        draft: object,
+        saved_runtime_fields: object,
+    ) -> object:
+        captured.append((self.current_step, set(fields)))
+        return original(self, fields, draft, saved_runtime_fields)
+
+    monkeypatch.setattr(SetupWizardScreen, "_build_step_transaction", capture)
+    controller = _WizardSetupController()
+    controller.revision = 0
+    controller.apply_step_transaction = lambda *args, **kwargs: None
+    controller.draft = SimpleNamespace(workflow=__import__(
+        "src.developer_workflow.setup_models", fromlist=["WorkflowDraft"]
+    ).WorkflowDraft())
+    for step in tuple(SetupStep)[:-1]:
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        for step in tuple(SetupStep)[:-1]:
+            screen.current_step = step
+            screen._render_state()
+            try:
+                await screen.action_test_connection()
+            except BaseException:
+                pass
+    assert dict(captured) == expected
+
+
+@pytest.mark.asyncio
+async def test_setup_prepare_failure_restores_button_and_retry_succeeds() -> None:
+    from src.developer_workflow.setup_validation import SetupStep
+
+    class FailsOnce(_WizardSetupController):
+        failures = 1
+
+        async def test_step(self, step: object, probe: object = None) -> object:
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("SENSITIVE FAILURE")
+            return await super().test_step(step, probe)
+
+    controller = FailsOnce()
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        screen.query_one("#sandbox-profile").value = "managed-profile"
+        await screen.action_test_connection()
+        assert screen.query_one("#test-connection").disabled is False
+        await screen.action_test_connection()
+        assert len(controller.calls) == 1
+        assert screen.query_one("#test-connection").disabled is False
 
 
 class _SetupController:

@@ -267,6 +267,12 @@ class SetupController:
     def revision(self) -> int:
         return self._revision
 
+    @property
+    def runtime_public_fields(self) -> Mapping[str, str]:
+        """Return a detached, secret-free snapshot of validated runtime fragments."""
+
+        return MappingProxyType(dict(self._runtime_fields))
+
     def apply_step_transaction(
         self,
         step: SetupStep,
@@ -591,6 +597,10 @@ class SetupController:
         current = asyncio.current_task() if self._has_running_loop() else None
         if task is not None and task is not current and not task.done():
             task.cancel()
+        for step, result in tuple(self._results.items()):
+            if result.status is ValidationStatus.PENDING:
+                self._results.pop(step, None)
+                self._invalidate_after(step, include_step=False)
         self._clear_transient_secrets()
 
     def confirm_review(self) -> None:
@@ -642,6 +652,16 @@ class SetupController:
                 self._results.pop(step, None)
                 raise
             except SetupActionError:
+                if (
+                    self._results.get(step, _fixed_result(step)).status
+                    is ValidationStatus.PENDING
+                ):
+                    self._results[step] = _fixed_result(
+                        step,
+                        status=ValidationStatus.FAILED,
+                        category="incompatible",
+                    )
+                    self._invalidate_after(step, include_step=False)
                 raise
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
