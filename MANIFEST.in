@@ -1,6 +1,7 @@
 include README.md pyproject.toml server.py main.py
 recursive-include config *.py
 recursive-include src *.py *.json *.tcss
+recursive-include src *.md
 prune tests
 prune agent-gui
 prune data

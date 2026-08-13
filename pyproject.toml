@@ -45,6 +45,7 @@ include-package-data = false
 
 [tool.setuptools.package-data]
 "src.developer_workflow" = ["schemas/*.json", "tui/*.tcss"]
+"src.llm" = ["prompts/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

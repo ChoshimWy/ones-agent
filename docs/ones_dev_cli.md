@@ -8,18 +8,29 @@
 uv run ones-dev tui --config docs/examples/ones-dev.config.json
 ```
 
-启动会先完整校验生产配置，不提供“缺少凭据时只读降级”模式。配置文件必须提供
-`run_root`、`mirror_root`、`worktree_root`、`sandbox_permission_profile`、
-`repositories` 或 `repository_groups`、`publishing.provider`，以及可选的
-`tui_max_concurrency`（1–8，默认 3）。环境必须提供 ONES 登录与类型配置
-`ONES_BASE_URL`、`ONES_EMAIL`、`ONES_PASSWORD`、`ONES_TEAM_ID`、
-`ONES_ISSUE_TYPE_ID`，PR provider 配置 `ONES_DEV_PROVIDER_TOKEN`、
-`ONES_DEV_PROVIDER_HOST`、`ONES_DEV_PROVIDER_API_URL`，Git 身份
-`ONES_DEV_GIT_AUTHOR_NAME`、`ONES_DEV_GIT_AUTHOR_EMAIL`，以及可用的 Codex
-认证（`CODEX_HOME`、`CODEX_API_KEY`、`CODEX_AUTH_TOKEN` 或
-`OPENAI_API_KEY` 中符合部署策略的一种）。Git 凭据传输仍只接受配置章节列出的
-五个 allowlist 变量。所有值的格式、私有目录约束和可选容量限制以“配置”章节为准；
-凭据只从受控进程环境注入，不写入 JSON，也不会显示在 widget、通知或错误消息中。
+`--config` 指向的示例文件只用于导入，不会被改写；其中的标识符和地址仍是占位符。
+首次配置或已保存配置不完整时，TUI 会进入受限配置模式，而不是要求用户先在终端中
+准备完整配置。配置过程依次包含七个步骤：托管 profile、ONES、仓库与仓库组、Git
+provider、Codex、私有目录和 Review。每一步只执行对应的只读连接或能力检查；Review
+确认并再次显式确认“保存并激活”之前，不会构建生产 Orchestrator，也不会创建 run、
+mirror、worktree、commit、push、PR 或写入 ONES。
+
+ONES、provider、Codex 和 Git 传输凭据保存在 Windows Credential Manager；版本化配置
+文件只保存非敏感策略。sandbox 与 Codex 只能选择管理员预先安装并被探测通过的托管
+profile。全部检查通过后无需重启即可进入 Dashboard。Dashboard 的 `Configure runtime`
+可先关闭现有 runtime，再进入重新配置；取消会恢复之前的稳定 generation。若进程在
+激活中断，下一次启动会显示恢复页面；恢复旧 generation、丢弃未完成 generation 和
+清理孤立凭据均要求二次确认。任何错误、通知、Rich renderable 或 TaskEvent 都只显示
+固定类别，不回显凭据、认证邮箱、私有路径或外部错误文本。
+
+配置向导支持键盘和鼠标。`Tab`/`Shift+Tab` 在字段和操作间移动，`Ctrl+Enter` 执行
+当前步骤的连接测试或在 Review 请求激活确认，`Escape` 取消当前编辑并清除瞬态凭据；
+普通 `Enter` 不会保存凭据、激活 runtime 或执行恢复操作。
+
+非交互 CLI 保持原有兼容语义：继续从受控进程环境变量以及命令指定的 `--config`
+装配 runtime，不读取 TUI 的 Credential Manager generation，也不会自动改写或删除
+环境变量和 `.env`。环境或 `.env` 中检测到的凭据只有在配置向导中明确选择来源并确认
+导入后，才会进入本次编辑事务。
 
 常用键：
 

@@ -1033,10 +1033,33 @@ def test_packaging_declares_root_entry_modules_and_workflow_runtime_data() -> No
     assert {"server", "main"}.issubset(set(setuptools["py-modules"]))
     assert "schemas/*.json" in setuptools["package-data"]["src.developer_workflow"]
     assert "tui/*.tcss" in setuptools["package-data"]["src.developer_workflow"]
+    assert "prompts/*.md" in setuptools["package-data"]["src.llm"]
     assert setuptools["packages"]["find"]["include"] == ["src*", "config*"]
 
     manifest = Path("MANIFEST.in").read_text(encoding="utf-8")
     assert "recursive-include src *.py *.json *.tcss" in manifest
+    assert "recursive-include src *.md" in manifest
+    for excluded in (
+        "prune tests",
+        "prune data",
+        "prune .agents",
+        "prune .codex",
+        "global-exclude .env .env.*",
+    ):
+        assert excluded in manifest
+    for runtime in (
+        "runtime_bootstrap.py",
+        "setup_controller.py",
+        "setup_import.py",
+        "setup_models.py",
+        "setup_repository.py",
+        "setup_store.py",
+        "setup_validation.py",
+        "tui/setup_screens.py",
+        "tui/tui.tcss",
+        "schemas/workflow-result.schema.json",
+    ):
+        assert (Path("src/developer_workflow") / runtime).is_file()
 
 
 def test_private_roots_are_created_with_verified_private_access(tmp_path: Path) -> None:
