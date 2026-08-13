@@ -22,7 +22,8 @@ from ..setup_models import (
     SecretKind,
     WorkflowDraft,
 )
-from ..setup_repository import RepositoryGroupDraftBuilder
+from ..setup_controller import SetupStepTransaction
+from ..setup_repository import RepositoryGroupDraftBuilder, build_repository
 from ..setup_validation import SetupStep, ValidationStatus
 from .setup_models import build_setup_step_view, setup_step_label
 
@@ -331,6 +332,7 @@ class SetupWizardScreen(SetupRootScreen):
                         "provider_api_url": fields["provider-api-url"],
                         "git_author_name": fields["git-author-name"],
                         "git_author_email": fields["git-author-email"],
+                        "provider": fields["provider-type"],
                     }
                 ),
             )
@@ -462,6 +464,144 @@ class SetupWizardScreen(SetupRootScreen):
         )
         apply_runtime(runtime, changed_step=SetupStep.CODEX)
 
+    def _build_step_transaction(
+        self, fields: Mapping[str, str], draft: object | None
+    ) -> SetupStepTransaction:
+        workflow = (
+            draft.workflow.model_copy(deep=True)
+            if draft is not None and hasattr(draft, "workflow")
+            else WorkflowDraft()
+        )
+        if self.current_step is SetupStep.PROFILE:
+            workflow.sandbox_permission_profile = fields["sandbox-profile"]
+            return SetupStepTransaction(workflow=workflow)
+        if self.current_step is SetupStep.ONES:
+            return SetupStepTransaction(
+                runtime_fields=MappingProxyType(
+                    {
+                        "ones_base_url": fields["ones-base-url"],
+                        "ones_team_id": fields["ones-team-id"],
+                        "ones_issue_type_id": fields["ones-issue-type-id"],
+                    }
+                )
+            )
+        if self.current_step is SetupStep.REPOSITORIES:
+            repository = build_repository(
+                key=fields["repository-key"],
+                project_id=fields["repository-project-id"],
+                iteration_id=fields["repository-iteration-id"],
+                repo_url=fields["repository-url"],
+                repo_name=fields["repository-name"],
+                base_branch=fields["repository-branch"],
+                source_path=Path(fields["repository-path"]),
+            )
+            group_key = fields["repository-group-key"]
+            primary = fields["repository-primary"]
+            if not group_key and not primary:
+                return SetupStepTransaction(repository=repository)
+            members = [
+                item
+                for item in workflow.repositories
+                if item.project_id == repository.project_id
+                and item.iteration_id == repository.iteration_id
+                and item.key != repository.key
+            ]
+            existing_group = next(
+                (
+                    item
+                    for item in workflow.repository_groups
+                    if item.key == group_key
+                ),
+                None,
+            )
+            if existing_group is not None:
+                members.extend(
+                    item
+                    for item in existing_group.repositories
+                    if item.key != repository.key
+                    and not any(candidate.key == item.key for candidate in members)
+                )
+            members.append(repository)
+            builder = RepositoryGroupDraftBuilder(
+                key=group_key,
+                project_id=repository.project_id,
+                iteration_id=repository.iteration_id,
+            )
+            for member in members:
+                builder.add(member)
+            return SetupStepTransaction(
+                repository_group=builder.build(primary=primary)
+            )
+        if self.current_step is SetupStep.PROVIDER:
+            workflow.publishing = PublishingConfig(
+                provider=PublishingProvider(fields["provider-type"]),
+                default_target_branch=fields["repository-branch"],
+            )
+            return SetupStepTransaction(
+                workflow=workflow,
+                runtime_fields=MappingProxyType(
+                    {
+                        "provider_host": fields["provider-host"],
+                        "provider_api_url": fields["provider-api-url"],
+                        "git_author_name": fields["git-author-name"],
+                        "git_author_email": fields["git-author-email"],
+                        "provider": fields["provider-type"],
+                    }
+                ),
+            )
+        if self.current_step is SetupStep.CODEX:
+            codex_home = fields["codex-home"]
+            return SetupStepTransaction(
+                runtime=RuntimePublicConfig(
+                    ones_base_url=fields["ones-base-url"],
+                    ones_team_id=fields["ones-team-id"],
+                    ones_issue_type_id=fields["ones-issue-type-id"],
+                    ones_comment_list_path_template=(
+                        DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
+                    ),
+                    provider_host=fields["provider-host"],
+                    provider_api_url=fields["provider-api-url"],
+                    git_author_name=fields["git-author-name"],
+                    git_author_email=fields["git-author-email"],
+                    codex_auth_mode=fields["codex-auth-mode"],
+                    codex_home=Path(codex_home) if codex_home else None,
+                )
+            )
+        if self.current_step is SetupStep.PRIVATE_PATHS:
+            workflow.run_root = Path(fields["run-root"])
+            workflow.mirror_root = Path(fields["mirror-root"])
+            workflow.worktree_root = Path(fields["worktree-root"])
+            return SetupStepTransaction(workflow=workflow)
+        return SetupStepTransaction()
+
+    def _commit_step_candidate(
+        self,
+        transaction: SetupStepTransaction,
+        secret_values: list[list[object]],
+        expected_revision: int | None,
+        fields: Mapping[str, str],
+    ) -> None:
+        apply_transaction = getattr(
+            self.controller, "apply_step_transaction", None
+        )
+        if callable(apply_transaction) and expected_revision is not None:
+            secrets = MappingProxyType(
+                {item[0]: item[1] for item in secret_values}
+            )
+            try:
+                apply_transaction(
+                    self.current_step,
+                    transaction,
+                    expected_revision=expected_revision,
+                    secrets=secrets,
+                )
+            finally:
+                for item in secret_values:
+                    item[1] = ""
+            return
+        self._consume_step_secrets(secret_values)
+        self._apply_current_public_fields(fields)
+
     def _belongs_to_current_step(self, widget: Input) -> bool:
         target = _STEP_IDS[self.current_step]
         return any(getattr(node, "id", None) == target for node in widget.ancestors)
@@ -497,13 +637,24 @@ class SetupWizardScreen(SetupRootScreen):
         fields = self._snapshot_fields()
         public_fields = self._snapshot_all_public_fields()
         secret_values = self._take_step_secrets()
+        expected_revision = getattr(self.controller, "revision", None)
+        draft = getattr(self.controller, "draft", None)
         button.disabled = True
         self.query_one("#setup-notice", Static).update("Testing connection")
         async def prepare_and_probe() -> object:
-            await asyncio.to_thread(self._consume_step_secrets, secret_values)
-            await asyncio.to_thread(
-                self._apply_current_public_fields, public_fields
+            if callable(getattr(self.controller, "apply_step_transaction", None)):
+                transaction = await asyncio.to_thread(
+                    self._build_step_transaction, public_fields, draft
+                )
+            else:
+                transaction = SetupStepTransaction()
+            if generation != self._generation or not self.is_attached:
+                raise asyncio.CancelledError
+            self._commit_step_candidate(
+                transaction, secret_values, expected_revision, public_fields
             )
+            if generation != self._generation or not self.is_attached:
+                raise asyncio.CancelledError
             return await self.controller.test_step(self.current_step, fields)
         try:
             result = await self._supervisor.run_readonly(

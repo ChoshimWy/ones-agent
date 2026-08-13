@@ -78,6 +78,49 @@ def _secrets(**updates: str) -> RuntimeSecrets:
     return RuntimeSecrets(values)
 
 
+@pytest.mark.asyncio
+async def test_provider_probe_transport_uses_gitlab_private_token_header() -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    builder = RuntimeBootstrapper()
+    transport = builder.build_provider_probe_transport(
+        {
+            "provider_host": "gitlab.example.invalid",
+            "provider_api_url": "https://gitlab.example.invalid/api/v4",
+            "provider": "gitlab",
+        },
+        RuntimeSecrets({SecretKind.PROVIDER_TOKEN: "GITLAB-SECRET"}),
+    )
+    try:
+        assert transport.headers["PRIVATE-TOKEN"] == "GITLAB-SECRET"
+        assert "Authorization" not in transport.headers
+    finally:
+        await transport.aclose()
+
+
+def test_malicious_provider_url_is_rejected_before_secret_read() -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    class Secrets:
+        reads = 0
+
+        def require(self, kind: object) -> str:
+            self.reads += 1
+            return "MUST-NOT-BE-READ"
+
+    secrets = Secrets()
+    with pytest.raises(Exception):
+        RuntimeBootstrapper().build_provider_probe_transport(
+            {
+                "provider_host": "gitlab.example.invalid",
+                "provider_api_url": "https://user:pass@gitlab.example.invalid/api?leak=1",
+                "provider": "gitlab",
+            },
+            secrets,  # type: ignore[arg-type]
+        )
+    assert secrets.reads == 0
+
+
 def test_bootstrap_uses_explicit_inputs_without_mutating_parent_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

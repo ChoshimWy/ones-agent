@@ -40,6 +40,8 @@ from .setup_models import (
     RuntimePublicConfig,
     RuntimeSecrets,
     SecretKind,
+    OnesProbePublicConfig,
+    ProviderProbePublicConfig,
 )
 from .state_store import FileRunStore
 
@@ -213,14 +215,21 @@ class RuntimeBootstrapper:
     ) -> OnesGateway:
         """Build a fresh read-only gateway from the current setup edit."""
 
+        checked = OnesProbePublicConfig(
+            base_url=public["ones_base_url"],
+            team_id=public["ones_team_id"],
+            issue_type_id=public["ones_issue_type_id"],
+        )
+        email = secrets.require(SecretKind.ONES_EMAIL)
+        password = secrets.require(SecretKind.ONES_PASSWORD)
         settings = _RuntimeOnesSettings.model_validate(
             {
-                "base_url": public["ones_base_url"],
-                "email": secrets.require(SecretKind.ONES_EMAIL),
-                "password": secrets.require(SecretKind.ONES_PASSWORD),
-                "team_id": public["ones_team_id"],
+                "base_url": checked.base_url,
+                "email": email,
+                "password": password,
+                "team_id": checked.team_id,
                 "project_id": "",
-                "issue_type_id": public["ones_issue_type_id"],
+                "issue_type_id": checked.issue_type_id,
                 "api_token": "",
                 "defect_status_ids": "",
                 "comment_list_path_template": DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
@@ -233,10 +242,21 @@ class RuntimeBootstrapper:
     ) -> httpx.AsyncClient:
         """Build a fresh authenticated GET-only client for one provider probe."""
 
-        token = secrets.require(SecretKind.PROVIDER_TOKEN)
+        checked = ProviderProbePublicConfig(
+            host=public["provider_host"],
+            api_url=public["provider_api_url"],
+            provider=public["provider"],
+        )
+        policy = HttpPullRequestClient(
+            provider=checked.provider,
+            provider_host=checked.host,
+            api_base_url=checked.api_url,
+            token_provider=lambda: secrets.require(SecretKind.PROVIDER_TOKEN),
+            client=object(),  # type: ignore[arg-type]
+        )
         return httpx.AsyncClient(
-            base_url=public["provider_api_url"],
-            headers={"Authorization": f"Bearer {token}"},
+            base_url=checked.api_url,
+            headers=policy._headers(),
             timeout=10.0,
         )
 

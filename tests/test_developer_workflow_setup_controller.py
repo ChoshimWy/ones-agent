@@ -474,6 +474,80 @@ def test_runtime_field_revisit_updates_real_draft_and_invalidates_downstream(
     assert controller.result_for(SetupStep.PROVIDER).status is ValidationStatus.NOT_CONFIGURED
 
 
+def test_group_transaction_moves_members_and_replaces_nested_mapping(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.contracts import (
+        RepositoryGroupMapping,
+        RepositoryMapping,
+        RepositoryRole,
+    )
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller, _, _, _ = _controller(tmp_path)
+    sdk = controller.draft.workflow.repositories[0]
+    dependency = RepositoryMapping(
+        key="dependency", project_id=sdk.project_id,
+        iteration_id=sdk.iteration_id,
+        repo_url="https://git.example.test/dependency.git",
+        repo_name="dependency", role=RepositoryRole.DEPENDENCY,
+        depends_on=("sdk",),
+    )
+    group = RepositoryGroupMapping(
+        key="workspace", project_id=sdk.project_id,
+        iteration_id=sdk.iteration_id, primary_repository="sdk",
+        repositories=(
+            sdk.validated_update(role=RepositoryRole.PRIMARY), dependency
+        ),
+    )
+    controller.apply_step_transaction(
+        SetupStep.REPOSITORIES,
+        SetupStepTransaction(repository_group=group),
+        expected_revision=controller.revision,
+    )
+    assert controller.draft.workflow.repositories == ()
+    assert len(controller.draft.workflow.repository_groups) == 1
+    changed = group.validated_update(
+        repositories=(
+            group.repositories[0].validated_update(base_branch="release"),
+            group.repositories[1],
+        )
+    )
+    controller.apply_step_transaction(
+        SetupStep.REPOSITORIES,
+        SetupStepTransaction(repository_group=changed),
+        expected_revision=controller.revision,
+    )
+    workflow = controller.draft.workflow
+    assert len(workflow.repository_groups) == 1
+    assert workflow.repository_groups[0].repositories[0].base_branch == "release"
+    DeveloperWorkflowConfig.model_validate(workflow.model_dump(round_trip=True))
+
+
+def test_step_transaction_rejects_all_changes_without_partial_secret_write(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller, _, _, _ = _controller(tmp_path)
+    before = controller.draft
+    with pytest.raises(SetupActionError):
+        controller.apply_step_transaction(
+            SetupStep.ONES,
+            SetupStepTransaction(
+                runtime_fields={
+                    "ones_base_url": "https://changed.ones.example.test",
+                    "ones_team_id": "changed-team",
+                    "ones_issue_type_id": "changed-issue",
+                }
+            ),
+            expected_revision=controller.revision,
+            secrets={SecretKind.ONES_PASSWORD: "BAD\nSECRET"},
+        )
+    assert controller.draft == before
+    assert controller.secret_presence(SecretKind.ONES_PASSWORD)
+
+
 def test_cancel_clears_transient_secrets(tmp_path: Path) -> None:
     controller, _, _, _ = _controller(tmp_path)
     assert "TOKEN-SECRET" not in repr(controller)

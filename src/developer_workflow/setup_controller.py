@@ -16,6 +16,8 @@ from .contracts import RepositoryGroupMapping, RepositoryMapping
 from .setup_import import ImportDetection, import_selected
 from .setup_models import (
     ActiveSetup,
+    OnesProbePublicConfig,
+    ProviderProbePublicConfig,
     RuntimePublicConfig,
     RuntimeSecrets,
     SecretKind,
@@ -143,6 +145,15 @@ class SetupControllerState:
     error_category: str | None
 
 
+@dataclass(frozen=True, slots=True)
+class SetupStepTransaction:
+    runtime: RuntimePublicConfig | None = None
+    workflow: WorkflowDraft | None = None
+    runtime_fields: Mapping[str, str] | None = None
+    repository: RepositoryMapping | None = None
+    repository_group: RepositoryGroupMapping | None = None
+
+
 _NOT_CONFIGURED = "invalid_field"
 _SECRET_STEP: dict[SecretKind, SetupStep] = {
     SecretKind.ONES_EMAIL: SetupStep.ONES,
@@ -253,6 +264,103 @@ class SetupController:
         return self._activation_error
 
     @property
+    def revision(self) -> int:
+        return self._revision
+
+    def apply_step_transaction(
+        self,
+        step: SetupStep,
+        transaction: SetupStepTransaction,
+        *,
+        expected_revision: int,
+        secrets: Mapping[SecretKind, str] = MappingProxyType({}),
+    ) -> None:
+        """Atomically commit one prevalidated UI candidate under a revision CAS."""
+
+        self._ensure_mutable()
+        self._require_step(step)
+        if (
+            type(transaction) is not SetupStepTransaction
+            or type(expected_revision) is not int
+            or expected_revision != self._revision
+            or any(type(kind) is not SecretKind or type(value) is not str or not value
+                   for kind, value in secrets.items())
+        ):
+            raise SetupActionError("configuration changed")
+        draft = self._draft.model_copy(deep=True)
+        runtime_fields = dict(self._runtime_fields)
+        encoded: dict[SecretKind, bytearray] = {}
+        try:
+            if transaction.runtime_fields is not None:
+                raw_fields = dict(transaction.runtime_fields)
+                if step is SetupStep.ONES:
+                    OnesProbePublicConfig(
+                        base_url=raw_fields["ones_base_url"],
+                        team_id=raw_fields["ones_team_id"],
+                        issue_type_id=raw_fields["ones_issue_type_id"],
+                    )
+                elif step is SetupStep.PROVIDER:
+                    ProviderProbePublicConfig(
+                        host=raw_fields["provider_host"],
+                        api_url=raw_fields["provider_api_url"],
+                        provider=raw_fields["provider"],
+                    )
+            for kind, value in secrets.items():
+                raw = bytearray(value.encode("utf-8", errors="strict"))
+                if len(raw) > 2560 or any(
+                    unicodedata.category(character)
+                    in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+                    for character in value
+                ):
+                    raise ValueError
+                encoded[kind] = raw
+            if transaction.runtime is not None:
+                draft.runtime = transaction.runtime.model_copy(deep=True)
+            if transaction.workflow is not None:
+                draft.workflow = transaction.workflow.model_copy(deep=True)
+            if transaction.runtime_fields is not None:
+                runtime_fields.update(dict(transaction.runtime_fields))
+            workflow = draft.workflow
+            if transaction.repository is not None:
+                repository = transaction.repository.model_copy(deep=True)
+                repositories = tuple(
+                    repository if item.key == repository.key else item
+                    for item in workflow.repositories
+                )
+                if not any(item.key == repository.key for item in workflow.repositories):
+                    repositories = (*repositories, repository)
+                workflow.repositories = repositories
+            if transaction.repository_group is not None:
+                group = transaction.repository_group.model_copy(deep=True)
+                member_keys = {item.key for item in group.repositories}
+                workflow.repositories = tuple(
+                    item for item in workflow.repositories if item.key not in member_keys
+                )
+                groups = tuple(
+                    group if item.key == group.key else item
+                    for item in workflow.repository_groups
+                )
+                if not any(item.key == group.key for item in workflow.repository_groups):
+                    groups = (*groups, group)
+                workflow.repository_groups = groups
+            # Validate the complete draft shape before any owned state changes.
+            WorkflowDraft.model_validate(workflow.model_dump(round_trip=True))
+        except BaseException as error:
+            for raw in encoded.values():
+                self._zero(raw)
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise SetupActionError("step configuration is invalid") from None
+        self._draft = draft
+        self._runtime_fields = runtime_fields
+        for kind, raw in encoded.items():
+            old = self._secrets.get(kind)
+            if old is not None:
+                self._zero(old)
+            self._secrets[kind] = raw
+        self._changed(step)
+
+    @property
     def current_step(self) -> SetupStep:
         for step in self.STEPS[:-1]:
             result = self._results.get(step)
@@ -315,6 +423,7 @@ class SetupController:
                     "provider_api_url",
                     "git_author_name",
                     "git_author_email",
+                    "provider",
                 }
             ),
             SetupStep.CODEX: frozenset({"codex_auth_mode", "codex_home"}),
@@ -327,7 +436,9 @@ class SetupController:
         self._runtime_fields.update({key: fields[key] for key in allowed})
         runtime = self._draft.runtime
         if runtime is not None:
-            updates: dict[str, object] = dict(fields)
+            updates: dict[str, object] = {
+                key: value for key, value in fields.items() if key != "provider"
+            }
             if "codex_home" in updates:
                 raw_home = updates["codex_home"]
                 updates["codex_home"] = Path(raw_home) if raw_home else None
@@ -1242,4 +1353,5 @@ __all__ = [
     "SetupActionError",
     "SetupController",
     "SetupControllerState",
+    "SetupStepTransaction",
 ]

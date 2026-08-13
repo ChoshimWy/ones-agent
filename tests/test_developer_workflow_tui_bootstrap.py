@@ -419,7 +419,9 @@ async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
 
 
 @pytest.mark.asyncio
-async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_result() -> None:
+async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import asyncio
     from threading import Event
 
@@ -428,11 +430,35 @@ async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_
     started = Event()
     release = Event()
 
+    commits: list[object] = []
+
     class BlockingController(_WizardSetupController):
-        def upsert_repository(self, **fields: object) -> object:
-            started.set()
-            release.wait(2)
-            return SimpleNamespace(key=fields["key"])
+        revision = 0
+
+        @property
+        def draft(self) -> object:
+            from src.developer_workflow.setup_models import SetupDraft
+
+            return SetupDraft()
+
+        def apply_step_transaction(self, *args: object, **kwargs: object) -> None:
+            commits.append((args, kwargs))
+
+    def blocking_build(**fields: object) -> object:
+        from src.developer_workflow.contracts import RepositoryMapping
+
+        started.set()
+        release.wait(2)
+        return RepositoryMapping(
+            key=fields["key"], project_id=fields["project_id"],
+            iteration_id=fields["iteration_id"], repo_url=fields["repo_url"],
+            repo_name=fields["repo_name"], base_branch=fields["base_branch"],
+        )
+
+    monkeypatch.setattr(
+        "src.developer_workflow.tui.setup_screens.build_repository",
+        blocking_build,
+    )
 
     controller = BlockingController()
     controller.current_step = SetupStep.REPOSITORIES
@@ -464,6 +490,7 @@ async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_
         await asyncio.gather(task, return_exceptions=True)
         assert ticked
         assert controller.calls == []
+        assert commits == []
 
 
 class _SetupController:

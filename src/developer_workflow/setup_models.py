@@ -301,6 +301,51 @@ class RuntimePublicConfig(SetupModel):
         return self
 
 
+class OnesProbePublicConfig(SetupModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    base_url: StrictStr
+    team_id: StrictStr
+    issue_type_id: StrictStr
+
+    @field_validator("base_url")
+    @classmethod
+    def validate_base_url(cls, value: str) -> str:
+        return _validated_url(value, "base_url", schemes=frozenset({"http", "https"}))
+
+    @field_validator("team_id", "issue_type_id")
+    @classmethod
+    def validate_identifiers(cls, value: str, info: Any) -> str:
+        return _validated_text(value, info.field_name, maximum=320)
+
+
+class ProviderProbePublicConfig(SetupModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
+
+    host: StrictStr
+    api_url: StrictStr
+    provider: Literal["github", "gitlab"]
+
+    @field_validator("host")
+    @classmethod
+    def validate_host(cls, value: str) -> str:
+        _validated_text(value, "host", maximum=253)
+        if _canonical_host(value) != value:
+            raise ValueError("host is invalid")
+        return value
+
+    @field_validator("api_url")
+    @classmethod
+    def validate_api_url(cls, value: str) -> str:
+        return _validated_url(value, "api_url", schemes=frozenset({"https"}))
+
+    @model_validator(mode="after")
+    def validate_binding(self) -> ProviderProbePublicConfig:
+        if _canonical_host(urlsplit(self.api_url).hostname) != self.host:
+            raise ValueError("provider endpoint is invalid")
+        return self
+
+
 class WorkflowDraft(SetupModel):
     model_config = ConfigDict(
         extra="forbid", validate_assignment=True, hide_input_in_errors=True
@@ -512,6 +557,8 @@ class RuntimeInputs:
 __all__ = [
     "ActiveSetup",
     "DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE",
+    "OnesProbePublicConfig",
+    "ProviderProbePublicConfig",
     "RuntimeInputs",
     "RuntimePublicConfig",
     "RuntimeSecrets",
