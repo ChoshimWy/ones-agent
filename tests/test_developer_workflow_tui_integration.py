@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -203,7 +204,7 @@ def test_tui_controller_close_failure_after_normal_runner_fails_safely(
     assert error.getvalue() == "error: command failed safely\n"
 
 
-def test_incomplete_production_runtime_fails_before_tui_runner_and_root_creation(
+def test_incomplete_production_runtime_enters_setup_before_legacy_config_load(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     for name in (
@@ -222,18 +223,21 @@ def test_incomplete_production_runtime_fails_before_tui_runner_and_root_creation
     config_path = _config_file(tmp_path)
     calls: list[object] = []
 
+    monkeypatch.setattr(
+        DeveloperWorkflowConfig,
+        "load",
+        lambda path: (_ for _ in ()).throw(AssertionError("legacy load called")),
+    )
+    host = (SimpleNamespace(close=lambda: None), object())
     code = cli.main(
         ["tui", "--config", str(config_path)],
         factory=cli.build_production_orchestrator,
+        tui_host_factory=lambda path: host,
         tui_runner=lambda controller, limit: calls.append((controller, limit)),
     )
 
-    config = DeveloperWorkflowConfig.load(config_path)
-    assert code == 1
-    assert calls == []
-    assert not config.run_root.exists()
-    assert not config.mirror_root.exists()
-    assert not config.worktree_root.exists()
+    assert code == 0
+    assert calls == [host]
 
 
 def test_run_tui_constructs_and_runs_the_production_app(

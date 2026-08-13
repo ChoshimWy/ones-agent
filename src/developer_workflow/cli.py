@@ -42,7 +42,11 @@ class DefectListFactory(Protocol):
 
 
 class TuiRunner(Protocol):
-    def __call__(self, controller: object, max_concurrency: int) -> None: ...
+    def __call__(self, first: object, second: object) -> None: ...
+
+
+class TuiHostFactory(Protocol):
+    def __call__(self, template_path: Path) -> tuple[object, object]: ...
 
 
 class SandboxProfileValidator(Protocol):
@@ -624,12 +628,53 @@ def _execute_tui(
     return 0
 
 
+def build_production_tui_host(template_path: Path) -> tuple[object, object]:
+    """Build only the private setup host; no workflow runtime is opened here."""
+
+    from .credential_store import WindowsCredentialStore
+    from .runtime_bootstrap import RuntimeBootstrapper as WorkflowRuntimeBootstrapper
+    from .setup_controller import SetupController
+    from .setup_store import SetupStore
+    from .setup_validation import RuntimeBootstrapper as ValidationBootstrapper
+
+    # Task 10 imports this optional template explicitly. It is deliberately not
+    # parsed as the authoritative legacy workflow configuration at host startup.
+    _ = Path(template_path)
+    runtime_builder = WorkflowRuntimeBootstrapper()
+    validation = ValidationBootstrapper.production()
+    controller = SetupController(
+        profile_id="default",
+        store=SetupStore(WindowsCredentialStore()),
+        runtime_builder=runtime_builder,
+        runtime_bootstrap=validation,
+    )
+    return controller, runtime_builder
+
+
+def _execute_tui_bootstrap(
+    template_path: Path,
+    host_factory: TuiHostFactory,
+    tui_runner: TuiRunner,
+) -> int:
+    setup_controller, runtime_bootstrapper = host_factory(template_path)
+    try:
+        tui_runner(setup_controller, runtime_bootstrapper)
+    except BaseException:
+        try:
+            setup_controller.close()
+        except BaseException:
+            pass
+        raise
+    return 0
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
     factory: OrchestratorFactory = build_production_orchestrator,
     defect_list_factory: DefectListFactory = build_production_defect_list_client,
     tui_runner: TuiRunner | None = None,
+    tui_host_factory: TuiHostFactory | None = None,
     stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
@@ -647,13 +692,24 @@ def main(
             return _execute_defect_list(
                 args, defect_list_factory, stdout=stdout, stderr=stderr
             )
-        config = DeveloperWorkflowConfig.load(args.config)
         if args.command == "tui":
             if tui_runner is None:
                 from .tui import run_tui
 
                 tui_runner = run_tui
+            if tui_host_factory is not None:
+                return _execute_tui_bootstrap(
+                    Path(args.config), tui_host_factory, tui_runner
+                )
+            if factory is build_production_orchestrator:
+                return _execute_tui_bootstrap(
+                    Path(args.config), build_production_tui_host, tui_runner
+                )
+            # Compatibility for callers that injected the old orchestration
+            # factory. The installed CLI always uses the bootstrap branch above.
+            config = DeveloperWorkflowConfig.load(args.config)
             return _execute_tui(config, factory, tui_runner)
+        config = DeveloperWorkflowConfig.load(args.config)
         orchestrator = factory(config)
         return _execute(
             args, orchestrator, stdin=stdin, stdout=stdout, stderr=stderr
@@ -669,6 +725,7 @@ def main(
 __all__ = [
     "build_production_defect_list_client",
     "build_production_orchestrator",
+    "build_production_tui_host",
     "main",
 ]
 

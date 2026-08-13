@@ -24,6 +24,8 @@ from .models import (
     safe_tui_text,
 )
 from .run_index import RunIndex
+from .runtime_session import TuiRuntimeCloseError, TuiRuntimeSession
+from .setup_screens import SetupRootScreen
 from .supervisor import (
     RunTaskSupervisor,
     SupervisorClosedError,
@@ -32,10 +34,18 @@ from .supervisor import (
 )
 
 
-def run_tui(controller: TuiController, max_concurrency: int) -> None:
-    """Run the full-screen terminal application for an assembled controller."""
+def run_tui(setup_controller: object, runtime_bootstrapper: object) -> None:
+    """Run the two-stage terminal host without pre-constructing workflow services."""
 
-    DeveloperWorkflowTuiApp(controller, max_concurrency).run()
+    if type(runtime_bootstrapper) is int:
+        DeveloperWorkflowTuiApp(
+            setup_controller, runtime_bootstrapper  # type: ignore[arg-type]
+        ).run()
+        return
+    DeveloperWorkflowTuiApp(
+        setup_controller=setup_controller,
+        runtime_bootstrapper=runtime_bootstrapper,
+    ).run()
 
 __all__ = [
     "CandidateSessionView",
@@ -51,6 +61,7 @@ __all__ = [
     "RunIndex",
     "RunSummary",
     "RunTaskSupervisor",
+    "SetupRootScreen",
     "SupervisorClosedError",
     "SupervisorLoopError",
     "TestView",
@@ -59,6 +70,8 @@ __all__ = [
     "TuiControllerError",
     "TuiDisplayError",
     "TaskEvent",
+    "TuiRuntimeCloseError",
+    "TuiRuntimeSession",
     "run_detail_from_run",
     "run_tui",
     "safe_tui_text",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import weakref
 
 from textual.app import App
@@ -12,7 +13,9 @@ from textual.timer import Timer
 from .controller import TuiController
 from .models import RunActivity
 from .screens import DashboardScreen, HelpScreen, SettingsView
-from .supervisor import RunTaskSupervisor, TaskEvent
+from .runtime_session import TuiRuntimeSession
+from .setup_screens import SetupRootScreen
+from .supervisor import TaskEvent
 
 
 class TuiTaskMessage(Message):
@@ -37,9 +40,11 @@ class DeveloperWorkflowTuiApp(App[None]):
 
     def __init__(
         self,
-        controller: TuiController,
-        max_concurrency: int,
+        controller: TuiController | None = None,
+        max_concurrency: int = 3,
         *,
+        setup_controller: object | None = None,
+        runtime_bootstrapper: object | None = None,
         provider_type: str = "configured",
         sandbox_configured: bool = True,
         poll_interval: float = 2.0,
@@ -51,8 +56,19 @@ class DeveloperWorkflowTuiApp(App[None]):
         ):
             raise ValueError("poll_interval must be positive")
         super().__init__()
-        self.controller = controller
+        if controller is None and (
+            setup_controller is None or runtime_bootstrapper is None
+        ):
+            raise ValueError("TUI bootstrap configuration is invalid")
+        if controller is not None and setup_controller is not None:
+            raise ValueError("TUI bootstrap configuration is invalid")
+        self.setup_controller = setup_controller
+        self.runtime_bootstrapper = runtime_bootstrapper
+        self.runtime_session: TuiRuntimeSession | None = None
+        self.controller: TuiController | None = None
+        self.supervisor: object | None = None
         self.poll_interval = float(poll_interval)
+        self._max_concurrency = max_concurrency
         self.settings = SettingsView(
             max_concurrency=max_concurrency,
             provider_type=provider_type,
@@ -61,6 +77,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self.activities: dict[str, RunActivity] = {}
         self._accept_events = True
         self._ui_closed = False
+        self._transition_lock = asyncio.Lock()
         self._poll_timer: Timer | None = None
         app_ref = weakref.ref(self)
 
@@ -69,27 +86,132 @@ class DeveloperWorkflowTuiApp(App[None]):
             if app is not None and app._accept_events:
                 app.post_message(TuiTaskMessage(event))
 
-        self.supervisor = RunTaskSupervisor(
-            max_concurrency,
-            sink,
+        self._event_sink = sink
+        self._dashboard: DashboardScreen | None = None
+        if controller is not None:
+            self.runtime_session = TuiRuntimeSession.from_controller(
+                controller, max_concurrency, sink
+            )
+            self._bind_runtime_session(self.runtime_session)
+
+    async def on_mount(self) -> None:
+        if self.runtime_session is None:
+            assert self.setup_controller is not None
+            try:
+                handle = await self.setup_controller.activate_existing()
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                handle = None
+            if handle is None:
+                await self.push_screen(
+                    SetupRootScreen(self.setup_controller), self._setup_done
+                )
+                return
+            try:
+                await self._replace_with_runtime(handle)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                try:
+                    handle.close()
+                except BaseException:
+                    pass
+                await self.push_screen(
+                    SetupRootScreen(self.setup_controller), self._setup_done
+                )
+            return
+        await self._mount_dashboard()
+
+    def _build_runtime_session(self, handle: object) -> TuiRuntimeSession:
+        return TuiRuntimeSession.from_handle(
+            handle, self._max_concurrency, self._event_sink  # type: ignore[arg-type]
         )
-        self._dashboard = DashboardScreen(
-            self.controller,
-            self.supervisor,
+
+    def _build_dashboard(self, session: TuiRuntimeSession) -> DashboardScreen:
+        return DashboardScreen(
+            session.controller,
+            session.supervisor,
             self.settings,
         )
 
-    async def on_mount(self) -> None:
-        await self.push_screen(self._dashboard)
-        await self._dashboard.refresh_runs()
+    def _bind_runtime_session(self, session: TuiRuntimeSession) -> None:
+        self.runtime_session = session
+        self.controller = session.controller
+        self.supervisor = session.supervisor
+        self._dashboard = self._build_dashboard(session)
+
+    async def _mount_dashboard(self) -> None:
+        dashboard = self._dashboard
+        if dashboard is None:
+            raise RuntimeError("TUI runtime is unavailable")
+        await self.push_screen(dashboard)
+        await dashboard.refresh_runs()
         self._poll_timer = self.set_interval(
             self.poll_interval, self.refresh_runs
         )
+
+    async def _replace_with_runtime(self, handle: object) -> None:
+        session = self._build_runtime_session(handle)
+        self._bind_runtime_session(session)
+        try:
+            await self._mount_dashboard()
+        except BaseException:
+            self.runtime_session = None
+            self.controller = None
+            self.supervisor = None
+            self._dashboard = None
+            await session.close()
+            raise
+
+    async def _setup_done(self, handle: object | None) -> None:
+        async with self._transition_lock:
+            if handle is None or self._ui_closed or self.runtime_session is not None:
+                if handle is not None and self.runtime_session is not None:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.to_thread(handle.close), timeout=5.0
+                        )
+                    except BaseException:
+                        pass
+                return
+            await self._finish_setup(handle)
+
+    async def _finish_setup(self, handle: object) -> None:
+        session: TuiRuntimeSession | None = None
+        try:
+            session = self._build_runtime_session(handle)
+            assert self.setup_controller is not None
+            close = getattr(self.setup_controller, "aclose", None)
+            if callable(close):
+                await close()
+            else:
+                self.setup_controller.close()
+            self._bind_runtime_session(session)
+            await self._mount_dashboard()
+        except BaseException as error:
+            if session is not None:
+                try:
+                    await session.close()
+                except BaseException:
+                    pass
+            self.runtime_session = None
+            self.controller = None
+            self.supervisor = None
+            self._dashboard = None
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            if not self._ui_closed and self.setup_controller is not None:
+                await self.push_screen(
+                    SetupRootScreen(self.setup_controller), self._setup_done
+                )
 
     async def refresh_runs(self) -> None:
         """Refresh persisted runs without performing workflow mutations."""
 
         dashboard = self._dashboard
+        if dashboard is None:
+            return
         mount_generation = dashboard.mount_generation
         if (
             self._ui_closed
@@ -122,22 +244,23 @@ class DeveloperWorkflowTuiApp(App[None]):
         self.exit()
 
     def action_help(self) -> None:
-        if self.screen is self._dashboard:
+        if self._dashboard is not None and self.screen is self._dashboard:
             self.push_screen(HelpScreen())
 
     def action_search(self) -> None:
-        if self.screen is self._dashboard:
+        if self._dashboard is not None and self.screen is self._dashboard:
             self._dashboard.action_search()
 
     def action_filter(self) -> None:
-        if self.screen is self._dashboard:
+        if self._dashboard is not None and self.screen is self._dashboard:
             self._dashboard.action_filter()
 
     async def on_unmount(self) -> None:
         await self._close_ui()
 
     async def _close_ui(self) -> None:
-        self._dashboard.begin_teardown()
+        if self._dashboard is not None:
+            self._dashboard.begin_teardown()
         if self._ui_closed:
             return
         self._ui_closed = True
@@ -145,7 +268,28 @@ class DeveloperWorkflowTuiApp(App[None]):
         if self._poll_timer is not None:
             self._poll_timer.stop()
             self._poll_timer = None
-        await self.supervisor.close()
+        if self.runtime_session is not None:
+            try:
+                if (
+                    self.supervisor is not None
+                    and self.supervisor is not self.runtime_session.supervisor
+                ):
+                    await self.supervisor.close()
+                await self.runtime_session.close()
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+            self.runtime_session = None
+        elif self.setup_controller is not None:
+            close = getattr(self.setup_controller, "aclose", None)
+            try:
+                if callable(close):
+                    await close()
+                else:
+                    self.setup_controller.close()
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
         self.activities.clear()
 
 
