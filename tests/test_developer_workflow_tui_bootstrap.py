@@ -476,6 +476,29 @@ async def test_setup_rejects_stale_draft_profile_and_blocks_empty_catalog() -> N
 
 
 @pytest.mark.asyncio
+async def test_detached_profile_loader_cancellation_propagates_without_render() -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+
+    class CancelledController(_WizardSetupController):
+        async def list_managed_profiles(self) -> tuple[str, ...]:
+            raise asyncio.CancelledError
+
+    screen = SetupWizardScreen(CancelledController())
+    populated: list[bool] = []
+    rendered: list[bool] = []
+    screen._populate_public_draft = lambda: populated.append(True)  # type: ignore[method-assign]
+    screen._render_state = lambda: rendered.append(True)  # type: ignore[method-assign]
+
+    with pytest.raises(asyncio.CancelledError):
+        await screen.on_mount()
+
+    assert populated == []
+    assert rendered == []
+
+
+@pytest.mark.asyncio
 async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
     from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
 

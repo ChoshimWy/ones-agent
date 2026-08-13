@@ -332,6 +332,7 @@ class SetupWizardScreen(SetupRootScreen):
         self._test_task: asyncio.Task[None] | None = None
         self._managed_profiles: tuple[str, ...] = ()
         self._profile_catalog_ready = False
+        self._profile_generation = 0
         self._syncing_profile = False
 
     def compose(self) -> ComposeResult:
@@ -434,10 +435,14 @@ class SetupWizardScreen(SetupRootScreen):
     async def on_mount(self) -> None:
         self._apply_layout(self.size.width)
         await self._refresh_managed_profiles()
+        if not self.is_attached:
+            return
         self._populate_public_draft()
         self._render_state()
 
     async def _refresh_managed_profiles(self) -> None:
+        self._profile_generation += 1
+        generation = self._profile_generation
         loader = getattr(self.controller, "list_managed_profiles", None)
         notice: str | None = None
         if not callable(loader):
@@ -449,12 +454,14 @@ class SetupWizardScreen(SetupRootScreen):
             return
         try:
             profiles = tuple(await loader())
+        except asyncio.CancelledError:
+            raise
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             profiles = ()
             notice = "Managed profiles are unavailable"
-        if not self.is_attached:
+        if generation != self._profile_generation or not self.is_attached:
             return
         self._managed_profiles = profiles
         self._profile_catalog_ready = True
@@ -470,7 +477,11 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Select.Changed, "#sandbox-profile, #codex-profile")
     def _profile_changed(self, event: Select.Changed) -> None:
-        if self._syncing_profile or type(event.value) is not str:
+        if (
+            not self.is_attached
+            or self._syncing_profile
+            or type(event.value) is not str
+        ):
             return
         self._syncing_profile = True
         try:
@@ -1261,6 +1272,7 @@ class SetupWizardScreen(SetupRootScreen):
 
     def on_unmount(self) -> None:
         self._generation += 1
+        self._profile_generation += 1
         self._supervisor.close()
         task = self._test_task
         if task is not None and not task.done():
