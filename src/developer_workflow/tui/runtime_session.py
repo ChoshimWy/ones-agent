@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import _thread
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Event, Thread
@@ -172,7 +173,12 @@ class TuiRuntimeSession:
                 fatal = fatal or error
             else:
                 start_failed = True
-            worker()
+            try:
+                _thread.start_new_thread(worker, ())
+            except BaseException as fallback_error:
+                if isinstance(fallback_error, (KeyboardInterrupt, SystemExit)):
+                    fatal = fatal or fallback_error
+                start_failed = True
         while not done.is_set():
             await asyncio.sleep(min(0.01, self._close_timeout))
         worker_fatal = outcome[0]

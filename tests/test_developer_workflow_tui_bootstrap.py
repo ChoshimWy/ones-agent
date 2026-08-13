@@ -727,6 +727,102 @@ async def test_app_internal_close_task_cancel_is_taken_over_without_double_close
 
 
 @pytest.mark.asyncio
+async def test_app_close_deadline_preserves_owned_setup_until_real_drain() -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.app import (
+        DeveloperWorkflowTuiApp,
+        TuiAppCloseError,
+    )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingSetup(_SetupController):
+        close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            entered.set()
+            await release.wait()
+            self.closed = True
+
+    setup = BlockingSetup(None)
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        close_timeout=0.05,
+    )
+
+    with pytest.raises(TuiAppCloseError) as raised:
+        await app._close_ui()
+    assert str(raised.value) == "TUI close timed out"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert entered.is_set()
+    assert not app._close_complete.is_set()
+    assert app._closing_setup_controller is setup
+    assert setup.close_calls == 1
+
+    release.set()
+    await app._close_ui()
+
+    assert setup.closed
+    assert app._closing_setup_controller is None
+    assert app._close_complete.is_set()
+
+
+@pytest.mark.asyncio
+async def test_app_close_child_cancellation_never_reports_orphans_as_closed() -> None:
+    import asyncio
+    from contextlib import suppress
+
+    from src.developer_workflow.tui.app import (
+        DeveloperWorkflowTuiApp,
+        TuiAppCloseError,
+    )
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingSetup(_SetupController):
+        async def aclose(self) -> None:
+            entered.set()
+            await release.wait()
+            self.closed = True
+
+    setup = BlockingSetup(None)
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        close_timeout=0.05,
+    )
+    outer = asyncio.create_task(app._close_ui())
+    await entered.wait()
+    owned = next(
+        task
+        for task in asyncio.all_tasks()
+        if task not in {asyncio.current_task(), outer, app._close_task}
+        and "capture" in repr(task.get_coro())
+    )
+
+    owned.cancel()
+    assert app._close_task is not None
+    app._close_task.cancel()
+    with suppress(asyncio.CancelledError, TuiAppCloseError):
+        await outer
+    await asyncio.sleep(0)
+
+    assert not app._close_complete.is_set()
+    assert app._closing_setup_controller is setup
+
+    release.set()
+    await app._close_ui()
+    assert setup.closed
+    assert app._close_complete.is_set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("fatal_stage", ["setup", "session"])
 async def test_app_close_drains_then_propagates_same_fatal_to_all_waiters(
@@ -1003,6 +1099,55 @@ async def test_runtime_close_thread_start_failure_drains_synchronously_and_is_st
         assert raised.value.__context__ is None
 
     assert order == ["controller", "handle"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_thread_start_fallback_never_blocks_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+
+    import src.developer_workflow.tui.runtime_session as runtime_session
+    from src.developer_workflow.tui.runtime_session import (
+        TuiRuntimeCloseError,
+        TuiRuntimeSession,
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+    handle_closed = threading.Event()
+
+    class BrokenThread:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("sensitive thread start failure")
+
+    def close_controller() -> None:
+        entered.set()
+        release.wait()
+
+    monkeypatch.setattr(runtime_session, "Thread", BrokenThread)
+    session = TuiRuntimeSession(
+        handle=SimpleNamespace(close=handle_closed.set),
+        controller=SimpleNamespace(close=close_controller),
+        run_index=object(),
+        supervisor=SimpleNamespace(close=_async_noop),
+        event_sink=lambda event: None,
+        close_timeout=0.05,
+    )
+
+    try:
+        with pytest.raises(TuiRuntimeCloseError, match="runtime close failed"):
+            await asyncio.wait_for(session.close(), timeout=0.5)
+        assert entered.wait(0.5)
+        assert not handle_closed.is_set()
+    finally:
+        release.set()
+
+    assert handle_closed.wait(0.5)
 
 
 def test_tui_dispatches_before_legacy_config_load(

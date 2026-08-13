@@ -32,6 +32,14 @@ class _TransitionClosed(RuntimeError):
     """Internal control flow when UI shutdown has acquired lifecycle priority."""
 
 
+class TuiAppCloseError(RuntimeError):
+    """The bounded UI close wait expired without losing resource ownership."""
+
+
+class _OwnedCloseCancelled(RuntimeError):
+    """An owned close coroutine was externally cancelled before completion."""
+
+
 @dataclass(frozen=True, slots=True)
 class _AppCloseOutcome:
     fatal: BaseException | None = None
@@ -61,13 +69,17 @@ class DeveloperWorkflowTuiApp(App[None]):
         provider_type: str = "configured",
         sandbox_configured: bool = True,
         poll_interval: float = 2.0,
+        close_timeout: float = 5.0,
     ) -> None:
         if (
             isinstance(poll_interval, bool)
             or not isinstance(poll_interval, (int, float))
             or poll_interval <= 0
+            or isinstance(close_timeout, bool)
+            or not isinstance(close_timeout, (int, float))
+            or close_timeout <= 0
         ):
-            raise ValueError("poll_interval must be positive")
+            raise ValueError("TUI timing configuration is invalid")
         super().__init__()
         if controller is None and (
             runtime_bootstrapper is None
@@ -85,6 +97,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self.controller: TuiController | None = None
         self.supervisor: object | None = None
         self.poll_interval = float(poll_interval)
+        self._close_timeout = float(close_timeout)
         self._max_concurrency = max_concurrency
         self.settings = SettingsView(
             max_concurrency=max_concurrency,
@@ -97,6 +110,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._close_started = False
         self._close_complete = asyncio.Event()
         self._close_task: asyncio.Task[_AppCloseOutcome] | None = None
+        self._closing_setup_controller: object | None = None
         self._transition_lock = asyncio.Lock()
         self._activation_handles: list[object] = []
         self._poll_timer: Timer | None = None
@@ -433,6 +447,9 @@ class DeveloperWorkflowTuiApp(App[None]):
 
     async def _close_ui(self) -> None:
         task = self._close_task
+        if task is not None and task.cancelled():
+            self._close_task = None
+            task = None
         if task is None:
             self._close_started = True
             self._ui_closed = True
@@ -442,11 +459,19 @@ class DeveloperWorkflowTuiApp(App[None]):
                 self._poll_timer = None
             task = asyncio.create_task(self._drain_close_ui())
             self._close_task = task
-        outcome = await asyncio.shield(task)
+        timed_out = False
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(task), timeout=self._close_timeout
+            )
+        except asyncio.TimeoutError:
+            timed_out = True
+        if timed_out:
+            raise TuiAppCloseError("TUI close timed out") from None
         if not outcome.complete:
             if self._close_task is task:
                 self._close_task = None
-            raise RuntimeError("TUI close timed out") from None
+            raise TuiAppCloseError("TUI close timed out") from None
         if outcome.fatal is not None:
             raise outcome.fatal
 
@@ -463,6 +488,8 @@ class DeveloperWorkflowTuiApp(App[None]):
             try:
                 result, error = await asyncio.shield(task)
                 if error is not None:
+                    if isinstance(error, asyncio.CancelledError):
+                        raise _OwnedCloseCancelled from None
                     raise error
                 return result
             except asyncio.CancelledError:
@@ -472,14 +499,19 @@ class DeveloperWorkflowTuiApp(App[None]):
                 if task.done():
                     result, error = task.result()
                     if error is not None:
+                        if isinstance(error, asyncio.CancelledError):
+                            raise _OwnedCloseCancelled from None
                         raise error
                     return result
 
     async def _drain_close_ui(self) -> _AppCloseOutcome:
         acquired = False
+        complete = False
         fatal: BaseException | None = None
         try:
-            acquired = await self._acquire_transition_for_close(5.0)
+            acquired = await self._acquire_transition_for_close(
+                self._close_timeout
+            )
             if not acquired:
                 return _AppCloseOutcome(complete=False)
             if self._dashboard is not None:
@@ -489,6 +521,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                     if isinstance(error, (KeyboardInterrupt, SystemExit)):
                         fatal = error
             if self.runtime_session is not None:
+                runtime_incomplete = False
                 try:
                     if (
                         self.supervisor is not None
@@ -496,31 +529,47 @@ class DeveloperWorkflowTuiApp(App[None]):
                     ):
                         await self._await_owned(self.supervisor.close())
                     await self._await_owned(self.runtime_session.close())
+                except _OwnedCloseCancelled:
+                    runtime_incomplete = True
                 except BaseException as error:
                     if fatal is None and isinstance(
                         error, (KeyboardInterrupt, SystemExit)
                     ):
                         fatal = error
+                if runtime_incomplete:
+                    return _AppCloseOutcome(fatal=fatal, complete=False)
                 self.runtime_session = None
             else:
-                controller = self.setup_controller
+                controller = (
+                    self.setup_controller or self._closing_setup_controller
+                )
                 self.setup_controller = None
                 if controller is not None:
+                    self._closing_setup_controller = controller
+                    setup_incomplete = False
                     try:
                         close = getattr(controller, "aclose", None)
                         if callable(close):
                             await self._await_owned(close())
                         else:
                             controller.close()
+                    except _OwnedCloseCancelled:
+                        setup_incomplete = True
                     except BaseException as error:
                         if isinstance(error, (KeyboardInterrupt, SystemExit)):
                             fatal = error
+                    finally:
+                        if not setup_incomplete:
+                            self._closing_setup_controller = None
+                    if setup_incomplete:
+                        return _AppCloseOutcome(fatal=fatal, complete=False)
             self.activities.clear()
+            complete = True
             return _AppCloseOutcome(fatal=fatal)
         finally:
             if acquired:
                 self._transition_lock.release()
-            if acquired:
+            if acquired and complete:
                 self._close_complete.set()
 
     async def _acquire_transition_for_close(self, timeout: float) -> bool:
@@ -543,4 +592,4 @@ class DeveloperWorkflowTuiApp(App[None]):
                     current.uncancel()
 
 
-__all__ = ["DeveloperWorkflowTuiApp", "TuiTaskMessage"]
+__all__ = ["DeveloperWorkflowTuiApp", "TuiAppCloseError", "TuiTaskMessage"]
