@@ -615,6 +615,12 @@ def _close_descriptor(descriptor: int) -> None:
 def _prefer_cleanup_failure(
     primary: BaseException | None, cleanup: BaseException
 ) -> BaseException:
+    if isinstance(cleanup, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+        return cleanup
+    if isinstance(cleanup, MemoryError) and not isinstance(
+        primary, (KeyboardInterrupt, SystemExit, GeneratorExit)
+    ):
+        return cleanup
     if primary is None or (
         isinstance(primary, (_SourcePathRejected, _SourceDataRejected))
         and not isinstance(cleanup, (_SourcePathRejected, _SourceDataRejected))
