@@ -633,7 +633,7 @@ def _read_bounded(
                 _zero_buffer(scratch)
             except BaseException as error:
                 cleanup_failure = _prefer_cleanup_failure(cleanup_failure, error)
-        if content is not None and failure is not None:
+        if content is not None and (failure is not None or cleanup_failure is not None):
             try:
                 _zero_buffer(content)
             except BaseException as error:

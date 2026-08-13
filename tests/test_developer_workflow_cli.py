@@ -743,6 +743,56 @@ def test_tui_late_dotenv_buffer_zero_failure_is_fatal_and_sanitized(
         os.fstat(opened[0])
 
 
+@pytest.mark.parametrize("failure_kind", ["access", "runtime"])
+def test_tui_final_scratch_zero_failure_still_zeros_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure_kind: str
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-FINAL-SCRATCH-{failure_kind}"
+    secret = b"ONES_PASSWORD=safe\n"
+    dotenv = tmp_path / ".env"
+    dotenv.write_bytes(secret)
+    _protect_private_file(dotenv)
+    original_open = setup_import._open_source_readonly
+    original_zero = setup_import._zero_buffer
+    opened: list[int] = []
+    zeroed: list[bytes] = []
+
+    def capture_open(path: Path, **kwargs: object) -> int:
+        descriptor = original_open(path, **kwargs)
+        opened.append(descriptor)
+        return descriptor
+
+    zero_calls = 0
+
+    def fail_final_scratch_zero(value: bytearray) -> None:
+        nonlocal zero_calls
+        zero_calls += 1
+        original_zero(value)
+        zeroed.append(bytes(value))
+        if zero_calls == 2:
+            if failure_kind == "access":
+                raise PermissionError(errno.EACCES, canary)
+            raise RuntimeError(canary)
+
+    monkeypatch.setattr(setup_import, "_open_source_readonly", capture_open)
+    monkeypatch.setattr(setup_import, "_zero_buffer", fail_final_scratch_zero)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert canary not in repr(caught.value)
+    assert any(len(value) == len(secret) and set(value) <= {0} for value in zeroed)
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
 def test_tui_access_errors_are_optional_without_exception_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
