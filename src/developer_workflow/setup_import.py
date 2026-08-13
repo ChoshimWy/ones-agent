@@ -587,7 +587,11 @@ def _read_bounded(
             if final != opened or total != opened[2]:
                 raise _SourcePathRejected
         except BaseException as error:
-            failure = error
+            failure = (
+                _SourcePathRejected()
+                if isinstance(error, OSError) and _is_source_access_error(error)
+                else error
+            )
     finally:
         if scratch is not None:
             _zero_buffer(scratch)

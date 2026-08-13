@@ -539,6 +539,36 @@ def test_tui_reader_cleanup_fatal_overrides_access_read_rejection(
     assert canary not in repr(caught.value)
 
 
+@pytest.mark.parametrize("stage", ["first-descriptor-identity", "fileio-constructor"])
+def test_tui_descriptor_access_boundaries_are_optional_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-{stage}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    access_error = PermissionError(errno.EACCES, canary)
+    if stage == "first-descriptor-identity":
+        monkeypatch.setattr(
+            setup_import, "_descriptor_identity", lambda _descriptor: (_ for _ in ()).throw(access_error)
+        )
+    else:
+        monkeypatch.setattr(
+            setup_import.io, "FileIO", lambda *_args, **_kwargs: (_ for _ in ()).throw(access_error)
+        )
+    monkeypatch.chdir(tmp_path)
+
+    factory, _runtime = build_production_tui_host(tmp_path / "missing.json")
+    context = factory.import_context  # type: ignore[attr-defined]
+    assert context.detection.dotenv == ()
+    assert context.dotenv_path is None
+    assert canary not in repr(context)
+
+
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
 def test_tui_access_errors_are_optional_without_exception_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
