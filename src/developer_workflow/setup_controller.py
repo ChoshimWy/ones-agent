@@ -16,6 +16,7 @@ from .contracts import RepositoryGroupMapping, RepositoryMapping
 from .setup_import import ImportDetection, import_selected
 from .setup_models import (
     ActiveSetup,
+    DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
     OnesProbePublicConfig,
     ProviderProbePublicConfig,
     RuntimePublicConfig,
@@ -368,7 +369,11 @@ class SetupController:
                     raise ValueError
                 encoded[kind] = raw
             if transaction.runtime is not None:
-                draft.runtime = transaction.runtime.model_copy(deep=True)
+                draft.runtime = self._validated_codex_runtime(
+                    transaction.runtime,
+                    previous=draft.runtime,
+                    fragments=runtime_fields,
+                )
             if transaction.workflow is not None:
                 draft.workflow = transaction.workflow.model_copy(deep=True)
             if transaction.runtime_fields is not None:
@@ -426,6 +431,48 @@ class SetupController:
             if detected is not SetupStep.REVIEW:
                 affected = detected
         self._changed(affected)
+
+    @staticmethod
+    def _validated_codex_runtime(
+        candidate: RuntimePublicConfig,
+        *,
+        previous: RuntimePublicConfig | None,
+        fragments: Mapping[str, str],
+    ) -> RuntimePublicConfig:
+        """Bind Codex-only edits to public prefixes validated by earlier steps."""
+
+        prefix_names = (
+            "ones_base_url",
+            "ones_team_id",
+            "ones_issue_type_id",
+            "provider_host",
+            "provider_api_url",
+            "git_author_name",
+            "git_author_email",
+        )
+        if previous is None and any(name not in fragments for name in prefix_names):
+            raise ValueError
+        prefix = {
+            name: (
+                fragments[name]
+                if name in fragments
+                else getattr(previous, name)
+            )
+            for name in prefix_names
+        }
+        expected = RuntimePublicConfig(
+            **prefix,
+            ones_comment_list_path_template=(
+                previous.ones_comment_list_path_template
+                if previous is not None
+                else DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
+            ),
+            codex_auth_mode=candidate.codex_auth_mode,
+            codex_home=candidate.codex_home,
+        )
+        if candidate != expected:
+            raise ValueError
+        return expected
 
     @property
     def current_step(self) -> SetupStep:

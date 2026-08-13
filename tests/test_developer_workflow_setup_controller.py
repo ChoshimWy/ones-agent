@@ -586,6 +586,96 @@ def test_step_transaction_rejects_cross_step_members_and_secret_kinds(
     assert controller.draft == before
 
 
+def test_first_codex_materialization_rejects_unvalidated_runtime_prefix(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller = SetupController(
+        profile_id="managed-profile",
+        store=FakeStore(),
+        runtime_builder=FakeRuntimeBuilder(),
+        runtime_bootstrap=FakeBootstrap(),
+    )
+    controller.apply_runtime_fields(
+        SetupStep.ONES,
+        {
+            "ones_base_url": "https://ones.example.test",
+            "ones_team_id": "validated-team",
+            "ones_issue_type_id": "issue-1",
+        },
+    )
+    controller.apply_runtime_fields(
+        SetupStep.PROVIDER,
+        {
+            "provider_host": "provider.example.test",
+            "provider_api_url": "https://provider.example.test/api",
+            "git_author_name": "ONES Agent",
+            "git_author_email": "agent@example.test",
+            "provider": "github",
+        },
+    )
+    controller._results[SetupStep.ONES] = _result(SetupStep.ONES)
+    forged = _runtime().validated_update(ones_team_id="unvalidated-team")
+    before = controller.draft
+    revision = controller.revision
+
+    with pytest.raises(SetupActionError):
+        controller.apply_step_transaction(
+            SetupStep.CODEX,
+            SetupStepTransaction(runtime=forged),
+            expected_revision=revision,
+        )
+
+    assert controller.draft == before
+    assert controller.revision == revision
+    assert controller.result_for(SetupStep.ONES).status is ValidationStatus.PASSED
+
+
+def test_first_codex_materialization_rejects_missing_validated_fragments(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller = SetupController(
+        profile_id="managed-profile",
+        store=FakeStore(),
+        runtime_builder=FakeRuntimeBuilder(),
+        runtime_bootstrap=FakeBootstrap(),
+    )
+    controller.apply_runtime_fields(
+        SetupStep.ONES,
+        {
+            "ones_base_url": "https://ones.example.test",
+            "ones_team_id": "team-1",
+            "ones_issue_type_id": "issue-1",
+        },
+    )
+    with pytest.raises(SetupActionError):
+        controller.apply_step_transaction(
+            SetupStep.CODEX,
+            SetupStepTransaction(runtime=_runtime()),
+            expected_revision=controller.revision,
+        )
+
+
+def test_codex_materialization_preserves_validated_legacy_runtime_prefix(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller, _, _, _ = _controller(tmp_path)
+    previous = controller.draft.runtime
+    assert previous is not None
+    changed = previous.validated_update(codex_auth_mode="file", codex_home=tmp_path)
+    controller.apply_step_transaction(
+        SetupStep.CODEX,
+        SetupStepTransaction(runtime=changed),
+        expected_revision=controller.revision,
+    )
+    assert controller.draft.runtime == changed
+
+
 def test_step_transaction_invalidates_from_actual_earliest_workflow_diff(
     tmp_path: Path,
 ) -> None:
