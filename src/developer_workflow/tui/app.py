@@ -115,11 +115,12 @@ class DeveloperWorkflowTuiApp(App[None]):
                 return
             try:
                 await self._close_setup_controller()
-                await self._replace_with_runtime(handle)
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
                     raise
                 await self._recover_setup(handle=handle)
+                return
+            await self._replace_with_runtime(handle)
             return
         await self._mount_dashboard()
 
@@ -174,6 +175,21 @@ class DeveloperWorkflowTuiApp(App[None]):
             controller.close()
         self.setup_controller = None
 
+    async def _discard_setup_controller(self) -> None:
+        controller = self.setup_controller
+        self.setup_controller = None
+        if controller is None:
+            return
+        try:
+            close = getattr(controller, "aclose", None)
+            if callable(close):
+                await close()
+            else:
+                controller.close()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+
     def _build_dashboard(self, session: TuiRuntimeSession) -> DashboardScreen:
         return DashboardScreen(
             session.controller,
@@ -197,23 +213,26 @@ class DeveloperWorkflowTuiApp(App[None]):
             self.poll_interval, self.refresh_runs
         )
 
-    async def _replace_with_runtime(self, handle: object) -> None:
-        session = self._build_runtime_session(handle)
-        self._bind_runtime_session(session)
+    async def _replace_with_runtime(self, handle: object) -> bool:
+        session: TuiRuntimeSession | None = None
         try:
+            session = self._build_runtime_session(handle)
+            self._bind_runtime_session(session)
             await self._mount_dashboard()
-        except BaseException:
-            self.runtime_session = None
-            self.controller = None
-            self.supervisor = None
-            self._dashboard = None
-            await session.close()
-            raise
+            return True
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                await self._discard_runtime(handle=handle, session=session)
+                raise
+            await self._recover_setup(handle=handle, session=session)
+            return False
 
     async def _setup_done(self, handle: object | None) -> None:
         async with self._transition_lock:
             if handle is None or self._ui_closed or self.runtime_session is not None:
-                if handle is not None and self.runtime_session is not None:
+                if handle is not None and (
+                    self._ui_closed or self.runtime_session is not None
+                ):
                     try:
                         await asyncio.wait_for(
                             asyncio.to_thread(handle.close), timeout=5.0
@@ -221,27 +240,64 @@ class DeveloperWorkflowTuiApp(App[None]):
                     except BaseException:
                         pass
                 return
-            if not await self._remove_setup_screen():
+            removed = False
+            try:
+                removed = await self._remove_setup_screen()
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+            if not removed:
+                await self._recover_setup_removal_failure(handle)
                 return
             await self._finish_setup(handle)
 
     async def _finish_setup(self, handle: object) -> None:
-        session: TuiRuntimeSession | None = None
         try:
             await self._close_setup_controller()
-            session = self._build_runtime_session(handle)
-            self._bind_runtime_session(session)
-            await self._mount_dashboard()
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
-            await self._recover_setup(handle=handle, session=session)
+            await self._recover_setup(handle=handle)
+            return
+        await self._replace_with_runtime(handle)
+
+    async def _recover_setup_removal_failure(self, handle: object) -> None:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(handle.close), timeout=5.0)
+        except BaseException:
+            pass
+        await self._discard_setup_controller()
+        replacement = self._new_setup_controller()
+        self.setup_controller = replacement
+        screen = self._setup_screen
+        if screen is None:
+            await self._show_setup()
+            return
+        screen.controller = replacement
+        try:
+            current = self.screen is screen
+        except BaseException:
+            current = False
+        if not current:
+            await self.push_screen(screen, self._setup_done)
 
     async def _recover_setup(
         self,
         *,
         handle: object,
         session: TuiRuntimeSession | None = None,
+    ) -> None:
+        await self._discard_runtime(handle=handle, session=session)
+        if not self._ui_closed:
+            await self._discard_setup_controller()
+            self.setup_controller = self._new_setup_controller()
+            await self._show_setup()
+
+    async def _discard_runtime(
+        self,
+        *,
+        handle: object,
+        session: TuiRuntimeSession | None,
     ) -> None:
         dashboard = self._dashboard
         if dashboard is not None:
@@ -273,9 +329,6 @@ class DeveloperWorkflowTuiApp(App[None]):
         self.controller = None
         self.supervisor = None
         self._dashboard = None
-        if not self._ui_closed:
-            self.setup_controller = self._new_setup_controller()
-            await self._show_setup()
 
     async def refresh_runs(self) -> None:
         """Refresh persisted runs without performing workflow mutations."""

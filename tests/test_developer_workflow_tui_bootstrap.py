@@ -250,6 +250,227 @@ async def test_dashboard_first_refresh_failure_leaves_only_retryable_setup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("removal_failure", ["false", "raise"])
+async def test_setup_removal_failure_closes_handle_and_rebinds_retryable_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    removal_failure: str,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.setup_screens import SetupRootScreen
+
+    first = _SetupController(None)
+    replacement = _SetupController(None)
+    closes: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=first,
+        setup_controller_factory=lambda: replacement,
+        runtime_bootstrapper=object(),
+    )
+
+    async def fail_remove() -> bool:
+        if removal_failure == "raise":
+            raise RuntimeError("sensitive remove failure")
+        return False
+
+    async with app.run_test() as pilot:
+        old_screen = app.screen
+        assert isinstance(old_screen, SetupRootScreen)
+        monkeypatch.setattr(app, "_remove_setup_screen", fail_remove)
+        old_screen.complete(handle)
+        await pilot.pause()
+        await pilot.pause()
+
+        assert closes == ["handle"]
+        assert first.closed
+        assert app.setup_controller is replacement
+        assert isinstance(app.screen, SetupRootScreen)
+        assert app.screen.controller is replacement
+        assert len(app.query(SetupRootScreen)) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage", ["session", "dashboard", "bind", "push", "refresh"]
+)
+async def test_runtime_transition_failure_has_single_handle_owner_and_one_setup(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    from textual.screen import Screen
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.setup_screens import SetupRootScreen
+
+    closes: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    first = _SetupController(None)
+    replacement = _SetupController(None)
+
+    class OwnedSession(_RuntimeSession):
+        async def close(self) -> None:
+            if not self.closed:
+                self.closed = True
+                handle.close()
+
+    session = OwnedSession()
+
+    class Dashboard(Screen[None]):
+        async def refresh_runs(self) -> None:
+            if failure_stage == "refresh":
+                raise RuntimeError("sensitive refresh failure")
+
+        def begin_teardown(self) -> None:
+            return None
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=first,
+        setup_controller_factory=lambda: replacement,
+        runtime_bootstrapper=object(),
+    )
+    original_push = app.push_screen
+
+    def build(value: object) -> _RuntimeSession:
+        if failure_stage == "session":
+            raise RuntimeError("sensitive session failure")
+        return session
+
+    def dashboard(value: object) -> Dashboard:
+        if failure_stage == "dashboard":
+            raise RuntimeError("sensitive dashboard failure")
+        return Dashboard()
+
+    original_bind = app._bind_runtime_session
+
+    def bind(value: object) -> None:
+        if failure_stage == "bind":
+            raise RuntimeError("sensitive bind failure")
+        original_bind(value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app, "_build_runtime_session", build)
+    monkeypatch.setattr(app, "_build_dashboard", dashboard)
+    monkeypatch.setattr(app, "_bind_runtime_session", bind)
+
+    async with app.run_test() as pilot:
+        if failure_stage == "push":
+            async def fail_dashboard_push(screen: object, *args: object):
+                if isinstance(screen, Dashboard):
+                    raise RuntimeError("sensitive push failure")
+                return await original_push(screen, *args)
+
+            monkeypatch.setattr(app, "push_screen", fail_dashboard_push)
+        setup_screen = app.screen
+        assert isinstance(setup_screen, SetupRootScreen)
+        setup_screen.complete(handle)
+        await pilot.pause()
+        await pilot.pause()
+
+        assert closes == ["handle"]
+        assert app.runtime_session is None
+        assert isinstance(app.screen, SetupRootScreen)
+        assert len(app.query(SetupRootScreen)) == 1
+        assert not app.query(Dashboard)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_stage", ["session", "dashboard", "bind", "push", "refresh"]
+)
+async def test_existing_runtime_transition_failure_transfers_ownership_once(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    from textual.screen import Screen
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.setup_screens import SetupRootScreen
+
+    closes: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    first = _SetupController(handle)
+    replacement = _SetupController(None)
+
+    class OwnedSession(_RuntimeSession):
+        async def close(self) -> None:
+            if not self.closed:
+                self.closed = True
+                handle.close()
+
+    session = OwnedSession()
+
+    class Dashboard(Screen[None]):
+        async def refresh_runs(self) -> None:
+            if failure_stage == "refresh":
+                raise RuntimeError("sensitive refresh failure")
+
+        def begin_teardown(self) -> None:
+            return None
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=first,
+        setup_controller_factory=lambda: replacement,
+        runtime_bootstrapper=object(),
+    )
+
+    def build(value: object) -> _RuntimeSession:
+        if failure_stage == "session":
+            raise RuntimeError("sensitive session failure")
+        return session
+
+    def dashboard(value: object) -> Dashboard:
+        if failure_stage == "dashboard":
+            raise RuntimeError("sensitive dashboard failure")
+        return Dashboard()
+
+    original_bind = app._bind_runtime_session
+
+    def bind(value: object) -> None:
+        if failure_stage == "bind":
+            raise RuntimeError("sensitive bind failure")
+        original_bind(value)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(app, "_build_runtime_session", build)
+    monkeypatch.setattr(app, "_build_dashboard", dashboard)
+    monkeypatch.setattr(app, "_bind_runtime_session", bind)
+    if failure_stage == "push":
+        original_push = app.push_screen
+
+        async def fail_dashboard_push(screen: object, *args: object):
+            if isinstance(screen, Dashboard):
+                raise RuntimeError("sensitive push failure")
+            return await original_push(screen, *args)
+
+        monkeypatch.setattr(app, "push_screen", fail_dashboard_push)
+
+    async with app.run_test() as pilot:
+        await pilot.pause()
+
+        assert closes == ["handle"]
+        assert first.closed
+        assert app.runtime_session is None
+        assert isinstance(app.screen, SetupRootScreen)
+        assert len(app.query(SetupRootScreen)) == 1
+        assert not app.query(Dashboard)
+
+
+@pytest.mark.asyncio
+async def test_activation_callback_after_exit_closes_unclaimed_handle() -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    closes: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=_SetupController(None),
+        runtime_bootstrapper=object(),
+    )
+    app._ui_closed = True
+
+    await app._setup_done(handle)
+
+    assert closes == ["handle"]
+
+
+@pytest.mark.asyncio
 async def test_concurrent_activation_callback_builds_one_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
