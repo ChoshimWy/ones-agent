@@ -953,9 +953,12 @@ class SetupController:
     async def activate_existing(self) -> object | None:
         """Load without mutating the active pointer; failures enter safe recovery."""
 
-        if self._closed:
+        if self._closed or self._closing:
             return None
         async with self._operation_lock:
+            if self._closed or self._closing:
+                self._activation_error = "setup is closed"
+                return None
             self._operation_task = asyncio.current_task()
             try:
                 document = await asyncio.to_thread(

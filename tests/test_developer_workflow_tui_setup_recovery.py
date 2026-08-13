@@ -475,8 +475,9 @@ async def test_recovery_remove_fatal_closes_controller_without_activation(
         async def aclose(self) -> None:
             calls.append("close-old")
 
+    setup = Setup()
     app = DeveloperWorkflowTuiApp(
-        setup_controller=Setup(), runtime_bootstrapper=object()
+        setup_controller=setup, runtime_bootstrapper=object()
     )
 
     async def remove() -> bool:
@@ -503,3 +504,120 @@ async def test_exit_wins_before_recovery_completion_without_mutation() -> None:
     app._ui_closed = True
     await app._recovery_done("discard")
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_queued_activate_existing_is_rejected_after_close_starts() -> None:
+    from src.developer_workflow.setup_controller import SetupActionError
+
+    calls: list[str] = []
+
+    class Store:
+        def load_or_empty(self, *, profile_id: str):
+            calls.append("load")
+            raise AssertionError("active pointer must not be read")
+
+        def read_active_secrets(self, document: object):
+            calls.append("secret-read")
+            raise AssertionError("credentials must not be read")
+
+    controller = _controller_for_store(Store())
+    await controller._operation_lock.acquire()
+    activation = asyncio.create_task(controller.activate_existing())
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(controller.aclose())
+    await asyncio.sleep(0)
+    controller._operation_lock.release()
+
+    assert await activation is None
+    await closing
+    assert calls == []
+    assert controller.activation_error == "setup is closed"
+
+
+@pytest.mark.asyncio
+async def test_cancel_reconfigure_remove_failure_never_activates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    calls: list[str] = []
+
+    class Setup:
+        async def activate_existing(self) -> object:
+            calls.append("activate")
+            return object()
+
+        async def aclose(self) -> None:
+            calls.append("close-old")
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=Setup(),
+        setup_controller_factory=lambda: calls.append("factory") or SimpleNamespace(),
+        runtime_bootstrapper=object(),
+    )
+    app._reconfiguring = True
+
+    async def remove() -> bool:
+        calls.append("remove-failed")
+        return False
+
+    async def recover() -> None:
+        calls.append("setup-screen")
+
+    monkeypatch.setattr(app, "_remove_setup_screen", remove)
+    monkeypatch.setattr(app, "_show_setup", recover)
+    await app._cancel_setup()
+
+    assert "activate" not in calls
+    assert calls == ["remove-failed", "close-old", "factory", "setup-screen"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fatal_type", (RuntimeError, KeyboardInterrupt, SystemExit))
+async def test_cancel_reconfigure_closes_handle_once_when_setup_close_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_type: type[BaseException],
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    calls: list[str] = []
+
+    class Handle:
+        def close(self) -> None:
+            calls.append("handle-close")
+
+    class Setup:
+        async def activate_existing(self) -> Handle:
+            calls.append("activate")
+            return Handle()
+
+        async def aclose(self) -> None:
+            calls.append("setup-close")
+            raise fatal_type("SENSITIVE close failure")
+
+    setup = Setup()
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup, runtime_bootstrapper=object()
+    )
+    app._reconfiguring = True
+
+    async def remove() -> bool:
+        return True
+
+    async def close_ui() -> None:
+        calls.append("safe-exit")
+        app._ui_closed = True
+
+    monkeypatch.setattr(app, "_remove_setup_screen", remove)
+    monkeypatch.setattr(app, "_close_ui", close_ui)
+    monkeypatch.setattr(app, "exit", lambda: calls.append("exit"))
+
+    if fatal_type is RuntimeError:
+        await app._cancel_setup()
+    else:
+        with pytest.raises(fatal_type, match="SENSITIVE close failure"):
+            await app._cancel_setup()
+    assert calls.count("handle-close") == 1
+    assert calls[:3] == ["activate", "setup-close", "handle-close"]
+    assert app.setup_controller is setup
