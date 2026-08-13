@@ -705,7 +705,11 @@ async def test_each_step_candidate_receives_only_its_exact_config_fields(
         SetupStep.REPOSITORIES: {
             "repository-key", "repository-project-id", "repository-iteration-id",
             "repository-name", "repository-path", "repository-url",
-            "repository-branch", "repository-group-key", "repository-primary",
+            "repository-branch", "repository-role", "repository-depends-on",
+            "repository-allowed-paths", "repository-lint-commands",
+            "repository-build-commands", "repository-test-commands",
+            "repository-group-key", "repository-primary",
+            "repository-integration-commands",
         },
         SetupStep.PROVIDER: {
             "provider-host", "provider-api-url", "git-author-name",
@@ -741,6 +745,7 @@ async def test_each_step_candidate_receives_only_its_exact_config_fields(
         )
     async with _wizard_app(controller).run_test() as pilot:
         screen = pilot.app.screen
+        screen.query_one("#sandbox-profile").value = "managed-profile"
         for step in tuple(SetupStep)[:-1]:
             screen.current_step = step
             screen._render_state()
@@ -1742,6 +1747,37 @@ async def test_concurrent_activation_callback_builds_one_runtime(
 
     assert len(builds) == 1
     assert app._activation_handles == set()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_same_handle_never_closes_active_runtime_winner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    class Handle:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    winner = Handle()
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=_SetupController(None), runtime_bootstrapper=object()
+    )
+    monkeypatch.setattr(app, "_build_runtime_session", lambda handle: _RuntimeSession())
+    monkeypatch.setattr(
+        app, "_build_dashboard", lambda session: SimpleNamespace(refresh_runs=_async_noop)
+    )
+    monkeypatch.setattr(app, "push_screen", _async_noop)
+    monkeypatch.setattr(app, "set_interval", lambda *args: None)
+
+    await asyncio.gather(app._setup_done(winner), app._setup_done(winner))
+
+    assert winner.closed == 0
+    assert app._active_handle_identity == id(winner)
 
 
 @pytest.mark.asyncio

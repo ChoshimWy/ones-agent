@@ -128,6 +128,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._closing_setup_controller: object | None = None
         self._transition_lock = asyncio.Lock()
         self._activation_handles: set[int] = set()
+        self._active_handle_identity: int | None = None
         self._pending_runtime_handle: object | None = None
         self._poll_timer: Timer | None = None
         self._reconfiguring = False
@@ -435,6 +436,7 @@ class DeveloperWorkflowTuiApp(App[None]):
             if self._ui_closed:
                 raise _TransitionClosed
             self._bind_runtime_session(session)
+            self._active_handle_identity = id(handle)
             if self._ui_closed:
                 raise _TransitionClosed
             await self._mount_dashboard()
@@ -459,7 +461,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                     already_owned = (
                         handle is not None
                         and self.runtime_session is not None
-                        and getattr(self.runtime_session, "handle", None) is handle
+                        and self._active_handle_identity == id(handle)
                     )
                     if handle is not None and not already_owned and (
                         self._ui_closed or self.runtime_session is not None
@@ -587,6 +589,7 @@ class DeveloperWorkflowTuiApp(App[None]):
             self._notify_runtime_close_pending()
             return False
         self.runtime_session = None
+        self._active_handle_identity = None
         self.controller = None
         self.supervisor = None
         self._dashboard = None
@@ -630,6 +633,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                 return
             else:
                 self.runtime_session = None
+                self._active_handle_identity = None
                 self.controller = None
                 self.supervisor = None
                 await self._remove_dashboard()
@@ -894,6 +898,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                 if runtime_incomplete:
                     return _AppCloseOutcome(fatal=fatal, complete=False)
                 self.runtime_session = None
+                self._active_handle_identity = None
             else:
                 pending = self._pending_runtime_handle
                 if pending is not None:
