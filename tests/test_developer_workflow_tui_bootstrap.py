@@ -731,6 +731,9 @@ async def test_existing_configuration_opens_dashboard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from pathlib import Path
+    from src.developer_workflow.setup_import import ImportDetection
+    from src.developer_workflow.tui.setup_screens import SetupImportContext
 
     handle = object()
     setup = _SetupController(handle)
@@ -750,8 +753,14 @@ async def test_existing_configuration_opens_dashboard(
     async def push(screen: object, *args: object) -> None:
         pushed.append(screen)
 
+    context = SetupImportContext(
+        detection=ImportDetection((), (), False),
+        dotenv_path=Path("must-not-open.env"),
+    )
     app = DeveloperWorkflowTuiApp(
-        setup_controller=setup, runtime_bootstrapper=object()
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        setup_import=context,
     )
     monkeypatch.setattr(app, "push_screen", push)
     monkeypatch.setattr(app, "set_interval", lambda *args: None)
@@ -760,6 +769,34 @@ async def test_existing_configuration_opens_dashboard(
     assert setup.activate_calls == 1
     assert app.runtime_session is session
     assert len(pushed) == 1
+    assert context.consumed is True
+    assert app._setup_import is None
+
+
+@pytest.mark.asyncio
+async def test_close_ui_discards_import_context_without_mounting_screen() -> None:
+    from pathlib import Path
+    from src.developer_workflow.setup_import import ImportDetection
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.setup_screens import SetupImportContext
+
+    setup = _SetupController(None)
+    context = SetupImportContext(
+        detection=ImportDetection((), (), False),
+        dotenv_path=Path("must-not-open.env"),
+    )
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        setup_import=context,
+    )
+
+    await app._close_ui()
+
+    assert context.consumed is True
+    assert app._setup_import is None
+    with pytest.raises(RuntimeError, match="import source is unavailable"):
+        context.import_into(setup, "environment")
 
 
 async def _async_noop(*args: object, **kwargs: object) -> None:

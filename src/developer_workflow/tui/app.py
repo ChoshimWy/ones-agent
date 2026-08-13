@@ -405,6 +405,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._dashboard = self._build_dashboard(session)
 
     async def _mount_dashboard(self) -> None:
+        self._discard_setup_import()
         dashboard = self._dashboard
         if dashboard is None:
             raise RuntimeError("TUI runtime is unavailable")
@@ -737,6 +738,12 @@ class DeveloperWorkflowTuiApp(App[None]):
         await self._close_ui()
 
     async def _close_ui(self) -> None:
+        try:
+            await self._close_ui_impl()
+        finally:
+            self._discard_setup_import()
+
+    async def _close_ui_impl(self) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._close_timeout
         while True:
