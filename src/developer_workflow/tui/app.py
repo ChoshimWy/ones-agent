@@ -16,7 +16,7 @@ from .controller import TuiController
 from .models import RunActivity
 from .screens import DashboardScreen, HelpScreen, SettingsView
 from .runtime_session import TuiRuntimeSession
-from .setup_screens import SetupRootScreen
+from .setup_screens import SetupRootScreen, SetupWizardScreen
 from .supervisor import TaskEvent
 
 
@@ -185,9 +185,31 @@ class DeveloperWorkflowTuiApp(App[None]):
     async def _show_setup(self) -> None:
         if self.setup_controller is None:
             self.setup_controller = self._new_setup_controller()
-        screen = SetupRootScreen(self.setup_controller)
+        try:
+            screen = SetupWizardScreen(
+                self.setup_controller,
+                activation_callback=self._activate_setup_candidate,
+            )
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            screen = SetupRootScreen(self.setup_controller)
         self._setup_screen = screen
         await self.push_screen(screen, self._setup_done)
+
+    async def _activate_setup_candidate(self) -> object | None:
+        """Delegate the explicit review action to the setup controller boundary."""
+
+        controller = self.setup_controller
+        activate = getattr(controller, "save_and_activate", None)
+        if controller is None or not callable(activate):
+            return None
+        try:
+            return await activate()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            return None
 
     async def _remove_setup_screen(self) -> bool:
         screen = self._setup_screen

@@ -25,7 +25,8 @@ from .models import (
 )
 from .run_index import RunIndex
 from .runtime_session import TuiRuntimeCloseError, TuiRuntimeSession
-from .setup_screens import SetupRootScreen
+from .setup_models import SetupStepView, build_setup_step_view
+from .setup_screens import SetupRootScreen, SetupWizardScreen
 from .supervisor import (
     RunTaskSupervisor,
     SupervisorClosedError,
@@ -59,6 +60,8 @@ __all__ = [
     "RunSummary",
     "RunTaskSupervisor",
     "SetupRootScreen",
+    "SetupStepView",
+    "SetupWizardScreen",
     "SupervisorClosedError",
     "SupervisorLoopError",
     "TestView",
@@ -72,4 +75,5 @@ __all__ = [
     "run_detail_from_run",
     "run_tui",
     "safe_tui_text",
+    "build_setup_step_view",
 ]

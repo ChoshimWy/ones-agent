@@ -1,8 +1,266 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from types import MappingProxyType
 
 import pytest
+
+
+class _WizardSetupController:
+    def __init__(self) -> None:
+        from src.developer_workflow.setup_validation import (
+            ConnectionTestResult,
+            SetupStep,
+            ValidationStatus,
+        )
+
+        self.current_step = SetupStep.PROFILE
+        self.calls: list[tuple[SetupStep, object]] = []
+        self.cancel_calls = 0
+        self._results = {
+            step: ConnectionTestResult(
+                step=step,
+                status=ValidationStatus.NOT_CONFIGURED,
+                category="invalid_field",
+            )
+            for step in SetupStep
+        }
+
+    @property
+    def state(self) -> object:
+        return SimpleNamespace(
+            current_step=self.current_step,
+            results=tuple(self._results.values()),
+            repository_count=0,
+            repository_group_count=0,
+            secret_count=0,
+            review_confirmed=False,
+            closed=False,
+            error_category=None,
+        )
+
+    def result_for(self, step: object) -> object:
+        return self._results[step]
+
+    async def test_step(self, step: object, probe: object = None) -> object:
+        from src.developer_workflow.setup_validation import (
+            ConnectionTestResult,
+            ValidationStatus,
+        )
+
+        self.calls.append((step, probe))
+        result = ConnectionTestResult(
+            step=step,
+            status=ValidationStatus.PASSED,
+            category="ok",
+        )
+        self._results[step] = result
+        return result
+
+    def cancel_edit(self) -> None:
+        self.cancel_calls += 1
+
+
+def _wizard_app(controller: object):
+    from textual.app import App
+
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+
+    class WizardApp(App[None]):
+        CSS_PATH = "../src/developer_workflow/tui/tui.tcss"
+
+        def on_mount(self) -> None:
+            self.push_screen(SetupWizardScreen(controller))
+
+    return WizardApp()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("width,layout", [(60, "one"), (99, "two"), (120, "three")])
+async def test_setup_layout_preserves_explicit_actions(width: int, layout: str) -> None:
+    controller = _WizardSetupController()
+    async with _wizard_app(controller).run_test(size=(width, 32)) as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert screen.has_class(layout)
+        assert screen.query_one("#test-connection").display
+        assert screen.query_one("#next-step").display
+        assert screen.query_one("#back-step").display
+        assert screen.query_one("#cancel-setup").display
+
+
+@pytest.mark.asyncio
+async def test_setup_plain_enter_does_not_test_advance_or_activate() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    controller._results[SetupStep.PROFILE] = controller._results[
+        SetupStep.PROFILE
+    ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
+    async with _wizard_app(controller).run_test() as pilot:
+        password = pilot.app.screen.query_one("#ones-password")
+        password.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert controller.calls == []
+        assert pilot.app.screen.current_step is SetupStep.ONES
+
+
+@pytest.mark.asyncio
+async def test_setup_test_uses_immutable_transient_snapshot_and_authoritative_result() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    controller._results[SetupStep.PROFILE] = controller._results[
+        SetupStep.PROFILE
+    ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
+    async with _wizard_app(controller).run_test() as pilot:
+        password = pilot.app.screen.query_one("#ones-password")
+        password.value = "wizard-secret-value"
+        await pilot.click("#test-connection")
+        await pilot.pause()
+        assert len(controller.calls) == 1
+        step, probe = controller.calls[0]
+        assert step is SetupStep.ONES
+        assert isinstance(probe, MappingProxyType)
+        assert probe["ones-password"] == "wizard-secret-value"
+        assert pilot.app.screen.query_one("#next-step").disabled is False
+        assert password.value == ""
+
+
+@pytest.mark.asyncio
+async def test_setup_view_and_renderables_never_contain_sensitive_values() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+    from src.developer_workflow.tui.setup_models import build_setup_step_view
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    view = build_setup_step_view(controller.state, SetupStep.ONES)
+    assert "secret" not in repr(view).casefold()
+    assert "password" not in repr(view).casefold()
+    assert "token" not in repr(view).casefold()
+    async with _wizard_app(controller).run_test() as pilot:
+        password = pilot.app.screen.query_one("#ones-password")
+        password.value = "SENSITIVE-WIZARD-CANARY"
+        assert password.password is True
+        rendered = "\n".join(str(widget.render()) for widget in pilot.app.screen.query("Static"))
+        assert "SENSITIVE-WIZARD-CANARY" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_clears_secret_and_controller_exactly_once() -> None:
+    from src.developer_workflow.setup_validation import SetupStep
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    async with _wizard_app(controller).run_test() as pilot:
+        password = pilot.app.screen.query_one("#ones-password")
+        password.value = "SENSITIVE-CANCEL-CANARY"
+        await pilot.click("#cancel-setup")
+        await pilot.pause()
+        assert password.value == ""
+        assert controller.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_setup_has_seven_independent_steps_and_cannot_skip_controller_gate() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        assert len(screen.query(".setup-step")) == 7
+        await pilot.click("#nav-review")
+        await pilot.pause()
+        assert screen.current_step is SetupStep.PROFILE
+        assert screen.query_one("#profile-step").display
+        assert not screen.query_one("#review-step").display
+        controller._results[SetupStep.PROFILE] = controller._results[
+            SetupStep.PROFILE
+        ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
+        await pilot.click("#nav-ones")
+        await pilot.pause()
+        assert screen.current_step is SetupStep.ONES
+
+
+@pytest.mark.asyncio
+async def test_setup_review_activation_uses_explicit_host_callback() -> None:
+    from textual.app import App
+
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+
+    controller = _WizardSetupController()
+    for step in tuple(SetupStep)[:-1]:
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    controller.current_step = SetupStep.REVIEW
+    activated: list[bool] = []
+
+    async def activate() -> None:
+        activated.append(True)
+        return None
+
+    class WizardApp(App[None]):
+        def on_mount(self) -> None:
+            self.push_screen(
+                SetupWizardScreen(controller, activation_callback=activate)
+            )
+
+    async with WizardApp().run_test() as pilot:
+        await pilot.click("#activate-runtime")
+        await pilot.pause()
+        assert activated == [True]
+
+
+@pytest.mark.asyncio
+async def test_setup_duplicate_test_is_suppressed_and_unmounted_result_is_discarded() -> None:
+    import asyncio
+
+    from textual.app import App
+
+    from src.developer_workflow.setup_validation import (
+        ConnectionTestResult,
+        SetupStep,
+        ValidationStatus,
+    )
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+
+    release = asyncio.Event()
+
+    class BlockingController(_WizardSetupController):
+        async def test_step(self, step: object, probe: object = None) -> object:
+            self.calls.append((step, probe))
+            await release.wait()
+            return ConnectionTestResult(
+                step=step, status=ValidationStatus.PASSED, category="ok"
+            )
+
+    controller = BlockingController()
+    controller.current_step = SetupStep.ONES
+    controller._results[SetupStep.PROFILE] = controller._results[
+        SetupStep.PROFILE
+    ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
+
+    class WizardApp(App[None]):
+        def on_mount(self) -> None:
+            self.push_screen(SetupWizardScreen(controller))
+
+    async with WizardApp().run_test() as pilot:
+        await pilot.pause()
+        first = asyncio.create_task(pilot.app.screen.action_test_connection())
+        while not controller.calls:
+            await asyncio.sleep(0)
+        await pilot.app.screen.action_test_connection()
+        assert len(controller.calls) == 1
+        screen = pilot.app.screen
+        await screen.remove()
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        assert controller.cancel_calls == 1
 
 
 class _SetupController:
