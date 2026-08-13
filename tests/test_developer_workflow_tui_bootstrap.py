@@ -823,6 +823,46 @@ async def test_app_close_child_cancellation_never_reports_orphans_as_closed() ->
 
 
 @pytest.mark.asyncio
+async def test_app_close_single_retry_replaces_stale_incomplete_task_once() -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.app import (
+        DeveloperWorkflowTuiApp,
+        TuiAppCloseError,
+    )
+
+    class CountingSetup(_SetupController):
+        close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            self.closed = True
+
+    setup = CountingSetup(None)
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+        close_timeout=0.05,
+    )
+    await app._transition_lock.acquire()
+
+    with pytest.raises(TuiAppCloseError, match="TUI close timed out"):
+        await app._close_ui()
+    old_task = app._close_task
+    assert old_task is not None
+    await asyncio.wait_for(asyncio.shield(old_task), timeout=0.5)
+    assert not old_task.result().complete
+    app._transition_lock.release()
+
+    await asyncio.gather(app._close_ui(), app._close_ui())
+
+    assert setup.close_calls == 1
+    assert setup.closed
+    assert app._close_complete.is_set()
+    assert app._close_task is not old_task
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("fatal_stage", ["setup", "session"])
 async def test_app_close_drains_then_propagates_same_fatal_to_all_waiters(

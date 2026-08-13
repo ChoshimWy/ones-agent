@@ -446,34 +446,41 @@ class DeveloperWorkflowTuiApp(App[None]):
         await self._close_ui()
 
     async def _close_ui(self) -> None:
-        task = self._close_task
-        if task is not None and task.cancelled():
-            self._close_task = None
-            task = None
-        if task is None:
-            self._close_started = True
-            self._ui_closed = True
-            self._accept_events = False
-            if self._poll_timer is not None:
-                self._poll_timer.stop()
-                self._poll_timer = None
-            task = asyncio.create_task(self._drain_close_ui())
-            self._close_task = task
-        timed_out = False
-        try:
-            outcome = await asyncio.wait_for(
-                asyncio.shield(task), timeout=self._close_timeout
-            )
-        except asyncio.TimeoutError:
-            timed_out = True
-        if timed_out:
-            raise TuiAppCloseError("TUI close timed out") from None
-        if not outcome.complete:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._close_timeout
+        while True:
+            task = self._close_task
+            if task is not None and task.cancelled():
+                if self._close_task is task:
+                    self._close_task = None
+                continue
+            if task is None:
+                self._close_started = True
+                self._ui_closed = True
+                self._accept_events = False
+                if self._poll_timer is not None:
+                    self._poll_timer.stop()
+                    self._poll_timer = None
+                task = asyncio.create_task(self._drain_close_ui())
+                self._close_task = task
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise TuiAppCloseError("TUI close timed out") from None
+            timed_out = False
+            try:
+                outcome = await asyncio.wait_for(
+                    asyncio.shield(task), timeout=remaining
+                )
+            except asyncio.TimeoutError:
+                timed_out = True
+            if timed_out:
+                raise TuiAppCloseError("TUI close timed out") from None
+            if outcome.complete:
+                if outcome.fatal is not None:
+                    raise outcome.fatal
+                return
             if self._close_task is task:
                 self._close_task = None
-            raise TuiAppCloseError("TUI close timed out") from None
-        if outcome.fatal is not None:
-            raise outcome.fatal
 
     @staticmethod
     async def _await_owned(awaitable) -> object:
