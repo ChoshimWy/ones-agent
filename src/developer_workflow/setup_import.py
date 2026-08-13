@@ -549,8 +549,7 @@ def _read_bounded(
             try:
                 reader.close()
             except BaseException as error:
-                if reader_failure is None:
-                    reader_failure = error
+                reader_failure = _prefer_cleanup_failure(reader_failure, error)
             if reader_failure is not None:
                 raise reader_failure
             final = _descriptor_identity(descriptor)
@@ -568,8 +567,7 @@ def _read_bounded(
         except BaseException as error:
             if content is not None:
                 _zero_buffer(content)
-            if failure is None:
-                failure = error
+            failure = _prefer_cleanup_failure(failure, error)
     if failure is not None:
         if isinstance(failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
             raise failure
@@ -612,6 +610,17 @@ def _read_into(reader: io.FileIO, target: memoryview) -> int:
 
 def _close_descriptor(descriptor: int) -> None:
     os.close(descriptor)
+
+
+def _prefer_cleanup_failure(
+    primary: BaseException | None, cleanup: BaseException
+) -> BaseException:
+    if primary is None or (
+        isinstance(primary, (_SourcePathRejected, _SourceDataRejected))
+        and not isinstance(cleanup, (_SourcePathRejected, _SourceDataRejected))
+    ):
+        return cleanup
+    return primary
 
 
 def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:

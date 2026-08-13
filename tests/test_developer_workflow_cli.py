@@ -554,6 +554,99 @@ def test_tui_fatal_dotenv_boundaries_do_not_retain_exception_canaries(
     assert canary not in output.getvalue() + error.getvalue()
 
 
+@pytest.mark.parametrize("cleanup_boundary", ["reader", "descriptor"])
+@pytest.mark.parametrize(
+    "failure_type", [RuntimeError, MemoryError, KeyboardInterrupt, SystemExit],
+)
+def test_tui_cleanup_fatal_overrides_expected_dotenv_data_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_boundary: str,
+    failure_type: type[BaseException],
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host, main
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-{cleanup_boundary}-{failure_type.__name__}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    monkeypatch.chdir(tmp_path)
+    zeroed: list[bytes] = []
+    original_zero = setup_import._zero_buffer
+    original_close = setup_import._close_descriptor
+    closes: list[int] = []
+
+    def observe_zero(value: bytearray) -> None:
+        original_zero(value)
+        zeroed.append(bytes(value))
+
+    def close_descriptor(descriptor: int) -> None:
+        closes.append(descriptor)
+        original_close(descriptor)
+        if cleanup_boundary == "descriptor":
+            if failure_type is RuntimeError:
+                raise failure_type(canary)
+            raise failure_type()
+
+    monkeypatch.setattr(setup_import, "_zero_buffer", observe_zero)
+    monkeypatch.setattr(
+        setup_import,
+        "_read_into",
+        lambda _reader, _target: setup_import._MAX_SOURCE_BYTES + 1,
+    )
+    monkeypatch.setattr(setup_import, "_close_descriptor", close_descriptor)
+    if cleanup_boundary == "reader":
+        original_file = setup_import.io.FileIO
+
+        class ReaderThatFailsClose:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self._reader = original_file(*args, **kwargs)
+
+            def readinto(self, target: memoryview) -> int:
+                return self._reader.readinto(target)
+
+            def close(self) -> None:
+                self._reader.close()
+                if failure_type is RuntimeError:
+                    raise failure_type(canary)
+                raise failure_type()
+
+        monkeypatch.setattr(setup_import.io, "FileIO", ReaderThatFailsClose)
+
+    if failure_type is RuntimeError:
+        expected: type[BaseException] = SetupImportError
+    else:
+        expected = failure_type
+    with pytest.raises(expected) as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    if failure_type is RuntimeError:
+        assert type(caught.value) is SetupImportError
+        assert caught.value.__cause__ is None
+        assert caught.value.__context__ is None
+    assert canary not in str(caught.value)
+    assert canary not in repr(caught.value)
+    assert closes and len(closes) == 1
+    assert zeroed and all(set(value) <= {0} for value in zeroed)
+
+    output, error = Terminal(tty=False), Terminal(tty=False)
+    code = main(
+        ["tui", "--config", str(tmp_path / "missing.json")],
+        tui_runner=lambda _controller, _runtime: None,
+        stdout=output,
+        stderr=error,
+    )
+    if failure_type in (KeyboardInterrupt, SystemExit):
+        assert code == 130
+        assert error.getvalue() == "error: command interrupted safely\n"
+    else:
+        assert code == 1
+        assert error.getvalue() == "error: command failed safely\n"
+    assert canary not in output.getvalue() + error.getvalue()
+
+
 def test_tui_unsafe_template_reports_only_fixed_failure(
     tmp_path: Path,
 ) -> None:
