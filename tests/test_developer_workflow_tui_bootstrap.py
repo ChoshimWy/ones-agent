@@ -310,6 +310,12 @@ async def test_setup_consumes_secrets_before_probe_without_recording_them() -> N
             (SecretKind.ONES_PASSWORD, "FRAME-SECRET-CANARY"),
         ]
         _, probe = controller.calls[-1]
+        assert set(probe) == {
+            "ones-team-id",
+            "ones-project-id",
+            "ones-status-id",
+            "ones-item-id",
+        }
         assert "FRAME-SECRET-CANARY" not in repr(probe)
         assert "private@example.invalid" not in repr(probe)
         assert screen.query_one("#ones-email").value == ""
@@ -410,6 +416,54 @@ async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
         await screen.action_test_connection()
         assert len(controller.calls) == 1
         assert controller.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_blocking_repository_builder_runs_off_ui_loop_and_cancel_discards_result() -> None:
+    import asyncio
+    from threading import Event
+
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    started = Event()
+    release = Event()
+
+    class BlockingController(_WizardSetupController):
+        def upsert_repository(self, **fields: object) -> object:
+            started.set()
+            release.wait(2)
+            return SimpleNamespace(key=fields["key"])
+
+    controller = BlockingController()
+    controller.current_step = SetupStep.REPOSITORIES
+    for step in (SetupStep.PROFILE, SetupStep.ONES):
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        values = {
+            "#repository-key": "primary",
+            "#repository-project-id": "project-1",
+            "#repository-iteration-id": "iteration-1",
+            "#repository-name": "primary",
+            "#repository-path": "C:/safe/repository",
+            "#repository-url": "https://git.example.invalid/team/primary.git",
+            "#repository-branch": "main",
+        }
+        for widget_id, value in values.items():
+            screen.query_one(widget_id).value = value
+        task = asyncio.create_task(screen.action_test_connection())
+        while not started.is_set():
+            await asyncio.sleep(0)
+        ticked = False
+        await asyncio.sleep(0.01)
+        ticked = True
+        screen.action_cancel_edit()
+        release.set()
+        await asyncio.gather(task, return_exceptions=True)
+        assert ticked
+        assert controller.calls == []
 
 
 class _SetupController:

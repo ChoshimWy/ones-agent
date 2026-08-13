@@ -30,6 +30,11 @@ class SetupValidationError(ValueError):
     """Raised when bootstrap configuration cannot safely be activated."""
 
 
+DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE = (
+    "/project/api/project/team/{team_id}/task/{item_id}/comments"
+)
+
+
 class SecretKind(str, Enum):
     ONES_EMAIL = "ones_email"
     ONES_PASSWORD = "ones_password"
@@ -506,6 +511,7 @@ class RuntimeInputs:
 
 __all__ = [
     "ActiveSetup",
+    "DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE",
     "RuntimeInputs",
     "RuntimePublicConfig",
     "RuntimeSecrets",

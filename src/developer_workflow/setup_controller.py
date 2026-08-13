@@ -232,6 +232,7 @@ class SetupController:
         self._cleanup_timeout = float(cleanup_timeout)
         self._draft = (draft or SetupDraft()).model_copy(deep=True)
         self._results: dict[SetupStep, ConnectionTestResult] = {}
+        self._runtime_fields: dict[str, str] = {}
         self._secrets: dict[SecretKind, bytearray] = {}
         self._revision = 0
         self._review_confirmed = False
@@ -298,6 +299,49 @@ class SetupController:
         self._draft.runtime = runtime.model_copy(deep=True)
         self._changed(invalidation_step)
 
+    def apply_runtime_fields(
+        self, step: SetupStep, fields: Mapping[str, str]
+    ) -> None:
+        """Retain strict public fragments needed to build fresh setup transports."""
+
+        self._ensure_mutable()
+        allowed = {
+            SetupStep.ONES: frozenset(
+                {"ones_base_url", "ones_team_id", "ones_issue_type_id"}
+            ),
+            SetupStep.PROVIDER: frozenset(
+                {
+                    "provider_host",
+                    "provider_api_url",
+                    "git_author_name",
+                    "git_author_email",
+                }
+            ),
+            SetupStep.CODEX: frozenset({"codex_auth_mode", "codex_home"}),
+        }.get(step)
+        if allowed is None or set(fields) != set(allowed) or any(
+            type(value) is not str for value in fields.values()
+        ):
+            raise SetupActionError("public configuration fields are invalid")
+        changed = any(self._runtime_fields.get(key) != fields[key] for key in allowed)
+        self._runtime_fields.update({key: fields[key] for key in allowed})
+        runtime = self._draft.runtime
+        if runtime is not None:
+            updates: dict[str, object] = dict(fields)
+            if "codex_home" in updates:
+                raw_home = updates["codex_home"]
+                updates["codex_home"] = Path(raw_home) if raw_home else None
+            try:
+                updated = runtime.model_copy(update=updates, deep=True)
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                raise SetupActionError("public configuration fields are invalid") from None
+            self.apply_runtime(updated, changed_step=step)
+            return
+        if changed:
+            self._changed(step)
+
     def apply_workflow(
         self,
         workflow: WorkflowDraft,
@@ -325,6 +369,27 @@ class SetupController:
             raise SetupActionError("repository configuration is invalid") from None
         workflow = self._draft.workflow.model_copy(deep=True)
         workflow.repositories = (*workflow.repositories, repository)
+        self.apply_workflow(workflow, changed_step=SetupStep.REPOSITORIES)
+        return repository.model_copy(deep=True)
+
+    def upsert_repository(self, **fields: object) -> RepositoryMapping:
+        """Validate first, then atomically insert or replace one mapping by key."""
+
+        self._ensure_mutable()
+        try:
+            repository = build_repository(**fields)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise SetupActionError("repository configuration is invalid") from None
+        workflow = self._draft.workflow.model_copy(deep=True)
+        existing = tuple(workflow.repositories)
+        replacement = tuple(
+            repository if item.key == repository.key else item for item in existing
+        )
+        if not any(item.key == repository.key for item in existing):
+            replacement = (*existing, repository)
+        workflow.repositories = replacement
         self.apply_workflow(workflow, changed_step=SetupStep.REPOSITORIES)
         return repository.model_copy(deep=True)
 
@@ -700,19 +765,77 @@ class SetupController:
             SetupStep.PRIVATE_PATHS: "probe_private_paths",
         }[step]
         method = getattr(self._validator, method_name)
-        if step is SetupStep.REPOSITORIES and isinstance(probe, (tuple, list)):
-            if not probe:
-                return _fixed_result(
-                    step,
-                    status=ValidationStatus.FAILED,
-                    category="invalid_field",
+        temporary: object | None = None
+        original: object | None = None
+        attribute: str | None = None
+        try:
+            if step is SetupStep.ONES and getattr(
+                self._validator, "ones_gateway", None
+            ) is None:
+                factory = getattr(
+                    self._runtime_builder, "build_ones_probe_gateway", None
                 )
-            for item in probe:
-                result = await method(item)
-                if result.status is not ValidationStatus.PASSED:
-                    return result
-            return _fixed_result(step, status=ValidationStatus.PASSED, category="ok")
-        return await method(probe)
+                if callable(factory):
+                    temporary = factory(
+                        MappingProxyType(dict(self._runtime_fields)),
+                        self._probe_secrets(
+                            SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD
+                        ),
+                    )
+                    attribute = "ones_gateway"
+            elif step is SetupStep.PROVIDER and getattr(
+                self._validator, "provider_transport", None
+            ) is None:
+                factory = getattr(
+                    self._runtime_builder, "build_provider_probe_transport", None
+                )
+                if callable(factory):
+                    temporary = factory(
+                        MappingProxyType(dict(self._runtime_fields)),
+                        self._probe_secrets(SecretKind.PROVIDER_TOKEN),
+                    )
+                    attribute = "provider_transport"
+            if attribute is not None:
+                original = getattr(self._validator, attribute)
+                setattr(self._validator, attribute, temporary)
+            if step is SetupStep.REPOSITORIES and isinstance(probe, (tuple, list)):
+                if not probe:
+                    return _fixed_result(
+                        step,
+                        status=ValidationStatus.FAILED,
+                        category="invalid_field",
+                    )
+                for item in probe:
+                    result = await method(item)
+                    if result.status is not ValidationStatus.PASSED:
+                        return result
+                return _fixed_result(step, status=ValidationStatus.PASSED, category="ok")
+            return await method(probe)
+        finally:
+            if attribute is not None:
+                setattr(self._validator, attribute, original)
+            if temporary is not None:
+                close = getattr(temporary, "aclose", None)
+                if not callable(close):
+                    close = getattr(temporary, "close", None)
+                if callable(close):
+                    outcome = close()
+                    if asyncio.iscoroutine(outcome):
+                        await outcome
+
+    def _probe_secrets(self, *kinds: SecretKind) -> RuntimeSecrets:
+        values: dict[SecretKind, str] = {}
+        try:
+            for kind in kinds:
+                raw = self._secrets.get(kind)
+                if raw is None:
+                    raise ValueError
+                values[kind] = bytes(raw).decode("utf-8", errors="strict")
+            return RuntimeSecrets(values)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise SetupActionError("credential is unavailable") from None
 
     @staticmethod
     def _normalize_ui_probe(step: SetupStep, probe: object | None) -> object | None:

@@ -394,6 +394,86 @@ async def test_controller_reaches_review_with_ui_shaped_allowlist_probes(
     assert controller.draft.workflow.repositories[0].key == "sdk"
 
 
+def test_upsert_repository_replaces_same_key_and_invalidates_downstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _, _, _ = _controller(tmp_path)
+    replacement = controller.draft.workflow.repositories[0].validated_update(
+        base_branch="release"
+    )
+    monkeypatch.setattr(
+        "src.developer_workflow.setup_controller.build_repository",
+        lambda **fields: replacement,
+    )
+    controller.upsert_repository(
+        key="sdk",
+        project_id="project-1",
+        iteration_id="iteration-1",
+        repo_url="https://git.example.test/sdk.git",
+        repo_name="sdk",
+        base_branch="release",
+    )
+    repositories = controller.draft.workflow.repositories
+    assert len(repositories) == 1
+    assert repositories[0].base_branch == "release"
+
+
+@pytest.mark.asyncio
+async def test_probe_factories_receive_current_public_fields_and_transient_secrets(
+    tmp_path: Path,
+) -> None:
+    controller, _, builder, bootstrap = _controller(tmp_path)
+    bootstrap.validator.ones_gateway = None
+    captured: list[tuple[object, object]] = []
+
+    class Gateway:
+        async def close(self) -> None:
+            return None
+
+    def build_gateway(public: object, secrets: object) -> Gateway:
+        captured.append((public, secrets))
+        return Gateway()
+
+    builder.build_ones_probe_gateway = build_gateway  # type: ignore[attr-defined]
+    controller.apply_runtime_fields(
+        SetupStep.ONES,
+        {
+            "ones_base_url": "https://new.ones.example.test",
+            "ones_team_id": "new-team",
+            "ones_issue_type_id": "new-defect",
+        },
+    )
+    controller.set_secret(SecretKind.ONES_EMAIL, "fresh@example.test")
+    controller.set_secret(SecretKind.ONES_PASSWORD, "FRESH-SECRET")
+    await controller.test_step(SetupStep.PROFILE)
+    await controller.test_step(SetupStep.ONES, object())
+    public, secrets = captured[0]
+    assert public["ones_team_id"] == "new-team"
+    assert secrets.require(SecretKind.ONES_PASSWORD) == "FRESH-SECRET"
+    assert bootstrap.validator.ones_gateway is None
+
+
+def test_runtime_field_revisit_updates_real_draft_and_invalidates_downstream(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _ = _controller(tmp_path)
+    controller._results = {
+        step: _result(step) for step in SetupController.STEPS[:-1]
+    }
+    controller.apply_runtime_fields(
+        SetupStep.ONES,
+        {
+            "ones_base_url": "https://changed.ones.example.test",
+            "ones_team_id": "changed-team",
+            "ones_issue_type_id": "changed-issue",
+        },
+    )
+    assert controller.draft.runtime.ones_team_id == "changed-team"
+    assert controller.result_for(SetupStep.ONES).status is ValidationStatus.NOT_CONFIGURED
+    assert controller.result_for(SetupStep.PROVIDER).status is ValidationStatus.NOT_CONFIGURED
+
+
 def test_cancel_clears_transient_secrets(tmp_path: Path) -> None:
     controller, _, _, _ = _controller(tmp_path)
     assert "TOKEN-SECRET" not in repr(controller)

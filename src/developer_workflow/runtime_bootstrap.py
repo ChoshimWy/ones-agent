@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+import httpx
 from pydantic import Field
 
 from config.settings import OnesSettings
@@ -33,7 +34,13 @@ from .requirement_flow import (
     SandboxCommandExecutor,
     sandbox_preflight_command,
 )
-from .setup_models import ActiveSetup, RuntimePublicConfig, RuntimeSecrets, SecretKind
+from .setup_models import (
+    DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
+    ActiveSetup,
+    RuntimePublicConfig,
+    RuntimeSecrets,
+    SecretKind,
+)
 from .state_store import FileRunStore
 
 
@@ -200,6 +207,38 @@ class RuntimeBootstrapper:
     sandbox_profile_validator: SandboxProfileValidator = _default_sandbox_validator
     gateway_close: Callable[[OnesGateway], None] = _run_gateway_close
     ambient_environment: Callable[[], Mapping[str, str]] = lambda: os.environ
+
+    def build_ones_probe_gateway(
+        self, public: Mapping[str, str], secrets: RuntimeSecrets
+    ) -> OnesGateway:
+        """Build a fresh read-only gateway from the current setup edit."""
+
+        settings = _RuntimeOnesSettings.model_validate(
+            {
+                "base_url": public["ones_base_url"],
+                "email": secrets.require(SecretKind.ONES_EMAIL),
+                "password": secrets.require(SecretKind.ONES_PASSWORD),
+                "team_id": public["ones_team_id"],
+                "project_id": "",
+                "issue_type_id": public["ones_issue_type_id"],
+                "api_token": "",
+                "defect_status_ids": "",
+                "comment_list_path_template": DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
+            }
+        )
+        return OnesGateway(settings=settings)
+
+    def build_provider_probe_transport(
+        self, public: Mapping[str, str], secrets: RuntimeSecrets
+    ) -> httpx.AsyncClient:
+        """Build a fresh authenticated GET-only client for one provider probe."""
+
+        token = secrets.require(SecretKind.PROVIDER_TOKEN)
+        return httpx.AsyncClient(
+            base_url=public["provider_api_url"],
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+        )
 
     def build(self, active: ActiveSetup, secrets: RuntimeSecrets) -> RuntimeHandle:
         gateway: OnesGateway | None = None

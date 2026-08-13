@@ -16,7 +16,12 @@ from textual.screen import Screen
 from textual.widgets import Button, Input, Label, Static
 
 from ..config import PublishingConfig, PublishingProvider
-from ..setup_models import RuntimePublicConfig, SecretKind, WorkflowDraft
+from ..setup_models import (
+    DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
+    RuntimePublicConfig,
+    SecretKind,
+    WorkflowDraft,
+)
 from ..setup_repository import RepositoryGroupDraftBuilder
 from ..setup_validation import SetupStep, ValidationStatus
 from .setup_models import build_setup_step_view, setup_step_label
@@ -54,6 +59,20 @@ _SECRET_FIELDS = {
         ("codex-api-key", SecretKind.CODEX_API_KEY),
         ("codex-auth-token", SecretKind.CODEX_AUTH_TOKEN),
     ),
+}
+_PROBE_FIELDS = {
+    SetupStep.PROFILE: (),
+    SetupStep.ONES: (
+        "ones-team-id",
+        "ones-project-id",
+        "ones-status-id",
+        "ones-item-id",
+    ),
+    SetupStep.REPOSITORIES: ("repository-path", "repository-url"),
+    SetupStep.PROVIDER: ("provider-host", "provider-api-url"),
+    SetupStep.CODEX: ("codex-profile", "codex-worktree"),
+    SetupStep.PRIVATE_PATHS: ("run-root", "mirror-root", "worktree-root"),
+    SetupStep.REVIEW: (),
 }
 
 
@@ -252,32 +271,81 @@ class SetupWizardScreen(SetupRootScreen):
 
     def _snapshot_fields(self) -> Mapping[str, str]:
         values = {
-            widget.id: widget.value
-            for widget in self.query(Input)
-            if widget.id is not None
-            and not widget.password
-            and widget.ancestors_with_self
-            and self._belongs_to_current_step(widget)
+            field_name: self.query_one(f"#{field_name}", Input).value
+            for field_name in _PROBE_FIELDS[self.current_step]
         }
         return MappingProxyType(values)
 
-    def _consume_step_secrets(self) -> None:
-        set_secret = getattr(self.controller, "set_secret", None)
+    def _snapshot_all_public_fields(self) -> Mapping[str, str]:
+        return MappingProxyType(
+            {
+                widget.id: widget.value
+                for widget in self.query(Input)
+                if widget.id is not None and not widget.password
+            }
+        )
+
+    def _take_step_secrets(self) -> list[list[object]]:
+        values: list[list[object]] = []
         for widget_id, kind in _SECRET_FIELDS.get(self.current_step, ()):
             widget = self.query_one(f"#{widget_id}", Input)
-            if not widget.value:
-                continue
-            if not callable(set_secret):
-                widget.value = ""
-                raise RuntimeError("credential input is unavailable")
-            value = widget.value
+            if widget.value:
+                values.append([kind, widget.value])
             widget.value = ""
+        return values
+
+    def _consume_step_secrets(self, values: list[list[object]]) -> None:
+        set_secret = getattr(self.controller, "set_secret", None)
+        for item in values:
+            kind, value = item
+            if not callable(set_secret):
+                raise RuntimeError("credential input is unavailable")
             try:
                 set_secret(kind, value)
             finally:
-                value = ""
+                item[1] = ""
 
-    def _apply_current_public_fields(self) -> None:
+    def _apply_current_public_fields(self, fields: Mapping[str, str]) -> None:
+        apply_runtime_fields = getattr(
+            self.controller, "apply_runtime_fields", None
+        )
+        if self.current_step is SetupStep.ONES and callable(apply_runtime_fields):
+            apply_runtime_fields(
+                SetupStep.ONES,
+                MappingProxyType(
+                    {
+                        "ones_base_url": fields["ones-base-url"],
+                        "ones_team_id": fields["ones-team-id"],
+                        "ones_issue_type_id": fields["ones-issue-type-id"],
+                    }
+                ),
+            )
+        elif self.current_step is SetupStep.PROVIDER and callable(
+            apply_runtime_fields
+        ):
+            apply_runtime_fields(
+                SetupStep.PROVIDER,
+                MappingProxyType(
+                    {
+                        "provider_host": fields["provider-host"],
+                        "provider_api_url": fields["provider-api-url"],
+                        "git_author_name": fields["git-author-name"],
+                        "git_author_email": fields["git-author-email"],
+                    }
+                ),
+            )
+        elif self.current_step is SetupStep.CODEX and callable(
+            apply_runtime_fields
+        ):
+            apply_runtime_fields(
+                SetupStep.CODEX,
+                MappingProxyType(
+                    {
+                        "codex_auth_mode": fields["codex-auth-mode"],
+                        "codex_home": fields["codex-home"],
+                    }
+                ),
+            )
         if self.current_step is SetupStep.PROFILE:
             apply_workflow = getattr(self.controller, "apply_workflow", None)
             if not callable(apply_workflow):
@@ -288,16 +356,18 @@ class SetupWizardScreen(SetupRootScreen):
                 if draft is not None and hasattr(draft, "workflow")
                 else WorkflowDraft()
             )
-            workflow.sandbox_permission_profile = self.query_one(
-                "#sandbox-profile", Input
-            ).value
+            workflow.sandbox_permission_profile = fields["sandbox-profile"]
             apply_workflow(workflow, changed_step=SetupStep.PROFILE)
             return
         if self.current_step is SetupStep.REPOSITORIES:
+            upsert_repository = getattr(self.controller, "upsert_repository", None)
             add_repository = getattr(self.controller, "add_repository", None)
-            if not callable(add_repository):
+            repository_writer = (
+                upsert_repository if callable(upsert_repository) else add_repository
+            )
+            if not callable(repository_writer):
                 raise RuntimeError("repository input is unavailable")
-            key = self.query_one("#repository-key", Input).value
+            key = fields["repository-key"]
             draft = getattr(self.controller, "draft", None)
             existing = (
                 tuple(draft.workflow.repositories)
@@ -308,41 +378,35 @@ class SetupWizardScreen(SetupRootScreen):
                 (item for item in existing if getattr(item, "key", None) == key),
                 None,
             )
-            if repository is None:
-                repository = add_repository(
+            if repository is None or callable(upsert_repository):
+                repository = repository_writer(
                     key=key,
-                    project_id=self.query_one(
-                        "#repository-project-id", Input
-                    ).value,
-                    iteration_id=self.query_one(
-                        "#repository-iteration-id", Input
-                    ).value,
-                    repo_url=self.query_one("#repository-url", Input).value,
-                    repo_name=self.query_one("#repository-name", Input).value,
-                    base_branch=self.query_one(
-                        "#repository-branch", Input
-                    ).value,
-                    source_path=Path(
-                        self.query_one("#repository-path", Input).value
-                    ),
+                    project_id=fields["repository-project-id"],
+                    iteration_id=fields["repository-iteration-id"],
+                    repo_url=fields["repository-url"],
+                    repo_name=fields["repository-name"],
+                    base_branch=fields["repository-branch"],
+                    source_path=Path(fields["repository-path"]),
                 )
-            group_key = self.query_one("#repository-group-key", Input).value
-            primary = self.query_one("#repository-primary", Input).value
+            group_key = fields["repository-group-key"]
+            primary = fields["repository-primary"]
             if group_key or primary:
                 add_group = getattr(self.controller, "add_repository_group", None)
                 if not callable(add_group):
                     raise RuntimeError("repository group input is unavailable")
-                builder = RepositoryGroupDraftBuilder(
-                    key=group_key,
-                    project_id=self.query_one(
-                        "#repository-project-id", Input
-                    ).value,
-                    iteration_id=self.query_one(
-                        "#repository-iteration-id", Input
-                    ).value,
+                groups = (
+                    tuple(draft.workflow.repository_groups)
+                    if draft is not None and hasattr(draft, "workflow")
+                    else ()
                 )
-                builder.add(repository)
-                add_group(builder, primary=primary)
+                if not any(getattr(item, "key", None) == group_key for item in groups):
+                    builder = RepositoryGroupDraftBuilder(
+                        key=group_key,
+                        project_id=fields["repository-project-id"],
+                        iteration_id=fields["repository-iteration-id"],
+                    )
+                    builder.add(repository)
+                    add_group(builder, primary=primary)
             return
         if self.current_step is SetupStep.PROVIDER:
             apply_workflow = getattr(self.controller, "apply_workflow", None)
@@ -354,12 +418,10 @@ class SetupWizardScreen(SetupRootScreen):
                 if draft is not None and hasattr(draft, "workflow")
                 else WorkflowDraft()
             )
-            provider = self.query_one("#provider-type", Input).value
+            provider = fields["provider-type"]
             workflow.publishing = PublishingConfig(
                 provider=PublishingProvider(provider),
-                default_target_branch=self.query_one(
-                    "#repository-branch", Input
-                ).value,
+                default_target_branch=fields["repository-branch"],
             )
             apply_workflow(workflow, changed_step=SetupStep.PROVIDER)
             return
@@ -373,11 +435,9 @@ class SetupWizardScreen(SetupRootScreen):
                 if draft is not None and hasattr(draft, "workflow")
                 else WorkflowDraft()
             )
-            workflow.run_root = Path(self.query_one("#run-root", Input).value)
-            workflow.mirror_root = Path(self.query_one("#mirror-root", Input).value)
-            workflow.worktree_root = Path(
-                self.query_one("#worktree-root", Input).value
-            )
+            workflow.run_root = Path(fields["run-root"])
+            workflow.mirror_root = Path(fields["mirror-root"])
+            workflow.worktree_root = Path(fields["worktree-root"])
             apply_workflow(workflow, changed_step=SetupStep.PRIVATE_PATHS)
             return
         if self.current_step is not SetupStep.CODEX:
@@ -385,19 +445,19 @@ class SetupWizardScreen(SetupRootScreen):
         apply_runtime = getattr(self.controller, "apply_runtime", None)
         if not callable(apply_runtime):
             raise RuntimeError("runtime input is unavailable")
-        codex_home = self.query_one("#codex-home", Input).value
+        codex_home = fields["codex-home"]
         runtime = RuntimePublicConfig(
-            ones_base_url=self.query_one("#ones-base-url", Input).value,
-            ones_team_id=self.query_one("#ones-team-id", Input).value,
-            ones_issue_type_id=self.query_one("#ones-issue-type-id", Input).value,
+            ones_base_url=fields["ones-base-url"],
+            ones_team_id=fields["ones-team-id"],
+            ones_issue_type_id=fields["ones-issue-type-id"],
             ones_comment_list_path_template=(
-                "/team/{team_id}/item/{item_id}/comments"
+                DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
             ),
-            provider_host=self.query_one("#provider-host", Input).value,
-            provider_api_url=self.query_one("#provider-api-url", Input).value,
-            git_author_name=self.query_one("#git-author-name", Input).value,
-            git_author_email=self.query_one("#git-author-email", Input).value,
-            codex_auth_mode=self.query_one("#codex-auth-mode", Input).value,
+            provider_host=fields["provider-host"],
+            provider_api_url=fields["provider-api-url"],
+            git_author_name=fields["git-author-name"],
+            git_author_email=fields["git-author-email"],
+            codex_auth_mode=fields["codex-auth-mode"],
             codex_home=Path(codex_home) if codex_home else None,
         )
         apply_runtime(runtime, changed_step=SetupStep.CODEX)
@@ -432,25 +492,22 @@ class SetupWizardScreen(SetupRootScreen):
         if button.disabled:
             return
         self._transients_cleared = False
-        try:
-            self._consume_step_secrets()
-            self._apply_current_public_fields()
-        except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                raise
-            self._clear_inputs()
-            self.query_one("#setup-notice", Static).update(
-                "Configuration fields are incomplete"
-            )
-            return
         self._generation += 1
         generation = self._generation
         fields = self._snapshot_fields()
+        public_fields = self._snapshot_all_public_fields()
+        secret_values = self._take_step_secrets()
         button.disabled = True
         self.query_one("#setup-notice", Static).update("Testing connection")
+        async def prepare_and_probe() -> object:
+            await asyncio.to_thread(self._consume_step_secrets, secret_values)
+            await asyncio.to_thread(
+                self._apply_current_public_fields, public_fields
+            )
+            return await self.controller.test_step(self.current_step, fields)
         try:
             result = await self._supervisor.run_readonly(
-                lambda: self.controller.test_step(self.current_step, fields)
+                prepare_and_probe
             )
         except asyncio.CancelledError:
             return
