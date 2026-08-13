@@ -1,18 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
-from textual.widgets import Button, Input
+from textual.widgets import Button, Input, Static
 
 from src.developer_workflow.setup_models import SetupDraft
-from src.developer_workflow.contracts import (
-    RepositoryGroupMapping,
-    RepositoryMapping,
-    RepositoryRole,
-)
+from src.developer_workflow.setup_controller import SetupController
+from src.developer_workflow.setup_store import SetupStore
+from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
 from src.developer_workflow.setup_validation import (
     ConnectionTestResult,
     SetupStep,
@@ -22,10 +21,16 @@ from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
 from src.developer_workflow.contracts import WorkflowState
 from src.developer_workflow.tui.app import TuiTaskMessage
 from src.developer_workflow.tui.models import RunActivity
+from src.developer_workflow.tui.supervisor import TaskEvent
 from src.developer_workflow.tui.screens import DashboardScreen
 from src.developer_workflow.tui.setup_screens import SetupWizardScreen
 from tests.test_developer_workflow_tui_integration import _group_ui_runtime
+from tests.test_developer_workflow_tui_integration import _source_facts
 from tests.test_developer_workflow_tui_security import SECRETS, _audit
+from tests.test_developer_workflow_setup_controller import (
+    FakeBootstrap,
+    IntegrationCredentials,
+)
 
 
 class _SetupHarness:
@@ -42,6 +47,7 @@ class _SetupHarness:
         self.activation_calls = 0
         self.closed = False
         self.probe_effects: list[str] = []
+        self.probe_failure: BaseException | None = None
 
     @property
     def revision(self) -> int:
@@ -110,6 +116,8 @@ class _SetupHarness:
 
     async def test_step(self, step: SetupStep, probe: object):
         del probe
+        if self.probe_failure is not None:
+            raise self.probe_failure
         result = ConnectionTestResult(
             step=step, status=ValidationStatus.PASSED, category="ok"
         )
@@ -192,57 +200,69 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         orchestrator=original_controller._orchestrator,
         close=lambda: None,
     )
-    setup = _SetupHarness(handle)
-    # The repository builder's read-only Git probes are covered separately.  Keep
-    # this UI-to-runtime E2E hermetic while retaining the production contract.
-    monkeypatch.setattr(
-        "src.developer_workflow.tui.setup_screens.build_repository",
-        lambda **fields: RepositoryMapping(**fields),
+    credentials = IntegrationCredentials()
+    setup_store = SetupStore(
+        credentials,
+        config_path=tmp_path / "private-config" / "config.json",
     )
 
-    class LocalGroupBuilder:
-        def __init__(self, *, key, project_id, iteration_id) -> None:
-            self.key = key
-            self.project_id = project_id
-            self.iteration_id = iteration_id
-            self.repositories: list[RepositoryMapping] = []
-
-        def add(self, repository: RepositoryMapping):
-            self.repositories.append(repository)
-            return self
-
-        def build(self, *, primary: str) -> RepositoryGroupMapping:
-            return RepositoryGroupMapping(
-                key=self.key,
-                project_id=self.project_id,
-                iteration_id=self.iteration_id,
-                primary_repository=primary,
-                repositories=tuple(
-                    item.validated_update(
-                        role=(
-                            RepositoryRole.PRIMARY
-                            if item.key == primary
-                            else RepositoryRole.DEPENDENCY
-                        )
-                    )
-                    for item in self.repositories
-                ),
+    class ProductionRuntimeBuilder:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.bootstrapper = RuntimeBootstrapper(
+                sandbox_profile_validator=lambda profile, env: None,
+                ambient_environment=lambda: {},
             )
 
+        def build(self, active, secrets):
+            # Exercise the real production graph constructor.  The E2E then swaps
+            # to the established fully-instrumented local graph so its allowed
+            # fake ONES/Codex/PR/comment transports remain observable.
+            built = self.bootstrapper.build(active, secrets)
+            built.close()
+            self.calls += 1
+            return handle
+
+    runtime_builder = ProductionRuntimeBuilder()
+    bootstrap = FakeBootstrap()
+    setup = SetupController(
+        profile_id="managed-profile",
+        store=setup_store,
+        runtime_builder=runtime_builder,
+        runtime_bootstrap=bootstrap,
+        activation_timeout=10,
+    )
+    # Keep the real repository/group builders and all local snapshot checks;
+    # replace only their allowed read-only remote transport.
+    from src.developer_workflow.setup_validation import ReadOnlyRepositoryInspector
+
+    class LocalReadOnlyInspector(ReadOnlyRepositoryInspector):
+        def _run(self, argv, **kwargs):
+            if "ls-remote" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return super()._run(argv, **kwargs)
+
+        def ls_remote(self, path, remote_url, *, timeout):
+            del path, remote_url, timeout
+            return None
+
     monkeypatch.setattr(
-        "src.developer_workflow.tui.setup_screens.RepositoryGroupDraftBuilder",
-        LocalGroupBuilder,
+        "src.developer_workflow.setup_repository.ReadOnlyRepositoryInspector",
+        LocalReadOnlyInspector,
     )
     app = DeveloperWorkflowTuiApp(
         setup_controller=setup,
-        setup_controller_factory=lambda: _SetupHarness(handle),
+        setup_controller_factory=lambda: SetupController(
+            profile_id="managed-profile",
+            store=setup_store,
+            runtime_builder=runtime_builder,
+            runtime_bootstrap=FakeBootstrap(),
+            activation_timeout=10,
+        ),
         runtime_bootstrapper=object(),
         poll_interval=10,
     )
-    source_before = {
-        key: ((path / "src" / "value.py").read_bytes(),)
-        for key, path in sources.items()
-    }
+    source_before = {key: _source_facts(path) for key, path in sources.items()}
     run_id: str | None = None
     confirmation_finished = asyncio.Event()
     approval_finished = asyncio.Event()
@@ -263,9 +283,9 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
     ) as pilot:
         assert isinstance(app.screen, SetupWizardScreen)
         assert store.list_run_ids() == ()
-        assert effects == setup.probe_effects == []
+        assert effects == []
 
-        await _set_inputs(app, {"sandbox-profile": "managed-dev"})
+        await _set_inputs(app, {"sandbox-profile": "managed-profile"})
         await _test_current_step(pilot, app, SetupStep.PROFILE)
         await _next_step(pilot, app)
 
@@ -337,15 +357,13 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         await _test_current_step(pilot, app, SetupStep.PROVIDER)
         await _next_step(pilot, app)
 
-        codex_home = (tmp_path / "codex-home").resolve()
-        codex_home.mkdir()
         await _set_inputs(
             app,
             {
                 "codex-auth-mode": "credential",
-                "codex-profile": "managed-dev",
+                "codex-profile": "managed-profile",
                 "codex-worktree": str(sources["primary"].resolve()),
-                "codex-home": str(codex_home),
+                "codex-home": "",
                 "codex-api-key": "Setup-Codex-Key-74813",
                 "codex-auth-token": "",
             },
@@ -365,6 +383,14 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         await _next_step(pilot, app)
         assert app.screen.current_step is SetupStep.REVIEW
         assert effects == [] and store.list_run_ids() == ()
+        assert credentials.data == {}
+        assert runtime_builder.calls == 0
+        for private_root in (
+            tmp_path / "configured-runs",
+            tmp_path / "configured-mirrors",
+            tmp_path / "configured-worktrees",
+        ):
+            assert not private_root.exists()
         await pilot.click("#confirm-review")
         await pilot.click("#activate-runtime")
         assert app.screen.id == "setup-activation-confirmation"
@@ -374,8 +400,13 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             if isinstance(app.screen, DashboardScreen):
                 break
         assert isinstance(app.screen, DashboardScreen)
-        assert setup.activation_calls == 1
+        assert runtime_builder.calls == 1
         assert effects == [] and store.list_run_ids() == ()
+        persisted = setup_store.load()
+        assert persisted.active is not None
+        assert persisted.activation_owner_generation is None
+        generation = persisted.active.generation
+        assert ("managed-profile", generation) in credentials.data
 
         # Continue from the activated Dashboard through the existing real
         # requirement flow.  Only ONES/Codex/PR/comment/sandbox are fakes; the
@@ -421,11 +452,9 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         "comment",
     ]
     assert commenter.status_updates == 0
+    assert commenter.mutation_requests == [("comment", "REQ-UI")]
 
-    assert {
-        key: ((path / "src" / "value.py").read_bytes(),)
-        for key, path in sources.items()
-    } == source_before
+    assert {key: _source_facts(path) for key, path in sources.items()} == source_before
 
 
 @pytest.mark.asyncio
@@ -433,14 +462,6 @@ async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() ->
     # Reuse the established unfiltered Rich/widget auditor with every sensitive
     # boundary category injected into the real seven-step screen.
     setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
-    setup.raw_boundaries = {
-        "ones": SECRETS["ones"],
-        "codex": SECRETS["codex"],
-        "provider": SECRETS["provider"],
-        "git": SECRETS["git"],
-        "path": SECRETS["path"],
-        "control": SECRETS["control"],
-    }
     app = DeveloperWorkflowTuiApp(
         setup_controller=setup,
         setup_controller_factory=lambda: setup,
@@ -455,10 +476,52 @@ async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() ->
         for step in SetupStep:
             app.screen.current_step = step
             app.screen._render_state()
+            # Inject credentials into the real password widgets for their owned
+            # production steps.  Raw widget/repr/Rich output must still be masked.
+            injected = {
+                SetupStep.ONES: (("ones-email", SECRETS["email"]), ("ones-password", SECRETS["ones"])),
+                SetupStep.PROVIDER: (("provider-token", SECRETS["provider"]),),
+                SetupStep.CODEX: (("codex-api-key", SECRETS["codex"]),),
+            }.get(step, ())
+            for widget_id, secret in injected:
+                app.screen.query_one(f"#{widget_id}", Input).value = secret
             _audit(app, f"setup-{step.value}")
+            for widget_id, _ in injected:
+                app.screen.query_one(f"#{widget_id}", Input).value = ""
         app.notify("Configuration action failed safely")
         await pilot.pause()
         _audit(app, "setup-notification")
+        app.post_message(
+            TuiTaskMessage(TaskEvent.failed("setup-probe", "validate"))
+        )
+        await pilot.pause()
+        _audit(app, "setup-task-event")
+
+        # Inject path/control/Rich-looking values through an actual failing
+        # validator boundary.  The screen must retain only its fixed category.
+        app.screen.current_step = SetupStep.PROFILE
+        app.screen._render_state()
+        app.screen.query_one("#sandbox-profile", Input).value = "managed-profile"
+        setup.probe_failure = RuntimeError(
+            f"{SECRETS['path']} {SECRETS['control']} {SECRETS['codex']}"
+        )
+        await app.screen.action_test_connection()
+        _audit(app, "setup-validator-fixed-error")
+
+
+@pytest.mark.asyncio
+async def test_setup_surface_auditor_detects_a_deliberate_raw_and_rich_leak() -> None:
+    setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        setup_controller_factory=lambda: setup,
+        runtime_bootstrapper=object(),
+        poll_interval=10,
+    )
+    async with app.run_test(size=(120, 32)):
+        await app.screen.mount(Static(SECRETS["control"], id="deliberate-leak"))
+        with pytest.raises(AssertionError, match="setup-negative-control"):
+            _audit(app, "setup-negative-control")
 
 
 def test_setup_release_policy_declares_resources_and_private_exclusions() -> None:
@@ -488,5 +551,15 @@ def test_setup_release_policy_declares_resources_and_private_exclusions() -> Non
         "重新配置",
         "示例文件只用于导入",
         "非交互 CLI",
+        "pip install --no-deps <wheel>",
+        "不表示该 wheel 可在没有依赖的 Python 中独立运行",
     ):
         assert phrase in documentation
+    for production_identifier in (
+        "XjJ3QvWeJyNQWgwu",
+        "JkYR4hqe",
+        "Q6kE8A2m",
+        "CKA6U955",
+        "WwhszYN8",
+    ):
+        assert production_identifier not in documentation

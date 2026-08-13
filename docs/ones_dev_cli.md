@@ -32,6 +32,14 @@ profile。全部检查通过后无需重启即可进入 Dashboard。Dashboard �
 环境变量和 `.env`。环境或 `.env` 中检测到的凭据只有在配置向导中明确选择来源并确认
 导入后，才会进入本次编辑事务。
 
+发行物验证使用仓库外的新建 venv。`pip install --no-deps <wheel>` 只验证 wheel 自身
+内容，不表示该 wheel 可在没有依赖的 Python 中独立运行；导入和 `ones-dev tui --help`
+smoke 必须显式使用已安装的只读第三方依赖（例如新 venv 的
+`--system-site-packages`，或仅把既有 venv 的 `site-packages` 加入测试进程搜索路径）。
+验证脚本同时断言 `runtime_bootstrap`、setup screen、`main` 的 `__file__` 都位于新 venv
+安装目录，当前工作目录位于仓库外，并从安装包读取 TUI CSS、workflow schema 与 planner
+prompt，避免误用源码树掩盖缺失资源。
+
 常用键：
 
 - `n`：新建需求或缺陷工作流；缺陷查询的状态值必须是 ONES 工作流状态 ID，多个 ID 用英文逗号分隔，不按状态名称匹配。
@@ -188,10 +196,10 @@ ones-dev cancel <run-id> --actor <identity> [--config <path>]
 
 ```powershell
 uv run ones-dev defects list `
-  --project XjJ3QvWeJyNQWgwu `
-  --iteration JkYR4hqe `
-  --assignee Q6kE8A2m `
-  --status CKA6U955,WwhszYN8
+  --project <ONES_PROJECT_ID> `
+  --iteration <ONES_ITERATION_ID> `
+  --assignee <ONES_ASSIGNEE_ID> `
+  --status <PENDING_STATUS_ID>,<FIXING_STATUS_ID>
 ```
 
 TTY 下，`requirement` 可交互确认唯一仓库映射，`defect` 用候选序号完成单选。非 TTY 下必须显式提供 `--mapping`，缺陷还必须提供当前快照中的 `--select` UUID；不允许根据名称或模糊匹配自动选择。`revise` 的 scope 固定为：需求 `implementation`、缺陷 `repair`。缺陷若需要推翻既有根因或复现证据，应新建运行，而不是扩大 revision scope。

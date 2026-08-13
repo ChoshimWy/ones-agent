@@ -357,12 +357,20 @@ class _EffectPR:
 class _EffectCommenter:
     effects: list[str]
     status_updates: int = 0
+    mutation_requests: list[tuple[str, str]] = field(default_factory=list)
 
     def ensure_comment(self, run: WorkflowRun) -> str:
         assert run.group_publication is not None
         assert all(item.pr_url for item in run.group_publication.repositories)
         self.effects.append("comment")
+        self.mutation_requests.append(("comment", run.work_item_id))
         return "comment-1"
+
+    def update_status(self, item_id: str, status_id: str) -> None:
+        """Audit guard: production workflow must never call this mutation."""
+
+        self.status_updates += 1
+        self.mutation_requests.append(("status", f"{item_id}:{status_id}"))
 
 
 def _group_ui_runtime(tmp_path: Path):
@@ -710,6 +718,7 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
         "comment",
     ]
     assert commenter.status_updates == 0
+    assert commenter.mutation_requests == [("comment", "REQ-UI")]
     assert app.supervisor.closed is True
     assert not any(
         path.name.startswith((".ones-sandbox", ".ones-sandbox-probes-"))
