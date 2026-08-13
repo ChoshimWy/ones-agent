@@ -145,14 +145,20 @@ def load_template_workflow(path: Path | None) -> DeveloperWorkflowConfig | None:
 def parse_dotenv(path: Path) -> dict[str, str]:
     """Read a bounded, non-shell ``NAME=value`` file without following links."""
 
+    rejected_path = False
+    rejected_data = False
     try:
         raw = _read_bounded(path, missing_ok=True)
     except FileNotFoundError:
         return {}
     except _SourceDataRejected:
-        raise SetupImportSourceUnavailable("dotenv file is invalid") from None
+        rejected_data = True
     except _SourcePathRejected:
-        raise SetupImportSourceUnavailable("dotenv path is unsafe") from None
+        rejected_path = True
+    if rejected_data:
+        raise SetupImportSourceUnavailable("dotenv file is invalid")
+    if rejected_path:
+        raise SetupImportSourceUnavailable("dotenv path is unsafe")
     if raw is None:
         return {}
     try:
@@ -476,18 +482,25 @@ def _read_bounded(
     if not isinstance(path, Path):
         raise SetupImportError("source read failed")
     preflight_fatal = False
+    preflight_rejected = False
     try:
         candidate = path.absolute()
         unsafe_ancestor = _has_unsafe_ancestor(candidate)
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
-        preflight_fatal = True
+        if isinstance(error, OSError) and _is_source_access_error(error):
+            preflight_rejected = True
+        else:
+            preflight_fatal = True
     if preflight_fatal:
         raise SetupImportError("source read failed")
+    if preflight_rejected:
+        raise _SourcePathRejected
     if unsafe_ancestor:
         raise _SourcePathRejected
     initial_identity_fatal = False
+    initial_identity_rejected = False
     try:
         expected = _path_identity(candidate)
     except FileNotFoundError:
@@ -498,15 +511,19 @@ def _read_bounded(
         raise
     except OSError as error:
         if _is_source_access_error(error):
-            raise _SourcePathRejected from None
-        initial_identity_fatal = True
+            initial_identity_rejected = True
+        else:
+            initial_identity_fatal = True
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
         initial_identity_fatal = True
     if initial_identity_fatal:
         raise SetupImportError("source read failed")
+    if initial_identity_rejected:
+        raise _SourcePathRejected
     open_fatal = False
+    open_rejected = False
     try:
         descriptor = (
             _open_source_readonly(candidate)
@@ -519,14 +536,17 @@ def _read_bounded(
         raise
     except OSError as error:
         if _is_source_access_error(error):
-            raise _SourcePathRejected from None
-        open_fatal = True
+            open_rejected = True
+        else:
+            open_fatal = True
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
         open_fatal = True
     if open_fatal:
         raise SetupImportError("source read failed")
+    if open_rejected:
+        raise _SourcePathRejected
     content: bytearray | None = None
     scratch: bytearray | None = None
     failure: BaseException | None = None
@@ -560,6 +580,8 @@ def _read_bounded(
             except BaseException as error:
                 reader_failure = _prefer_cleanup_failure(reader_failure, error)
             if reader_failure is not None:
+                if isinstance(reader_failure, OSError) and _is_source_access_error(reader_failure):
+                    raise _SourcePathRejected
                 raise reader_failure
             final = _descriptor_identity(descriptor)
             if final != opened or total != opened[2]:
@@ -594,6 +616,12 @@ def _read_bounded(
     except FileNotFoundError:
         _zero_buffer(content)
         post_read_rejection = _SourcePathRejected()
+    except OSError as error:
+        _zero_buffer(content)
+        if _is_source_access_error(error):
+            post_read_rejection = _SourcePathRejected()
+        else:
+            post_read_fatal = True
     except BaseException as error:
         _zero_buffer(content)
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
@@ -741,7 +769,9 @@ def _zero_buffer(value: bytearray) -> None:
 
 
 def _is_source_access_error(error: OSError) -> bool:
-    return error.errno in {errno.EACCES, errno.EPERM} or getattr(
+    return error.errno in {
+        errno.EACCES, errno.EPERM, errno.EAGAIN, errno.EWOULDBLOCK, errno.EBUSY
+    } or getattr(
         error, "winerror", None
     ) in {5, 32, 33}
 

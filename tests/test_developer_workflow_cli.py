@@ -450,6 +450,46 @@ def test_tui_optional_dotenv_classifies_only_access_os_errors(
             build_production_tui_host(tmp_path / "missing.json")
 
 
+@pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
+def test_tui_access_errors_are_optional_without_exception_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportSourceUnavailable, parse_dotenv
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-{stage}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    error = PermissionError(errno.EACCES, canary)
+    if stage == "ancestor":
+        monkeypatch.setattr(setup_import, "_has_unsafe_ancestor", lambda _path: (_ for _ in ()).throw(error))
+    elif stage == "read":
+        monkeypatch.setattr(setup_import, "_read_into", lambda _reader, _target: (_ for _ in ()).throw(error))
+    else:
+        original = setup_import._path_identity
+        calls = 0
+        def fail_post(path: Path):
+            nonlocal calls
+            calls += 1
+            if calls % 2 == 0:
+                raise error
+            return original(path)
+        monkeypatch.setattr(setup_import, "_path_identity", fail_post)
+
+    with pytest.raises(SetupImportSourceUnavailable) as caught:
+        parse_dotenv(dotenv)
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert canary not in repr(caught.value)
+    if stage == "ancestor":
+        return
+    monkeypatch.chdir(tmp_path)
+    factory, _runtime = build_production_tui_host(tmp_path / "missing.json")
+    assert factory.import_context.dotenv_path is None  # type: ignore[attr-defined]
+
+
 @pytest.mark.parametrize("failure", [MemoryError, RuntimeError])
 def test_tui_optional_dotenv_internal_failures_are_not_ignored(
     tmp_path: Path,
