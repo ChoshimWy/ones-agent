@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from pydantic import Field
+
 from config.settings import OnesSettings
 from src.services.ones_gateway import OnesGateway
 
@@ -37,6 +39,11 @@ from .state_store import FileRunStore
 
 class RuntimeBootstrapError(RuntimeError):
     """Production runtime inputs could not be safely activated."""
+
+
+class _RuntimeOnesSettings(OnesSettings):
+    email: str = Field(default="", repr=False)
+    password: str = Field(default="", repr=False)
 
 
 class PrivateRootPreparer(Protocol):
@@ -139,24 +146,51 @@ def _run_gateway_close(gateway: OnesGateway) -> None:
         raise RuntimeBootstrapError("production runtime close failed") from None
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, repr=False)
 class RuntimeHandle:
     orchestrator: DeveloperWorkflowOrchestrator
     gateway: OnesGateway
     close_callback: Callable[[], None] = field(repr=False)
-    _closed: bool = field(default=False, init=False, repr=False)
-    _lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
+    _condition: threading.Condition = field(
+        default_factory=threading.Condition, init=False, repr=False
+    )
+    _state: str = field(default="open", init=False, repr=False)
+    _close_failed: bool = field(default=False, init=False, repr=False)
+
+    def __repr__(self) -> str:
+        return "RuntimeHandle(<redacted>)"
 
     def close(self) -> None:
-        with self._lock:
-            if self._closed:
+        with self._condition:
+            while self._state == "closing":
+                self._condition.wait()
+            if self._state == "closed":
+                if self._close_failed:
+                    raise RuntimeBootstrapError(
+                        "production runtime close failed"
+                    ) from None
                 return
-            self._closed = True
+            self._state = "closing"
+        failed = False
+        fatal: BaseException | None = None
         try:
             self.close_callback()
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
-                raise
+                fatal = error
+            else:
+                failed = True
+        finally:
+            with self._condition:
+                if fatal is not None:
+                    self._state = "open"
+                else:
+                    self._close_failed = failed
+                    self._state = "closed"
+                self._condition.notify_all()
+        if fatal is not None:
+            raise fatal
+        if failed:
             raise RuntimeBootstrapError("production runtime close failed") from None
 
 
@@ -177,11 +211,24 @@ class RuntimeBootstrapper:
                 raise ValueError
             public = active.runtime
             workflow = active.workflow
+            codex_kinds = {
+                SecretKind.CODEX_API_KEY,
+                SecretKind.CODEX_AUTH_TOKEN,
+            } & set(active.credential_kinds)
+            if public.codex_auth_mode == "credential":
+                if len(codex_kinds) != 1 or public.codex_home is not None:
+                    raise ValueError
+            elif (
+                public.codex_auth_mode != "file"
+                or codex_kinds
+                or public.codex_home is None
+            ):
+                raise ValueError
             validated_secrets = {
                 kind: _validate_runtime_secret(value)
                 for kind, value in secrets.values.items()
             }
-            settings = OnesSettings.model_validate(
+            settings = _RuntimeOnesSettings.model_validate(
                 {
                     "base_url": public.ones_base_url,
                     "email": validated_secrets[SecretKind.ONES_EMAIL],

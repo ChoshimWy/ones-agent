@@ -822,7 +822,7 @@ def test_production_factory_builds_the_real_service_graph_without_network(
 
     orchestrator = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile: None,
+        sandbox_profile_validator=lambda profile, environment: None,
     )
 
     assert isinstance(orchestrator.requirement_flow, RequirementFlow)
@@ -861,7 +861,7 @@ def test_production_factory_delegates_legacy_environment_to_runtime_bootstrap(
 
     result = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile: None,
+        sandbox_profile_validator=lambda profile, environment: None,
     )
 
     assert result is expected
@@ -887,7 +887,7 @@ def test_production_factory_rejects_invalid_git_email_before_creating_roots(
 
     with pytest.raises(RuntimeError, match="production runtime configuration is incomplete"):
         build_production_orchestrator(
-            config, sandbox_profile_validator=lambda profile: None
+            config, sandbox_profile_validator=lambda profile, environment: None
         )
 
     assert not config.run_root.exists()
@@ -924,7 +924,7 @@ def test_production_factory_requires_a_verified_codex_auth_source_before_roots(
         RuntimeError, match="production runtime configuration is incomplete"
     ):
         build_production_orchestrator(
-            config, sandbox_profile_validator=lambda profile: None
+            config, sandbox_profile_validator=lambda profile, environment: None
         )
 
     assert not config.run_root.exists()
@@ -947,7 +947,8 @@ def test_production_factory_validates_managed_sandbox_profile_before_roots(
     config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
     seen: list[str] = []
 
-    def reject_profile(profile: str) -> None:
+    def reject_profile(profile: str, environment: dict[str, str]) -> None:
+        del environment
         seen.append(profile)
         raise RuntimeError("sandbox profile is unavailable")
 

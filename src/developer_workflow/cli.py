@@ -46,7 +46,7 @@ class TuiRunner(Protocol):
 
 
 class SandboxProfileValidator(Protocol):
-    def __call__(self, profile: str) -> None: ...
+    def __call__(self, profile: str, environment: dict[str, str]) -> None: ...
 
 
 class _ParserExit(Exception):
@@ -497,7 +497,9 @@ def _valid_runtime_text(value: str) -> bool:
     )
 
 
-def _validate_sandbox_permission_profile(profile: str) -> None:
+def _validate_sandbox_permission_profile(
+    profile: str, environment: dict[str, str]
+) -> None:
     """Prove the managed profile's sandbox capabilities before service startup."""
 
     from .requirement_flow import SandboxCommandExecutor, sandbox_preflight_command
@@ -508,7 +510,7 @@ def _validate_sandbox_permission_profile(profile: str) -> None:
         completed = executor(
             sandbox_preflight_command(),
             cwd=cwd,
-            env=dict(os.environ),
+            env=dict(environment),
             timeout=20,
             max_output_bytes=64 * 1024,
         )
@@ -534,9 +536,7 @@ def build_production_orchestrator(
     )
     bootstrapper = RuntimeBootstrapper(
         ambient_environment=lambda: environment,
-        sandbox_profile_validator=lambda profile, runtime_environment: (
-            sandbox_profile_validator(profile)
-        ),
+        sandbox_profile_validator=sandbox_profile_validator,
     )
     return bootstrapper.build(active, secrets).orchestrator
 

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -193,6 +195,198 @@ def test_sandbox_preflight_never_receives_credentials_or_userinfo_urls(
         )
         assert "proxy-secret" not in repr(seen)
         assert "api-secret" not in repr(seen)
+    finally:
+        handle.close()
+
+
+def test_legacy_sandbox_adapter_forwards_only_sanitized_preflight_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.cli import build_production_orchestrator
+
+    from tests.test_developer_workflow_cli import (
+        _config_file,
+        _set_complete_non_ones_runtime,
+    )
+
+    _set_complete_non_ones_runtime(monkeypatch)
+    monkeypatch.setenv("ONES_EMAIL", "legacy@example.invalid")
+    monkeypatch.setenv("ONES_PASSWORD", "LEGACY-PASSWORD")
+    monkeypatch.setenv(
+        "ONES_COMMENT_LIST_PATH_TEMPLATE",
+        "/project/api/project/team/{team_id}/task/{item_id}/comments",
+    )
+    monkeypatch.setenv("HTTPS_PROXY", "https://user:secret@proxy.invalid")
+    seen: list[dict[str, str]] = []
+
+    orchestrator = build_production_orchestrator(
+        DeveloperWorkflowConfig.load(_config_file(tmp_path)),
+        sandbox_profile_validator=lambda profile, environment: seen.append(
+            dict(environment)
+        ),
+    )
+
+    assert len(seen) == 1
+    assert "ONES_PASSWORD" not in seen[0]
+    assert "HTTPS_PROXY" not in seen[0]
+    assert "LEGACY-PASSWORD" not in repr(seen)
+    orchestrator.publisher.pr_client.client.close()
+
+
+@pytest.mark.parametrize(
+    ("mode", "codex_home", "codex_kinds"),
+    [
+        ("credential", "present", (SecretKind.CODEX_API_KEY,)),
+        ("credential", None, (SecretKind.CODEX_API_KEY, SecretKind.CODEX_AUTH_TOKEN)),
+        ("file", None, ()),
+        ("file", "present", (SecretKind.CODEX_API_KEY,)),
+    ],
+)
+def test_codex_auth_mode_contract_rejects_conflicting_or_unused_inputs_before_roots(
+    tmp_path: Path,
+    mode: str,
+    codex_home: str | None,
+    codex_kinds: tuple[SecretKind, ...],
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeBootstrapError,
+        RuntimeBootstrapper,
+    )
+
+    home = (tmp_path / "codex-home").resolve() if codex_home else None
+    if home is not None:
+        home.mkdir()
+        (home / "auth.json").write_text("{}", encoding="utf-8")
+    active = _active(tmp_path).validated_update(
+        runtime=_active(tmp_path).runtime.validated_update(
+            codex_auth_mode=mode, codex_home=home
+        ),
+        credential_kinds=(
+            SecretKind.ONES_EMAIL,
+            SecretKind.ONES_PASSWORD,
+            SecretKind.PROVIDER_TOKEN,
+            *codex_kinds,
+        ),
+    )
+    values = {
+        SecretKind.ONES_EMAIL: "stored@example.invalid",
+        SecretKind.ONES_PASSWORD: "STORED-PASSWORD",
+        SecretKind.PROVIDER_TOKEN: "STORED-PROVIDER-TOKEN",
+    }
+    for kind in codex_kinds:
+        values[kind] = f"STORED-{kind.value}"
+    root_calls: list[object] = []
+
+    with pytest.raises(RuntimeBootstrapError):
+        RuntimeBootstrapper(
+            private_root_preparer=lambda roots: root_calls.append(roots) or tuple(roots),
+            sandbox_profile_validator=lambda profile, environment: None,
+        ).build(active, RuntimeSecrets(values))
+    assert root_calls == []
+
+
+def test_runtime_handle_close_is_single_flight_for_concurrent_callers() -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeHandle
+
+    entered = threading.Event()
+    release = threading.Event()
+    calls: list[int] = []
+
+    def cleanup() -> None:
+        calls.append(1)
+        entered.set()
+        assert release.wait(5)
+
+    handle = RuntimeHandle(object(), object(), cleanup)
+    finished: list[int] = []
+    threads = [
+        threading.Thread(target=lambda index=index: (handle.close(), finished.append(index)))
+        for index in range(2)
+    ]
+    threads[0].start()
+    assert entered.wait(5)
+    threads[1].start()
+    time.sleep(0.05)
+    assert finished == []
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    assert calls == [1]
+    assert sorted(finished) == [0, 1]
+
+
+def test_runtime_handle_close_replays_one_sanitized_failure_to_all_waiters() -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeBootstrapError,
+        RuntimeHandle,
+    )
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    def cleanup() -> None:
+        entered.set()
+        assert release.wait(5)
+        raise RuntimeError("STORED-PASSWORD")
+
+    handle = RuntimeHandle(object(), object(), cleanup)
+    errors: list[BaseException] = []
+
+    def close() -> None:
+        try:
+            handle.close()
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=close) for _ in range(2)]
+    threads[0].start()
+    assert entered.wait(5)
+    threads[1].start()
+    release.set()
+    for thread in threads:
+        thread.join(5)
+    with pytest.raises(RuntimeBootstrapError) as later:
+        handle.close()
+    assert len(errors) == 2
+    assert all(type(error) is RuntimeBootstrapError for error in errors)
+    assert all(str(error) == "production runtime close failed" for error in errors)
+    assert str(later.value) == "production runtime close failed"
+    assert all(error.__cause__ is None for error in (*errors, later.value))
+
+
+def test_runtime_handle_and_reachable_runtime_repr_never_expose_secrets(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    secrets = RuntimeSecrets(
+        {
+            **_secrets().values,
+            SecretKind.GIT_ASKPASS: "C:/trusted/STORED-GIT-ASKPASS.exe",
+        }
+    )
+    active = _active(tmp_path).validated_update(
+        credential_kinds=(
+            *_active(tmp_path).credential_kinds,
+            SecretKind.GIT_ASKPASS,
+        )
+    )
+    handle = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, environment: None,
+    ).build(active, secrets)
+    try:
+        rendered = "\n".join(
+            (
+                repr(handle),
+                str(handle),
+                repr(handle.gateway),
+                repr(handle.gateway.settings),
+                repr(handle.orchestrator),
+                repr(handle.orchestrator.publisher.pr_client),
+            )
+        )
+        assert not any(value in rendered for value in secrets.values.values())
     finally:
         handle.close()
 
