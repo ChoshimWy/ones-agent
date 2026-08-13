@@ -613,6 +613,7 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     from .setup_controller import SetupController
     from .setup_import import (
         ImportDetection,
+        SetupImportError,
         detect_import_sources,
         load_template_workflow,
     )
@@ -623,12 +624,20 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
 
     template_path = Path(template_path)
     environment = dict(os.environ)
-    dotenv_path = Path.cwd() / ".env"
-    detected = detect_import_sources(
-        template_config_path=None,
-        dotenv_path=dotenv_path,
-        environment=environment,
-    )
+    dotenv_path: Path | None = Path.cwd() / ".env"
+    try:
+        detected = detect_import_sources(
+            template_config_path=None,
+            dotenv_path=dotenv_path,
+            environment=environment,
+        )
+    except SetupImportError:
+        dotenv_path = None
+        detected = detect_import_sources(
+            template_config_path=None,
+            dotenv_path=dotenv_path,
+            environment=environment,
+        )
     template = load_template_workflow(template_path)
     detection = ImportDetection(
         environment=detected.environment,

@@ -323,6 +323,25 @@ def test_tui_missing_optional_template_still_builds_setup_host(
     assert runtime is not None
 
 
+def test_tui_unsafe_optional_dotenv_is_ignored_without_exposing_canary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.cli import build_production_tui_host
+
+    canary = "UNSAFE-DOTENV-CANARY"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(f"ONES_PASSWORD={canary}\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    factory, runtime = build_production_tui_host(tmp_path / "missing.json")
+    context = factory.import_context  # type: ignore[attr-defined]
+
+    assert context.detection.dotenv == ()
+    assert context.dotenv_path is None
+    assert canary not in repr(context)
+    assert runtime is not None
+
+
 def test_tui_unsafe_template_reports_only_fixed_failure(
     tmp_path: Path,
 ) -> None:
