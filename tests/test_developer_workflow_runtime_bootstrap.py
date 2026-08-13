@@ -78,6 +78,39 @@ def _secrets(**updates: str) -> RuntimeSecrets:
     return RuntimeSecrets(values)
 
 
+def test_runtime_adapter_bundle_is_explicit_and_defaults_remain_production() -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeAdapterBundle
+
+    bundle = RuntimeAdapterBundle()
+    assert bundle.gateway_factory is None
+    assert bundle.codex_factory is None
+    assert bundle.repository_factory is None
+    assert bundle.sandbox_factory is None
+    assert bundle.pr_factory is None
+    assert bundle.commenter_factory is None
+
+
+def test_bootstrap_normalizes_committed_workflow_to_public_runtime_contracts(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    active = _active(tmp_path)
+    assert type(active.workflow) is not DeveloperWorkflowConfig
+    handle = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, environment: None,
+    ).build(active, _secrets())
+    try:
+        assert type(handle.orchestrator.config) is DeveloperWorkflowConfig
+        assert type(handle.orchestrator.config.repositories[0]) is RepositoryMapping
+        assert handle.orchestrator.config.repositories[0] == _workflow(
+            tmp_path
+        ).repositories[0]
+    finally:
+        handle.close()
+
+
 @pytest.mark.asyncio
 async def test_provider_probe_transport_uses_gitlab_private_token_header() -> None:
     from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper

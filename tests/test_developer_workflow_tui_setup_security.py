@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from textual.widgets import Button, Input, Static
@@ -11,7 +13,15 @@ from textual.widgets import Button, Input, Static
 from src.developer_workflow.setup_models import SetupDraft
 from src.developer_workflow.setup_controller import SetupController
 from src.developer_workflow.setup_store import SetupStore
-from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+from src.developer_workflow.runtime_bootstrap import (
+    RuntimeAdapterBundle,
+    RuntimeBootstrapper,
+)
+from src.developer_workflow.credential_store import (
+    CredentialStoreError,
+    WindowsCredentialStore,
+)
+from src.developer_workflow.repository import WorktreeRepository
 from src.developer_workflow.setup_validation import (
     ConnectionTestResult,
     SetupStep,
@@ -24,13 +34,32 @@ from src.developer_workflow.tui.models import RunActivity
 from src.developer_workflow.tui.supervisor import TaskEvent
 from src.developer_workflow.tui.screens import DashboardScreen
 from src.developer_workflow.tui.setup_screens import SetupWizardScreen
-from tests.test_developer_workflow_tui_integration import _group_ui_runtime
+from tests.test_developer_workflow_tui_integration import (
+    _EffectRepository,
+    _MultiRemoteRunner,
+    _group_ui_runtime,
+)
 from tests.test_developer_workflow_tui_integration import _source_facts
 from tests.test_developer_workflow_tui_security import SECRETS, _audit
-from tests.test_developer_workflow_setup_controller import (
-    FakeBootstrap,
-    IntegrationCredentials,
-)
+from tests.test_developer_workflow_setup_controller import FakeBootstrap
+
+
+@pytest.fixture
+def real_windows_credentials():
+    if os.name != "nt":
+        pytest.skip("Windows Credential Manager is required")
+    profile = f"tui-e2e-{uuid4().hex}"
+    try:
+        credentials = WindowsCredentialStore()
+        assert credentials.list_generations(profile) == ()
+    except CredentialStoreError:
+        pytest.skip("Windows Credential Manager is unavailable")
+    try:
+        yield credentials, profile
+    finally:
+        for generation in credentials.list_generations(profile):
+            credentials.delete_generation(profile, generation)
+        assert credentials.list_generations(profile) == ()
 
 
 class _SetupHarness:
@@ -186,47 +215,65 @@ async def _next_step(pilot, app: DeveloperWorkflowTuiApp) -> None:
 async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    real_windows_credentials,
 ) -> None:
     (
         unused_app,
         original_controller,
-        store,
+        fixture_store,
         effects,
         sources,
         remotes,
         commenter,
     ) = _group_ui_runtime(tmp_path)
-    handle = SimpleNamespace(
-        orchestrator=original_controller._orchestrator,
-        close=lambda: None,
-    )
-    credentials = IntegrationCredentials()
+    credentials, profile = real_windows_credentials
     setup_store = SetupStore(
         credentials,
         config_path=tmp_path / "private-config" / "config.json",
     )
+    original = original_controller._orchestrator
+    original_flow = original.requirement_flow
+    original_publisher = original.publisher
+    remote_runner = _MultiRemoteRunner(
+        {
+            "https://git.example.invalid/team/dependency.git": remotes["dependency"],
+            "https://git.example.invalid/team/primary.git": remotes["primary"],
+        }
+    )
 
-    class ProductionRuntimeBuilder:
-        def __init__(self) -> None:
-            self.calls = 0
-            self.bootstrapper = RuntimeBootstrapper(
-                sandbox_profile_validator=lambda profile, env: None,
-                ambient_environment=lambda: {},
-            )
+    def repository_factory(
+        mirror_root, worktree_root, credential_provider, identity_provider
+    ):
+        raw = WorktreeRepository(
+            mirror_root,
+            worktree_root,
+            command_runner=remote_runner,
+            credential_env_provider=credential_provider,
+            identity_env_provider=identity_provider,
+        )
+        return _EffectRepository(raw, effects)
 
-        def build(self, active, secrets):
-            # Exercise the real production graph constructor.  The E2E then swaps
-            # to the established fully-instrumented local graph so its allowed
-            # fake ONES/Codex/PR/comment transports remain observable.
-            built = self.bootstrapper.build(active, secrets)
-            built.close()
-            self.calls += 1
-            return handle
-
-    runtime_builder = ProductionRuntimeBuilder()
+    runtime_builder = RuntimeBootstrapper(
+        sandbox_profile_validator=lambda selected, env: None,
+        gateway_close=lambda gateway: None,
+        ambient_environment=lambda: {},
+        adapters=RuntimeAdapterBundle(
+            gateway_factory=lambda settings: original_flow.gateway,
+            codex_factory=lambda run_root, repository, environment: original_flow.codex,
+            repository_factory=repository_factory,
+            sandbox_factory=lambda selected: original_flow.test_runner,
+            pr_factory=lambda **kwargs: original_publisher.pr_client,
+            commenter_factory=lambda gateway, runtime_store: commenter,
+        ),
+    )
     bootstrap = FakeBootstrap()
+    bootstrap.catalog = SimpleNamespace(
+        require_selected=lambda selected: selected
+        if selected == profile
+        else (_ for _ in ()).throw(ValueError("profile unavailable"))
+    )
     setup = SetupController(
-        profile_id="managed-profile",
+        profile_id=profile,
         store=setup_store,
         runtime_builder=runtime_builder,
         runtime_bootstrap=bootstrap,
@@ -253,10 +300,10 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
     app = DeveloperWorkflowTuiApp(
         setup_controller=setup,
         setup_controller_factory=lambda: SetupController(
-            profile_id="managed-profile",
+            profile_id=profile,
             store=setup_store,
             runtime_builder=runtime_builder,
-            runtime_bootstrap=FakeBootstrap(),
+            runtime_bootstrap=bootstrap,
             activation_timeout=10,
         ),
         runtime_bootstrapper=object(),
@@ -282,10 +329,10 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         size=(140, 40), message_hook=observe_ui_message
     ) as pilot:
         assert isinstance(app.screen, SetupWizardScreen)
-        assert store.list_run_ids() == ()
+        assert fixture_store.list_run_ids() == ()
         assert effects == []
 
-        await _set_inputs(app, {"sandbox-profile": "managed-profile"})
+        await _set_inputs(app, {"sandbox-profile": profile})
         await _test_current_step(pilot, app, SetupStep.PROFILE)
         await _next_step(pilot, app)
 
@@ -340,6 +387,16 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             item.key
             for item in setup.draft.workflow.repository_groups[0].repositories
         ) == ("dependency", "primary")
+        # Commands/dependency metadata are non-secret deployment policy not yet
+        # editable as free text in the wizard.  Apply them through the real
+        # controller API, then re-run the repository capability gate.
+        workflow = setup.draft.workflow.model_copy(deep=True)
+        workflow.repository_groups = original.config.repository_groups
+        setup.apply_workflow(workflow, changed_step=SetupStep.REPOSITORIES)
+        await setup.test_step(
+            SetupStep.REPOSITORIES, app.screen._snapshot_fields()
+        )
+        app.screen._render_state()
         await _next_step(pilot, app)
 
         await _set_inputs(
@@ -361,7 +418,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             app,
             {
                 "codex-auth-mode": "credential",
-                "codex-profile": "managed-profile",
+                "codex-profile": profile,
                 "codex-worktree": str(sources["primary"].resolve()),
                 "codex-home": "",
                 "codex-api-key": "Setup-Codex-Key-74813",
@@ -382,9 +439,9 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         await _test_current_step(pilot, app, SetupStep.PRIVATE_PATHS)
         await _next_step(pilot, app)
         assert app.screen.current_step is SetupStep.REVIEW
-        assert effects == [] and store.list_run_ids() == ()
-        assert credentials.data == {}
-        assert runtime_builder.calls == 0
+        assert effects == [] and fixture_store.list_run_ids() == ()
+        assert credentials.list_generations(profile) == ()
+        assert app.runtime_session is None
         for private_root in (
             tmp_path / "configured-runs",
             tmp_path / "configured-mirrors",
@@ -400,13 +457,31 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
             if isinstance(app.screen, DashboardScreen):
                 break
         assert isinstance(app.screen, DashboardScreen)
-        assert runtime_builder.calls == 1
-        assert effects == [] and store.list_run_ids() == ()
+        assert app.runtime_session is not None
+        built_handle = app.runtime_session.handle
+        assert built_handle is not None
+        assert built_handle.orchestrator is app.controller._orchestrator
+        runtime_store = built_handle.orchestrator.store
+        assert built_handle.orchestrator.requirement_flow.store is runtime_store
+        assert built_handle.orchestrator.publisher.store is runtime_store
+        assert built_handle.orchestrator.config.repository_groups[0].key == "suite"
+        assert (
+            built_handle.orchestrator.config.repository_groups[0]
+            == original.config.repository_groups[0]
+        ), (
+            built_handle.orchestrator.config.repository_groups[0].model_dump(),
+            original.config.repository_groups[0].model_dump(),
+        )
+        assert effects == [] and runtime_store.list_run_ids() == ()
         persisted = setup_store.load()
         assert persisted.active is not None
         assert persisted.activation_owner_generation is None
         generation = persisted.active.generation
-        assert ("managed-profile", generation) in credentials.data
+        assert credentials.list_generations(profile) == (generation,)
+        persisted_secrets = credentials.read_generation(
+            profile, generation, persisted.active.credential_kinds
+        )
+        assert set(persisted_secrets.values) == set(persisted.active.credential_kinds)
 
         # Continue from the activated Dashboard through the existing real
         # requirement flow.  Only ONES/Codex/PR/comment/sandbox are fakes; the
@@ -416,8 +491,8 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         app.screen.query_one("#requirement-id", Input).value = "REQ-UI"
         app.screen.query_one("#start-requirement", Button).focus()
         await pilot.press("enter")
-        run_id = store.list_run_ids()[0]
-        assert store.load(run_id, read_only=True).state is WorkflowState.VALIDATING
+        run_id = runtime_store.list_run_ids()[0]
+        assert runtime_store.load(run_id, read_only=True).state is WorkflowState.VALIDATING
         assert effects == []
         app.screen.query_one("#mapping-0", Button).focus()
         await pilot.press("enter")
@@ -425,8 +500,12 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         await pilot.click("#confirm-start")
         await asyncio.wait_for(confirmation_finished.wait(), 180)
         await pilot.pause()
-        waiting = store.load(run_id, read_only=True)
-        assert waiting.state is WorkflowState.WAITING_APPROVAL
+        waiting = runtime_store.load(run_id, read_only=True)
+        assert waiting.state is WorkflowState.WAITING_APPROVAL, (
+            waiting.blocked_reason,
+            tuple((item.source, item.target, item.reason) for item in waiting.history),
+            type(app.screen).__name__,
+        )
         assert effects == []
         for _ in range(100):
             await pilot.pause(0.01)
@@ -440,7 +519,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         await asyncio.wait_for(approval_finished.wait(), 180)
         await pilot.pause()
 
-    completed = store.load(run_id, read_only=True)
+    completed = runtime_store.load(run_id, read_only=True)
     assert completed.state is WorkflowState.COMPLETED
     assert effects == [
         "commit:dependency",
@@ -492,7 +571,13 @@ async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() ->
         await pilot.pause()
         _audit(app, "setup-notification")
         app.post_message(
-            TuiTaskMessage(TaskEvent.failed("setup-probe", "validate"))
+            TuiTaskMessage(
+                TaskEvent.failed(
+                    "setup-probe",
+                    "validate",
+                    RuntimeError(" ".join(SECRETS.values())),
+                )
+            )
         )
         await pilot.pause()
         _audit(app, "setup-task-event")

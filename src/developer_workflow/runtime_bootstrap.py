@@ -88,6 +88,18 @@ class SandboxProfileValidator(Protocol):
     def __call__(self, profile: str, environment: Mapping[str, str]) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class RuntimeAdapterBundle:
+    """Explicit test/deployment adapters; ``None`` preserves production defaults."""
+
+    gateway_factory: Callable[..., object] | None = None
+    codex_factory: Callable[..., object] | None = None
+    repository_factory: Callable[..., object] | None = None
+    sandbox_factory: Callable[..., object] | None = None
+    pr_factory: Callable[..., object] | None = None
+    commenter_factory: Callable[..., object] | None = None
+
+
 _GIT_SECRET_ENV = {
     SecretKind.GIT_ASKPASS: "GIT_ASKPASS",
     SecretKind.GIT_SSH: "GIT_SSH",
@@ -234,6 +246,7 @@ class RuntimeBootstrapper:
     sandbox_profile_validator: SandboxProfileValidator = _default_sandbox_validator
     gateway_close: Callable[[OnesGateway], None] = _run_gateway_close
     ambient_environment: Callable[[], Mapping[str, str]] = lambda: os.environ
+    adapters: RuntimeAdapterBundle = field(default_factory=RuntimeAdapterBundle)
 
     def build_ones_probe_gateway(
         self, public: Mapping[str, str], secrets: RuntimeSecrets
@@ -322,7 +335,13 @@ class RuntimeBootstrapper:
             if set(secrets.values) != set(active.credential_kinds):
                 raise ValueError
             public = active.runtime
-            workflow = active.workflow
+            # ActiveSetup deliberately freezes a private committed model for
+            # storage.  Re-validate it through the public runtime contract so
+            # Pydantic's type-sensitive equality cannot reject an otherwise
+            # identical mapping returned by an adapter.
+            workflow = DeveloperWorkflowConfig.model_validate(
+                active.workflow.model_dump(mode="python", round_trip=True)
+            )
             codex_kinds = {
                 SecretKind.CODEX_API_KEY,
                 SecretKind.CODEX_AUTH_TOKEN,
@@ -386,20 +405,47 @@ class RuntimeBootstrapper:
             )
 
             store = FileRunStore(run_root)
-            repository = WorktreeRepository(
-                mirror_root,
-                worktree_root,
-                credential_env_provider=lambda: dict(git_credentials),
-                identity_env_provider=lambda: dict(identity_values),
+            credential_provider = lambda: dict(git_credentials)
+            identity_provider = lambda: dict(identity_values)
+            if self.adapters.repository_factory is None:
+                repository = WorktreeRepository(
+                    mirror_root,
+                    worktree_root,
+                    credential_env_provider=credential_provider,
+                    identity_env_provider=identity_provider,
+                )
+            else:
+                repository = self.adapters.repository_factory(
+                    mirror_root,
+                    worktree_root,
+                    credential_provider,
+                    identity_provider,
+                )
+            gateway = (
+                OnesGateway(settings=settings)
+                if self.adapters.gateway_factory is None
+                else self.adapters.gateway_factory(settings)
             )
-            gateway = OnesGateway(settings=settings)
-            codex = CodexRunner(
-                run_root,
-                repository,
-                environment_provider=lambda: dict(codex_environment),
+            environment_provider = lambda: dict(codex_environment)
+            codex = (
+                CodexRunner(
+                    run_root,
+                    repository,
+                    environment_provider=environment_provider,
+                )
+                if self.adapters.codex_factory is None
+                else self.adapters.codex_factory(
+                    run_root, repository, environment_provider
+                )
             )
-            test_runner = SandboxCommandExecutor(
-                permission_profile=workflow.sandbox_permission_profile
+            test_runner = (
+                SandboxCommandExecutor(
+                    permission_profile=workflow.sandbox_permission_profile
+                )
+                if self.adapters.sandbox_factory is None
+                else self.adapters.sandbox_factory(
+                    workflow.sandbox_permission_profile
+                )
             )
             group_workspace = RepositoryGroupWorkspace(repository)
             requirement_flow = RequirementFlow(
@@ -411,18 +457,28 @@ class RuntimeBootstrapper:
                 group_workspace=group_workspace,
             )
             candidates = DefectCandidateService(gateway, settings.issue_type_id)
-            pr_client = HttpPullRequestClient(
-                provider=workflow.publishing.provider.value,
-                provider_host=public.provider_host,
-                api_base_url=public.provider_api_url,
-                token_provider=lambda: provider_token,
+            pr_arguments = {
+                "provider": workflow.publishing.provider.value,
+                "provider_host": public.provider_host,
+                "api_base_url": public.provider_api_url,
+                "token_provider": lambda: provider_token,
+            }
+            pr_client = (
+                HttpPullRequestClient(**pr_arguments)
+                if self.adapters.pr_factory is None
+                else self.adapters.pr_factory(**pr_arguments)
+            )
+            commenter = (
+                OnesCommenter(gateway, store)
+                if self.adapters.commenter_factory is None
+                else self.adapters.commenter_factory(gateway, store)
             )
             publisher = Publisher(
                 store,
                 repository,
                 WorkflowApprovalRebuilder(gateway, repository),
                 pr_client,
-                OnesCommenter(gateway, store),
+                commenter,
                 workflow.publishing.provider.value,
                 public.provider_host,
             )
@@ -433,7 +489,10 @@ class RuntimeBootstrapper:
             def close() -> None:
                 assert pr_client is not None and gateway is not None
                 try:
-                    pr_client.client.close()
+                    client = getattr(pr_client, "client", pr_client)
+                    close_client = getattr(client, "close", None)
+                    if callable(close_client):
+                        close_client()
                 finally:
                     self.gateway_close(gateway)
 
@@ -441,7 +500,10 @@ class RuntimeBootstrapper:
         except BaseException as error:
             if pr_client is not None:
                 try:
-                    pr_client.client.close()
+                    client = getattr(pr_client, "client", pr_client)
+                    close_client = getattr(client, "close", None)
+                    if callable(close_client):
+                        close_client()
                 except BaseException:
                     pass
             if gateway is not None:
@@ -483,7 +545,12 @@ class RuntimeBootstrapper:
         return environment
 
 
-__all__ = ["RuntimeBootstrapError", "RuntimeBootstrapper", "RuntimeHandle"]
+__all__ = [
+    "RuntimeAdapterBundle",
+    "RuntimeBootstrapError",
+    "RuntimeBootstrapper",
+    "RuntimeHandle",
+]
 
 
 def legacy_runtime_inputs(
