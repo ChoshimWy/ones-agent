@@ -328,6 +328,27 @@ def test_codex_auth_mode_contract_rejects_conflicting_or_unused_inputs_before_ro
     assert root_calls == []
 
 
+def test_codex_probe_checker_uses_only_explicit_runtime_auth_and_clears_it(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    public = _active(tmp_path).runtime.validated_update(
+        codex_auth_mode="credential", codex_home=None
+    )
+    checker = RuntimeBootstrapper(
+        ambient_environment=lambda: {"CODEX_AUTH_TOKEN": "AMBIENT-MUST-NOT-WIN"}
+    ).build_codex_probe_auth_checker(
+        public,
+        RuntimeSecrets({SecretKind.CODEX_API_KEY: "EXPLICIT-PROBE-KEY"}),
+    )
+    assert checker.metadata() == {"configured": True, "mode": "credential"}
+    assert "EXPLICIT-PROBE-KEY" not in repr(checker)
+    checker.close()
+    with pytest.raises(Exception):
+        checker.metadata()
+
+
 def test_runtime_handle_close_is_single_flight_for_concurrent_callers() -> None:
     from src.developer_workflow.runtime_bootstrap import RuntimeHandle
 

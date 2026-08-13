@@ -319,8 +319,9 @@ async def test_ui_mapping_snapshot_is_converted_to_strict_ones_probe(
                 "ones-team-id": "team-1",
                 "ones-project-id": "project-1",
                 "ones-status-id": "status-1",
-                "ones-item-id": "item-1",
-                "ones-password": "MUST-NOT-ENTER-PROBE",
+                    "ones-item-id": "item-1",
+                    "ones-issue-type-id": "issue-1",
+                    "ones-password": "MUST-NOT-ENTER-PROBE",
             }
         ),
     )
@@ -359,6 +360,7 @@ async def test_controller_reaches_review_with_ui_shaped_allowlist_probes(
                 "ones-project-id": "project-1",
                 "ones-status-id": "status-1",
                 "ones-item-id": "item-1",
+                "ones-issue-type-id": "issue-1",
             }
         ),
         SetupStep.REPOSITORIES: MappingProxyType(
@@ -546,6 +548,135 @@ def test_step_transaction_rejects_all_changes_without_partial_secret_write(
         )
     assert controller.draft == before
     assert controller.secret_presence(SecretKind.ONES_PASSWORD)
+
+
+def test_step_transaction_rejects_cross_step_members_and_secret_kinds(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller, _, _, _ = _controller(tmp_path)
+    before = controller.draft
+    with pytest.raises(SetupActionError):
+        controller.apply_step_transaction(
+            SetupStep.ONES,
+            SetupStepTransaction(workflow=before.workflow),
+            expected_revision=controller.revision,
+        )
+    with pytest.raises(SetupActionError):
+        controller.apply_step_transaction(
+            SetupStep.ONES,
+            SetupStepTransaction(),
+            expected_revision=controller.revision,
+            secrets={SecretKind.PROVIDER_TOKEN: "WRONG-STEP-TOKEN"},
+        )
+    with pytest.raises(SetupActionError):
+        controller.apply_step_transaction(
+            SetupStep.ONES,
+            SetupStepTransaction(
+                runtime_fields={
+                    "ones_base_url": "https://ones.example.test",
+                    "ones_team_id": "team-1",
+                    "ones_issue_type_id": "issue-1",
+                    "provider_host": "cross-step.example.test",
+                }
+            ),
+            expected_revision=controller.revision,
+        )
+    assert controller.draft == before
+
+
+def test_step_transaction_invalidates_from_actual_earliest_workflow_diff(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.setup_controller import SetupStepTransaction
+
+    controller, _, _, _ = _controller(tmp_path)
+    controller._results = {
+        step: _result(step) for step in SetupController.STEPS[:-1]
+    }
+    workflow = controller.draft.workflow.model_copy(deep=True)
+    workflow.sandbox_permission_profile = "changed-profile"
+    controller.apply_step_transaction(
+        SetupStep.PRIVATE_PATHS,
+        SetupStepTransaction(workflow=workflow),
+        expected_revision=controller.revision,
+    )
+    assert controller.result_for(SetupStep.PROFILE).status is ValidationStatus.NOT_CONFIGURED
+
+    controller._results = {
+        candidate: _result(candidate) for candidate in SetupController.STEPS[:-1]
+    }
+    workflow = controller.draft.workflow.model_copy(deep=True)
+    workflow.run_root = tmp_path / "new-runs"
+    controller.apply_step_transaction(
+        SetupStep.PROFILE,
+        SetupStepTransaction(workflow=workflow),
+        expected_revision=controller.revision,
+    )
+    assert controller.result_for(SetupStep.PROFILE).status is ValidationStatus.PASSED
+    assert (
+        controller.result_for(SetupStep.PRIVATE_PATHS).status
+        is ValidationStatus.NOT_CONFIGURED
+    )
+
+
+@pytest.mark.asyncio
+async def test_ones_tui_probe_uses_validated_issue_type_from_current_edit(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, bootstrap = _controller(tmp_path)
+    await controller.test_step(SetupStep.PROFILE)
+    await controller.test_step(
+        SetupStep.ONES,
+        {
+            "ones-team-id": "team-1",
+            "ones-project-id": "project-1",
+            "ones-status-id": "status-1",
+            "ones-item-id": "item-1",
+            "ones-issue-type-id": "defect-1",
+        },
+    )
+    probe = bootstrap.validator.probes[-1][1]
+    assert probe.issue_type_id == "defect-1"
+
+
+@pytest.mark.asyncio
+async def test_complete_setup_candidate_retains_all_accepted_credentials(
+    tmp_path: Path,
+) -> None:
+    controller, _, builder, _ = _controller(tmp_path)
+    controller.set_secret(SecretKind.ONES_EMAIL, "agent@example.test")
+    controller.set_secret(SecretKind.CODEX_API_KEY, "EXPLICIT-CODEX-KEY")
+    await _pass_all(controller)
+    await controller.save_and_activate(confirmed=True)
+    assert set(builder.calls[0][0].credential_kinds) == {
+        SecretKind.ONES_EMAIL,
+        SecretKind.ONES_PASSWORD,
+        SecretKind.PROVIDER_TOKEN,
+        SecretKind.CODEX_API_KEY,
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_probe_cannot_be_passed_by_ambient_auth(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
+
+    controller, _, _, bootstrap = _controller(tmp_path)
+    for step in SetupController.STEPS[:4]:
+        await controller.test_step(step, object())
+    controller._runtime_builder = RuntimeBootstrapper(
+        ambient_environment=lambda: {"CODEX_API_KEY": "AMBIENT-MUST-NOT-WIN"}
+    )
+    result = await controller.test_step(SetupStep.CODEX, object())
+    assert result.status is ValidationStatus.FAILED
+
+    controller.set_secret(SecretKind.CODEX_API_KEY, "EXPLICIT-CODEX-KEY")
+    result = await controller.test_step(SetupStep.CODEX, object())
+    assert result.status is ValidationStatus.PASSED
+    assert bootstrap.validator.codex_auth_metadata is None
 
 
 def test_cancel_clears_transient_secrets(tmp_path: Path) -> None:

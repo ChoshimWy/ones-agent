@@ -68,6 +68,7 @@ _PROBE_FIELDS = {
         "ones-project-id",
         "ones-status-id",
         "ones-item-id",
+        "ones-issue-type-id",
     ),
     SetupStep.REPOSITORIES: ("repository-path", "repository-url"),
     SetupStep.PROVIDER: ("provider-host", "provider-api-url"),
@@ -169,7 +170,7 @@ class SetupWizardScreen(SetupRootScreen):
 
     BINDINGS = [
         Binding("escape", "cancel_edit", "Cancel edit"),
-        Binding("ctrl+enter", "test_connection", "Test"),
+        Binding("ctrl+enter", "start_test_connection", "Test"),
     ]
 
     def __init__(
@@ -184,6 +185,7 @@ class SetupWizardScreen(SetupRootScreen):
         self._supervisor = _SetupReadOnlySupervisor()
         self._generation = 0
         self._transients_cleared = False
+        self._test_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="setup-shell"):
@@ -670,7 +672,31 @@ class SetupWizardScreen(SetupRootScreen):
 
     def _leave_step(self) -> None:
         self._clear_inputs()
-        self._clear_controller_transients_once()
+
+    def _start_test_connection(self) -> None:
+        if self._test_task is not None and not self._test_task.done():
+            return
+        task = asyncio.create_task(
+            self.action_test_connection(), name="tui-setup-test-action"
+        )
+        self._test_task = task
+
+        def completed(done: asyncio.Task[None]) -> None:
+            if self._test_task is done:
+                self._test_task = None
+            if done.cancelled():
+                return
+            try:
+                done.exception()
+            except BaseException:
+                return
+
+        task.add_done_callback(completed)
+
+    def action_start_test_connection(self) -> None:
+        """Binding entry point: schedule work without occupying the message pump."""
+
+        self._start_test_connection()
 
     async def action_test_connection(self) -> None:
         if self._supervisor.busy or self.current_step is SetupStep.REVIEW:
@@ -746,14 +772,15 @@ class SetupWizardScreen(SetupRootScreen):
         self._generation += 1
         self._supervisor.close()
         self._leave_step()
+        self._clear_controller_transients_once()
         self._supervisor = _SetupReadOnlySupervisor()
         if self.is_attached:
             self.query_one("#setup-notice", Static).update("Setup edit cancelled")
             self._render_state()
 
     @on(Button.Pressed, "#test-connection")
-    async def _pressed_test(self) -> None:
-        await self.action_test_connection()
+    def _pressed_test(self) -> None:
+        self._start_test_connection()
 
     @on(Button.Pressed, ".setup-nav-button")
     def _pressed_navigation(self, event: Button.Pressed) -> None:
@@ -847,6 +874,9 @@ class SetupWizardScreen(SetupRootScreen):
     def on_unmount(self) -> None:
         self._generation += 1
         self._supervisor.close()
+        task = self._test_task
+        if task is not None and not task.done():
+            task.cancel()
         self._clear_inputs()
         self._clear_controller_transients_once()
 

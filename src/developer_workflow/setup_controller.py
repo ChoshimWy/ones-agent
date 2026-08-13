@@ -154,6 +154,28 @@ class SetupStepTransaction:
     repository_group: RepositoryGroupMapping | None = None
 
 
+_TRANSACTION_MEMBERS: dict[SetupStep, frozenset[str]] = {
+    SetupStep.PROFILE: frozenset({"workflow"}),
+    SetupStep.ONES: frozenset({"runtime_fields"}),
+    SetupStep.REPOSITORIES: frozenset({"repository", "repository_group"}),
+    SetupStep.PROVIDER: frozenset({"workflow", "runtime_fields"}),
+    SetupStep.CODEX: frozenset({"runtime"}),
+    SetupStep.PRIVATE_PATHS: frozenset({"workflow"}),
+    SetupStep.REVIEW: frozenset(),
+}
+_TRANSACTION_RUNTIME_FIELDS: dict[SetupStep, frozenset[str]] = {
+    SetupStep.ONES: frozenset(
+        {"ones_base_url", "ones_team_id", "ones_issue_type_id"}
+    ),
+    SetupStep.PROVIDER: frozenset(
+        {
+            "provider_host", "provider_api_url", "git_author_name",
+            "git_author_email", "provider",
+        }
+    ),
+}
+
+
 _NOT_CONFIGURED = "invalid_field"
 _SECRET_STEP: dict[SecretKind, SetupStep] = {
     SecretKind.ONES_EMAIL: SetupStep.ONES,
@@ -293,6 +315,31 @@ class SetupController:
                    for kind, value in secrets.items())
         ):
             raise SetupActionError("configuration changed")
+        populated = {
+            name
+            for name in (
+                "runtime", "workflow", "runtime_fields", "repository",
+                "repository_group",
+            )
+            if getattr(transaction, name) is not None
+        }
+        allowed_secrets = {
+            kind for kind, owner in _SECRET_STEP.items() if owner is step
+        }
+        expected_runtime_fields = _TRANSACTION_RUNTIME_FIELDS.get(step)
+        if (
+            not populated <= _TRANSACTION_MEMBERS[step]
+            or not set(secrets) <= allowed_secrets
+            or transaction.runtime_fields is not None
+            and (
+                expected_runtime_fields is None
+                or set(transaction.runtime_fields) != expected_runtime_fields
+            )
+            or transaction.repository is not None
+            and transaction.repository_group is not None
+        ):
+            raise SetupActionError("step transaction is invalid")
+        previous_draft = self._draft.model_copy(deep=True)
         draft = self._draft.model_copy(deep=True)
         runtime_fields = dict(self._runtime_fields)
         encoded: dict[SecretKind, bytearray] = {}
@@ -364,7 +411,21 @@ class SetupController:
             if old is not None:
                 self._zero(old)
             self._secrets[kind] = raw
-        self._changed(step)
+        affected = step
+        if transaction.runtime is not None:
+            if previous_draft.runtime is not None:
+                detected = self._runtime_invalidation_step(
+                    previous_draft.runtime, draft.runtime, SetupStep.REVIEW
+                )
+                if detected is not SetupStep.REVIEW:
+                    affected = detected
+        if transaction.workflow is not None:
+            detected = self._workflow_invalidation_step(
+                previous_draft.workflow, draft.workflow, SetupStep.REVIEW
+            )
+            if detected is not SetupStep.REVIEW:
+                affected = detected
+        self._changed(affected)
 
     @property
     def current_step(self) -> SetupStep:
@@ -926,8 +987,27 @@ class SetupController:
                         self._probe_secrets(SecretKind.PROVIDER_TOKEN),
                     )
                     attribute = "provider_transport"
+            elif step is SetupStep.CODEX:
+                factory = getattr(
+                    self._runtime_builder, "build_codex_probe_auth_checker", None
+                )
+                runtime = self._draft.runtime
+                if callable(factory) and runtime is not None:
+                    codex_kinds = tuple(
+                        kind
+                        for kind in (
+                            SecretKind.CODEX_API_KEY,
+                            SecretKind.CODEX_AUTH_TOKEN,
+                        )
+                        if kind in self._secrets
+                    )
+                    temporary = factory(
+                        runtime,
+                        self._probe_secrets(*codex_kinds),
+                    )
+                    attribute = "codex_auth_metadata"
             if attribute is not None:
-                original = getattr(self._validator, attribute)
+                original = getattr(self._validator, attribute, None)
                 setattr(self._validator, attribute, temporary)
             if step is SetupStep.REPOSITORIES and isinstance(probe, (tuple, list)):
                 if not probe:
@@ -982,6 +1062,7 @@ class SetupController:
                     project_id=values["ones-project-id"],
                     status_id=values["ones-status-id"],
                     item_id=values["ones-item-id"],
+                    issue_type_id=values["ones-issue-type-id"],
                 )
             if step is SetupStep.PROVIDER:
                 return ProviderProbeInput(

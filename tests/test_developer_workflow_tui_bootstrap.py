@@ -315,6 +315,7 @@ async def test_setup_consumes_secrets_before_probe_without_recording_them() -> N
             "ones-project-id",
             "ones-status-id",
             "ones-item-id",
+            "ones-issue-type-id",
         }
         assert "FRAME-SECRET-CANARY" not in repr(probe)
         assert "private@example.invalid" not in repr(probe)
@@ -421,6 +422,96 @@ async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
         await screen.action_test_connection()
         assert len(controller.calls) == 1
         assert controller.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_normal_navigation_preserves_controller_accepted_credentials() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    for step in (SetupStep.PROFILE, SetupStep.ONES):
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        screen.query_one("#ones-password").value = "UNCOMMITTED-LOCAL"
+        await pilot.click("#next-step")
+        assert screen.current_step is SetupStep.REPOSITORIES
+        assert screen.query_one("#ones-password").value == ""
+        assert controller.cancel_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_test_button_handler_returns_before_blocking_builder_and_escape_cancels(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    from threading import Event
+
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    started = Event()
+    release = Event()
+    commits: list[object] = []
+
+    class BlockingController(_WizardSetupController):
+        revision = 0
+
+        @property
+        def draft(self) -> object:
+            from src.developer_workflow.setup_models import SetupDraft
+
+            return SetupDraft()
+
+        def apply_step_transaction(self, *args: object, **kwargs: object) -> None:
+            commits.append((args, kwargs))
+
+    def blocking_build(**fields: object) -> object:
+        from src.developer_workflow.contracts import RepositoryMapping
+
+        started.set()
+        release.wait(2)
+        return RepositoryMapping(
+            key=fields["key"], project_id=fields["project_id"],
+            iteration_id=fields["iteration_id"], repo_url=fields["repo_url"],
+            repo_name=fields["repo_name"], base_branch=fields["base_branch"],
+        )
+
+    monkeypatch.setattr(
+        "src.developer_workflow.tui.setup_screens.build_repository", blocking_build
+    )
+    controller = BlockingController()
+    controller.current_step = SetupStep.REPOSITORIES
+    for step in (SetupStep.PROFILE, SetupStep.ONES):
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    try:
+        async with _wizard_app(controller).run_test() as pilot:
+            screen = pilot.app.screen
+            for widget_id, value in {
+                "#repository-key": "primary",
+                "#repository-project-id": "project-1",
+                "#repository-iteration-id": "iteration-1",
+                "#repository-name": "primary",
+                "#repository-path": "C:/safe/repository",
+                "#repository-url": "https://git.example.invalid/team/primary.git",
+                "#repository-branch": "main",
+            }.items():
+                screen.query_one(widget_id).value = value
+            click = asyncio.create_task(pilot.click("#test-connection"))
+            while not started.is_set():
+                await asyncio.sleep(0)
+            await asyncio.wait_for(asyncio.shield(click), timeout=0.1)
+            await pilot.press("escape")
+            release.set()
+            await pilot.pause()
+            assert controller.cancel_calls == 1
+            assert commits == []
+    finally:
+        release.set()
 
 
 @pytest.mark.asyncio

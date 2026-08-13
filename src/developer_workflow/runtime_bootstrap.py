@@ -50,6 +50,31 @@ class RuntimeBootstrapError(RuntimeError):
     """Production runtime inputs could not be safely activated."""
 
 
+@dataclass(slots=True, repr=False)
+class _CodexProbeAuthChecker:
+    environment: dict[str, str] = field(repr=False)
+    _closed: bool = False
+
+    def metadata(self) -> Mapping[str, object]:
+        if self._closed:
+            raise RuntimeError("codex auth probe is closed")
+        home = validate_codex_auth_source(self.environment)
+        credential = bool(
+            self.environment.get("CODEX_API_KEY")
+            or self.environment.get("CODEX_AUTH_TOKEN")
+        )
+        return {
+            "configured": True,
+            "mode": "credential" if credential and home is None else "file",
+        }
+
+    def close(self) -> None:
+        for key in tuple(self.environment):
+            self.environment[key] = ""
+        self.environment.clear()
+        self._closed = True
+
+
 class _RuntimeOnesSettings(OnesSettings):
     email: str = Field(default="", repr=False)
     password: str = Field(default="", repr=False)
@@ -259,6 +284,34 @@ class RuntimeBootstrapper:
             headers=policy._headers(),
             timeout=10.0,
         )
+
+    def build_codex_probe_auth_checker(
+        self, public: RuntimePublicConfig, secrets: RuntimeSecrets
+    ) -> _CodexProbeAuthChecker:
+        """Freeze explicit setup auth for one Codex validation probe."""
+
+        if type(public) is not RuntimePublicConfig or type(secrets) is not RuntimeSecrets:
+            raise RuntimeBootstrapError("codex probe configuration is invalid")
+        try:
+            environment: dict[str, str] = {}
+            if public.codex_auth_mode == "credential":
+                api_key = secrets.values.get(SecretKind.CODEX_API_KEY, "")
+                token = secrets.values.get(SecretKind.CODEX_AUTH_TOKEN, "")
+                if bool(api_key) == bool(token):
+                    raise ValueError
+                environment["CODEX_API_KEY" if api_key else "CODEX_AUTH_TOKEN"] = (
+                    api_key or token
+                )
+            elif public.codex_auth_mode == "file" and public.codex_home is not None:
+                environment["CODEX_HOME"] = str(public.codex_home)
+            else:
+                raise ValueError
+            validate_codex_auth_source(environment)
+            return _CodexProbeAuthChecker(environment)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit)):
+                raise
+            raise RuntimeBootstrapError("codex probe configuration is invalid") from None
 
     def build(self, active: ActiveSetup, secrets: RuntimeSecrets) -> RuntimeHandle:
         gateway: OnesGateway | None = None
