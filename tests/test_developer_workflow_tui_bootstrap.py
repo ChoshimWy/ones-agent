@@ -471,6 +471,156 @@ async def test_activation_callback_after_exit_closes_unclaimed_handle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_wins_while_setup_close_is_blocked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closes: list[str] = []
+    builds: list[object] = []
+
+    class BlockingSetup(_SetupController):
+        close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            entered.set()
+            await release.wait()
+            self.closed = True
+
+    setup = BlockingSetup(None)
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        setup_controller_factory=lambda: _SetupController(None),
+        runtime_bootstrapper=object(),
+    )
+    monkeypatch.setattr(
+        app,
+        "_build_runtime_session",
+        lambda value: builds.append(value) or _RuntimeSession(),
+    )
+
+    transition = asyncio.create_task(app._setup_done(handle))
+    await entered.wait()
+    closing = asyncio.create_task(app._close_ui())
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(transition, closing)
+
+    assert builds == []
+    assert closes == ["handle"]
+    assert setup.close_calls == 1
+    assert app.runtime_session is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("fatal_stage", ["remove", "setup-close", "session-build"])
+async def test_transition_fatal_closes_activation_handle_once_and_preserves_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_type: type[BaseException],
+    fatal_stage: str,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    closes: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    setup = _SetupController(None)
+
+    if fatal_stage == "setup-close":
+        async def fatal_close() -> None:
+            raise fatal_type("original fatal")
+
+        setup.aclose = fatal_close  # type: ignore[method-assign]
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        setup_controller_factory=lambda: _SetupController(None),
+        runtime_bootstrapper=object(),
+    )
+    if fatal_stage == "remove":
+        async def fatal_remove() -> bool:
+            raise fatal_type("original fatal")
+
+        monkeypatch.setattr(app, "_remove_setup_screen", fatal_remove)
+    if fatal_stage == "session-build":
+        monkeypatch.setattr(
+            app,
+            "_build_runtime_session",
+            lambda value: (_ for _ in ()).throw(fatal_type("original fatal")),
+        )
+
+    with pytest.raises(fatal_type, match="original fatal"):
+        await app._setup_done(handle)
+
+    assert closes == ["handle"]
+    assert app.runtime_session is None
+
+
+@pytest.mark.asyncio
+async def test_close_wins_during_recovery_session_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from textual.screen import Screen
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    closes: list[str] = []
+    factories: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+
+    class BlockingSession(_RuntimeSession):
+        async def close(self) -> None:
+            if self.closed:
+                return
+            self.closed = True
+            entered.set()
+            await release.wait()
+            handle.close()
+
+    class FailingDashboard(Screen[None]):
+        async def refresh_runs(self) -> None:
+            raise RuntimeError("sensitive refresh failure")
+
+        def begin_teardown(self) -> None:
+            return None
+
+    session = BlockingSession()
+
+    def replacement() -> _SetupController:
+        factories.append("factory")
+        return _SetupController(None)
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=_SetupController(None),
+        setup_controller_factory=replacement,
+        runtime_bootstrapper=object(),
+    )
+    monkeypatch.setattr(app, "_build_runtime_session", lambda value: session)
+    monkeypatch.setattr(app, "_build_dashboard", lambda value: FailingDashboard())
+
+    transition = asyncio.create_task(app._setup_done(handle))
+    await entered.wait()
+    closing = asyncio.create_task(app._close_ui())
+    await asyncio.sleep(0)
+    release.set()
+    await asyncio.gather(transition, closing)
+
+    assert closes == ["handle"]
+    assert factories == []
+    assert app.runtime_session is None
+
+
+@pytest.mark.asyncio
 async def test_concurrent_activation_callback_builds_one_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
