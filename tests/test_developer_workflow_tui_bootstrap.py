@@ -17,6 +17,10 @@ class _WizardSetupController:
         self.current_step = SetupStep.PROFILE
         self.calls: list[tuple[SetupStep, object]] = []
         self.cancel_calls = 0
+        self.runtime_calls: list[object] = []
+        self.workflow_calls: list[object] = []
+        self.secret_calls: list[tuple[object, str]] = []
+        self.repository_calls: list[dict[str, object]] = []
         self._results = {
             step: ConnectionTestResult(
                 step=step,
@@ -60,6 +64,19 @@ class _WizardSetupController:
     def cancel_edit(self) -> None:
         self.cancel_calls += 1
 
+    def set_secret(self, kind: object, value: str) -> None:
+        self.secret_calls.append((kind, value))
+
+    def apply_runtime(self, runtime: object, **kwargs: object) -> None:
+        self.runtime_calls.append(runtime)
+
+    def apply_workflow(self, workflow: object, **kwargs: object) -> None:
+        self.workflow_calls.append(workflow)
+
+    def add_repository(self, **fields: object) -> object:
+        self.repository_calls.append(fields)
+        return SimpleNamespace(key=fields["key"])
+
 
 def _wizard_app(controller: object):
     from textual.app import App
@@ -76,7 +93,9 @@ def _wizard_app(controller: object):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("width,layout", [(60, "one"), (99, "two"), (120, "three")])
+@pytest.mark.parametrize(
+    "width,layout", [(60, "one"), (99, "two"), (100, "two"), (120, "three")]
+)
 async def test_setup_layout_preserves_explicit_actions(width: int, layout: str) -> None:
     controller = _WizardSetupController()
     async with _wizard_app(controller).run_test(size=(width, 32)) as pilot:
@@ -119,13 +138,13 @@ async def test_setup_test_uses_immutable_transient_snapshot_and_authoritative_re
     async with _wizard_app(controller).run_test() as pilot:
         password = pilot.app.screen.query_one("#ones-password")
         password.value = "wizard-secret-value"
-        await pilot.click("#test-connection")
+        await pilot.app.screen.action_test_connection()
         await pilot.pause()
         assert len(controller.calls) == 1
         step, probe = controller.calls[0]
         assert step is SetupStep.ONES
         assert isinstance(probe, MappingProxyType)
-        assert probe["ones-password"] == "wizard-secret-value"
+        assert "ones-password" not in probe
         assert pilot.app.screen.query_one("#next-step").disabled is False
         assert password.value == ""
 
@@ -263,6 +282,136 @@ async def test_setup_duplicate_test_is_suppressed_and_unmounted_result_is_discar
         assert controller.cancel_calls == 1
 
 
+@pytest.mark.asyncio
+async def test_setup_consumes_secrets_before_probe_without_recording_them() -> None:
+    from src.developer_workflow.setup_models import SecretKind
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    controller._results[SetupStep.PROFILE] = controller._results[
+        SetupStep.PROFILE
+    ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        screen.query_one("#ones-email").value = "private@example.invalid"
+        screen.query_one("#ones-password").value = "FRAME-SECRET-CANARY"
+        for widget_id, value in {
+            "#ones-team-id": "team-1",
+            "#ones-project-id": "project-1",
+            "#ones-status-id": "status-1",
+            "#ones-item-id": "item-1",
+        }.items():
+            screen.query_one(widget_id).value = value
+        await pilot.click("#test-connection")
+        await pilot.pause()
+        assert controller.secret_calls == [
+            (SecretKind.ONES_EMAIL, "private@example.invalid"),
+            (SecretKind.ONES_PASSWORD, "FRAME-SECRET-CANARY"),
+        ]
+        _, probe = controller.calls[-1]
+        assert "FRAME-SECRET-CANARY" not in repr(probe)
+        assert "private@example.invalid" not in repr(probe)
+        assert screen.query_one("#ones-email").value == ""
+        assert screen.query_one("#ones-password").value == ""
+
+
+@pytest.mark.asyncio
+async def test_setup_codex_applies_complete_public_runtime() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.CODEX
+    for step in tuple(SetupStep)[:4]:
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        values = {
+            "#ones-base-url": "https://ones.example.invalid",
+            "#ones-team-id": "team-1",
+            "#ones-issue-type-id": "defect-1",
+            "#provider-host": "git.example.invalid",
+            "#provider-api-url": "https://git.example.invalid/api",
+            "#git-author-name": "ONES Developer",
+            "#git-author-email": "developer@example.invalid",
+            "#codex-auth-mode": "credential",
+            "#codex-profile": "managed-profile",
+            "#codex-worktree": "C:/safe/probe",
+        }
+        for widget_id, value in values.items():
+            screen.query_one(widget_id).value = value
+        await screen.action_test_connection()
+        await pilot.pause()
+        assert len(controller.runtime_calls) == 1
+        runtime = controller.runtime_calls[0]
+        assert runtime.ones_team_id == "team-1"
+        assert runtime.provider_host == "git.example.invalid"
+        assert runtime.codex_auth_mode == "credential"
+
+
+@pytest.mark.asyncio
+async def test_setup_profile_and_repository_use_controller_builders() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        screen.query_one("#sandbox-profile").value = "managed-profile"
+        await pilot.click("#test-connection")
+        await pilot.pause()
+        assert len(controller.workflow_calls) == 1
+        assert controller.workflow_calls[0].sandbox_permission_profile == "managed-profile"
+
+        controller.current_step = SetupStep.REPOSITORIES
+        for step in (SetupStep.PROFILE, SetupStep.ONES):
+            controller._results[step] = controller._results[step].model_copy(
+                update={"status": ValidationStatus.PASSED, "category": "ok"}
+            )
+        screen.current_step = SetupStep.REPOSITORIES
+        screen._render_state()
+        values = {
+            "#repository-key": "primary",
+            "#repository-project-id": "project-1",
+            "#repository-iteration-id": "iteration-1",
+            "#repository-name": "primary",
+            "#repository-path": "C:/safe/repository",
+            "#repository-url": "https://git.example.invalid/team/primary.git",
+            "#repository-branch": "main",
+        }
+        for widget_id, value in values.items():
+            screen.query_one(widget_id).value = value
+        await screen.action_test_connection()
+        await pilot.pause()
+        assert controller.repository_calls[0]["key"] == "primary"
+        assert controller.repository_calls[0]["project_id"] == "project-1"
+
+
+@pytest.mark.asyncio
+async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+
+    controller = _WizardSetupController()
+    controller.current_step = SetupStep.ONES
+    controller._results[SetupStep.PROFILE] = controller._results[
+        SetupStep.PROFILE
+    ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        await pilot.press("escape")
+        for widget_id, value in {
+            "#ones-team-id": "team-1",
+            "#ones-project-id": "project-1",
+            "#ones-status-id": "status-1",
+            "#ones-item-id": "item-1",
+        }.items():
+            screen.query_one(widget_id).value = value
+        await screen.action_test_connection()
+        assert len(controller.calls) == 1
+        assert controller.cancel_calls == 1
+
+
 class _SetupController:
     def __init__(self, handle: object | None) -> None:
         self.handle = handle
@@ -292,7 +441,7 @@ async def test_incomplete_configuration_opens_setup_without_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
-    from src.developer_workflow.tui.setup_screens import SetupRootScreen
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
 
     setup = _SetupController(None)
     built: list[object] = []
@@ -306,7 +455,7 @@ async def test_incomplete_configuration_opens_setup_without_runtime(
     )
 
     async with app.run_test() as _pilot:
-        assert isinstance(app.screen, SetupRootScreen)
+        assert type(app.screen) is SetupWizardScreen
         assert built == []
         assert not app.query("#run-list")
 

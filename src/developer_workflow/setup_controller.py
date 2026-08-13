@@ -985,6 +985,10 @@ class SetupController:
         requested: SetupStep,
     ) -> SetupStep:
         self._require_step(requested)
+        if previous is None:
+            # The wizard validates earlier capability probes from immutable field
+            # snapshots before the complete cross-step public model exists.
+            return requested
         detected: list[SetupStep] = []
         field_steps = {
             SetupStep.ONES: (
@@ -1002,7 +1006,7 @@ class SetupController:
             SetupStep.CODEX: ("codex_auth_mode", "codex_home"),
         }
         for step, fields in field_steps.items():
-            if previous is None or any(
+            if any(
                 getattr(previous, field_name) != getattr(current, field_name)
                 for field_name in fields
             ):

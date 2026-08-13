@@ -329,6 +329,71 @@ async def test_ui_mapping_snapshot_is_converted_to_strict_ones_probe(
     assert "MUST-NOT-ENTER-PROBE" not in repr(probe)
 
 
+@pytest.mark.asyncio
+async def test_first_runtime_materialization_at_codex_preserves_prior_probes(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, _ = _controller(tmp_path)
+    await controller.test_step(SetupStep.PROFILE)
+    await controller.test_step(SetupStep.ONES, object())
+    await controller.test_step(SetupStep.REPOSITORIES, object())
+    await controller.test_step(SetupStep.PROVIDER, object())
+    controller._draft.runtime = None
+    controller.apply_runtime(_runtime(), changed_step=SetupStep.CODEX)
+    assert controller.result_for(SetupStep.ONES).status is ValidationStatus.PASSED
+    assert controller.result_for(SetupStep.PROVIDER).status is ValidationStatus.PASSED
+    assert controller.current_step is SetupStep.CODEX
+
+
+@pytest.mark.asyncio
+async def test_controller_reaches_review_with_ui_shaped_allowlist_probes(
+    tmp_path: Path,
+) -> None:
+    from types import MappingProxyType
+
+    controller, _, _, _ = _controller(tmp_path)
+    probes = {
+        SetupStep.ONES: MappingProxyType(
+            {
+                "ones-team-id": "team-1",
+                "ones-project-id": "project-1",
+                "ones-status-id": "status-1",
+                "ones-item-id": "item-1",
+            }
+        ),
+        SetupStep.REPOSITORIES: MappingProxyType(
+            {
+                "repository-path": str(tmp_path),
+                "repository-url": "https://git.example.test/sdk.git",
+            }
+        ),
+        SetupStep.PROVIDER: MappingProxyType(
+            {
+                "provider-host": "provider.example.test",
+                "provider-api-url": "https://provider.example.test/api",
+            }
+        ),
+        SetupStep.CODEX: MappingProxyType(
+            {
+                "codex-profile": "managed-profile",
+                "codex-worktree": str(tmp_path),
+            }
+        ),
+        SetupStep.PRIVATE_PATHS: MappingProxyType(
+            {
+                "run-root": str(tmp_path / "runs"),
+                "mirror-root": str(tmp_path / "mirrors"),
+                "worktree-root": str(tmp_path / "worktrees"),
+            }
+        ),
+    }
+    await controller.test_step(SetupStep.PROFILE)
+    for step in SetupController.STEPS[1:-1]:
+        await controller.test_step(step, probes[step])
+    assert controller.current_step is SetupStep.REVIEW
+    assert controller.draft.workflow.repositories[0].key == "sdk"
+
+
 def test_cancel_clears_transient_secrets(tmp_path: Path) -> None:
     controller, _, _, _ = _controller(tmp_path)
     assert "TOKEN-SECRET" not in repr(controller)
