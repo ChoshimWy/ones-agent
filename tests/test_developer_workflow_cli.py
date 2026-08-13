@@ -450,6 +450,56 @@ def test_tui_optional_dotenv_classifies_only_access_os_errors(
             build_production_tui_host(tmp_path / "missing.json")
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows deny-share integration")
+def test_tui_windows_deny_share_optional_dotenv_is_ignored_without_reading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = "WINDOWS-DENY-SHARE-CANARY"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(f"ONES_PASSWORD={canary}\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateFileW(str(dotenv), 0x80000000, 0, None, 3, 0x80, None)
+    if handle == ctypes.c_void_p(-1).value:
+        code = ctypes.get_last_error()
+        if code in {5, 50}:
+            pytest.skip(f"deny-share handle unavailable: {code}")
+        raise ctypes.WinError(code)
+    reads = 0
+    original_read = setup_import._read_into
+
+    def count_reads(reader: object, target: memoryview) -> int:
+        nonlocal reads
+        reads += 1
+        return original_read(reader, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(setup_import, "_read_into", count_reads)
+    monkeypatch.chdir(tmp_path)
+    try:
+        factory, _runtime = build_production_tui_host(tmp_path / "missing.json")
+    finally:
+        assert kernel.CloseHandle(handle)
+    context = factory.import_context  # type: ignore[attr-defined]
+    assert context.detection.dotenv == ()
+    assert context.dotenv_path is None
+    assert reads == 0
+    assert canary not in repr(context)
+
+
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
 def test_tui_access_errors_are_optional_without_exception_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
