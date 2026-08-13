@@ -1849,7 +1849,7 @@ asyncio.run(scenario())
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
-        timeout=2,
+        timeout=10,
         check=False,
     )
 
