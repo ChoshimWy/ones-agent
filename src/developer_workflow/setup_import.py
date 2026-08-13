@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Literal, Mapping
+from typing import Literal, Mapping, NoReturn
 import unicodedata
 
 from .private_paths import (
@@ -38,6 +38,14 @@ class SetupImportError(RuntimeError):
 
 class SetupImportSourceUnavailable(SetupImportError):
     """An optional import source was rejected before any value was accepted."""
+
+
+class _SourcePathRejected(Exception):
+    """A known unsafe or unavailable source-path condition."""
+
+
+class _SourceDataRejected(Exception):
+    """A known source-data validation or bounded-read condition."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,9 +148,9 @@ def parse_dotenv(path: Path) -> dict[str, str]:
         raw = _read_bounded(path, missing_ok=True)
     except FileNotFoundError:
         return {}
-    except ValueError:
+    except _SourceDataRejected:
         raise SetupImportSourceUnavailable("dotenv file is invalid") from None
-    except (OSError, TypeError):
+    except _SourcePathRejected:
         raise SetupImportSourceUnavailable("dotenv path is unsafe") from None
     if raw is None:
         return {}
@@ -423,9 +431,9 @@ def _read_template_object(path: Path | None) -> dict[str, object] | None:
         raw = _read_bounded(path, missing_ok=True, require_private=False)
     except FileNotFoundError:
         return None
-    except ValueError:
+    except _SourceDataRejected:
         raise SetupImportError("template config is invalid") from None
-    except (OSError, TypeError):
+    except _SourcePathRejected:
         raise SetupImportError("template config path is unsafe") from None
     if raw is None:
         return None
@@ -465,16 +473,24 @@ def _read_bounded(
     path: Path, *, missing_ok: bool, require_private: bool = True
 ) -> bytearray | None:
     if not isinstance(path, Path):
-        raise TypeError
-    candidate = path.absolute()
-    if _has_unsafe_ancestor(candidate):
-        raise OSError
+        raise SetupImportError("source read failed")
+    try:
+        candidate = path.absolute()
+        unsafe_ancestor = _has_unsafe_ancestor(candidate)
+    except BaseException as error:
+        _raise_fatal_source_error(error)
+    if unsafe_ancestor:
+        raise _SourcePathRejected
     try:
         expected = _path_identity(candidate)
     except FileNotFoundError:
         if missing_ok:
             return None
         raise
+    except _SourcePathRejected:
+        raise
+    except BaseException as error:
+        _raise_fatal_source_error(error)
     try:
         descriptor = (
             _open_source_readonly(candidate)
@@ -482,7 +498,11 @@ def _read_bounded(
             else _open_source_readonly(candidate, require_private=False)
         )
     except FileNotFoundError:
-        raise OSError from None
+        raise _SourcePathRejected from None
+    except _SourcePathRejected:
+        raise
+    except BaseException as error:
+        _raise_fatal_source_error(error)
     content: bytearray | None = None
     scratch: bytearray | None = None
     failure: BaseException | None = None
@@ -492,9 +512,9 @@ def _read_bounded(
             scratch = _allocate_buffer(_READ_CHUNK)
             opened = _descriptor_identity(descriptor)
             if opened[:2] != expected[:2]:
-                raise OSError
+                raise _SourcePathRejected
             if opened[2] > _MAX_SOURCE_BYTES:
-                raise ValueError
+                raise _SourceDataRejected
             total = 0
             reader = io.FileIO(descriptor, mode="rb", closefd=False)
             reader_failure: BaseException | None = None
@@ -508,7 +528,7 @@ def _read_bounded(
                     total += count
                     _zero_buffer(scratch)
                     if total > _MAX_SOURCE_BYTES:
-                        raise ValueError
+                        raise _SourceDataRejected
             except BaseException as error:
                 reader_failure = error
             try:
@@ -520,7 +540,7 @@ def _read_bounded(
                 raise reader_failure
             final = _descriptor_identity(descriptor)
             if final != opened or total != opened[2]:
-                raise OSError
+                raise _SourcePathRejected
         except BaseException as error:
             failure = error
     finally:
@@ -540,26 +560,22 @@ def _read_bounded(
             raise failure
         if isinstance(failure, MemoryError):
             raise failure
-        if isinstance(failure, ValueError):
-            raise ValueError("source data is invalid") from None
-        if isinstance(failure, (OSError, TypeError)):
-            raise OSError("source path is unsafe") from None
+        if isinstance(failure, (_SourcePathRejected, _SourceDataRejected)):
+            raise failure
         raise SetupImportError("source read failed") from None
     assert content is not None
     try:
         if _path_identity(candidate) != expected:
-            raise OSError
+            raise _SourcePathRejected
     except FileNotFoundError:
         _zero_buffer(content)
-        raise OSError from None
+        raise _SourcePathRejected from None
     except BaseException as error:
         _zero_buffer(content)
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
-        if isinstance(error, ValueError):
-            raise ValueError("source data is invalid") from None
-        if isinstance(error, (OSError, TypeError)):
-            raise OSError("source path is unsafe") from None
+        if isinstance(error, (_SourcePathRejected, _SourceDataRejected)):
+            raise
         raise SetupImportError("source read failed") from None
     return content
 
@@ -576,6 +592,12 @@ def _close_descriptor(descriptor: int) -> None:
     os.close(descriptor)
 
 
+def _raise_fatal_source_error(error: BaseException) -> NoReturn:
+    if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
+        raise error
+    raise SetupImportError("source read failed") from None
+
+
 def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
     """Open without following links; Windows denies concurrent write/delete access."""
 
@@ -586,14 +608,17 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
             info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077
         ):
             os.close(descriptor)
-            raise OSError
+            raise _SourcePathRejected
         try:
             import fcntl
 
             fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except (ImportError, OSError):
+        except ImportError:
             os.close(descriptor)
-            raise OSError from None
+            raise
+        except OSError:
+            os.close(descriptor)
+            raise
         return descriptor
 
     import msvcrt
@@ -634,7 +659,7 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
         buffer = ctypes.create_unicode_buffer(32768)
         length = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
         if not length or length >= len(buffer):
-            raise OSError
+            raise _SourcePathRejected
         final = buffer.value
         if final.startswith("\\\\?\\UNC\\"):
             final = "\\\\" + final[8:]
@@ -643,7 +668,7 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
         if os.path.normcase(os.path.abspath(final)) != os.path.normcase(
             os.path.abspath(path)
         ):
-            raise OSError
+            raise _SourcePathRejected
         if require_private:
             owner, entries, protected = _windows_descriptor(path)
             user = _current_user_sid()
@@ -661,7 +686,7 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
                     for sid, mask, flags, ace_type in entries
                 )
             ):
-                raise OSError
+                raise _SourcePathRejected
         return msvcrt.open_osfhandle(
             int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
@@ -677,17 +702,17 @@ def _zero_buffer(value: bytearray) -> None:
 
 def _path_identity(path: Path) -> tuple[int, int, int, int]:
     if _is_link_or_reparse(path):
-        raise OSError
+        raise _SourcePathRejected
     info = path.stat(follow_symlinks=False)
     if not stat.S_ISREG(info.st_mode):
-        raise OSError
+        raise _SourcePathRejected
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
 def _descriptor_identity(descriptor: int) -> tuple[int, int, int, int]:
     info = os.fstat(descriptor)
     if not stat.S_ISREG(info.st_mode):
-        raise OSError
+        raise _SourcePathRejected
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
 
 
@@ -697,7 +722,7 @@ def _has_unsafe_ancestor(path: Path) -> bool:
         try:
             if _is_link_or_reparse(current):
                 return True
-        except OSError:
+        except FileNotFoundError:
             return True
         if current.parent == current:
             return False

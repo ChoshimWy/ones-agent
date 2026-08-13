@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import io
 import json
 import os
@@ -419,6 +420,54 @@ def test_tui_optional_dotenv_internal_failures_are_not_ignored(
     if failure is RuntimeError:
         assert type(caught.value) is SetupImportError
     assert "UNSAFE-DOTENV-CANARY" not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "failure_factory",
+    [
+        lambda: OSError(errno.EMFILE, "TOKEN-SECRET"),
+        lambda: TypeError("TOKEN-SECRET"),
+        lambda: ValueError("TOKEN-SECRET"),
+    ],
+    ids=["emfile", "type-error", "value-error"],
+)
+def test_tui_optional_dotenv_read_errors_are_fatal_and_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_factory: object,
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host, main
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = "UNSAFE-DOTENV-CANARY"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text(f"ONES_PASSWORD={canary}\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    monkeypatch.chdir(tmp_path)
+
+    def fail_read(_reader: object, _target: memoryview) -> int:
+        raise failure_factory()  # type: ignore[operator]
+
+    monkeypatch.setattr(setup_import, "_read_into", fail_read)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    assert type(caught.value) is SetupImportError
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert canary not in repr(caught.value)
+
+    output, error = Terminal(tty=False), Terminal(tty=False)
+    code = main(
+        ["tui", "--config", str(tmp_path / "missing.json")],
+        tui_runner=lambda _controller, _runtime: None,
+        stdout=output,
+        stderr=error,
+    )
+    assert code == 1
+    assert error.getvalue() == "error: command failed safely\n"
+    assert canary not in output.getvalue() + error.getvalue()
 
 
 def test_tui_unsafe_template_reports_only_fixed_failure(

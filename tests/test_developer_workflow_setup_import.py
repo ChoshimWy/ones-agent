@@ -646,15 +646,17 @@ def test_close_failure_still_zeroes_content_and_closes_descriptor(
     monkeypatch.setattr(setup_import, "_open_source_readonly", capture)
     monkeypatch.setattr(setup_import, "_close_descriptor", close_then_fail)
     monkeypatch.setattr(setup_import, "_zero_buffer", observe)
-    with pytest.raises(SetupImportError, match="^dotenv path is unsafe$") as caught:
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
         parse_dotenv(dotenv)
+    assert type(caught.value) is SetupImportError
+    assert caught.value.__cause__ is None
     assert "TOKEN" not in repr(caught.value.__context__)
     assert zeroed and all(set(item) <= {0} for item in zeroed)
     with pytest.raises(OSError):
         os.fstat(opened[0])
 
 
-def test_read_error_precedes_close_error_without_sensitive_chain(
+def test_read_error_precedes_close_error_as_fatal_sanitized_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from src.developer_workflow import setup_import
@@ -671,8 +673,9 @@ def test_read_error_precedes_close_error_without_sensitive_chain(
 
     monkeypatch.setattr(setup_import, "_read_into", fail_read)
     monkeypatch.setattr(setup_import, "_close_descriptor", close_then_fail)
-    with pytest.raises(SetupImportError, match="^dotenv file is invalid$") as caught:
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
         parse_dotenv(dotenv)
+    assert type(caught.value) is SetupImportError
     assert caught.value.__cause__ is None
     assert "TOKEN" not in repr(caught.value.__context__)
 
