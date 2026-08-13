@@ -37,13 +37,10 @@ from .supervisor import (
 def run_tui(setup_controller: object, runtime_bootstrapper: object) -> None:
     """Run the two-stage terminal host without pre-constructing workflow services."""
 
-    if type(runtime_bootstrapper) is int:
-        DeveloperWorkflowTuiApp(
-            setup_controller, runtime_bootstrapper  # type: ignore[arg-type]
-        ).run()
-        return
+    if not callable(setup_controller):
+        raise TypeError("TUI bootstrap host is invalid")
     DeveloperWorkflowTuiApp(
-        setup_controller=setup_controller,
+        setup_controller_factory=setup_controller,
         runtime_bootstrapper=runtime_bootstrapper,
     ).run()
 

@@ -114,7 +114,7 @@ async def test_activation_closes_setup_before_dashboard(
     monkeypatch.setattr(
         DeveloperWorkflowTuiApp,
         "_build_runtime_session",
-        lambda self, value: session,
+        lambda self, value: order.append("runtime-built") or session,
     )
     monkeypatch.setattr(
         DeveloperWorkflowTuiApp,
@@ -129,8 +129,124 @@ async def test_activation_closes_setup_before_dashboard(
 
     await app._setup_done(object())
 
-    assert order == ["setup-closed", "dashboard"]
+    assert order == ["setup-closed", "runtime-built", "dashboard"]
     assert app.runtime_session is session
+
+
+@pytest.mark.asyncio
+async def test_existing_activation_closes_setup_before_runtime_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    order: list[str] = []
+    setup = _SetupController(object())
+
+    async def close_setup() -> None:
+        order.append("setup-closed")
+        setup.closed = True
+
+    setup.aclose = close_setup  # type: ignore[method-assign]
+    session = _RuntimeSession()
+    monkeypatch.setattr(
+        DeveloperWorkflowTuiApp,
+        "_build_runtime_session",
+        lambda self, value: order.append("runtime-built") or session,
+    )
+    monkeypatch.setattr(
+        DeveloperWorkflowTuiApp,
+        "_build_dashboard",
+        lambda self, value: SimpleNamespace(refresh_runs=_async_noop),
+    )
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        setup_controller_factory=lambda: _SetupController(None),
+        runtime_bootstrapper=object(),
+    )
+    monkeypatch.setattr(app, "push_screen", _async_noop)
+    monkeypatch.setattr(app, "set_interval", lambda *args: None)
+
+    await app.on_mount()
+
+    assert order == ["setup-closed", "runtime-built"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_build_failure_recreates_one_retryable_setup_screen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.setup_screens import SetupRootScreen
+
+    first = _SetupController(None)
+    replacement = _SetupController(None)
+    handles_closed: list[object] = []
+    handle = SimpleNamespace(close=lambda: handles_closed.append(handle))
+    pushed: list[object] = []
+
+    async def push(screen: object, *args: object) -> None:
+        pushed.append(screen)
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=first,
+        setup_controller_factory=lambda: replacement,
+        runtime_bootstrapper=object(),
+    )
+    monkeypatch.setattr(
+        app,
+        "_build_runtime_session",
+        lambda value: (_ for _ in ()).throw(RuntimeError("secret")),
+    )
+    monkeypatch.setattr(app, "push_screen", push)
+
+    await app._setup_done(handle)
+
+    assert first.closed
+    assert app.setup_controller is replacement
+    assert len(pushed) == 1
+    assert isinstance(pushed[0], SetupRootScreen)
+    assert handles_closed == [handle]
+
+
+@pytest.mark.asyncio
+async def test_dashboard_first_refresh_failure_leaves_only_retryable_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from textual.screen import Screen
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+    from src.developer_workflow.tui.setup_screens import SetupRootScreen
+
+    class FailingDashboard(Screen[None]):
+        async def refresh_runs(self) -> None:
+            raise RuntimeError("sensitive refresh failure")
+
+        def begin_teardown(self) -> None:
+            return None
+
+    first = _SetupController(None)
+    replacement = _SetupController(None)
+    session = _RuntimeSession()
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=first,
+        setup_controller_factory=lambda: replacement,
+        runtime_bootstrapper=object(),
+    )
+    monkeypatch.setattr(app, "_build_runtime_session", lambda handle: session)
+    monkeypatch.setattr(app, "_build_dashboard", lambda value: FailingDashboard())
+
+    async with app.run_test() as pilot:
+        setup_screen = app.screen
+        assert isinstance(setup_screen, SetupRootScreen)
+        setup_screen.complete(object())
+        await pilot.pause()
+        await pilot.pause()
+
+        assert isinstance(app.screen, SetupRootScreen)
+        assert len(app.query(SetupRootScreen)) == 1
+        assert not app.query(FailingDashboard)
+        assert first.closed
+        assert session.closed
 
 
 @pytest.mark.asyncio

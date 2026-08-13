@@ -605,29 +605,6 @@ def build_production_defect_list_client(
     return _ProductionDefectListClient(gateway, candidates)
 
 
-def _execute_tui(
-    config: DeveloperWorkflowConfig,
-    factory: OrchestratorFactory,
-    tui_runner: TuiRunner,
-) -> int:
-    """Assemble the TUI from the same validated production workflow graph."""
-
-    from .tui import RunIndex, TuiController
-
-    orchestrator = factory(config)
-    controller = TuiController(orchestrator, RunIndex(orchestrator.store))
-    try:
-        tui_runner(controller, config.tui_max_concurrency)
-    except BaseException:
-        try:
-            controller.close()
-        except BaseException:
-            pass
-        raise
-    controller.close()
-    return 0
-
-
 def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     """Build only the private setup host; no workflow runtime is opened here."""
 
@@ -642,13 +619,17 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     _ = Path(template_path)
     runtime_builder = WorkflowRuntimeBootstrapper()
     validation = ValidationBootstrapper.production()
-    controller = SetupController(
-        profile_id="default",
-        store=SetupStore(WindowsCredentialStore()),
-        runtime_builder=runtime_builder,
-        runtime_bootstrap=validation,
-    )
-    return controller, runtime_builder
+    store = SetupStore(WindowsCredentialStore())
+
+    def new_setup_controller() -> SetupController:
+        return SetupController(
+            profile_id="default",
+            store=store,
+            runtime_builder=runtime_builder,
+            runtime_bootstrap=validation,
+        )
+
+    return new_setup_controller, runtime_builder
 
 
 def _execute_tui_bootstrap(
@@ -697,18 +678,11 @@ def main(
                 from .tui import run_tui
 
                 tui_runner = run_tui
-            if tui_host_factory is not None:
-                return _execute_tui_bootstrap(
-                    Path(args.config), tui_host_factory, tui_runner
-                )
-            if factory is build_production_orchestrator:
-                return _execute_tui_bootstrap(
-                    Path(args.config), build_production_tui_host, tui_runner
-                )
-            # Compatibility for callers that injected the old orchestration
-            # factory. The installed CLI always uses the bootstrap branch above.
-            config = DeveloperWorkflowConfig.load(args.config)
-            return _execute_tui(config, factory, tui_runner)
+            return _execute_tui_bootstrap(
+                Path(args.config),
+                tui_host_factory or build_production_tui_host,
+                tui_runner,
+            )
         config = DeveloperWorkflowConfig.load(args.config)
         orchestrator = factory(config)
         return _execute(
