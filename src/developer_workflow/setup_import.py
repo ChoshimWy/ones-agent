@@ -36,6 +36,10 @@ class SetupImportError(RuntimeError):
     """A sanitized failure while inspecting or importing legacy inputs."""
 
 
+class SetupImportSourceUnavailable(SetupImportError):
+    """An optional import source was rejected before any value was accepted."""
+
+
 @dataclass(frozen=True, slots=True)
 class ImportDetection:
     """Secret kinds present in approved sources, never their values or paths."""
@@ -137,15 +141,15 @@ def parse_dotenv(path: Path) -> dict[str, str]:
     except FileNotFoundError:
         return {}
     except ValueError:
-        raise SetupImportError("dotenv file is invalid") from None
+        raise SetupImportSourceUnavailable("dotenv file is invalid") from None
     except (OSError, TypeError):
-        raise SetupImportError("dotenv path is unsafe") from None
+        raise SetupImportSourceUnavailable("dotenv path is unsafe") from None
     if raw is None:
         return {}
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeError:
-        raise SetupImportError("dotenv file is invalid") from None
+        raise SetupImportSourceUnavailable("dotenv file is invalid") from None
     finally:
         _zero_buffer(raw)
     try:
@@ -178,7 +182,7 @@ def parse_dotenv(path: Path) -> dict[str, str]:
             values[name] = value
         return values
     except ValueError:
-        raise SetupImportError("dotenv file is invalid") from None
+        raise SetupImportSourceUnavailable("dotenv file is invalid") from None
 
 
 def import_selected(
@@ -534,9 +538,13 @@ def _read_bounded(
     if failure is not None:
         if isinstance(failure, (KeyboardInterrupt, SystemExit, GeneratorExit)):
             raise failure
+        if isinstance(failure, MemoryError):
+            raise failure
         if isinstance(failure, ValueError):
             raise ValueError("source data is invalid") from None
-        raise OSError("source path is unsafe") from None
+        if isinstance(failure, (OSError, TypeError)):
+            raise OSError("source path is unsafe") from None
+        raise SetupImportError("source read failed") from None
     assert content is not None
     try:
         if _path_identity(candidate) != expected:
@@ -544,9 +552,15 @@ def _read_bounded(
     except FileNotFoundError:
         _zero_buffer(content)
         raise OSError from None
-    except BaseException:
+    except BaseException as error:
         _zero_buffer(content)
-        raise
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
+            raise
+        if isinstance(error, ValueError):
+            raise ValueError("source data is invalid") from None
+        if isinstance(error, (OSError, TypeError)):
+            raise OSError("source path is unsafe") from None
+        raise SetupImportError("source read failed") from None
     return content
 
 
@@ -693,6 +707,7 @@ def _has_unsafe_ancestor(path: Path) -> bool:
 __all__ = [
     "ImportDetection",
     "SetupImportError",
+    "SetupImportSourceUnavailable",
     "detect_import_sources",
     "import_selected",
     "load_template_workflow",

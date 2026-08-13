@@ -613,7 +613,7 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     from .setup_controller import SetupController
     from .setup_import import (
         ImportDetection,
-        SetupImportError,
+        SetupImportSourceUnavailable,
         detect_import_sources,
         load_template_workflow,
     )
@@ -631,7 +631,7 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
             dotenv_path=dotenv_path,
             environment=environment,
         )
-    except SetupImportError:
+    except SetupImportSourceUnavailable:
         dotenv_path = None
         detected = detect_import_sources(
             template_config_path=None,

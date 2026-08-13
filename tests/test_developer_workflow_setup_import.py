@@ -562,7 +562,7 @@ def test_windows_source_with_inherited_writable_acl_is_rejected(
         parse_dotenv(dotenv)
 
 
-def test_buffer_allocation_failure_closes_open_descriptor(
+def test_buffer_allocation_failure_closes_open_descriptor_without_reclassification(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from src.developer_workflow import setup_import
@@ -582,13 +582,40 @@ def test_buffer_allocation_failure_closes_open_descriptor(
 
     monkeypatch.setattr(setup_import, "_open_source_readonly", capture)
     monkeypatch.setattr(setup_import, "_allocate_buffer", fail_allocation)
-    with pytest.raises(SetupImportError, match="^dotenv path is unsafe$") as caught:
+    with pytest.raises(MemoryError, match="^TOKEN-ALLOCATION$") as caught:
         parse_dotenv(dotenv)
-    assert caught.value.__cause__ is None
-    assert "TOKEN" not in repr(caught.value.__context__)
     assert len(opened) == 1
     with pytest.raises(OSError):
         os.fstat(opened[0])
+
+
+def test_runtime_read_failure_is_fatal_and_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    dotenv = tmp_path / "runtime.env"
+    _write_private(dotenv, "ONES_PASSWORD=TOKEN\n")
+
+    def fail_read(_reader: object, _target: memoryview) -> int:
+        raise RuntimeError("TOKEN-RUNTIME")
+
+    monkeypatch.setattr(setup_import, "_read_into", fail_read)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        parse_dotenv(dotenv)
+    assert type(caught.value) is SetupImportError
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "TOKEN" not in repr(caught.value)
+
+
+def test_dotenv_source_rejection_has_specific_unavailable_class(tmp_path: Path) -> None:
+    unsafe = tmp_path / "unsafe.env"
+    unsafe.mkdir()
+
+    with pytest.raises(SetupImportError) as caught:
+        parse_dotenv(unsafe)
+    assert type(caught.value).__name__ == "SetupImportSourceUnavailable"
 
 
 def test_close_failure_still_zeroes_content_and_closes_descriptor(

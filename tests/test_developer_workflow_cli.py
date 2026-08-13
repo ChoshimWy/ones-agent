@@ -5,6 +5,8 @@ import io
 import json
 import os
 from pathlib import Path
+import stat
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -26,6 +28,7 @@ from src.developer_workflow.contracts import (
     WorkflowType,
     utc_now,
 )
+from src.developer_workflow.setup_models import SecretKind
 
 
 class Terminal(io.StringIO):
@@ -323,23 +326,99 @@ def test_tui_missing_optional_template_still_builds_setup_host(
     assert runtime is not None
 
 
+def _make_unsafe_optional_dotenv(path: Path, payload: str) -> None:
+    path.write_text(payload, encoding="utf-8")
+    if os.name != "nt":
+        path.chmod(0o644)
+        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+        return
+
+    completed = subprocess.run(
+        ["icacls", str(path), "/inheritance:e", "/grant", "*S-1-1-0:(R)", "/q"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        shell=False,
+    )
+    if completed.returncode != 0:
+        pytest.skip("cannot create a Windows loose dotenv ACL")
+    from src.developer_workflow.private_paths import _windows_descriptor
+
+    _owner, entries, protected = _windows_descriptor(path)
+    if protected or not any(sid == "S-1-1-0" for sid, *_ in entries):
+        pytest.skip("cannot verify a Windows loose dotenv ACL")
+
+
 def test_tui_unsafe_optional_dotenv_is_ignored_without_exposing_canary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    from src.developer_workflow import setup_import
     from src.developer_workflow.cli import build_production_tui_host
 
     canary = "UNSAFE-DOTENV-CANARY"
     dotenv = tmp_path / ".env"
-    dotenv.write_text(f"ONES_PASSWORD={canary}\n", encoding="utf-8")
+    _make_unsafe_optional_dotenv(dotenv, f"ONES_PASSWORD={canary}\n")
+    reads = 0
+    original_read = setup_import._read_into
+
+    def count_reads(reader: object, target: memoryview) -> int:
+        nonlocal reads
+        reads += 1
+        return original_read(reader, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(setup_import, "_read_into", count_reads)
+    monkeypatch.setenv("ONES_EMAIL", "env@example.invalid")
     monkeypatch.chdir(tmp_path)
 
     factory, runtime = build_production_tui_host(tmp_path / "missing.json")
     context = factory.import_context  # type: ignore[attr-defined]
 
     assert context.detection.dotenv == ()
+    assert context.detection.environment == (SecretKind.ONES_EMAIL,)
     assert context.dotenv_path is None
+    assert reads == 0
     assert canary not in repr(context)
     assert runtime is not None
+
+
+@pytest.mark.parametrize("failure", [MemoryError, RuntimeError])
+def test_tui_optional_dotenv_internal_failures_are_not_ignored(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=UNSAFE-DOTENV-CANARY\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    monkeypatch.chdir(tmp_path)
+    if failure is MemoryError:
+        monkeypatch.setattr(
+            setup_import,
+            "_allocate_buffer",
+            lambda _size: (_ for _ in ()).throw(MemoryError("allocation failure")),
+        )
+    else:
+        monkeypatch.setattr(
+            setup_import,
+            "_read_into",
+            lambda _reader, _target: (_ for _ in ()).throw(RuntimeError("read failure")),
+        )
+
+    if failure is MemoryError:
+        expected: type[BaseException] = MemoryError
+    else:
+        expected = SetupImportError
+    with pytest.raises(expected) as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    if failure is RuntimeError:
+        assert type(caught.value) is SetupImportError
+    assert "UNSAFE-DOTENV-CANARY" not in repr(caught.value)
 
 
 def test_tui_unsafe_template_reports_only_fixed_failure(
