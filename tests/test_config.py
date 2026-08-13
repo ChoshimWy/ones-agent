@@ -1,9 +1,23 @@
 """config.py 测试"""
 
 import os
+import sys
 
 
 class TestConfig:
+    def test_settings_module_import_is_lazy_but_legacy_constants_remain_available(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("ONES_EMAIL", "legacy@example.invalid")
+        sys.modules.pop("config", None)
+
+        from config.settings import Settings
+        import config
+
+        assert "_settings" not in config.__dict__
+        assert config.ONES_EMAIL == "legacy@example.invalid"
+        assert isinstance(config._settings, Settings)
+
     def test_default_values(self, monkeypatch):
         """未设置环境变量时有默认值"""
         for key in ["ONES_BASE_URL", "ONES_EMAIL", "ONES_PASSWORD",

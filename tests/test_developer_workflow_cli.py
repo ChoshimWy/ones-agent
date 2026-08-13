@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import stat
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -351,6 +352,43 @@ def _make_unsafe_optional_dotenv(path: Path, payload: str) -> None:
         pytest.skip("cannot verify a Windows loose dotenv ACL")
 
 
+def test_tui_cold_start_does_not_retain_unsafe_dotenv_in_legacy_config(
+    tmp_path: Path,
+) -> None:
+    canary = "COLD-START-UNSAFE-DOTENV-CANARY"
+    _make_unsafe_optional_dotenv(tmp_path / ".env", f"ONES_PASSWORD={canary}\n")
+    child = (
+        "import config\n"
+        "from pathlib import Path\n"
+        "from src.developer_workflow.cli import build_production_tui_host\n"
+        "factory, runtime = build_production_tui_host(Path('missing.json'))\n"
+        "context = factory.import_context\n"
+        "assert context.detection.dotenv == ()\n"
+        "assert context.dotenv_path is None\n"
+        "assert runtime is not None\n"
+        "if '_settings' in config.__dict__:\n"
+        f"    print('GLOBAL_RETAINED', {canary!r})\n"
+        "    raise SystemExit(1)\n"
+        "print('cold-host-ok')\n"
+    )
+    environment = dict(os.environ)
+    environment["PYTHONPATH"] = str(Path.cwd())
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=tmp_path,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout == "cold-host-ok\n"
+    assert canary not in completed.stdout + completed.stderr
+
+
 def test_tui_unsafe_optional_dotenv_is_ignored_without_exposing_canary(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -381,6 +419,35 @@ def test_tui_unsafe_optional_dotenv_is_ignored_without_exposing_canary(
     assert reads == 0
     assert canary not in repr(context)
     assert runtime is not None
+
+
+@pytest.mark.parametrize(
+    ("error", "builds_host"),
+    [(PermissionError(errno.EACCES, "denied"), True), (OSError(errno.EMFILE, "busy"), False)],
+)
+def test_tui_optional_dotenv_classifies_only_access_os_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError, builds_host: bool
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        setup_import, "_open_source_readonly", lambda _path: (_ for _ in ()).throw(error)
+    )
+
+    if builds_host:
+        factory, _runtime = build_production_tui_host(tmp_path / "missing.json")
+        assert factory.import_context.detection.dotenv == ()  # type: ignore[attr-defined]
+        assert factory.import_context.dotenv_path is None  # type: ignore[attr-defined]
+    else:
+        with pytest.raises(SetupImportError, match="^source read failed$"):
+            build_production_tui_host(tmp_path / "missing.json")
 
 
 @pytest.mark.parametrize("failure", [MemoryError, RuntimeError])

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import ctypes
+import errno
 import io
 import json
 import os
@@ -495,6 +496,10 @@ def _read_bounded(
         raise
     except _SourcePathRejected:
         raise
+    except OSError as error:
+        if _is_source_access_error(error):
+            raise _SourcePathRejected from None
+        initial_identity_fatal = True
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
@@ -512,6 +517,10 @@ def _read_bounded(
         raise _SourcePathRejected from None
     except _SourcePathRejected:
         raise
+    except OSError as error:
+        if _is_source_access_error(error):
+            raise _SourcePathRejected from None
+        open_fatal = True
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
@@ -729,6 +738,12 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
 def _zero_buffer(value: bytearray) -> None:
     for index in range(len(value)):
         value[index] = 0
+
+
+def _is_source_access_error(error: OSError) -> bool:
+    return error.errno in {errno.EACCES, errno.EPERM} or getattr(
+        error, "winerror", None
+    ) in {5, 32, 33}
 
 
 def _path_identity(path: Path) -> tuple[int, int, int, int]:
