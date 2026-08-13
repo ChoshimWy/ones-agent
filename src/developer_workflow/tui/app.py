@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import weakref
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from textual.app import App
 from textual.binding import Binding
@@ -29,6 +30,11 @@ class TuiTaskMessage(Message):
 
 class _TransitionClosed(RuntimeError):
     """Internal control flow when UI shutdown has acquired lifecycle priority."""
+
+
+@dataclass(frozen=True, slots=True)
+class _AppCloseOutcome:
+    fatal: BaseException | None = None
 
 
 class DeveloperWorkflowTuiApp(App[None]):
@@ -89,7 +95,9 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._ui_closed = False
         self._close_started = False
         self._close_complete = asyncio.Event()
+        self._close_task: asyncio.Task[_AppCloseOutcome] | None = None
         self._transition_lock = asyncio.Lock()
+        self._activation_handles: list[object] = []
         self._poll_timer: Timer | None = None
         app_ref = weakref.ref(self)
 
@@ -254,6 +262,10 @@ class DeveloperWorkflowTuiApp(App[None]):
 
     async def _setup_done(self, handle: object | None) -> None:
         async with self._transition_lock:
+            if handle is not None:
+                if any(handle is owned for owned in self._activation_handles):
+                    return
+                self._activation_handles.append(handle)
             if handle is None or self._ui_closed or self.runtime_session is not None:
                 if handle is not None and (
                     self._ui_closed or self.runtime_session is not None
@@ -419,34 +431,70 @@ class DeveloperWorkflowTuiApp(App[None]):
         await self._close_ui()
 
     async def _close_ui(self) -> None:
-        if self._close_started:
-            await self._close_complete.wait()
-            return
-        self._close_started = True
-        self._ui_closed = True
-        self._accept_events = False
-        if self._poll_timer is not None:
-            self._poll_timer.stop()
-            self._poll_timer = None
+        task = self._close_task
+        if task is None:
+            self._close_started = True
+            self._ui_closed = True
+            self._accept_events = False
+            if self._poll_timer is not None:
+                self._poll_timer.stop()
+                self._poll_timer = None
+            task = asyncio.create_task(self._drain_close_ui())
+            self._close_task = task
+        outcome = await asyncio.shield(task)
+        if outcome.fatal is not None:
+            raise outcome.fatal
+
+    async def _drain_close_ui(self) -> _AppCloseOutcome:
+        acquired = False
+        fatal: BaseException | None = None
         try:
-            async with self._transition_lock:
-                if self._dashboard is not None:
+            while not acquired:
+                try:
+                    await asyncio.wait_for(
+                        self._transition_lock.acquire(), timeout=5.0
+                    )
+                    acquired = True
+                except asyncio.TimeoutError:
+                    continue
+            if self._dashboard is not None:
+                try:
                     self._dashboard.begin_teardown()
-                if self.runtime_session is not None:
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        fatal = error
+            if self.runtime_session is not None:
+                try:
+                    if (
+                        self.supervisor is not None
+                        and self.supervisor is not self.runtime_session.supervisor
+                    ):
+                        await self.supervisor.close()
+                    await self.runtime_session.close()
+                except BaseException as error:
+                    if fatal is None and isinstance(
+                        error, (KeyboardInterrupt, SystemExit)
+                    ):
+                        fatal = error
+                self.runtime_session = None
+            else:
+                controller = self.setup_controller
+                self.setup_controller = None
+                if controller is not None:
                     try:
-                        if (
-                            self.supervisor is not None
-                            and self.supervisor is not self.runtime_session.supervisor
-                        ):
-                            await self.supervisor.close()
-                        await self.runtime_session.close()
-                    except BaseException:
-                        pass
-                    self.runtime_session = None
-                else:
-                    await self._discard_setup_controller()
-                self.activities.clear()
+                        close = getattr(controller, "aclose", None)
+                        if callable(close):
+                            await close()
+                        else:
+                            controller.close()
+                    except BaseException as error:
+                        if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                            fatal = error
+            self.activities.clear()
+            return _AppCloseOutcome(fatal=fatal)
         finally:
+            if acquired:
+                self._transition_lock.release()
             self._close_complete.set()
 
 

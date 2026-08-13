@@ -621,6 +621,117 @@ async def test_close_wins_during_recovery_session_close(
 
 
 @pytest.mark.asyncio
+async def test_duplicate_setup_completion_same_handle_is_not_closed_by_loser(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    closes: list[str] = []
+    handle = SimpleNamespace(close=lambda: closes.append("handle"))
+    session = _RuntimeSession()
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=_SetupController(None),
+        setup_controller_factory=lambda: _SetupController(None),
+        runtime_bootstrapper=object(),
+    )
+    monkeypatch.setattr(app, "_build_runtime_session", lambda value: session)
+    monkeypatch.setattr(
+        app,
+        "_build_dashboard",
+        lambda value: SimpleNamespace(refresh_runs=_async_noop),
+    )
+    monkeypatch.setattr(app, "push_screen", _async_noop)
+    monkeypatch.setattr(app, "set_interval", lambda *args: None)
+
+    await asyncio.gather(app._setup_done(handle), app._setup_done(handle))
+
+    assert app.runtime_session is session
+    assert closes == []
+
+
+@pytest.mark.asyncio
+async def test_app_close_is_single_flight_when_first_waiter_is_cancelled() -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingSetup(_SetupController):
+        close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            entered.set()
+            await release.wait()
+            self.closed = True
+
+    setup = BlockingSetup(None)
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+    )
+
+    first = asyncio.create_task(app._close_ui())
+    await entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert not app._close_complete.is_set()
+    release.set()
+    await app._close_ui()
+
+    assert setup.close_calls == 1
+    assert setup.closed
+    assert app._close_complete.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("fatal_stage", ["setup", "session"])
+async def test_app_close_drains_then_propagates_same_fatal_to_all_waiters(
+    fatal_type: type[BaseException],
+    fatal_stage: str,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    calls: list[str] = []
+    setup = _SetupController(None)
+
+    async def fatal_setup_close() -> None:
+        calls.append("setup")
+        raise fatal_type("original fatal")
+
+    if fatal_stage == "setup":
+        setup.aclose = fatal_setup_close  # type: ignore[method-assign]
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+    )
+    if fatal_stage == "session":
+        class FatalSession:
+            supervisor = object()
+
+            async def close(self) -> None:
+                calls.append("session")
+                raise fatal_type("original fatal")
+
+        session = FatalSession()
+        app.runtime_session = session  # type: ignore[assignment]
+        app.supervisor = session.supervisor
+
+    for _ in range(2):
+        with pytest.raises(fatal_type, match="original fatal"):
+            await app._close_ui()
+
+    assert calls == [fatal_stage]
+    assert app._close_complete.is_set()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_activation_callback_builds_one_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -716,6 +827,79 @@ async def test_runtime_session_close_drains_later_resources_after_failure() -> N
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert order == ["supervisor", "controller", "handle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+async def test_runtime_session_fatal_drains_all_resources_and_rethrows_consistently(
+    fatal_type: type[BaseException],
+) -> None:
+    from src.developer_workflow.tui.runtime_session import TuiRuntimeSession
+
+    order: list[str] = []
+
+    class Supervisor:
+        async def close(self) -> None:
+            order.append("supervisor")
+
+    def close_controller() -> None:
+        order.append("controller")
+        raise fatal_type("original fatal")
+
+    session = TuiRuntimeSession(
+        handle=SimpleNamespace(close=lambda: order.append("handle")),
+        controller=SimpleNamespace(close=close_controller),
+        run_index=object(),
+        supervisor=Supervisor(),
+        event_sink=lambda event: None,
+    )
+
+    for _ in range(2):
+        with pytest.raises(fatal_type, match="original fatal"):
+            await session.close()
+
+    assert order == ["supervisor", "controller", "handle"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_session_controller_and_handle_share_owned_serial_worker() -> None:
+    import asyncio
+    from threading import Event
+
+    from src.developer_workflow.tui.runtime_session import (
+        TuiRuntimeCloseError,
+        TuiRuntimeSession,
+    )
+
+    entered, release, finished = Event(), Event(), Event()
+    order: list[str] = []
+
+    def close_controller() -> None:
+        order.append("controller-start")
+        entered.set()
+        release.wait(2)
+        order.append("controller-end")
+
+    def close_handle() -> None:
+        order.append("handle")
+        finished.set()
+
+    session = TuiRuntimeSession(
+        handle=SimpleNamespace(close=close_handle),
+        controller=SimpleNamespace(close=close_controller),
+        run_index=object(),
+        supervisor=SimpleNamespace(close=_async_noop),
+        event_sink=lambda event: None,
+        close_timeout=0.05,
+    )
+
+    with pytest.raises(TuiRuntimeCloseError):
+        await session.close()
+    assert entered.is_set()
+    assert order == ["controller-start"]
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 1)
+    assert order == ["controller-start", "controller-end", "handle"]
 
 
 def test_tui_dispatches_before_legacy_config_load(

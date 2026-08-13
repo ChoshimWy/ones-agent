@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass
+from threading import Event, Thread
 from typing import Any
 
 from ..runtime_bootstrap import RuntimeHandle
@@ -14,6 +16,12 @@ from .supervisor import RunTaskSupervisor, TaskEvent
 
 class TuiRuntimeCloseError(RuntimeError):
     """A runtime session could not be completely closed."""
+
+
+@dataclass(frozen=True, slots=True)
+class _CloseOutcome:
+    fatal: BaseException | None
+    failed: bool
 
 
 class TuiRuntimeSession:
@@ -27,13 +35,21 @@ class TuiRuntimeSession:
         run_index: RunIndex | Any,
         supervisor: RunTaskSupervisor | Any,
         event_sink: Callable[[TaskEvent], None],
+        close_timeout: float = 5.0,
     ) -> None:
+        if (
+            isinstance(close_timeout, bool)
+            or not isinstance(close_timeout, (int, float))
+            or close_timeout <= 0
+        ):
+            raise ValueError("TUI runtime close timeout is invalid")
         self.handle = handle
         self.controller = controller
         self.run_index = run_index
         self.supervisor = supervisor
         self._event_sink: Callable[[TaskEvent], None] | None = event_sink
-        self._close_lock = asyncio.Lock()
+        self._close_timeout = float(close_timeout)
+        self._close_task: asyncio.Task[_CloseOutcome] | None = None
         self._closed = False
 
     @classmethod
@@ -90,37 +106,73 @@ class TuiRuntimeSession:
     async def close(self) -> None:
         """Stop UI work, controller runtime and shared services exactly once."""
 
-        async with self._close_lock:
-            if self._closed:
-                return
+        task = self._close_task
+        if task is None:
             self._closed = True
             self._event_sink = None
-            failed = False
+            task = asyncio.create_task(self._drain_close())
+            self._close_task = task
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(task), timeout=self._close_timeout
+            )
+        except asyncio.TimeoutError:
+            raise TuiRuntimeCloseError("TUI runtime close failed") from None
+        if outcome.fatal is not None:
+            raise outcome.fatal
+        if outcome.failed:
+            raise TuiRuntimeCloseError("TUI runtime close failed") from None
+
+    async def _drain_close(self) -> _CloseOutcome:
+        fatal: BaseException | None = None
+        failed = False
+        try:
+            await asyncio.wait_for(
+                self.supervisor.close(), timeout=self._close_timeout
+            )
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                fatal = error
+            else:
+                failed = True
+
+        done = Event()
+        outcome: list[object] = []
+
+        def worker() -> None:
+            worker_fatal: BaseException | None = None
+            worker_failed = False
             try:
-                await asyncio.wait_for(self.supervisor.close(), timeout=5.0)
+                self.controller.close()
             except BaseException as error:
                 if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                    raise
-                failed = True
-            try:
-                await asyncio.wait_for(
-                    asyncio.to_thread(self.controller.close), timeout=5.0
-                )
-            except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                    raise
-                failed = True
+                    worker_fatal = error
+                else:
+                    worker_failed = True
             if self.handle is not None:
                 try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(self.handle.close), timeout=5.0
-                    )
+                    self.handle.close()
                 except BaseException as error:
-                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                        raise
-                    failed = True
-            if failed:
-                raise TuiRuntimeCloseError("TUI runtime close failed") from None
+                    if (
+                        worker_fatal is None
+                        and isinstance(error, (KeyboardInterrupt, SystemExit))
+                    ):
+                        worker_fatal = error
+                    elif not isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        worker_failed = True
+            outcome.extend((worker_fatal, worker_failed))
+            done.set()
+
+        Thread(target=worker, name="ones-dev-tui-runtime-close", daemon=True).start()
+        while not done.is_set():
+            await asyncio.sleep(min(0.01, self._close_timeout))
+        worker_fatal = outcome[0]
+        return _CloseOutcome(
+            fatal=fatal or (
+                worker_fatal if isinstance(worker_fatal, BaseException) else None
+            ),
+            failed=failed or bool(outcome[1]),
+        )
 
 
 __all__ = ["TuiRuntimeCloseError", "TuiRuntimeSession"]
