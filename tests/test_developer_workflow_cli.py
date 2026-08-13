@@ -569,6 +569,53 @@ def test_tui_descriptor_access_boundaries_are_optional_and_sanitized(
     assert canary not in repr(context)
 
 
+def test_tui_reader_close_access_failure_is_fatal_not_optional(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = "TOKEN-READER-CLOSE-EACCES"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    original_file = setup_import.io.FileIO
+    original_close = setup_import._close_descriptor
+    closes: list[int] = []
+    zeroed: list[bytes] = []
+    original_zero = setup_import._zero_buffer
+
+    class ReaderThatFailsClose:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._reader = original_file(*args, **kwargs)
+        def readinto(self, target: memoryview) -> int:
+            return self._reader.readinto(target)
+        def close(self) -> None:
+            self._reader.close()
+            raise PermissionError(errno.EACCES, canary)
+
+    def close_descriptor(descriptor: int) -> None:
+        closes.append(descriptor)
+        original_close(descriptor)
+    def observe_zero(value: bytearray) -> None:
+        original_zero(value)
+        zeroed.append(bytes(value))
+
+    monkeypatch.setattr(setup_import.io, "FileIO", ReaderThatFailsClose)
+    monkeypatch.setattr(setup_import, "_close_descriptor", close_descriptor)
+    monkeypatch.setattr(setup_import, "_zero_buffer", observe_zero)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    assert type(caught.value) is SetupImportError
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert canary not in repr(caught.value)
+    assert len(closes) == 1
+    assert zeroed and all(set(value) <= {0} for value in zeroed)
+
+
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
 def test_tui_access_errors_are_optional_without_exception_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str

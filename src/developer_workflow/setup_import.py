@@ -49,6 +49,10 @@ class _SourceDataRejected(Exception):
     """A known source-data validation or bounded-read condition."""
 
 
+class _CleanupFailure(Exception):
+    """A cleanup failure which must not be reclassified as a source rejection."""
+
+
 @dataclass(frozen=True, slots=True)
 class ImportDetection:
     """Secret kinds present in approved sources, never their values or paths."""
@@ -580,6 +584,8 @@ def _read_bounded(
             try:
                 reader.close()
             except BaseException as error:
+                if isinstance(error, OSError) and _is_source_access_error(error):
+                    error = _CleanupFailure()
                 reader_failure = _prefer_cleanup_failure(reader_failure, error)
             if reader_failure is not None:
                 raise reader_failure
