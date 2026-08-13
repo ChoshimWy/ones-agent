@@ -554,17 +554,22 @@ def _read_bounded(
     content: bytearray | None = None
     scratch: bytearray | None = None
     failure: BaseException | None = None
+    source_access_boundary = False
     try:
         try:
             content = _allocate_buffer(0)
             scratch = _allocate_buffer(_READ_CHUNK)
+            source_access_boundary = True
             opened = _descriptor_identity(descriptor)
+            source_access_boundary = False
             if opened[:2] != expected[:2]:
                 raise _SourcePathRejected
             if opened[2] > _MAX_SOURCE_BYTES:
                 raise _SourceDataRejected
             total = 0
+            source_access_boundary = True
             reader = io.FileIO(descriptor, mode="rb", closefd=False)
+            source_access_boundary = False
             reader_failure: BaseException | None = None
             try:
                 while True:
@@ -589,13 +594,17 @@ def _read_bounded(
                 reader_failure = _prefer_cleanup_failure(reader_failure, error)
             if reader_failure is not None:
                 raise reader_failure
+            source_access_boundary = True
             final = _descriptor_identity(descriptor)
+            source_access_boundary = False
             if final != opened or total != opened[2]:
                 raise _SourcePathRejected
         except BaseException as error:
             failure = (
                 _SourcePathRejected()
-                if isinstance(error, OSError) and _is_source_access_error(error)
+                if source_access_boundary
+                and isinstance(error, OSError)
+                and _is_source_access_error(error)
                 else error
             )
     finally:

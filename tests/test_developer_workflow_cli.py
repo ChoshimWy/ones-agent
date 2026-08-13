@@ -616,6 +616,45 @@ def test_tui_reader_close_access_failure_is_fatal_not_optional(
     assert zeroed and all(set(value) <= {0} for value in zeroed)
 
 
+@pytest.mark.parametrize("stage", ["allocate", "zero"])
+def test_tui_internal_access_errors_are_fatal_not_optional(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-INTERNAL-{stage}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    original_open = setup_import._open_source_readonly
+    opened: list[int] = []
+    def capture(path: Path) -> int:
+        descriptor = original_open(path)
+        opened.append(descriptor)
+        return descriptor
+    monkeypatch.setattr(setup_import, "_open_source_readonly", capture)
+    if stage == "allocate":
+        monkeypatch.setattr(
+            setup_import, "_allocate_buffer", lambda _size: (_ for _ in ()).throw(PermissionError(errno.EACCES, canary))
+        )
+    else:
+        original_zero = setup_import._zero_buffer
+        def fail_zero(value: bytearray) -> None:
+            original_zero(value)
+            raise PermissionError(errno.EACCES, canary)
+        monkeypatch.setattr(setup_import, "_zero_buffer", fail_zero)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert canary not in repr(caught.value)
+    with pytest.raises(OSError):
+        os.fstat(opened[0])
+
+
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])
 def test_tui_access_errors_are_optional_without_exception_chain(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
