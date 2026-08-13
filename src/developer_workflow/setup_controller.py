@@ -281,6 +281,7 @@ class SetupController:
         self._revision = 0
         self._review_confirmed = False
         self._closed = False
+        self._closing = False
         self._operation_lock = asyncio.Lock()
         self._operation_task: asyncio.Task[Any] | None = None
         self._activation_error: str | None = None
@@ -575,51 +576,95 @@ class SetupController:
         if failed:
             raise SetupActionError("active configuration is unavailable") from None
 
-    def list_orphan_generations(self) -> tuple[str, ...]:
-        failed = False
-        try:
-            return self._store.orphan_generations()
-        except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                raise
-            failed = True
-        if failed:
-            raise SetupActionError("credential cleanup unavailable") from None
-
-    def restore_pending(self, expected_generation: str) -> None:
-        self._resolve_pending(expected_generation)
-
-    def discard_pending(self, expected_generation: str) -> None:
-        self._resolve_pending(expected_generation)
-
-    def _resolve_pending(self, expected_generation: str) -> None:
+    async def list_orphan_generations(self) -> tuple[str, ...]:
         self._ensure_open()
         failed = False
-        try:
-            self._store.restore_previous(self._profile_id, expected_generation)
-            self._activation_error = None
-        except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        result: tuple[str, ...] = ()
+        async with self._operation_lock:
+            self._ensure_open()
+            self._operation_task = asyncio.current_task()
+            try:
+                result = await self._await_store_call(
+                    self._store.orphan_generations
+                )
+            except asyncio.CancelledError:
                 raise
-            self._activation_error = "activation recovery failed"
-            failed = True
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failed = True
+            finally:
+                self._operation_task = None
+        if failed:
+            raise SetupActionError("credential cleanup unavailable") from None
+        return result
+
+    async def restore_pending(self, expected_generation: str) -> None:
+        await self._resolve_pending(expected_generation)
+
+    async def discard_pending(self, expected_generation: str) -> None:
+        await self._resolve_pending(expected_generation)
+
+    async def _resolve_pending(self, expected_generation: str) -> None:
+        self._ensure_open()
+        failed = False
+        async with self._operation_lock:
+            self._ensure_open()
+            self._operation_task = asyncio.current_task()
+            try:
+                await self._await_store_call(
+                    self._store.restore_previous,
+                    self._profile_id,
+                    expected_generation,
+                )
+                self._activation_error = None
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                self._activation_error = "activation recovery failed"
+                failed = True
+            finally:
+                self._operation_task = None
         if failed:
             raise SetupActionError("activation recovery failed") from None
 
-    def cleanup_orphans(self, generations: tuple[str, ...]) -> None:
+    async def cleanup_orphans(self, generations: tuple[str, ...]) -> None:
         self._ensure_open()
         failed = False
-        try:
-            current = self._store.orphan_generations()
-            if generations != current:
-                raise SetupStoreError("credential cleanup refused")
-            self._store.cleanup_orphan_generations(generations)
-        except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+        async with self._operation_lock:
+            self._ensure_open()
+            self._operation_task = asyncio.current_task()
+            try:
+                current = await self._await_store_call(
+                    self._store.orphan_generations
+                )
+                if generations != current:
+                    raise SetupStoreError("credential cleanup refused")
+                await self._await_store_call(
+                    self._store.cleanup_orphan_generations, generations
+                )
+            except asyncio.CancelledError:
                 raise
-            failed = True
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failed = True
+            finally:
+                self._operation_task = None
         if failed:
             raise SetupActionError("credential cleanup failed") from None
+
+    async def _await_store_call(self, call: Callable[..., Any], *args: object) -> Any:
+        """Retain operation ownership until a non-cancellable store call finishes."""
+
+        task = asyncio.create_task(asyncio.to_thread(call, *args))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._harvest_task(task)
+            raise
 
     def result_for(self, step: SetupStep) -> ConnectionTestResult:
         self._require_step(step)
@@ -1090,13 +1135,25 @@ class SetupController:
         if self._closed:
             self._clear_transient_secrets()
             return
-        self.cancel_edit()
-        self._closed = True
+        self._closing = True
+        task = self._operation_task
+        if task is None or task.done():
+            self._closed = True
+            self._clear_transient_secrets()
+        else:
+            def finish_close(_done: asyncio.Task[Any]) -> None:
+                self._closed = True
+                self._clear_transient_secrets()
+
+            task.add_done_callback(finish_close)
 
     async def aclose(self) -> None:
         """Close setup and drain owned background work up to the cleanup deadline."""
 
         self.close()
+        async with self._operation_lock:
+            self._closed = True
+            self._clear_transient_secrets()
         tasks: set[asyncio.Task[Any]] = {
             *self._background_close_tasks,
             *self._abandoned_build_tasks,
@@ -1584,7 +1641,7 @@ class SetupController:
         )
 
     def _ensure_open(self) -> None:
-        if self._closed:
+        if self._closed or self._closing:
             raise SetupActionError("setup is closed")
 
     def _ensure_mutable(self) -> None:

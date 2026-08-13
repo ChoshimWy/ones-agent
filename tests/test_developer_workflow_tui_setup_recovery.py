@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
+from threading import Event
 
 import pytest
 
@@ -169,7 +171,8 @@ async def test_reconfigure_closes_runtime_before_creating_secret_screen(
     assert app.runtime_session is None
 
 
-def test_controller_recovery_uses_owner_generation_cas_and_fixed_errors(
+@pytest.mark.asyncio
+async def test_controller_recovery_uses_owner_generation_cas_and_fixed_errors(
     tmp_path,
 ) -> None:
     from src.developer_workflow.setup_controller import SetupActionError
@@ -211,13 +214,13 @@ def test_controller_recovery_uses_owner_generation_cas_and_fixed_errors(
     assert "SECRET" not in repr(state)
 
     with pytest.raises(SetupActionError) as raised:
-        controller.restore_pending("a" * 32)
+        await controller.restore_pending("a" * 32)
     assert str(raised.value) == "activation recovery failed"
     assert raised.value.__cause__ is None
     assert raised.value.__context__ is None
     assert store.restored == []
 
-    controller.restore_pending("b" * 32)
+    await controller.restore_pending("b" * 32)
     assert store.restored == ["b" * 32]
 
 
@@ -242,7 +245,8 @@ def test_reconfigure_loads_only_public_active_draft(tmp_path) -> None:
     assert "persisted-password" not in repr(controller.draft)
 
 
-def test_orphan_cleanup_requires_exact_fresh_snapshot() -> None:
+@pytest.mark.asyncio
+async def test_orphan_cleanup_requires_exact_fresh_snapshot() -> None:
     from src.developer_workflow.setup_controller import SetupActionError
 
     class Store:
@@ -257,12 +261,12 @@ def test_orphan_cleanup_requires_exact_fresh_snapshot() -> None:
 
     store = Store()
     controller = _controller_for_store(store)
-    stale = controller.list_orphan_generations()
+    stale = await controller.list_orphan_generations()
     store.current = ("d" * 32,)
     with pytest.raises(SetupActionError, match="^credential cleanup failed$"):
-        controller.cleanup_orphans(stale)
+        await controller.cleanup_orphans(stale)
     assert store.cleaned == []
-    controller.cleanup_orphans(store.current)
+    await controller.cleanup_orphans(store.current)
     assert store.cleaned == [("d" * 32,)]
 
 
@@ -365,3 +369,137 @@ async def test_reconfigure_close_failure_exits_without_secret_screen(
     assert calls == ["runtime-close", "remove", "safe-exit", "exit"]
     assert app.runtime_session is None
     assert app.setup_controller is not None  # startup controller; no replacement made
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ("restore_pending", "cleanup_orphans"))
+async def test_recovery_mutation_and_aclose_are_linearized(operation: str) -> None:
+    from src.developer_workflow.setup_controller import SetupActionError
+    from src.developer_workflow.setup_models import SetupDocument
+
+    entered = Event()
+    release = Event()
+    writes: list[str] = []
+
+    class Store:
+        document = SetupDocument(profile_id="managed-profile")
+
+        def restore_previous(self, profile_id: str, generation: str):
+            entered.set()
+            assert release.wait(2)
+            writes.append("restore")
+            return self.document
+
+        def orphan_generations(self) -> tuple[str, ...]:
+            return ("c" * 32,)
+
+        def cleanup_orphan_generations(self, generations: tuple[str, ...]) -> None:
+            entered.set()
+            assert release.wait(2)
+            writes.append("cleanup")
+
+    controller = _controller_for_store(Store())
+    if operation == "restore_pending":
+        mutation = asyncio.create_task(controller.restore_pending("b" * 32))
+    else:
+        mutation = asyncio.create_task(controller.cleanup_orphans(("c" * 32,)))
+    assert await asyncio.to_thread(entered.wait, 1)
+    closing = asyncio.create_task(controller.aclose())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    with pytest.raises(SetupActionError, match="setup is closed"):
+        await controller.discard_pending("b" * 32)
+    release.set()
+    await mutation
+    await closing
+    assert writes == ["restore" if operation == "restore_pending" else "cleanup"]
+    assert controller.closed
+
+    with pytest.raises(SetupActionError, match="setup is closed"):
+        await controller.cleanup_orphans(("c" * 32,))
+
+
+@pytest.mark.asyncio
+async def test_recovery_remove_failure_never_activates_or_reads_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    calls: list[str] = []
+
+    class Setup:
+        async def activate_existing(self) -> object:
+            calls.append("activate")
+            return object()
+
+        async def aclose(self) -> None:
+            calls.append("close-old")
+
+    replacement = SimpleNamespace()
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=Setup(),
+        setup_controller_factory=lambda: calls.append("factory") or replacement,
+        runtime_bootstrapper=object(),
+    )
+
+    async def remove() -> bool:
+        calls.append("remove-failed")
+        return False
+
+    async def recover() -> None:
+        calls.append("recovery-screen")
+
+    monkeypatch.setattr(app, "_remove_setup_screen", remove)
+    monkeypatch.setattr(app, "_show_setup", recover)
+    await app._recovery_done("restore")
+
+    assert "activate" not in calls
+    assert calls == ["remove-failed", "close-old", "factory", "recovery-screen"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fatal_type", (KeyboardInterrupt, SystemExit))
+async def test_recovery_remove_fatal_closes_controller_without_activation(
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_type: type[BaseException],
+) -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    calls: list[str] = []
+
+    class Setup:
+        async def activate_existing(self) -> object:
+            calls.append("activate")
+            return object()
+
+        async def aclose(self) -> None:
+            calls.append("close-old")
+
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=Setup(), runtime_bootstrapper=object()
+    )
+
+    async def remove() -> bool:
+        raise fatal_type("fatal removal")
+
+    monkeypatch.setattr(app, "_remove_setup_screen", remove)
+    with pytest.raises(fatal_type, match="fatal removal"):
+        await app._recovery_done("restore")
+    assert calls == ["close-old"]
+
+
+@pytest.mark.asyncio
+async def test_exit_wins_before_recovery_completion_without_mutation() -> None:
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    calls: list[str] = []
+    setup = SimpleNamespace(
+        activate_existing=lambda: calls.append("activate"),
+        close=lambda: calls.append("close"),
+    )
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup, runtime_bootstrapper=object()
+    )
+    app._ui_closed = True
+    await app._recovery_done("discard")
+    assert calls == []

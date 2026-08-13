@@ -213,6 +213,7 @@ class DeveloperWorkflowTuiApp(App[None]):
             self.setup_controller,
             owner_generation=getattr(recovery_state, "owner_generation", None),
             recovery_state=recovery_state,
+            recovery_callback=self._run_recovery_action,
         )
         self._setup_screen = screen
         await self.push_screen(screen, self._recovery_done)
@@ -223,7 +224,19 @@ class DeveloperWorkflowTuiApp(App[None]):
         async with self._transition_lock:
             if self._ui_closed:
                 return
-            await self._remove_setup_screen()
+            try:
+                removed = await self._remove_setup_screen()
+            except BaseException as error:
+                await self._discard_setup_controller()
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                removed = False
+            if not removed:
+                await self._recover_recovery_removal_failure()
+                return
+            if self._ui_closed:
+                await self._discard_setup_controller()
+                return
             controller = self.setup_controller
             if controller is None:
                 return
@@ -235,6 +248,68 @@ class DeveloperWorkflowTuiApp(App[None]):
                     await self._show_setup()
                 return
             await self._finish_setup(handle)
+
+    async def _run_recovery_action(
+        self, action: str, owner_generation: str
+    ) -> bool:
+        """Serialize recovery mutation with activation, reconfiguration, and exit."""
+
+        async with self._transition_lock:
+            if self._ui_closed:
+                return False
+            controller = self.setup_controller
+            if controller is None:
+                return False
+            try:
+                if action == "cleanup":
+                    generations = await controller.list_orphan_generations()
+                    await controller.cleanup_orphans(generations)
+                elif action == "restore":
+                    await controller.restore_pending(owner_generation)
+                elif action == "discard":
+                    await controller.discard_pending(owner_generation)
+                else:
+                    return False
+                return True
+            except asyncio.CancelledError:
+                raise
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                return False
+
+    async def _recover_recovery_removal_failure(self) -> None:
+        """Replace a stale recovery owner without activating or reading secrets."""
+
+        await self._discard_setup_controller()
+        if self._ui_closed:
+            return
+        try:
+            replacement = self._new_setup_controller()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            self._ui_closed = True
+            self._accept_events = False
+            self.exit()
+            return
+        self.setup_controller = replacement
+        screen = self._setup_screen
+        if screen is not None:
+            screen.controller = replacement
+            try:
+                if self.screen is screen:
+                    return
+            except BaseException:
+                pass
+        self._setup_screen = None
+        recovery = await asyncio.to_thread(
+            lambda: getattr(replacement, "recovery_state", None)
+        )
+        if getattr(recovery, "owner_generation", None):
+            await self._show_recovery(recovery)
+        else:
+            await self._show_setup()
 
     async def _activate_setup_candidate(self) -> object | None:
         """Delegate the explicit review action to the setup controller boundary."""

@@ -1008,6 +1008,9 @@ class SetupRecoveryScreen(SetupRootScreen):
         *,
         owner_generation: str | None = None,
         recovery_state: object | None = None,
+        recovery_callback: (
+            Callable[[str, str], Awaitable[bool]] | None
+        ) = None,
     ) -> None:
         super().__init__(controller, screen_id="setup-recovery")
         state = recovery_state or getattr(controller, "recovery_state", object())
@@ -1019,6 +1022,7 @@ class SetupRecoveryScreen(SetupRootScreen):
         )
         self._orphan_count = int(getattr(state, "orphan_count", 0) or 0)
         self._pending_action: str | None = None
+        self._recovery_callback = recovery_callback
 
     def compose(self) -> ComposeResult:
         yield Static("Runtime activation recovery required", id="recovery-title")
@@ -1068,21 +1072,21 @@ class SetupRecoveryScreen(SetupRootScreen):
             return
         action, self._pending_action = self._pending_action, None
         try:
-            if action == "cleanup":
-                generations = await asyncio.to_thread(
-                    self.controller.list_orphan_generations
-                )
-                outcome = await asyncio.to_thread(
-                    self.controller.cleanup_orphans, generations
-                )
+            callback = self._recovery_callback
+            if callback is not None:
+                succeeded = await callback(action, self.owner_generation)
+                if not succeeded:
+                    raise RuntimeError("recovery action failed")
+                outcome = None
+            elif action == "cleanup":
+                generations = self.controller.list_orphan_generations()
+                if inspect.isawaitable(generations):
+                    generations = await generations
+                outcome = self.controller.cleanup_orphans(generations)
             elif action == "restore":
-                outcome = await asyncio.to_thread(
-                    self.controller.restore_pending, self.owner_generation
-                )
+                outcome = self.controller.restore_pending(self.owner_generation)
             else:
-                outcome = await asyncio.to_thread(
-                    self.controller.discard_pending, self.owner_generation
-                )
+                outcome = self.controller.discard_pending(self.owner_generation)
             if inspect.isawaitable(outcome):
                 await outcome
         except BaseException as error:
