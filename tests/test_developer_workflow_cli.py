@@ -470,6 +470,90 @@ def test_tui_optional_dotenv_read_errors_are_fatal_and_sanitized(
     assert canary not in output.getvalue() + error.getvalue()
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    ["ancestor", "initial-identity", "open", "read", "close", "post-read-identity"],
+)
+def test_tui_fatal_dotenv_boundaries_do_not_retain_exception_canaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host, main
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-{boundary}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    monkeypatch.chdir(tmp_path)
+
+    def fail(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(canary)
+
+    if boundary == "ancestor":
+        monkeypatch.setattr(setup_import, "_has_unsafe_ancestor", fail)
+    elif boundary == "initial-identity":
+        monkeypatch.setattr(setup_import, "_path_identity", fail)
+    elif boundary == "open":
+        monkeypatch.setattr(setup_import, "_open_source_readonly", fail)
+    elif boundary == "read":
+        monkeypatch.setattr(setup_import, "_read_into", fail)
+    elif boundary == "close":
+        original_close = setup_import._close_descriptor
+
+        def close_then_fail(descriptor: int) -> None:
+            original_close(descriptor)
+            raise RuntimeError(canary)
+
+        monkeypatch.setattr(setup_import, "_close_descriptor", close_then_fail)
+    else:
+        original_identity = setup_import._path_identity
+        calls = 0
+
+        def fail_post_read_identity(path: Path) -> tuple[int, int, int, int]:
+            nonlocal calls
+            calls += 1
+            if calls % 2 == 0:
+                raise RuntimeError(canary)
+            return original_identity(path)
+
+        monkeypatch.setattr(setup_import, "_path_identity", fail_post_read_identity)
+
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    assert type(caught.value) is SetupImportError
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert canary not in str(caught.value)
+    assert canary not in repr(caught.value)
+    pending: list[BaseException] = [caught.value]
+    visited: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in visited:
+            continue
+        visited.add(id(current))
+        assert canary not in str(current)
+        assert canary not in repr(current)
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+
+    output, error = Terminal(tty=False), Terminal(tty=False)
+    code = main(
+        ["tui", "--config", str(tmp_path / "missing.json")],
+        tui_runner=lambda _controller, _runtime: None,
+        stdout=output,
+        stderr=error,
+    )
+    assert code == 1
+    assert error.getvalue() == "error: command failed safely\n"
+    assert canary not in output.getvalue() + error.getvalue()
+
+
 def test_tui_unsafe_template_reports_only_fixed_failure(
     tmp_path: Path,
 ) -> None:

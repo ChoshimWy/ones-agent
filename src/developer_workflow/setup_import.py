@@ -18,7 +18,7 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Literal, Mapping, NoReturn
+from typing import Literal, Mapping
 import unicodedata
 
 from .private_paths import (
@@ -474,13 +474,19 @@ def _read_bounded(
 ) -> bytearray | None:
     if not isinstance(path, Path):
         raise SetupImportError("source read failed")
+    preflight_fatal = False
     try:
         candidate = path.absolute()
         unsafe_ancestor = _has_unsafe_ancestor(candidate)
     except BaseException as error:
-        _raise_fatal_source_error(error)
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
+            raise
+        preflight_fatal = True
+    if preflight_fatal:
+        raise SetupImportError("source read failed")
     if unsafe_ancestor:
         raise _SourcePathRejected
+    initial_identity_fatal = False
     try:
         expected = _path_identity(candidate)
     except FileNotFoundError:
@@ -490,7 +496,12 @@ def _read_bounded(
     except _SourcePathRejected:
         raise
     except BaseException as error:
-        _raise_fatal_source_error(error)
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
+            raise
+        initial_identity_fatal = True
+    if initial_identity_fatal:
+        raise SetupImportError("source read failed")
+    open_fatal = False
     try:
         descriptor = (
             _open_source_readonly(candidate)
@@ -502,7 +513,11 @@ def _read_bounded(
     except _SourcePathRejected:
         raise
     except BaseException as error:
-        _raise_fatal_source_error(error)
+        if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
+            raise
+        open_fatal = True
+    if open_fatal:
+        raise SetupImportError("source read failed")
     content: bytearray | None = None
     scratch: bytearray | None = None
     failure: BaseException | None = None
@@ -564,19 +579,26 @@ def _read_bounded(
             raise failure
         raise SetupImportError("source read failed") from None
     assert content is not None
+    post_read_rejection: _SourcePathRejected | _SourceDataRejected | None = None
+    post_read_fatal = False
     try:
         if _path_identity(candidate) != expected:
             raise _SourcePathRejected
     except FileNotFoundError:
         _zero_buffer(content)
-        raise _SourcePathRejected from None
+        post_read_rejection = _SourcePathRejected()
     except BaseException as error:
         _zero_buffer(content)
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
         if isinstance(error, (_SourcePathRejected, _SourceDataRejected)):
-            raise
-        raise SetupImportError("source read failed") from None
+            post_read_rejection = error
+        else:
+            post_read_fatal = True
+    if post_read_rejection is not None:
+        raise post_read_rejection
+    if post_read_fatal:
+        raise SetupImportError("source read failed")
     return content
 
 
@@ -590,12 +612,6 @@ def _read_into(reader: io.FileIO, target: memoryview) -> int:
 
 def _close_descriptor(descriptor: int) -> None:
     os.close(descriptor)
-
-
-def _raise_fatal_source_error(error: BaseException) -> NoReturn:
-    if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
-        raise error
-    raise SetupImportError("source read failed") from None
 
 
 def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
