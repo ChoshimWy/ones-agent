@@ -19,7 +19,7 @@ import os
 from pathlib import Path
 import re
 import stat
-from typing import Literal, Mapping
+from typing import Callable, Literal, Mapping, TypeVar
 import unicodedata
 
 from .private_paths import (
@@ -51,6 +51,9 @@ class _SourceDataRejected(Exception):
 
 class _CleanupFailure(Exception):
     """A cleanup failure which must not be reclassified as a source rejection."""
+
+
+_SourceResult = TypeVar("_SourceResult")
 
 
 @dataclass(frozen=True, slots=True)
@@ -550,11 +553,8 @@ def _read_bounded(
         raise _SourcePathRejected from None
     except _SourcePathRejected:
         raise
-    except OSError as error:
-        if _is_source_access_error(error):
-            open_rejected = True
-        else:
-            open_fatal = True
+    except OSError:
+        open_fatal = True
     except BaseException as error:
         if isinstance(error, (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError)):
             raise
@@ -729,23 +729,28 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
     """Open without following links; Windows denies concurrent write/delete access."""
 
     if os.name != "nt":
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        info = os.fstat(descriptor)
-        if require_private and (
-            info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077
-        ):
-            os.close(descriptor)
-            raise _SourcePathRejected
+        descriptor = _run_source_operation(
+            lambda: os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        )
+        failure: BaseException | None = None
         try:
+            info = _run_source_operation(lambda: os.fstat(descriptor))
+            if require_private and (
+                info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077
+            ):
+                raise _SourcePathRejected
             import fcntl
 
-            fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except ImportError:
-            os.close(descriptor)
-            raise
-        except OSError:
-            os.close(descriptor)
-            raise
+            _run_source_operation(
+                lambda: fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            )
+        except BaseException as error:
+            failure = error
+        if failure is not None:
+            close_failure = _close_posix_descriptor(descriptor)
+            if close_failure is not None:
+                failure = _prefer_cleanup_failure(failure, close_failure)
+            raise failure
         return descriptor
 
     import msvcrt
@@ -771,22 +776,16 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
         wintypes.DWORD,
     ]
     kernel.GetFinalPathNameByHandleW.restype = wintypes.DWORD
-    handle = kernel.CreateFileW(
-        str(path),
-        0x80000000,
-        0x00000001,
-        None,
-        3,
-        0x00200000,
-        None,
-    )
+    handle = kernel.CreateFileW(str(path), 0x80000000, 0x00000001, None, 3, 0x00200000, None)
     if handle == ctypes.c_void_p(-1).value:
-        raise ctypes.WinError(ctypes.get_last_error())
+        _raise_windows_source_error(ctypes.get_last_error())
+    failure: BaseException | None = None
+    descriptor: int | None = None
     try:
         buffer = ctypes.create_unicode_buffer(32768)
         length = kernel.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
         if not length or length >= len(buffer):
-            raise _SourcePathRejected
+            _raise_windows_source_error(ctypes.get_last_error())
         final = buffer.value
         if final.startswith("\\\\?\\UNC\\"):
             final = "\\\\" + final[8:]
@@ -797,7 +796,13 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
         ):
             raise _SourcePathRejected
         if require_private:
-            owner, entries, protected = _windows_descriptor(path)
+            security_error: OSError | None = None
+            try:
+                owner, entries, protected = _windows_descriptor(path)
+            except OSError as error:
+                security_error = error
+            if security_error is not None:
+                _raise_source_access_error(security_error)
             user = _current_user_sid()
             trusted = {user, _SYSTEM_SID, _ADMINISTRATORS_SID}
             full_control = 0x001F01FF
@@ -814,12 +819,55 @@ def _open_source_readonly(path: Path, *, require_private: bool = True) -> int:
                 )
             ):
                 raise _SourcePathRejected
-        return msvcrt.open_osfhandle(
+        descriptor = msvcrt.open_osfhandle(
             int(handle), os.O_RDONLY | getattr(os, "O_BINARY", 0)
         )
-    except BaseException:
-        kernel.CloseHandle(handle)
-        raise
+    except BaseException as error:
+        failure = error
+    if failure is not None:
+        close_failure = _close_windows_handle(kernel, handle)
+        if close_failure is not None:
+            failure = _prefer_cleanup_failure(failure, close_failure)
+        raise failure
+    assert descriptor is not None
+    return descriptor
+
+
+def _run_source_operation(operation: Callable[[], _SourceResult]) -> _SourceResult:
+    source_error: OSError | None = None
+    try:
+        return operation()
+    except OSError as error:
+        source_error = error
+    assert source_error is not None
+    _raise_source_access_error(source_error)
+
+
+def _raise_source_access_error(error: OSError) -> None:
+    if _is_source_access_error(error):
+        raise _SourcePathRejected
+    raise error
+
+
+def _raise_windows_source_error(code: int) -> None:
+    _raise_source_access_error(ctypes.WinError(code))
+
+
+def _close_posix_descriptor(descriptor: int) -> BaseException | None:
+    try:
+        os.close(descriptor)
+    except BaseException as error:
+        return error
+    return None
+
+
+def _close_windows_handle(kernel: object, handle: int) -> BaseException | None:
+    try:
+        if not kernel.CloseHandle(handle):  # type: ignore[attr-defined]
+            return ctypes.WinError(ctypes.get_last_error())
+    except BaseException as error:
+        return error
+    return None
 
 
 def _zero_buffer(value: bytearray) -> None:

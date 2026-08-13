@@ -424,9 +424,9 @@ def test_tui_unsafe_optional_dotenv_is_ignored_without_exposing_canary(
 
 @pytest.mark.parametrize(
     ("error", "builds_host"),
-    [(PermissionError(errno.EACCES, "denied"), True), (OSError(errno.EMFILE, "busy"), False)],
+    [(PermissionError(errno.EACCES, "denied"), False), (OSError(errno.EMFILE, "busy"), False)],
 )
-def test_tui_optional_dotenv_classifies_only_access_os_errors(
+def test_tui_optional_dotenv_does_not_classify_helper_internal_os_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError, builds_host: bool
 ) -> None:
     from src.developer_workflow import setup_import

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import errno
 import json
 from pathlib import Path
 import sys
@@ -560,6 +561,96 @@ def test_windows_source_with_inherited_writable_acl_is_rejected(
         pytest.skip("test filesystem creates protected files by default")
     with pytest.raises(SetupImportError, match="^dotenv path is unsafe$"):
         parse_dotenv(dotenv)
+
+
+def test_posix_open_source_closes_descriptor_when_fstat_is_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    closed: list[int] = []
+    candidate = tmp_path / "source.env"
+    monkeypatch.setattr(setup_import.os, "name", "posix")
+    monkeypatch.setattr(setup_import.os, "open", lambda *_args: 31337)
+    monkeypatch.setattr(
+        setup_import.os,
+        "fstat",
+        lambda _descriptor: (_ for _ in ()).throw(RuntimeError("TOKEN-FSTAT")),
+    )
+    monkeypatch.setattr(setup_import.os, "close", closed.append)
+
+    with pytest.raises(RuntimeError, match="^TOKEN-FSTAT$"):
+        setup_import._open_source_readonly(candidate)
+    assert closed == [31337]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership")
+def test_windows_open_osfhandle_error_is_not_source_access_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow import setup_import
+
+    class Function:
+        def __init__(self, callback: object) -> None:
+            self.callback = callback
+
+        def __call__(self, *args: object) -> object:
+            return self.callback(*args)  # type: ignore[operator]
+
+    class Kernel:
+        def __init__(self) -> None:
+            self.closed: list[int] = []
+            self.CreateFileW = Function(lambda *_args: 31337)
+            self.GetFinalPathNameByHandleW = Function(self._final_path)
+            self.CloseHandle = Function(self._close)
+
+        def _final_path(
+            self, _handle: int, buffer: object, _size: int, _flags: int
+        ) -> int:
+            buffer.value = str(tmp_path / "source.env")  # type: ignore[attr-defined]
+            return len(buffer.value)  # type: ignore[attr-defined]
+
+        def _close(self, handle: int) -> bool:
+            self.closed.append(handle)
+            return True
+
+    class Msvcrt:
+        @staticmethod
+        def open_osfhandle(_handle: int, _flags: int) -> int:
+            raise PermissionError(errno.EACCES, "TOKEN-OSFHANDLE")
+
+    kernel = Kernel()
+    candidate = tmp_path / "source.env"
+    monkeypatch.setattr(setup_import.ctypes, "WinDLL", lambda *_args, **_kwargs: kernel)
+    monkeypatch.setitem(sys.modules, "msvcrt", Msvcrt)
+    monkeypatch.setattr(
+        setup_import, "_windows_descriptor", lambda _path: ("user", [("user", 0x001F01FF, 0, 0)], True)
+    )
+    monkeypatch.setattr(setup_import, "_current_user_sid", lambda: "user")
+
+    with pytest.raises(PermissionError, match=r"^\[Errno 13\] TOKEN-OSFHANDLE$"):
+        setup_import._open_source_readonly(candidate)
+    assert kernel.closed == [31337]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle ownership")
+def test_windows_close_handle_false_is_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import setup_import
+
+    class Kernel:
+        @staticmethod
+        def CloseHandle(_handle: int) -> bool:
+            return False
+
+    monkeypatch.setattr(setup_import.ctypes, "get_last_error", lambda: 5)
+    cleanup_failure = setup_import._close_windows_handle(Kernel(), 31337)
+
+    assert isinstance(cleanup_failure, OSError)
+    assert setup_import._prefer_cleanup_failure(
+        setup_import._SourcePathRejected(), cleanup_failure
+    ) is cleanup_failure
 
 
 def test_buffer_allocation_failure_closes_open_descriptor_without_reclassification(
