@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+import inspect
 from pathlib import Path
 from types import MappingProxyType
 
@@ -12,7 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Resize
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Input, Label, Static
 
 from ..config import PublishingConfig, PublishingProvider
@@ -170,7 +171,7 @@ class SetupWizardScreen(SetupRootScreen):
 
     BINDINGS = [
         Binding("escape", "cancel_edit", "Cancel edit"),
-        Binding("ctrl+enter", "start_test_connection", "Test"),
+        Binding("ctrl+enter", "confirm_primary_action", "Confirm"),
     ]
 
     def __init__(
@@ -178,10 +179,12 @@ class SetupWizardScreen(SetupRootScreen):
         controller: object,
         *,
         activation_callback: Callable[[], Awaitable[object | None]] | None = None,
+        cancel_callback: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         super().__init__(controller, screen_id="setup-wizard")
         self.current_step = self._controller_step()
         self._activation_callback = activation_callback
+        self._cancel_callback = cancel_callback
         self._supervisor = _SetupReadOnlySupervisor()
         self._generation = 0
         self._transients_cleared = False
@@ -278,7 +281,63 @@ class SetupWizardScreen(SetupRootScreen):
 
     def on_mount(self) -> None:
         self._apply_layout(self.size.width)
+        self._populate_public_draft()
         self._render_state()
+
+    def _populate_public_draft(self) -> None:
+        """Render the detached public draft; credential inputs always stay blank."""
+
+        draft = getattr(self.controller, "draft", None)
+        runtime = getattr(draft, "runtime", None)
+        workflow = getattr(draft, "workflow", None)
+        values: dict[str, str] = {}
+        if runtime is not None:
+            values.update(
+                {
+                    "ones-base-url": runtime.ones_base_url,
+                    "ones-team-id": runtime.ones_team_id,
+                    "ones-issue-type-id": runtime.ones_issue_type_id,
+                    "provider-host": runtime.provider_host,
+                    "provider-api-url": runtime.provider_api_url,
+                    "git-author-name": runtime.git_author_name,
+                    "git-author-email": runtime.git_author_email,
+                    "codex-auth-mode": runtime.codex_auth_mode,
+                    "codex-home": str(runtime.codex_home or ""),
+                }
+            )
+        if workflow is not None:
+            values.update(
+                {
+                    "sandbox-profile": workflow.sandbox_permission_profile or "",
+                    "run-root": str(workflow.run_root or ""),
+                    "mirror-root": str(workflow.mirror_root or ""),
+                    "worktree-root": str(workflow.worktree_root or ""),
+                }
+            )
+            publishing = workflow.publishing
+            if publishing is not None:
+                values["provider-type"] = publishing.provider.value
+                values["repository-branch"] = publishing.default_target_branch
+            repositories = tuple(workflow.repositories)
+            if repositories:
+                repository = repositories[0]
+                values.update(
+                    {
+                        "repository-key": repository.key,
+                        "repository-project-id": repository.project_id,
+                        "repository-iteration-id": repository.iteration_id,
+                        "repository-name": repository.repo_name,
+                        "repository-path": str(repository.source_path or ""),
+                        "repository-url": repository.repo_url,
+                        "repository-branch": repository.base_branch,
+                    }
+                )
+            groups = tuple(workflow.repository_groups)
+            if groups:
+                values["repository-group-key"] = groups[0].key
+                values["repository-primary"] = groups[0].primary_repository
+        for widget_id, value in values.items():
+            self.query_one(f"#{widget_id}", Input).value = value
 
     def on_resize(self, event: Resize) -> None:
         self._apply_layout(event.size.width)
@@ -698,6 +757,12 @@ class SetupWizardScreen(SetupRootScreen):
 
         self._start_test_connection()
 
+    def action_confirm_primary_action(self) -> None:
+        if self.current_step is SetupStep.REVIEW:
+            self._request_activation_confirmation()
+        else:
+            self._start_test_connection()
+
     async def action_test_connection(self) -> None:
         if self._supervisor.busy or self.current_step is SetupStep.REVIEW:
             return
@@ -855,7 +920,10 @@ class SetupWizardScreen(SetupRootScreen):
         self._render_state()
 
     @on(Button.Pressed, "#activate-runtime")
-    async def _pressed_activate(self) -> None:
+    def _pressed_activate(self) -> None:
+        self._request_activation_confirmation()
+
+    def _request_activation_confirmation(self) -> None:
         callback = self._activation_callback
         if callback is None:
             self.query_one("#setup-notice", Static).update(
@@ -863,13 +931,24 @@ class SetupWizardScreen(SetupRootScreen):
             )
             return
         self._clear_inputs()
-        handle = await callback()
+        self.app.push_screen(
+            SetupActivationConfirmation(callback), self._activation_finished
+        )
+
+    def _activation_finished(self, handle: object | None) -> None:
         if handle is not None and self.is_attached:
             self.complete(handle)
+        elif self.is_attached:
+            self.query_one("#setup-notice", Static).update(
+                "Runtime activation failed safely"
+            )
 
     @on(Button.Pressed, "#cancel-setup")
-    def _pressed_cancel(self) -> None:
+    async def _pressed_cancel(self) -> None:
         self.action_cancel_edit()
+        callback = self._cancel_callback
+        if callback is not None:
+            await callback()
 
     def on_unmount(self) -> None:
         self._generation += 1
@@ -881,4 +960,159 @@ class SetupWizardScreen(SetupRootScreen):
         self._clear_controller_transients_once()
 
 
-__all__ = ["SetupRootScreen", "SetupWizardScreen"]
+class _ExplicitConfirmation(ModalScreen[object | None]):
+    """Mouse/explicit-key confirmation that deliberately ignores plain Enter."""
+
+    BINDINGS = [Binding("enter", "ignore_enter", "", show=False, priority=True)]
+
+    def action_ignore_enter(self) -> None:
+        return None
+
+
+class SetupActivationConfirmation(_ExplicitConfirmation):
+    def __init__(self, callback: Callable[[], Awaitable[object | None]]) -> None:
+        super().__init__(id="setup-activation-confirmation")
+        self._callback = callback
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="setup-confirmation"):
+            yield Static("Save configuration and activate the runtime?")
+            yield Button(
+                "Save and activate", id="confirm-setup-activation", variant="warning"
+            )
+            yield Button("Back", id="cancel-setup-activation")
+
+    @on(Button.Pressed, "#confirm-setup-activation")
+    async def _confirm(self) -> None:
+        try:
+            handle = await self._callback()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            handle = None
+        self.dismiss(handle)
+
+    @on(Button.Pressed, "#cancel-setup-activation")
+    def _cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SetupRecoveryScreen(SetupRootScreen):
+    """Restricted pending-activation recovery without credential reads."""
+
+    BINDINGS = [Binding("enter", "ignore_enter", "", show=False, priority=True)]
+
+    def __init__(
+        self,
+        controller: object,
+        *,
+        owner_generation: str | None = None,
+        recovery_state: object | None = None,
+    ) -> None:
+        super().__init__(controller, screen_id="setup-recovery")
+        state = recovery_state or getattr(controller, "recovery_state", object())
+        self.owner_generation = owner_generation or getattr(
+            state, "owner_generation", ""
+        )
+        self._previous_available = bool(
+            getattr(state, "previous_available", False)
+        )
+        self._orphan_count = int(getattr(state, "orphan_count", 0) or 0)
+        self._pending_action: str | None = None
+
+    def compose(self) -> ComposeResult:
+        yield Static("Runtime activation recovery required", id="recovery-title")
+        yield Static(
+            "Previous configuration: "
+            + ("available" if self._previous_available else "unavailable"),
+            id="recovery-previous",
+        )
+        yield Static(f"Orphan credentials: {self._orphan_count}", id="recovery-orphans")
+        yield Static("Recovery category: activation interrupted", id="recovery-category")
+        yield Static("", id="recovery-notice")
+        yield Button(
+            "Restore previous",
+            id="restore-previous",
+            disabled=not self._previous_available,
+        )
+        yield Button("Discard pending", id="discard-pending", variant="warning")
+        yield Button(
+            "Clean orphan credentials",
+            id="cleanup-orphans",
+            variant="error",
+            disabled=self._orphan_count == 0,
+        )
+
+    def action_ignore_enter(self) -> None:
+        return None
+
+    @on(Button.Pressed, "#restore-previous")
+    def _restore(self) -> None:
+        self._confirm_action("restore")
+
+    @on(Button.Pressed, "#discard-pending")
+    def _discard(self) -> None:
+        self._confirm_action("discard")
+
+    @on(Button.Pressed, "#cleanup-orphans")
+    def _cleanup(self) -> None:
+        self._confirm_action("cleanup")
+
+    def _confirm_action(self, action: str) -> None:
+        self._pending_action = action
+        self.app.push_screen(_RecoveryConfirmation(), self._confirmed)
+
+    async def _confirmed(self, confirmed: bool | None) -> None:
+        if confirmed is not True or self._pending_action is None:
+            self._pending_action = None
+            return
+        action, self._pending_action = self._pending_action, None
+        try:
+            if action == "cleanup":
+                generations = await asyncio.to_thread(
+                    self.controller.list_orphan_generations
+                )
+                outcome = await asyncio.to_thread(
+                    self.controller.cleanup_orphans, generations
+                )
+            elif action == "restore":
+                outcome = await asyncio.to_thread(
+                    self.controller.restore_pending, self.owner_generation
+                )
+            else:
+                outcome = await asyncio.to_thread(
+                    self.controller.discard_pending, self.owner_generation
+                )
+            if inspect.isawaitable(outcome):
+                await outcome
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            self.query_one("#recovery-notice", Static).update(
+                "Recovery action failed safely"
+            )
+            return
+        if action == "cleanup":
+            self.query_one("#recovery-notice", Static).update(
+                "Orphan credentials cleaned"
+            )
+            return
+        self.dismiss(action)
+
+
+class _RecoveryConfirmation(_ExplicitConfirmation):
+    def compose(self) -> ComposeResult:
+        yield Static("Confirm the selected recovery action")
+        yield Button("Confirm", id="confirm-recovery-action", variant="warning")
+        yield Button("Back", id="cancel-recovery-action")
+
+    @on(Button.Pressed, "#confirm-recovery-action")
+    def _confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel-recovery-action")
+    def _cancel(self) -> None:
+        self.dismiss(False)
+
+
+__all__ = ["SetupRecoveryScreen", "SetupRootScreen", "SetupWizardScreen"]

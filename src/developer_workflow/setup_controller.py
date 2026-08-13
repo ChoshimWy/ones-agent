@@ -147,6 +147,16 @@ class SetupControllerState:
 
 
 @dataclass(frozen=True, slots=True)
+class SetupRecoveryState:
+    """Secret-free crash recovery summary for the restricted setup host."""
+
+    owner_generation: str | None
+    previous_available: bool
+    orphan_count: int
+    error_category: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class SetupStepTransaction:
     runtime: RuntimePublicConfig | None = None
     workflow: WorkflowDraft | None = None
@@ -501,6 +511,115 @@ class SetupController:
         """Return a detached non-secret draft for form population."""
 
         return self._draft.model_copy(deep=True)
+
+    @property
+    def recovery_state(self) -> SetupRecoveryState:
+        """Inspect pointer state without reading credentials or building a runtime."""
+
+        try:
+            document = self._store.load_or_empty(profile_id=self._profile_id)
+            orphans = self._store.orphan_generations() if document.active else ()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            return SetupRecoveryState(
+                owner_generation=None,
+                previous_available=False,
+                orphan_count=0,
+                error_category="recovery_unavailable",
+            )
+        owner = document.activation_owner_generation
+        return SetupRecoveryState(
+            owner_generation=owner,
+            previous_available=document.previous is not None,
+            orphan_count=len(orphans),
+            error_category=("activation_recovery_required" if owner else None),
+        )
+
+    def load_active_public_draft(self) -> None:
+        """Populate a reconfiguration draft from public active data only."""
+
+        self._ensure_mutable()
+        failed = False
+        try:
+            document = self._store.load_or_empty(profile_id=self._profile_id)
+            if document.activation_owner_generation is not None or document.active is None:
+                raise SetupStoreError("active configuration is unavailable")
+            active = document.active
+            workflow = WorkflowDraft.model_validate(
+                active.workflow.model_dump(mode="python", round_trip=True)
+            )
+            self._draft = SetupDraft(
+                runtime=active.runtime.model_copy(deep=True), workflow=workflow
+            )
+            self._runtime_fields = {
+                "ones_base_url": active.runtime.ones_base_url,
+                "ones_team_id": active.runtime.ones_team_id,
+                "ones_issue_type_id": active.runtime.ones_issue_type_id,
+                "provider_host": active.runtime.provider_host,
+                "provider_api_url": active.runtime.provider_api_url,
+                "git_author_name": active.runtime.git_author_name,
+                "git_author_email": active.runtime.git_author_email,
+                "provider": active.workflow.publishing.provider.value,
+                "codex_auth_mode": active.runtime.codex_auth_mode,
+                "codex_home": str(active.runtime.codex_home or ""),
+            }
+            self._results.clear()
+            self._review_confirmed = False
+            self._activation_error = None
+            self._revision += 1
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            failed = True
+        if failed:
+            raise SetupActionError("active configuration is unavailable") from None
+
+    def list_orphan_generations(self) -> tuple[str, ...]:
+        failed = False
+        try:
+            return self._store.orphan_generations()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            failed = True
+        if failed:
+            raise SetupActionError("credential cleanup unavailable") from None
+
+    def restore_pending(self, expected_generation: str) -> None:
+        self._resolve_pending(expected_generation)
+
+    def discard_pending(self, expected_generation: str) -> None:
+        self._resolve_pending(expected_generation)
+
+    def _resolve_pending(self, expected_generation: str) -> None:
+        self._ensure_open()
+        failed = False
+        try:
+            self._store.restore_previous(self._profile_id, expected_generation)
+            self._activation_error = None
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            self._activation_error = "activation recovery failed"
+            failed = True
+        if failed:
+            raise SetupActionError("activation recovery failed") from None
+
+    def cleanup_orphans(self, generations: tuple[str, ...]) -> None:
+        self._ensure_open()
+        failed = False
+        try:
+            current = self._store.orphan_generations()
+            if generations != current:
+                raise SetupStoreError("credential cleanup refused")
+            self._store.cleanup_orphan_generations(generations)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            failed = True
+        if failed:
+            raise SetupActionError("credential cleanup failed") from None
 
     def result_for(self, step: SetupStep) -> ConnectionTestResult:
         self._require_step(step)

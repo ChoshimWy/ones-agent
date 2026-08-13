@@ -7,16 +7,18 @@ import weakref
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from textual import on
 from textual.app import App
 from textual.binding import Binding
 from textual.message import Message
 from textual.timer import Timer
+from textual.widgets import Button
 
 from .controller import TuiController
 from .models import RunActivity
 from .screens import DashboardScreen, HelpScreen, SettingsView
 from .runtime_session import TuiRuntimeSession
-from .setup_screens import SetupRootScreen, SetupWizardScreen
+from .setup_screens import SetupRecoveryScreen, SetupRootScreen, SetupWizardScreen
 from .supervisor import TaskEvent
 
 
@@ -114,6 +116,7 @@ class DeveloperWorkflowTuiApp(App[None]):
         self._transition_lock = asyncio.Lock()
         self._activation_handles: list[object] = []
         self._poll_timer: Timer | None = None
+        self._reconfiguring = False
         app_ref = weakref.ref(self)
 
         def sink(event: TaskEvent) -> None:
@@ -146,7 +149,13 @@ class DeveloperWorkflowTuiApp(App[None]):
                     raise
                 handle = None
             if handle is None:
-                await self._show_setup()
+                recovery = await asyncio.to_thread(
+                    lambda: getattr(self.setup_controller, "recovery_state", None)
+                )
+                if getattr(recovery, "owner_generation", None):
+                    await self._show_recovery(recovery)
+                else:
+                    await self._show_setup()
                 return
             try:
                 await self._close_setup_controller()
@@ -189,6 +198,7 @@ class DeveloperWorkflowTuiApp(App[None]):
             screen = SetupWizardScreen(
                 self.setup_controller,
                 activation_callback=self._activate_setup_candidate,
+                cancel_callback=self._cancel_setup,
             )
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
@@ -196,6 +206,35 @@ class DeveloperWorkflowTuiApp(App[None]):
             screen = SetupRootScreen(self.setup_controller)
         self._setup_screen = screen
         await self.push_screen(screen, self._setup_done)
+
+    async def _show_recovery(self, recovery_state: object) -> None:
+        assert self.setup_controller is not None
+        screen = SetupRecoveryScreen(
+            self.setup_controller,
+            owner_generation=getattr(recovery_state, "owner_generation", None),
+            recovery_state=recovery_state,
+        )
+        self._setup_screen = screen
+        await self.push_screen(screen, self._recovery_done)
+
+    async def _recovery_done(self, action: object | None) -> None:
+        if action not in {"restore", "discard"}:
+            return
+        async with self._transition_lock:
+            if self._ui_closed:
+                return
+            await self._remove_setup_screen()
+            controller = self.setup_controller
+            if controller is None:
+                return
+            handle = await controller.activate_existing()
+            if handle is None:
+                if action == "discard":
+                    await self._show_setup()
+                else:
+                    await self._show_setup()
+                return
+            await self._finish_setup(handle)
 
     async def _activate_setup_candidate(self) -> object | None:
         """Delegate the explicit review action to the setup controller boundary."""
@@ -224,6 +263,17 @@ class DeveloperWorkflowTuiApp(App[None]):
             return False
         self._setup_screen = None
         return True
+
+    async def _remove_dashboard(self) -> None:
+        dashboard = self._dashboard
+        if dashboard is None:
+            return
+        dashboard.begin_teardown()
+        try:
+            if dashboard.is_attached:
+                await dashboard.remove()
+        finally:
+            self._dashboard = None
 
     async def _close_setup_controller(self) -> None:
         controller = self.setup_controller
@@ -414,6 +464,82 @@ class DeveloperWorkflowTuiApp(App[None]):
         self.controller = None
         self.supervisor = None
         self._dashboard = None
+
+    @on(Button.Pressed, "#configure-runtime")
+    async def _pressed_configure_runtime(self) -> None:
+        await self._begin_reconfigure()
+
+    async def _begin_reconfigure(self) -> None:
+        """Close the stable runtime completely before constructing setup UI."""
+
+        safe_exit = False
+        async with self._transition_lock:
+            if self._ui_closed or self.runtime_session is None:
+                return
+            if self._poll_timer is not None:
+                self._poll_timer.stop()
+                self._poll_timer = None
+            dashboard = self._dashboard
+            if dashboard is not None:
+                dashboard.begin_teardown()
+            try:
+                await self.runtime_session.close()
+            except BaseException as error:
+                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                    raise
+                safe_exit = True
+            finally:
+                self.runtime_session = None
+                self.controller = None
+                self.supervisor = None
+                await self._remove_dashboard()
+                self.activities.clear()
+            if not safe_exit:
+                try:
+                    controller = self._new_setup_controller()
+                    await asyncio.to_thread(controller.load_active_public_draft)
+                    self.setup_controller = controller
+                    self._reconfiguring = True
+                    await self._show_setup()
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    await self._discard_setup_controller()
+                    safe_exit = True
+        if safe_exit and not self._ui_closed:
+            await self._close_ui()
+            self.exit()
+
+    async def _cancel_setup(self) -> None:
+        """Cancel initial setup safely or reconstruct the prior stable runtime."""
+
+        safe_exit = False
+        async with self._transition_lock:
+            if self._ui_closed:
+                return
+            await self._remove_setup_screen()
+            controller = self.setup_controller
+            if not self._reconfiguring or controller is None:
+                await self._discard_setup_controller()
+                safe_exit = True
+            else:
+                try:
+                    handle = await controller.activate_existing()
+                except BaseException as error:
+                    if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    handle = None
+                if handle is None:
+                    await self._discard_setup_controller()
+                    safe_exit = True
+                else:
+                    await self._close_setup_controller()
+                    self._reconfiguring = False
+                    if not await self._replace_with_runtime(handle):
+                        safe_exit = True
+        if safe_exit and not self._ui_closed:
+            await self._close_ui()
+            self.exit()
 
     async def refresh_runs(self) -> None:
         """Refresh persisted runs without performing workflow mutations."""

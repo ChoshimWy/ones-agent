@@ -1120,6 +1120,7 @@ class DashboardScreen(Screen[None]):
             yield Button("Revise", id="action-revise")
             yield Button("Approve", id="action-approve")
             yield Button("Cancel", id="action-cancel")
+            yield Button("Configure Runtime", id="configure-runtime")
         yield Static("", id="notice", markup=False)
 
     def on_mount(self) -> None:

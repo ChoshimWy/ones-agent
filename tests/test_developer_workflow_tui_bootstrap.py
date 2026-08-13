@@ -232,6 +232,9 @@ async def test_setup_review_activation_uses_explicit_host_callback() -> None:
     async with WizardApp().run_test() as pilot:
         await pilot.click("#activate-runtime")
         await pilot.pause()
+        assert activated == []
+        await pilot.click("#confirm-setup-activation")
+        await pilot.pause()
         assert activated == [True]
 
 
