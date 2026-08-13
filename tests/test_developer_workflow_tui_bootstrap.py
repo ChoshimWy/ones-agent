@@ -690,6 +690,43 @@ async def test_app_close_is_single_flight_when_first_waiter_is_cancelled() -> No
 
 
 @pytest.mark.asyncio
+async def test_app_internal_close_task_cancel_is_taken_over_without_double_close() -> None:
+    import asyncio
+
+    from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingSetup(_SetupController):
+        close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            entered.set()
+            await release.wait()
+            self.closed = True
+
+    setup = BlockingSetup(None)
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=setup,
+        runtime_bootstrapper=object(),
+    )
+    waiter = asyncio.create_task(app._close_ui())
+    await entered.wait()
+    assert app._close_task is not None
+    app._close_task.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    await app._close_ui()
+    await waiter
+
+    assert setup.close_calls == 1
+    assert setup.closed
+    assert app._close_complete.is_set()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
 @pytest.mark.parametrize("fatal_stage", ["setup", "session"])
 async def test_app_close_drains_then_propagates_same_fatal_to_all_waiters(
@@ -900,6 +937,72 @@ async def test_runtime_session_controller_and_handle_share_owned_serial_worker()
     release.set()
     assert await asyncio.to_thread(finished.wait, 1)
     assert order == ["controller-start", "controller-end", "handle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+async def test_supervisor_fatal_is_captured_without_child_task_escape(
+    fatal_type: type[BaseException],
+) -> None:
+    from src.developer_workflow.tui.runtime_session import TuiRuntimeSession
+
+    order: list[str] = []
+
+    class Supervisor:
+        async def close(self) -> None:
+            order.append("supervisor")
+            raise fatal_type("supervisor fatal")
+
+    session = TuiRuntimeSession(
+        handle=SimpleNamespace(close=lambda: order.append("handle")),
+        controller=SimpleNamespace(close=lambda: order.append("controller")),
+        run_index=object(),
+        supervisor=Supervisor(),
+        event_sink=lambda event: None,
+    )
+
+    for _ in range(2):
+        with pytest.raises(fatal_type, match="supervisor fatal"):
+            await session.close()
+
+    assert order == ["supervisor", "controller", "handle"]
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_thread_start_failure_drains_synchronously_and_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.tui.runtime_session as runtime_session
+    from src.developer_workflow.tui.runtime_session import (
+        TuiRuntimeCloseError,
+        TuiRuntimeSession,
+    )
+
+    order: list[str] = []
+
+    class BrokenThread:
+        def __init__(self, *args: object, target, **kwargs: object) -> None:
+            self.target = target
+
+        def start(self) -> None:
+            raise RuntimeError("sensitive thread start failure")
+
+    monkeypatch.setattr(runtime_session, "Thread", BrokenThread)
+    session = TuiRuntimeSession(
+        handle=SimpleNamespace(close=lambda: order.append("handle")),
+        controller=SimpleNamespace(close=lambda: order.append("controller")),
+        run_index=object(),
+        supervisor=SimpleNamespace(close=_async_noop),
+        event_sink=lambda event: None,
+    )
+
+    for _ in range(2):
+        with pytest.raises(TuiRuntimeCloseError) as raised:
+            await session.close()
+        assert raised.value.__cause__ is None
+        assert raised.value.__context__ is None
+
+    assert order == ["controller", "handle"]
 
 
 def test_tui_dispatches_before_legacy_config_load(

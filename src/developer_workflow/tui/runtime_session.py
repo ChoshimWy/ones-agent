@@ -127,9 +127,8 @@ class TuiRuntimeSession:
         fatal: BaseException | None = None
         failed = False
         try:
-            await asyncio.wait_for(
-                self.supervisor.close(), timeout=self._close_timeout
-            )
+            async with asyncio.timeout(self._close_timeout):
+                await self.supervisor.close()
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 fatal = error
@@ -163,7 +162,17 @@ class TuiRuntimeSession:
             outcome.extend((worker_fatal, worker_failed))
             done.set()
 
-        Thread(target=worker, name="ones-dev-tui-runtime-close", daemon=True).start()
+        start_failed = False
+        try:
+            Thread(
+                target=worker, name="ones-dev-tui-runtime-close", daemon=True
+            ).start()
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                fatal = fatal or error
+            else:
+                start_failed = True
+            worker()
         while not done.is_set():
             await asyncio.sleep(min(0.01, self._close_timeout))
         worker_fatal = outcome[0]
@@ -171,7 +180,7 @@ class TuiRuntimeSession:
             fatal=fatal or (
                 worker_fatal if isinstance(worker_fatal, BaseException) else None
             ),
-            failed=failed or bool(outcome[1]),
+            failed=failed or start_failed or bool(outcome[1]),
         )
 
 

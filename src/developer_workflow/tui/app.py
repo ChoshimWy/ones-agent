@@ -35,6 +35,7 @@ class _TransitionClosed(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class _AppCloseOutcome:
     fatal: BaseException | None = None
+    complete: bool = True
 
 
 class DeveloperWorkflowTuiApp(App[None]):
@@ -442,21 +443,45 @@ class DeveloperWorkflowTuiApp(App[None]):
             task = asyncio.create_task(self._drain_close_ui())
             self._close_task = task
         outcome = await asyncio.shield(task)
+        if not outcome.complete:
+            if self._close_task is task:
+                self._close_task = None
+            raise RuntimeError("TUI close timed out") from None
         if outcome.fatal is not None:
             raise outcome.fatal
+
+    @staticmethod
+    async def _await_owned(awaitable) -> object:
+        async def capture() -> tuple[object | None, BaseException | None]:
+            try:
+                return await awaitable, None
+            except BaseException as error:
+                return None, error
+
+        task = asyncio.create_task(capture())
+        while True:
+            try:
+                result, error = await asyncio.shield(task)
+                if error is not None:
+                    raise error
+                return result
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                if task.done():
+                    result, error = task.result()
+                    if error is not None:
+                        raise error
+                    return result
 
     async def _drain_close_ui(self) -> _AppCloseOutcome:
         acquired = False
         fatal: BaseException | None = None
         try:
-            while not acquired:
-                try:
-                    await asyncio.wait_for(
-                        self._transition_lock.acquire(), timeout=5.0
-                    )
-                    acquired = True
-                except asyncio.TimeoutError:
-                    continue
+            acquired = await self._acquire_transition_for_close(5.0)
+            if not acquired:
+                return _AppCloseOutcome(complete=False)
             if self._dashboard is not None:
                 try:
                     self._dashboard.begin_teardown()
@@ -469,8 +494,8 @@ class DeveloperWorkflowTuiApp(App[None]):
                         self.supervisor is not None
                         and self.supervisor is not self.runtime_session.supervisor
                     ):
-                        await self.supervisor.close()
-                    await self.runtime_session.close()
+                        await self._await_owned(self.supervisor.close())
+                    await self._await_owned(self.runtime_session.close())
                 except BaseException as error:
                     if fatal is None and isinstance(
                         error, (KeyboardInterrupt, SystemExit)
@@ -484,7 +509,7 @@ class DeveloperWorkflowTuiApp(App[None]):
                     try:
                         close = getattr(controller, "aclose", None)
                         if callable(close):
-                            await close()
+                            await self._await_owned(close())
                         else:
                             controller.close()
                     except BaseException as error:
@@ -495,7 +520,27 @@ class DeveloperWorkflowTuiApp(App[None]):
         finally:
             if acquired:
                 self._transition_lock.release()
-            self._close_complete.set()
+            if acquired:
+                self._close_complete.set()
+
+    async def _acquire_transition_for_close(self, timeout: float) -> bool:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while True:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._transition_lock.acquire(), timeout=remaining
+                )
+                return True
+            except asyncio.TimeoutError:
+                return False
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
 
 
 __all__ = ["DeveloperWorkflowTuiApp", "TuiTaskMessage"]
