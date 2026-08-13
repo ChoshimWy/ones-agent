@@ -6,6 +6,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
@@ -498,6 +499,44 @@ def test_tui_windows_deny_share_optional_dotenv_is_ignored_without_reading(
     assert context.dotenv_path is None
     assert reads == 0
     assert canary not in repr(context)
+
+
+@pytest.mark.parametrize("cleanup_type", [RuntimeError, TypeError, ValueError])
+def test_tui_reader_cleanup_fatal_overrides_access_read_rejection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_type: type[Exception]
+) -> None:
+    from src.developer_workflow import setup_import
+    from src.developer_workflow.cli import build_production_tui_host
+    from src.developer_workflow.setup_import import SetupImportError
+    from src.developer_workflow.setup_store import _protect_private_file
+
+    canary = f"TOKEN-CLEANUP-{cleanup_type.__name__}"
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ONES_PASSWORD=safe\n", encoding="utf-8")
+    _protect_private_file(dotenv)
+    git_executable = shutil.which("git") or r"D:\Tools\Git\cmd\git.exe"
+    if not Path(git_executable).exists():
+        pytest.skip("Git executable is unavailable for isolated runtime import")
+    monkeypatch.setenv("GIT_PYTHON_GIT_EXECUTABLE", git_executable)
+    original_file = setup_import.io.FileIO
+
+    class ReaderThatFailsClose:
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self._reader = original_file(*args, **kwargs)
+
+        def close(self) -> None:
+            self._reader.close()
+            raise cleanup_type(canary)
+
+    monkeypatch.setattr(setup_import.io, "FileIO", ReaderThatFailsClose)
+    monkeypatch.setattr(
+        setup_import, "_read_into", lambda _reader, _target: (_ for _ in ()).throw(PermissionError(errno.EACCES, "denied"))
+    )
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SetupImportError, match="^source read failed$") as caught:
+        build_production_tui_host(tmp_path / "missing.json")
+    assert caught.value.__cause__ is None and caught.value.__context__ is None
+    assert canary not in repr(caught.value)
 
 
 @pytest.mark.parametrize("stage", ["ancestor", "read", "post-read"])

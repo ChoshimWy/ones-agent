@@ -575,13 +575,13 @@ def _read_bounded(
                         raise _SourceDataRejected
             except BaseException as error:
                 reader_failure = error
+            if isinstance(reader_failure, OSError) and _is_source_access_error(reader_failure):
+                reader_failure = _SourcePathRejected()
             try:
                 reader.close()
             except BaseException as error:
                 reader_failure = _prefer_cleanup_failure(reader_failure, error)
             if reader_failure is not None:
-                if isinstance(reader_failure, OSError) and _is_source_access_error(reader_failure):
-                    raise _SourcePathRejected
                 raise reader_failure
             final = _descriptor_identity(descriptor)
             if final != opened or total != opened[2]:
