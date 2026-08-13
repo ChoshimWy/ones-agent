@@ -112,9 +112,10 @@ class FakeValidator:
         self.started = asyncio.Event()
         self.release = asyncio.Event()
         self.block = False
+        self.probes: list[tuple[SetupStep, object]] = []
 
     async def _probe(self, step: SetupStep, probe: object) -> ConnectionTestResult:
-        del probe
+        self.probes.append((step, probe))
         if self.block:
             self.started.set()
             await self.release.wait()
@@ -299,6 +300,33 @@ async def test_incomplete_setup_never_builds_runtime(tmp_path: Path) -> None:
     with pytest.raises(SetupActionError, match="configuration is incomplete"):
         await controller.save_and_activate(confirmed=True)
     assert builder.calls == []
+
+
+@pytest.mark.asyncio
+async def test_ui_mapping_snapshot_is_converted_to_strict_ones_probe(
+    tmp_path: Path,
+) -> None:
+    from types import MappingProxyType
+
+    from src.developer_workflow.setup_validation import OnesProbeInput
+
+    controller, _, _, bootstrap = _controller(tmp_path)
+    await controller.test_step(SetupStep.PROFILE)
+    await controller.test_step(
+        SetupStep.ONES,
+        MappingProxyType(
+            {
+                "ones-team-id": "team-1",
+                "ones-project-id": "project-1",
+                "ones-status-id": "status-1",
+                "ones-item-id": "item-1",
+                "ones-password": "MUST-NOT-ENTER-PROBE",
+            }
+        ),
+    )
+    _, probe = bootstrap.validator.probes[-1]
+    assert isinstance(probe, OnesProbeInput)
+    assert "MUST-NOT-ENTER-PROBE" not in repr(probe)
 
 
 def test_cancel_clears_transient_secrets(tmp_path: Path) -> None:

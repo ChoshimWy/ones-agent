@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 from threading import Event, Lock, Thread
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol
@@ -24,7 +25,12 @@ from .setup_models import (
 from .setup_repository import RepositoryGroupDraftBuilder, build_repository
 from .setup_store import SetupStore, SetupStoreError
 from .setup_validation import (
+    CodexProbeInput,
     ConnectionTestResult,
+    OnesProbeInput,
+    PrivatePathsProbeInput,
+    ProviderProbeInput,
+    RepositoryProbeInput,
     SetupStep,
     SetupValidator,
     ValidationStatus,
@@ -685,6 +691,7 @@ class SetupController:
             return _fixed_result(
                 step, status=ValidationStatus.PASSED, category="ok"
             )
+        probe = self._normalize_ui_probe(step, probe)
         method_name = {
             SetupStep.ONES: "probe_ones",
             SetupStep.REPOSITORIES: "probe_repository",
@@ -706,6 +713,50 @@ class SetupController:
                     return result
             return _fixed_result(step, status=ValidationStatus.PASSED, category="ok")
         return await method(probe)
+
+    @staticmethod
+    def _normalize_ui_probe(step: SetupStep, probe: object | None) -> object | None:
+        """Convert the TUI's immutable transient snapshot through strict models."""
+
+        if not isinstance(probe, Mapping):
+            return probe
+        values = probe
+        try:
+            if step is SetupStep.ONES:
+                return OnesProbeInput(
+                    team_id=values["ones-team-id"],
+                    project_id=values["ones-project-id"],
+                    status_id=values["ones-status-id"],
+                    item_id=values["ones-item-id"],
+                )
+            if step is SetupStep.PROVIDER:
+                return ProviderProbeInput(
+                    host=values["provider-host"],
+                    api_url=values["provider-api-url"],
+                )
+            if step is SetupStep.REPOSITORIES:
+                return RepositoryProbeInput(
+                    path=Path(values["repository-path"]),
+                    remote_url=values["repository-url"],
+                )
+            if step is SetupStep.CODEX:
+                return CodexProbeInput(
+                    profile=values["codex-profile"],
+                    worktree=Path(values["codex-worktree"]),
+                )
+            if step is SetupStep.PRIVATE_PATHS:
+                return PrivatePathsProbeInput(
+                    paths=(
+                        Path(values["run-root"]),
+                        Path(values["mirror-root"]),
+                        Path(values["worktree-root"]),
+                    )
+                )
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            raise SetupActionError("connection test fields are invalid") from None
+        return probe
 
     def _build_candidate(self) -> tuple[ActiveSetup, RuntimeSecrets]:
         try:
