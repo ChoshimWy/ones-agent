@@ -316,6 +316,40 @@ def test_tui_parser_accepts_custom_config_path() -> None:
     assert args.config == "custom.json"
 
 
+def test_tui_main_cold_start_runs_without_git_executable() -> None:
+    root = Path(__file__).resolve().parents[1]
+    child = (
+        "from src.developer_workflow.cli import main\n"
+        "calls = []\n"
+        "def runner(first, second):\n"
+        "    calls.append((first, second))\n"
+        "code = main(['tui'], tui_runner=runner)\n"
+        "assert code == 0, code\n"
+        "assert len(calls) == 1\n"
+        "print('tui-main-ok')\n"
+    )
+    environment = dict(os.environ)
+    environment.pop("GIT_PYTHON_GIT_EXECUTABLE", None)
+    environment["GIT_PYTHON_REFRESH"] = "error"
+    environment["PATH"] = ""
+    environment["PYTHONPATH"] = str(root)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", child],
+        cwd=root,
+        env=environment,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert completed.stdout == "tui-main-ok\n"
+    assert "Bad git executable" not in completed.stderr
+
+
 def test_tui_missing_optional_template_still_builds_setup_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

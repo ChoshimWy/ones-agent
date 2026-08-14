@@ -1,11 +1,8 @@
 """Backend service boundaries for the ONES agent."""
 
-from src.services.analysis_result_shaper import AnalysisResultShaper
-from src.services.codebase_evidence import CodebaseEvidenceService
-from src.services.defect_analysis_workflow import DefectAnalysisWorkflowService
-from src.services.execution_service import ExecutionService
-from src.services.ones_gateway import OnesGateway
-from src.services.repo_resolver import RepoResolver
+from importlib import import_module
+from threading import RLock
+from typing import Any
 
 __all__ = [
     "AnalysisResultShaper",
@@ -15,3 +12,38 @@ __all__ = [
     "OnesGateway",
     "RepoResolver",
 ]
+
+_EXPORTS = {
+    "AnalysisResultShaper": (
+        "src.services.analysis_result_shaper",
+        "AnalysisResultShaper",
+    ),
+    "CodebaseEvidenceService": (
+        "src.services.codebase_evidence",
+        "CodebaseEvidenceService",
+    ),
+    "DefectAnalysisWorkflowService": (
+        "src.services.defect_analysis_workflow",
+        "DefectAnalysisWorkflowService",
+    ),
+    "ExecutionService": ("src.services.execution_service", "ExecutionService"),
+    "OnesGateway": ("src.services.ones_gateway", "OnesGateway"),
+    "RepoResolver": ("src.services.repo_resolver", "RepoResolver"),
+}
+_EXPORT_LOCK = RLock()
+
+
+def __getattr__(name: str) -> Any:
+    export = _EXPORTS.get(name)
+    if export is None:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from None
+
+    with _EXPORT_LOCK:
+        if name in globals():
+            return globals()[name]
+        module_name, attribute_name = export
+        value = getattr(import_module(module_name), attribute_name)
+        globals()[name] = value
+        return value
