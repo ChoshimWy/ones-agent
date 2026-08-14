@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlsplit
 
 from jsonschema import Draft202012Validator
 
-from .codex_runtime import LockedNativeCodex, discover_locked_native_codex
+from .codex_runtime import CodexRuntimePreparer
 from .contracts import (
     AcceptanceCoverage,
     CodexResult,
@@ -71,11 +71,13 @@ class CodexCommand:
     def __post_init__(self) -> None:
         if (
             type(self.prefix) is not tuple
-            or not self.prefix
+            or len(self.prefix) != 1
             or any(
                 type(component) is not str or not component or "\x00" in component
                 for component in self.prefix
             )
+            or not Path(self.prefix[0]).is_absolute()
+            or Path(self.prefix[0]).name.casefold() != "codex.exe"
         ):
             raise ValueError("Codex command prefix is invalid")
 
@@ -94,14 +96,16 @@ def _raise_codex_executable_unavailable() -> None:
 
 def resolve_codex_command(
     *,
-    _discover: Callable[[], LockedNativeCodex] = discover_locked_native_codex,
+    _prepare: Callable[[], Path] | None = None,
 ) -> CodexCommand:
-    """Remain fail-closed until Task 2B stages a verified private executable."""
+    """Return only the verified native executable staged in the private cache."""
 
-    locked: LockedNativeCodex | None = None
+    executable: Path | None = None
     failed = False
     try:
-        locked = _discover()
+        executable = (
+            CodexRuntimePreparer().prepare() if _prepare is None else _prepare()
+        )
     except BaseException as error:
         if (
             isinstance(error, MemoryError)
@@ -110,22 +114,11 @@ def resolve_codex_command(
         ):
             raise
         failed = True
-    if not failed:
-        try:
-            assert locked is not None
-            locked.close()
-        except BaseException as error:
-            if (
-                isinstance(error, MemoryError)
-                or not isinstance(error, Exception)
-                or not isinstance(error, OSError)
-            ):
-                raise
-        failed = True
     if failed:
-        del _discover, locked
+        del _prepare, executable
         _raise_codex_executable_unavailable()
-    raise AssertionError("unreachable")
+    assert executable is not None
+    return CodexCommand((str(executable),))
 
 
 class RepositoryGuard(Protocol):

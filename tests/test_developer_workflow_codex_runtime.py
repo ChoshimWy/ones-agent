@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import os
 import shutil
+import subprocess
 import traceback
 from pathlib import Path
 
@@ -118,6 +121,481 @@ class FakeRuntimeAdapter:
 
 def _normalized(path: Path) -> str:
     return str(path).replace("\\\\?\\", "").replace("/", "\\").casefold()
+
+
+class FakeLockedSource:
+    def __init__(self, payload: bytes = b"signed-native") -> None:
+        self.payload = payload
+        self.offset = 0
+        self.identity = NativeCodexIdentity(3, 5, len(payload), 7)
+        self.size = len(payload)
+        self.publisher = OPENAI_AUTHENTICODE_PUBLISHER
+        self.closed = False
+        self.read_calls = 0
+
+    def read_chunk(self, size: int) -> bytes:
+        self.read_calls += 1
+        chunk = self.payload[self.offset : self.offset + max(1, size // 2)]
+        self.offset += len(chunk)
+        return chunk
+
+    def rewind(self) -> None:
+        self.offset = 0
+
+    def current_identity(self) -> NativeCodexIdentity:
+        return self.identity
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeCacheAdapter:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, Path | tuple[str, ...]]] = []
+        self.publisher = OPENAI_AUTHENTICODE_PUBLISHER
+        self.smoke_error: BaseException | None = None
+        self.fsync_error: BaseException | None = None
+        self.directory_error: BaseException | None = None
+
+    def prepare_private_directory(self, path: Path) -> Path:
+        self.events.append(("prepare-directory", path))
+        path.mkdir(exist_ok=True)
+        return path.resolve(strict=True)
+
+    def validate_private_directory(self, path: Path) -> None:
+        self.events.append(("validate-directory", path))
+        if self.directory_error is not None and len(path.name) == 64:
+            raise self.directory_error
+        if not path.is_dir() or path.is_symlink():
+            raise OSError("unsafe directory")
+
+    def protect_private_file(self, path: Path) -> None:
+        self.events.append(("protect-file", path))
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]:
+        self.events.append(("inspect-executable", path))
+        metadata = path.stat()
+        return (
+            NativeCodexIdentity(
+                metadata.st_dev, metadata.st_ino, metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+            self.publisher,
+        )
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]:
+        self.events.append(("validate-file", path))
+        metadata = path.stat()
+        return metadata.st_dev, metadata.st_ino
+
+    def read_private_text(self, path: Path) -> str:
+        self.events.append(("read-file", path))
+        return path.read_text("utf-8")
+
+    def fsync_directory(self, path: Path) -> None:
+        self.events.append(("fsync-directory", path))
+        if self.fsync_error is not None:
+            raise self.fsync_error
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None:
+        self.events.append(("smoke", (str(executable), *sorted(environment))))
+        if self.smoke_error is not None:
+            raise self.smoke_error
+
+
+def test_preparer_streams_source_and_publishes_manifest_last(tmp_path: Path) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    source = FakeLockedSource()
+    adapter = FakeCacheAdapter()
+    root = tmp_path / "ones-dev" / "codex-runtime"
+
+    executable = CodexRuntimePreparer(
+        cache_root=root,
+        discover=lambda: source,  # type: ignore[arg-type]
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+        chunk_size=4,
+    ).prepare()
+
+    digest = __import__("hashlib").sha256(source.payload).hexdigest()
+    assert executable == (root / digest / "codex.exe").resolve(strict=True)
+    assert executable.read_bytes() == source.payload
+    manifest = json.loads((executable.parent / "manifest.json").read_text("utf-8"))
+    assert manifest == {
+        "publisher": OPENAI_AUTHENTICODE_PUBLISHER,
+        "schema_version": 1,
+        "sha256": digest,
+        "size": len(source.payload),
+        "target": "codex.exe",
+    }
+    assert source.closed
+    assert source.read_calls > 1
+    assert not tuple(root.glob(".staging-*"))
+
+
+def _prepare_runtime(
+    root: Path, source: FakeLockedSource, adapter: FakeCacheAdapter,
+) -> Path:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    return CodexRuntimePreparer(
+        cache_root=root,
+        discover=lambda: source,  # type: ignore[arg-type]
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+        chunk_size=3,
+    ).prepare()
+
+
+def test_preparer_uses_valid_cache_when_source_is_unavailable(tmp_path: Path) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    existing = _prepare_runtime(root, FakeLockedSource(b"trusted-old"), adapter)
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("sensitive missing source")
+
+    reused = CodexRuntimePreparer(
+        cache_root=root,
+        discover=missing,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+    ).prepare()
+
+    assert reused == existing
+    assert reused.read_bytes() == b"trusted-old"
+
+
+def test_preparer_reuses_matching_cache_without_replacing_executable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    first = _prepare_runtime(root, FakeLockedSource(b"same-version"), adapter)
+    initial_identity = first.stat().st_ino
+    source = FakeLockedSource(b"same-version")
+
+    second = _prepare_runtime(root, source, adapter)
+
+    assert second == first
+    assert second.stat().st_ino == initial_identity
+    assert source.closed
+
+
+def test_preparer_stages_new_hash_when_source_changes(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    old = _prepare_runtime(root, FakeLockedSource(b"version-one"), adapter)
+    new = _prepare_runtime(root, FakeLockedSource(b"version-two"), adapter)
+
+    assert old != new
+    assert old.read_bytes() == b"version-one"
+    assert new.read_bytes() == b"version-two"
+    assert (old.parent / "manifest.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda manifest: {**manifest, "target": "../../outside.exe"},
+        lambda manifest: {**manifest, "unexpected": True},
+        lambda manifest: {**manifest, "size": True},
+        lambda manifest: {**manifest, "sha256": "0" * 64},
+        lambda manifest: {**manifest, "publisher": "Different Publisher"},
+    ],
+)
+def test_preparer_never_uses_corrupt_or_path_injecting_manifest(
+    tmp_path: Path, mutate: object,
+) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    executable = _prepare_runtime(root, FakeLockedSource(), adapter)
+    manifest_path = executable.parent / "manifest.json"
+    manifest = json.loads(manifest_path.read_text("utf-8"))
+    manifest_path.write_text(
+        json.dumps(mutate(manifest)),  # type: ignore[operator]
+        encoding="utf-8",
+    )
+    adapter.events.clear()
+
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        CodexRuntimePreparer(
+            cache_root=root,
+            discover=lambda: (_ for _ in ()).throw(OSError("missing")),
+            _cache_adapter=adapter,  # type: ignore[arg-type]
+        ).prepare()
+
+    inspected = [
+        value for event, value in adapter.events if event == "inspect-executable"
+    ]
+    assert all(Path(value).is_relative_to(root) for value in inspected)
+
+
+def test_preparer_rejects_source_identity_change_and_cleans_owned_temps(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    source = FakeLockedSource()
+    source.identity = NativeCodexIdentity(3, 5, source.size, 99)
+    initial = source.identity
+
+    def changed_identity() -> NativeCodexIdentity:
+        return NativeCodexIdentity(
+            initial.volume_serial, initial.file_index, initial.size, 100,
+        )
+
+    source.current_identity = changed_identity  # type: ignore[method-assign]
+    with pytest.raises(OSError):
+        _prepare_runtime(root, source, adapter)
+
+    assert source.closed
+    assert not tuple(root.glob(".staging-*"))
+    assert not tuple(path for path in root.iterdir() if len(path.name) == 64)
+
+
+def test_cache_adapter_inspects_locked_target_and_closes_handle(
+    tmp_path: Path,
+) -> None:
+    target = (tmp_path / "codex.exe").resolve()
+    target.write_bytes(b"signed")
+    runtime = FakeRuntimeAdapter(tmp_path)
+    runtime.expected = target
+    runtime.final = target
+    adapter = codex_runtime_module._WindowsCacheRuntimeAdapter(  # type: ignore[attr-defined]
+        _runtime_adapter=runtime,
+    )
+
+    identity, publisher = adapter.inspect_private_executable(target)
+
+    assert identity == NativeCodexIdentity(7, 11, 6, 13)
+    assert publisher == OPENAI_AUTHENTICODE_PUBLISHER
+    assert runtime.verified == [(71, target)]
+    assert runtime.closed == [71]
+
+
+def test_smoke_environment_drops_credentials_and_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CODEX_API_KEY", "must-not-leak")
+    monkeypatch.setenv("PATH", "C:/attacker")
+    monkeypatch.setenv("SYSTEMROOT", "C:/Windows")
+
+    environment = codex_runtime_module._sanitized_smoke_environment()
+
+    assert environment["SYSTEMROOT"] == "C:/Windows"
+    assert "PATH" not in environment
+    assert "CODEX_API_KEY" not in environment
+
+
+@pytest.mark.parametrize("unsafe", ["signature", "directory"])
+def test_preparer_rejects_untrusted_cached_executable_or_directory(
+    tmp_path: Path, unsafe: str,
+) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    _prepare_runtime(root, FakeLockedSource(), adapter)
+    if unsafe == "signature":
+        adapter.publisher = "Wrong Publisher"
+    else:
+        adapter.directory_error = OSError("unsafe ACL")
+
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        CodexRuntimePreparer(
+            cache_root=root,
+            discover=lambda: (_ for _ in ()).throw(OSError("missing")),
+            _cache_adapter=adapter,  # type: ignore[arg-type]
+        ).prepare()
+
+
+@pytest.mark.parametrize("failure_point", ["fsync", "replace", "cancel"])
+def test_failed_stage_cleans_owned_temps_and_closes_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    source = FakeLockedSource()
+    if failure_point == "fsync":
+        adapter.fsync_error = OSError("disk full")
+    elif failure_point == "replace":
+        monkeypatch.setattr(
+            codex_runtime_module.os,
+            "replace",
+            lambda *args: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+    else:
+        original_read = source.read_chunk
+        calls = 0
+
+        def cancelled(size: int) -> bytes:
+            nonlocal calls
+            calls += 1
+            if calls > 4:
+                raise asyncio.CancelledError()
+            return original_read(size)
+
+        source.read_chunk = cancelled  # type: ignore[method-assign]
+
+    with pytest.raises(
+        asyncio.CancelledError if failure_point == "cancel" else OSError
+    ):
+        _prepare_runtime(root, source, adapter)
+
+    assert source.closed
+    assert not tuple(root.glob(".staging-*"))
+    assert not tuple(path for path in root.iterdir() if len(path.name) == 64)
+
+
+def test_control_flow_beats_source_close_failure_and_cleans_temps(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+
+    class CancellingSource(FakeLockedSource):
+        def read_chunk(self, size: int) -> bytes:
+            raise asyncio.CancelledError()
+
+        def close(self) -> None:
+            raise OSError("close-sensitive-path")
+
+    with pytest.raises(asyncio.CancelledError):
+        _prepare_runtime(root, CancellingSource(), FakeCacheAdapter())
+    assert not tuple(root.glob(".staging-*"))
+
+
+def test_partial_destination_writes_are_completed() -> None:
+    class PartialWriter:
+        def __init__(self) -> None:
+            self.value = bytearray()
+
+        def write(self, data: bytes | memoryview) -> int:
+            raw = bytes(data)
+            count = max(1, len(raw) // 2)
+            self.value.extend(raw[:count])
+            return count
+
+    writer = PartialWriter()
+    codex_runtime_module._write_all(writer, b"complete-payload")
+    assert bytes(writer.value) == b"complete-payload"
+
+
+def test_owned_cleanup_attempts_every_path_before_raising_priority_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    staging = tmp_path / ".staging-one"
+    version = tmp_path / ("a" * 64)
+    calls: list[Path] = []
+    priority = MemoryError("cleanup-memory")
+
+    def remove(path: Path) -> None:
+        calls.append(path)
+        if path == staging:
+            raise priority
+        raise OSError("cleanup-disk")
+
+    monkeypatch.setattr(codex_runtime_module, "_remove_owned_tree", remove)
+
+    assert codex_runtime_module._attempt_owned_cleanup((staging, version)) is priority
+    assert calls == [staging, version]
+
+
+def test_failed_new_version_preserves_and_returns_old_trusted_cache(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    old = _prepare_runtime(root, FakeLockedSource(b"trusted-old"), adapter)
+    adapter.fsync_error = OSError("new-version-fsync-failed")
+
+    fallback = _prepare_runtime(root, FakeLockedSource(b"unusable-new"), adapter)
+
+    assert fallback == old
+    assert old.read_bytes() == b"trusted-old"
+    assert (old.parent / "manifest.json").is_file()
+
+
+def test_preparer_rejects_nul_cache_root_before_filesystem_access() -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        CodexRuntimePreparer(cache_root=Path("C:/unsafe\x00root"))
+
+
+def test_zero_length_destination_write_fails_closed() -> None:
+    class StalledWriter:
+        def write(self, data: bytes | memoryview) -> int:
+            return 0
+
+    with pytest.raises(OSError, match="write failed"):
+        codex_runtime_module._write_all(StalledWriter(), b"payload")
+
+
+def test_smoke_uses_absolute_native_argv_shell_false_and_bounded_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executable = (tmp_path / "codex.exe").resolve()
+    calls: list[tuple[object, dict[str, object]]] = []
+
+    class FakeProcess:
+        stdout = io.BytesIO(b"codex-cli 1.2.3\n")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            raise AssertionError("successful smoke must not be killed")
+
+    def popen(argv: object, **kwargs: object) -> FakeProcess:
+        calls.append((argv, kwargs))
+        return FakeProcess()
+
+    monkeypatch.setattr(codex_runtime_module.subprocess, "Popen", popen)
+    codex_runtime_module._run_bounded_smoke(
+        executable,
+        environment={"SYSTEMROOT": "C:/Windows"},
+        timeout=2.0,
+    )
+
+    argv, kwargs = calls[0]
+    assert argv == [str(executable), "--version"]
+    assert kwargs["shell"] is False
+    assert kwargs["env"] == {"SYSTEMROOT": "C:/Windows"}
+
+
+def test_smoke_kills_process_when_output_exceeds_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    killed: list[bool] = []
+
+    class FakeProcess:
+        stdout = io.BytesIO(b"x" * (64 * 1024 + 1))
+
+        def wait(self, timeout: float | None = None) -> int:
+            return 0
+
+        def kill(self) -> None:
+            killed.append(True)
+
+    monkeypatch.setattr(
+        codex_runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: FakeProcess(),
+    )
+    with pytest.raises(OSError, match="smoke test failed"):
+        codex_runtime_module._run_bounded_smoke(
+            (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
+        )
+    assert killed
 
 
 def _discover(

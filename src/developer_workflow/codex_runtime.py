@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import shutil
 import stat
+import subprocess
+import threading
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -54,6 +59,28 @@ class _RuntimeAdapter(Protocol):
     def repository_path_identity(self, path: Path) -> tuple[int, int, int, int]: ...
 
 
+class _CacheRuntimeAdapter(Protocol):
+    def prepare_private_directory(self, path: Path) -> Path: ...
+
+    def validate_private_directory(self, path: Path) -> None: ...
+
+    def protect_private_file(self, path: Path) -> None: ...
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]: ...
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]: ...
+
+    def read_private_text(self, path: Path) -> str: ...
+
+    def fsync_directory(self, path: Path) -> None: ...
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None: ...
+
+
 @dataclass(slots=True, repr=False)
 class LockedNativeCodex:
     descriptor: int = field(repr=False)
@@ -75,11 +102,401 @@ class LockedNativeCodex:
             raise ValueError("native Codex payload is closed")
         self._adapter.rewind(self.descriptor)
 
+    def current_identity(self) -> NativeCodexIdentity:
+        if self._closed:
+            raise ValueError("native Codex payload is closed")
+        return self._adapter.identity(self.descriptor)
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         self._adapter.close(self.descriptor)
+
+
+_CACHE_SCHEMA_KEYS = frozenset(
+    {"publisher", "schema_version", "sha256", "size", "target"}
+)
+
+
+class CodexRuntimePreparer:
+    """Stage a verified native payload into a private content-addressed cache."""
+
+    def __init__(
+        self,
+        *,
+        cache_root: Path | None = None,
+        discover: Callable[[], LockedNativeCodex] | None = None,
+        _cache_adapter: _CacheRuntimeAdapter | None = None,
+        chunk_size: int = 1024 * 1024,
+        smoke_timeout: float = 5.0,
+    ) -> None:
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError("chunk size must be a positive integer")
+        if not isinstance(smoke_timeout, (int, float)) or smoke_timeout <= 0:
+            raise ValueError("smoke timeout must be positive")
+        if cache_root is None:
+            local_app_data = os.environ.get("LOCALAPPDATA")
+            if not local_app_data:
+                raise OSError("private Codex runtime is unavailable")
+            cache_root = Path(local_app_data) / "ones-dev" / "codex-runtime"
+        if "\x00" in os.fspath(cache_root):
+            raise OSError("private Codex runtime is unavailable")
+        self._cache_root = Path(cache_root)
+        self._discover = discover
+        self._cache_adapter = _cache_adapter
+        self._chunk_size = chunk_size
+        self._smoke_timeout = float(smoke_timeout)
+
+    def prepare(self) -> Path:
+        adapter = self._cache_adapter or _WindowsCacheRuntimeAdapter()
+        root = self._prepare_root(adapter)
+        cached = self._valid_cached_executables(root, adapter)
+        discovery = self._discover or discover_locked_native_codex
+        try:
+            locked = discovery()
+        except BaseException as error:
+            if _is_priority_failure(error) or not isinstance(error, OSError):
+                raise
+            if cached:
+                return cached[sorted(cached)[-1]]
+            raise OSError("private Codex runtime is unavailable") from None
+        result: Path | None = None
+        primary: BaseException | None = None
+        primary_traceback = None
+        try:
+            try:
+                source_sha256 = self._hash_locked_source(locked)
+                matching = cached.get(source_sha256)
+                result = (
+                    matching
+                    if matching is not None
+                    else self._stage_locked_source(
+                        root, locked, source_sha256, adapter
+                    )
+                )
+            except BaseException as error:
+                if _is_priority_failure(error) or not isinstance(error, OSError):
+                    raise
+                if cached:
+                    result = cached[sorted(cached)[-1]]
+                else:
+                    raise OSError(
+                        "private Codex runtime is unavailable"
+                    ) from None
+        except BaseException as error:
+            primary = error
+            primary_traceback = error.__traceback__
+        cleanup: BaseException | None = None
+        cleanup_traceback = None
+        try:
+            locked.close()
+        except BaseException as error:
+            cleanup = error
+            cleanup_traceback = error.__traceback__
+        if primary is not None:
+            if _is_priority_failure(primary):
+                raise primary.with_traceback(primary_traceback)
+            if cleanup is not None and _is_priority_failure(cleanup):
+                raise cleanup.with_traceback(cleanup_traceback)
+            raise primary.with_traceback(primary_traceback)
+        if cleanup is not None:
+            raise cleanup.with_traceback(cleanup_traceback)
+        assert result is not None
+        return result
+
+    def _hash_locked_source(self, locked: LockedNativeCodex) -> str:
+        digest = hashlib.sha256()
+        copied = 0
+        locked.rewind()
+        while True:
+            chunk = locked.read_chunk(self._chunk_size)
+            if not chunk:
+                break
+            digest.update(chunk)
+            copied += len(chunk)
+        if copied != locked.size or locked.current_identity() != locked.identity:
+            raise OSError("native Codex payload changed")
+        return digest.hexdigest()
+
+    def _stage_locked_source(
+        self,
+        root: Path,
+        locked: LockedNativeCodex,
+        source_sha256: str,
+        adapter: _CacheRuntimeAdapter,
+    ) -> Path:
+        staging = root / f".staging-{uuid.uuid4().hex}"
+        created_final: Path | None = None
+        manifest_published = False
+        result: Path | None = None
+        primary: BaseException | None = None
+        primary_traceback = None
+        try:
+            staging.mkdir(exist_ok=False)
+            adapter.prepare_private_directory(staging)
+            temporary = staging / f"codex-{uuid.uuid4().hex}.tmp"
+            digest = hashlib.sha256()
+            copied = 0
+            locked.rewind()
+            with temporary.open("xb", buffering=0) as destination:
+                while True:
+                    chunk = locked.read_chunk(self._chunk_size)
+                    if not chunk:
+                        break
+                    _write_all(destination, chunk)
+                    digest.update(chunk)
+                    copied += len(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            if copied != locked.size or locked.current_identity() != locked.identity:
+                raise OSError("native Codex payload changed")
+            adapter.protect_private_file(temporary)
+            sha256 = digest.hexdigest()
+            if sha256 != source_sha256:
+                raise OSError("native Codex payload changed")
+            final_directory = root / sha256
+            final_directory.mkdir(exist_ok=False)
+            created_final = final_directory
+            adapter.prepare_private_directory(final_directory)
+            executable = final_directory / "codex.exe"
+            os.replace(temporary, executable)
+            adapter.fsync_directory(final_directory)
+            self._validate_executable(
+                executable, sha256=sha256, size=copied, adapter=adapter,
+            )
+            adapter.smoke(
+                executable,
+                environment=_sanitized_smoke_environment(),
+                timeout=self._smoke_timeout,
+            )
+            manifest = {
+                "publisher": OPENAI_AUTHENTICODE_PUBLISHER,
+                "schema_version": 1,
+                "sha256": sha256,
+                "size": copied,
+                "target": "codex.exe",
+            }
+            manifest_temp = final_directory / f"manifest-{uuid.uuid4().hex}.tmp"
+            with manifest_temp.open("x", encoding="utf-8", newline="\n") as stream:
+                json.dump(manifest, stream, ensure_ascii=True, sort_keys=True)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            adapter.protect_private_file(manifest_temp)
+            os.replace(manifest_temp, final_directory / "manifest.json")
+            manifest_published = True
+            adapter.fsync_directory(final_directory)
+            adapter.fsync_directory(root)
+            result = executable.resolve(strict=True)
+        except BaseException as error:
+            primary = error
+            primary_traceback = error.__traceback__
+        cleanup_paths = [staging]
+        if created_final is not None and not manifest_published:
+            cleanup_paths.append(created_final)
+        cleanup = _attempt_owned_cleanup(tuple(cleanup_paths))
+        cleanup_traceback = cleanup.__traceback__ if cleanup is not None else None
+        if primary is not None:
+            if _is_priority_failure(primary):
+                raise primary.with_traceback(primary_traceback)
+            if cleanup is not None and _is_priority_failure(cleanup):
+                raise cleanup.with_traceback(cleanup_traceback)
+            raise primary.with_traceback(primary_traceback)
+        if cleanup is not None:
+            raise cleanup.with_traceback(cleanup_traceback)
+        assert result is not None
+        return result
+
+    def _prepare_root(self, adapter: _CacheRuntimeAdapter) -> Path:
+        root = self._cache_root
+        if not root.is_absolute():
+            raise OSError("private Codex runtime is unavailable")
+        parent = root.parent
+        if parent.parent == parent:
+            raise OSError("private Codex runtime is unavailable")
+        adapter.prepare_private_directory(parent)
+        prepared = adapter.prepare_private_directory(root)
+        adapter.validate_private_directory(parent)
+        adapter.validate_private_directory(prepared)
+        return prepared
+
+    def _valid_cached_executables(
+        self, root: Path, adapter: _CacheRuntimeAdapter,
+    ) -> dict[str, Path]:
+        valid: dict[str, Path] = {}
+        try:
+            candidates = tuple(root.iterdir())
+        except OSError:
+            raise OSError("private Codex runtime is unavailable") from None
+        for directory in candidates:
+            digest = directory.name
+            if not (
+                len(digest) == 64
+                and all(character in "0123456789abcdef" for character in digest)
+            ):
+                continue
+            try:
+                adapter.validate_private_directory(directory)
+                manifest_path = directory / "manifest.json"
+                initial_manifest_identity = adapter.validate_private_file(manifest_path)
+                manifest = _read_strict_manifest(manifest_path, adapter)
+                if adapter.validate_private_file(manifest_path) != initial_manifest_identity:
+                    raise OSError("manifest changed")
+                if not _is_valid_manifest(manifest, digest):
+                    raise OSError("invalid manifest")
+                executable = directory / "codex.exe"
+                self._validate_executable(
+                    executable,
+                    sha256=digest,
+                    size=manifest["size"],
+                    adapter=adapter,
+                )
+                adapter.smoke(
+                    executable,
+                    environment=_sanitized_smoke_environment(),
+                    timeout=self._smoke_timeout,
+                )
+                resolved = executable.resolve(strict=True)
+                if not resolved.is_relative_to(root.resolve(strict=True)):
+                    raise OSError("cache target escaped")
+                valid[digest] = resolved
+            except BaseException as error:
+                if _is_priority_failure(error) or not isinstance(
+                    error, (OSError, ValueError, json.JSONDecodeError)
+                ):
+                    raise
+        return valid
+
+    @staticmethod
+    def _validate_executable(
+        executable: Path,
+        *,
+        sha256: str,
+        size: int,
+        adapter: _CacheRuntimeAdapter,
+    ) -> None:
+        adapter.validate_private_file(executable)
+        first_identity, publisher = adapter.inspect_private_executable(executable)
+        if (
+            publisher != OPENAI_AUTHENTICODE_PUBLISHER
+            or first_identity.size != size
+            or _hash_file(executable) != sha256
+        ):
+            raise OSError("private Codex runtime is unavailable")
+        final_identity, final_publisher = adapter.inspect_private_executable(executable)
+        if final_identity != first_identity or final_publisher != publisher:
+            raise OSError("private Codex runtime is unavailable")
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_all(stream: object, data: bytes) -> None:
+    remaining = memoryview(data)
+    while remaining:
+        written = stream.write(remaining)  # type: ignore[attr-defined]
+        if type(written) is not int or written <= 0 or written > len(remaining):
+            raise OSError("private Codex runtime write failed")
+        remaining = remaining[written:]
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate manifest member")
+        result[key] = value
+    return result
+
+
+def _invalid_json_constant(value: str) -> None:
+    raise ValueError("invalid manifest constant")
+
+
+def _read_strict_manifest(
+    path: Path, adapter: _CacheRuntimeAdapter,
+) -> dict[str, object]:
+    metadata = path.stat(follow_symlinks=False)
+    if metadata.st_size > 4096:
+        raise ValueError("manifest is oversized")
+    raw = adapter.read_private_text(path)
+    parsed = json.loads(
+        raw,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_invalid_json_constant,
+    )
+    if type(parsed) is not dict:
+        raise ValueError("manifest must be an object")
+    return parsed
+
+
+def _is_valid_manifest(manifest: dict[str, object], directory_name: str) -> bool:
+    return (
+        frozenset(manifest) == _CACHE_SCHEMA_KEYS
+        and type(manifest.get("schema_version")) is int
+        and manifest["schema_version"] == 1
+        and type(manifest.get("sha256")) is str
+        and manifest["sha256"] == directory_name
+        and type(manifest.get("publisher")) is str
+        and manifest["publisher"] == OPENAI_AUTHENTICODE_PUBLISHER
+        and type(manifest.get("target")) is str
+        and manifest["target"] == "codex.exe"
+        and type(manifest.get("size")) is int
+        and manifest["size"] >= 0
+    )
+
+
+def _sanitized_smoke_environment() -> dict[str, str]:
+    keep = {"SYSTEMROOT", "WINDIR", "TEMP", "TMP"}
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() in keep and type(value) is str and "\x00" not in value
+    }
+
+
+def _remove_owned_tree(path: Path) -> None:
+    if not path.name.startswith(".staging-") and not (
+        len(path.name) == 64
+        and all(character in "0123456789abcdef" for character in path.name)
+    ):
+        return
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
+        return
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if stat.S_ISLNK(metadata.st_mode) or attributes & reparse:
+        if stat.S_ISDIR(metadata.st_mode):
+            path.rmdir()
+        else:
+            path.unlink()
+        return
+    shutil.rmtree(path)
+
+
+def _attempt_owned_cleanup(paths: tuple[Path, ...]) -> BaseException | None:
+    first: BaseException | None = None
+    priority: BaseException | None = None
+    for path in paths:
+        try:
+            _remove_owned_tree(path)
+        except BaseException as error:
+            if first is None:
+                first = error
+            if priority is None and _is_priority_failure(error):
+                priority = error
+    return priority or first
 
 
 def _final_path_has_fixed_layout(
@@ -412,6 +829,8 @@ if os.name == "nt":
     _kernel32.SetFilePointerEx.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     _kernel32.CloseHandle.restype = wintypes.BOOL
+    _kernel32.FlushFileBuffers.argtypes = [wintypes.HANDLE]
+    _kernel32.FlushFileBuffers.restype = wintypes.BOOL
 
     _wintrust.WinVerifyTrust.argtypes = [
         wintypes.HWND, ctypes.POINTER(_GUID), ctypes.c_void_p
@@ -699,10 +1118,180 @@ def _verify_wintrust_publisher(descriptor: int, path: Path) -> str:
         _raise_signature_not_trusted()
     raise AssertionError("unreachable")
 
+
+class _WindowsCacheRuntimeAdapter:
+    def __init__(self, *, _runtime_adapter: _RuntimeAdapter | None = None) -> None:
+        if os.name != "nt":
+            raise OSError("private Codex runtime is only available on Windows")
+        self._runtime = _runtime_adapter or _WindowsRuntimeAdapter()
+
+    def prepare_private_directory(self, path: Path) -> Path:
+        from .private_paths import PrivatePathError, prepare_private_directory
+
+        try:
+            return prepare_private_directory(path)
+        except (OSError, PrivatePathError):
+            raise OSError("private runtime directory is unsafe") from None
+
+    def validate_private_directory(self, path: Path) -> None:
+        from .private_paths import PrivatePathError, prepare_private_directory
+
+        try:
+            before = path.stat(follow_symlinks=False)
+            prepared = prepare_private_directory(path)
+            after = prepared.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(after.st_mode)
+                or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            ):
+                raise OSError("private runtime directory is unsafe")
+        except (OSError, PrivatePathError):
+            raise OSError("private runtime directory is unsafe") from None
+
+    def protect_private_file(self, path: Path) -> None:
+        from .setup_store import _protect_private_file
+
+        _protect_private_file(path)
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]:
+        from .setup_store import _validate_regular_file
+
+        return _validate_regular_file(path)
+
+    def read_private_text(self, path: Path) -> str:
+        from .setup_store import _read_nofollow
+
+        return _read_nofollow(path)
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]:
+        descriptor = self._runtime.open_locked(path)
+        primary: BaseException | None = None
+        primary_traceback = None
+        result: tuple[NativeCodexIdentity, str] | None = None
+        try:
+            if not self._runtime.is_disk_regular_non_reparse(descriptor):
+                raise OSError("private Codex executable is unsafe")
+            initial = self._runtime.identity(descriptor)
+            final_path = self._runtime.final_path(descriptor)
+            if not self._runtime.same_file(final_path, path):
+                raise OSError("private Codex executable changed")
+            publisher = self._runtime.verify_publisher(descriptor, final_path)
+            if publisher != OPENAI_AUTHENTICODE_PUBLISHER:
+                raise OSError("private Codex publisher is invalid")
+            if self._runtime.identity(descriptor) != initial:
+                raise OSError("private Codex executable changed")
+            result = initial, publisher
+        except BaseException as error:
+            primary = error
+            primary_traceback = error.__traceback__
+        cleanup: BaseException | None = None
+        cleanup_traceback = None
+        try:
+            self._runtime.close(descriptor)
+        except BaseException as error:
+            cleanup = error
+            cleanup_traceback = error.__traceback__
+        if primary is not None:
+            if _is_priority_failure(primary):
+                raise primary.with_traceback(primary_traceback)
+            if cleanup is not None and _is_priority_failure(cleanup):
+                raise cleanup.with_traceback(cleanup_traceback)
+            raise primary.with_traceback(primary_traceback)
+        if cleanup is not None:
+            raise cleanup.with_traceback(cleanup_traceback)
+        assert result is not None
+        return result
+
+    def fsync_directory(self, path: Path) -> None:
+        handle = _kernel32.CreateFileW(
+            str(path),
+            0x40000000,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        if handle == _INVALID_HANDLE_VALUE:
+            _raise_last_windows_error("could not open private runtime directory")
+        descriptor = int(handle)
+        primary: BaseException | None = None
+        try:
+            if not _kernel32.FlushFileBuffers(wintypes.HANDLE(descriptor)):
+                _raise_last_windows_error("could not flush private runtime directory")
+        except BaseException as error:
+            primary = error
+        try:
+            self._runtime.close(descriptor)
+        except BaseException:
+            if primary is None:
+                raise
+        if primary is not None:
+            raise primary
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None:
+        _run_bounded_smoke(executable, environment=environment, timeout=timeout)
+
+
+def _run_bounded_smoke(
+    executable: Path, *, environment: dict[str, str], timeout: float,
+) -> None:
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    process = subprocess.Popen(
+        [str(executable), "--version"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        env=environment,
+        creationflags=creationflags,
+    )
+    output = bytearray()
+    overflow = threading.Event()
+
+    def drain() -> None:
+        assert process.stdout is not None
+        while True:
+            chunk = process.stdout.read(8192)
+            if not chunk:
+                return
+            if len(output) + len(chunk) > 64 * 1024:
+                overflow.set()
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                return
+            output.extend(chunk)
+
+    reader = threading.Thread(target=drain, daemon=True)
+    reader.start()
+    try:
+        returncode = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            process.kill()
+        finally:
+            process.wait()
+        raise OSError("private Codex runtime smoke test failed") from None
+    finally:
+        reader.join(timeout=1.0)
+    if reader.is_alive() or overflow.is_set() or returncode != 0:
+        try:
+            process.kill()
+        except OSError:
+            pass
+        raise OSError("private Codex runtime smoke test failed")
+
 __all__ = [
     "OPENAI_AUTHENTICODE_PUBLISHER",
     "NATIVE_CODEX_RELATIVE_PATH",
     "LockedNativeCodex",
     "NativeCodexIdentity",
+    "CodexRuntimePreparer",
     "discover_locked_native_codex",
 ]

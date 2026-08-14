@@ -61,14 +61,12 @@ def test_codex_command_rejects_empty_or_nul_arguments(argument: str) -> None:
         command.argv(argument)
 
 
-def test_task_2a_resolver_never_returns_or_executes_an_external_prefix(
-    monkeypatch: pytest.MonkeyPatch,
+def test_resolver_returns_only_prepared_private_native_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[str] = []
-
-    class Locked:
-        def close(self) -> None:
-            events.append("closed")
+    executable = (tmp_path / "private" / "codex.exe").resolve()
+    executable.parent.mkdir()
+    executable.write_bytes(b"verified")
 
     def forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("Node, JS, cmd, ps1, and shell execution is forbidden")
@@ -77,22 +75,15 @@ def test_task_2a_resolver_never_returns_or_executes_an_external_prefix(
     monkeypatch.setattr(codex_runner_module.subprocess, "run", forbidden)
     monkeypatch.setattr(codex_runner_module.os, "system", forbidden)
 
-    with pytest.raises(
-        codex_runner_module.CodexProcessStartError,
-        match="^Codex executable is unavailable$",
-    ) as caught:
-        codex_runner_module.resolve_codex_command(
-            _discover=lambda: Locked(),  # type: ignore[arg-type]
-        )
+    command = codex_runner_module.resolve_codex_command(_prepare=lambda: executable)
 
-    assert events == ["closed"]
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    assert command.prefix == (str(executable),)
+    assert command.argv("exec") == [str(executable), "exec"]
 
 
-def test_resolver_sanitizes_discovery_failure_and_project_traceback_locals() -> None:
-    callable_canary = "discover-callable-canary"
-    failure_canary = "native-path-failure-canary"
+def test_resolver_sanitizes_preparation_failure_and_project_traceback_locals() -> None:
+    callable_canary = "prepare-callable-canary"
+    failure_canary = "private-path-failure-canary"
 
     class Discovery:
         def __repr__(self) -> str:
@@ -102,7 +93,7 @@ def test_resolver_sanitizes_discovery_failure_and_project_traceback_locals() -> 
             raise OSError(f"C:/sensitive/{failure_canary}/codex.exe")
 
     with pytest.raises(codex_runner_module.CodexProcessStartError) as caught:
-        codex_runner_module.resolve_codex_command(_discover=Discovery())
+        codex_runner_module.resolve_codex_command(_prepare=Discovery())
 
     assert str(caught.value) == "Codex executable is unavailable"
     assert caught.value.__cause__ is None
@@ -132,41 +123,42 @@ def test_resolver_sanitizes_discovery_failure_and_project_traceback_locals() -> 
     ],
 )
 def test_resolver_preserves_memory_and_control_flow(control_flow: BaseException) -> None:
-    def discover() -> object:
+    def prepare() -> object:
         raise control_flow
 
     with pytest.raises(type(control_flow)):
-        codex_runner_module.resolve_codex_command(_discover=discover)
+        codex_runner_module.resolve_codex_command(_prepare=prepare)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize("error_type", [AssertionError, TypeError, AttributeError])
-def test_resolver_preserves_internal_discovery_failures(
+def test_resolver_preserves_internal_preparation_failures(
     error_type: type[Exception],
 ) -> None:
     internal = error_type("internal-discovery-canary")
 
-    def discover() -> object:
+    def prepare() -> object:
         raise internal
 
     with pytest.raises(error_type) as caught:
-        codex_runner_module.resolve_codex_command(_discover=discover)
+        codex_runner_module.resolve_codex_command(_prepare=prepare)  # type: ignore[arg-type]
 
     assert caught.value is internal
 
 
-def test_resolver_preserves_internal_locked_handle_close_failure() -> None:
-    internal = TypeError("internal-close-canary")
-
-    class Locked:
-        def close(self) -> None:
-            raise internal
-
-    with pytest.raises(TypeError) as caught:
-        codex_runner_module.resolve_codex_command(
-            _discover=lambda: Locked(),  # type: ignore[arg-type]
-        )
-
-    assert caught.value is internal
+@pytest.mark.parametrize(
+    "prefix",
+    [
+        (r"C:\\private\\node.exe", r"C:\\private\\codex.js"),
+        (r"C:\\private\\codex.cmd",),
+        (r"C:\\private\\codex.ps1",),
+        (r"C:\\private\\node.exe",),
+    ],
+)
+def test_codex_command_rejects_non_native_or_multi_component_prefix(
+    prefix: tuple[str, ...],
+) -> None:
+    with pytest.raises(ValueError):
+        codex_runner_module.CodexCommand(prefix)
 
 
 def test_codex_auth_source_accepts_environment_auth_without_returning_secret() -> None:
@@ -291,8 +283,15 @@ def _runner(root: Path, executor: FakeExecutor, repository: FakeRepository | Non
     )
 
 
-def test_default_runner_fails_closed_before_bare_path_execution(tmp_path: Path) -> None:
+def test_default_runner_fails_closed_when_private_runtime_preparation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     executor = FakeExecutor()
+    monkeypatch.setattr(
+        codex_runner_module.CodexRuntimePreparer,
+        "prepare",
+        lambda self: (_ for _ in ()).throw(OSError("unavailable")),
+    )
     runner = CodexRunner(
         run_root=(tmp_path / "runs").resolve(),
         repository=FakeRepository(),
