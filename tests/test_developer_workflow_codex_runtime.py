@@ -316,7 +316,9 @@ def test_startup_preserves_actively_locked_owned_stage(tmp_path: Path) -> None:
     active = root / (".staging-" + "e" * 32)
     active.mkdir()
     adapter = FakeCacheAdapter()
-    lease = codex_runtime_module._StagingLease.acquire(active, adapter)
+    lease = codex_runtime_module._StagingLease.acquire(
+        root, "e" * 32, adapter,
+    )
     try:
         executable = _prepare_runtime(
             root, FakeLockedSource(b"fresh-beside-active"), adapter,
@@ -325,19 +327,102 @@ def test_startup_preserves_actively_locked_owned_stage(tmp_path: Path) -> None:
         assert active.is_dir()
     finally:
         lease.close()
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+    assert not lease.path.exists()
+
+
+def test_external_lease_closes_mkdir_race_window(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    adapter = FakeCacheAdapter()
+    token = "c" * 32
+    lease = codex_runtime_module._StagingLease.acquire(root, token, adapter)
+    try:
+        assert lease.path == root / f".lease-{token}"
+        assert not (root / f".staging-{token}").exists()
+        codex_runtime_module.CodexRuntimePreparer(
+            cache_root=root,
+            discover=FakeLockedSource,
+            _cache_adapter=adapter,  # type: ignore[arg-type]
+        )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+        assert lease.path.is_file()
+    finally:
+        lease.close()
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+    assert not lease.path.exists()
+
+
+def test_startup_removes_orphan_stage_without_lease(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    orphan = root / (".staging-" + "9" * 32)
+    orphan.mkdir()
+    (orphan / "codex.exe").write_bytes(b"incomplete")
+
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+    )._cleanup_stale_owned_entries(root, FakeCacheAdapter())  # type: ignore[arg-type]
+
+    assert not orphan.exists()
+
+
+def test_symlinked_external_lease_and_paired_stage_fail_closed(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    token = "8" * 32
+    stage = root / f".staging-{token}"
+    stage.mkdir()
+    target = tmp_path / "outside.lock"
+    target.write_bytes(f"ones-dev-stage-v2:{token}\n".encode("ascii"))
+    lease = root / f".lease-{token}"
+    try:
+        lease.symlink_to(target)
+    except OSError as error:
+        pytest.skip(f"symlink creation unavailable: {error}")
+    class NoSymlinkAdapter(FakeCacheAdapter):
+        def validate_private_file(self, path: Path) -> tuple[int, int]:
+            if path.is_symlink():
+                raise OSError("unsafe symlink")
+            return super().validate_private_file(path)
+
+    adapter = NoSymlinkAdapter()
+
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+
+    assert lease.is_symlink()
+    assert stage.is_dir()
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows delete-share lease invariant")
 def test_windows_staging_lease_survives_directory_publish(tmp_path: Path) -> None:
-    stage = tmp_path / (".staging-" + "f" * 32)
+    token = "f" * 32
+    stage = tmp_path / f".staging-{token}"
     final = tmp_path / ("a" * 64)
     stage.mkdir()
-    lease_path = tmp_path / f"{stage.name}.lock"
+    lease_path = tmp_path / f".lease-{token}"
     stream = codex_runtime_module._open_staging_lease(
         lease_path, create=True, native_windows=True,
     )
     try:
-        codex_runtime_module._write_all(stream, b"ones-dev-stage-v1\n")
+        codex_runtime_module._write_all(
+            stream, f"ones-dev-stage-v2:{token}\n".encode("ascii"),
+        )
         stream.seek(0)
         codex_runtime_module._lock_staging_descriptor(stream.fileno())
         os.replace(stage, final)
@@ -955,12 +1040,12 @@ def test_preparer_cleans_private_owned_incomplete_cache_and_retries(
 
     assert executable == (root / digest / "codex.exe").resolve(strict=True)
     if stale_kind == "random":
-        assert stale.is_dir()
+        assert not stale.exists()
     else:
         assert stale == executable.parent
 
 
-def test_preparer_ignores_potentially_active_random_staging_directory(
+def test_preparer_cleans_orphan_random_staging_directory(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "ones-dev" / "codex-runtime"
@@ -974,8 +1059,7 @@ def test_preparer_ignores_potentially_active_random_staging_directory(
     )
 
     assert executable.is_file()
-    assert active.is_dir()
-    assert (active / "codex.exe").read_bytes() == b"possibly-active"
+    assert not active.exists()
 
 
 def test_incomplete_hash_directory_is_validated_before_manifest_lookup(
@@ -1559,6 +1643,122 @@ def test_zero_length_destination_write_fails_closed() -> None:
 
     with pytest.raises(OSError, match="write failed"):
         codex_runtime_module._write_all(StalledWriter(), b"payload")
+
+
+def test_fixed_execution_verifier_uses_fresh_os_adapters_not_lease_callbacks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"fixed-os-verified"
+    digest = hashlib.sha256(payload).hexdigest()
+    profile = tmp_path / "profile"
+    path = (
+        profile / "AppData" / "Local" / "ones-dev" / "codex-runtime"
+        / digest / "codex.exe"
+    )
+    path.parent.mkdir(parents=True)
+    path.write_bytes(payload)
+    metadata = path.stat()
+    identity = NativeCodexIdentity(
+        metadata.st_dev, metadata.st_ino, metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+    manifest = {
+        "publisher": OPENAI_AUTHENTICODE_PUBLISHER,
+        "schema_version": 1,
+        "sha256": digest,
+        "size": len(payload),
+        "source_identity": codex_runtime_module._identity_manifest(identity),
+        "target": "codex.exe",
+    }
+    (path.parent / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8",
+    )
+
+    class FixedRuntime:
+        final = path
+
+        def __init__(self, *, poison: bool = False) -> None:
+            self.poison = poison
+            self.offset = 0
+
+        def _safe(self) -> None:
+            if self.poison:
+                raise AssertionError("lease runtime callback was trusted")
+
+        def is_disk_regular_non_reparse(self, descriptor: object) -> bool:
+            self._safe()
+            return descriptor == 41
+
+        def identity(self, descriptor: object) -> NativeCodexIdentity:
+            self._safe()
+            return identity
+
+        def final_path(self, descriptor: object) -> Path:
+            self._safe()
+            return self.final
+
+        def same_file(self, left: Path, right: Path) -> bool:
+            self._safe()
+            return left == right
+
+        def rewind(self, descriptor: object) -> None:
+            self._safe()
+            self.offset = 0
+
+        def read(self, descriptor: object, size: int) -> bytes:
+            self._safe()
+            chunk = payload[self.offset : self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+        def verify_publisher(self, descriptor: object, target: Path) -> str:
+            self._safe()
+            return OPENAI_AUTHENTICODE_PUBLISHER
+
+    class FixedCache:
+        def __init__(
+            self, *, _runtime_adapter: object | None = None, poison: bool = False,
+        ) -> None:
+            self.poison = poison
+
+        def _safe(self) -> None:
+            if self.poison:
+                raise AssertionError("lease cache callback was trusted")
+
+        def validate_cache_ancestor_chain(self, root: Path) -> None:
+            self._safe()
+
+        def validate_private_directory(self, directory: Path) -> None:
+            self._safe()
+            assert directory.is_dir()
+
+        def validate_private_file(self, target: Path) -> tuple[int, int]:
+            self._safe()
+            current = target.stat()
+            return current.st_dev, current.st_ino
+
+        def read_private_text(self, target: Path) -> str:
+            self._safe()
+            return target.read_text("utf-8")
+
+    monkeypatch.setattr(codex_runtime_module, "_WindowsRuntimeAdapter", FixedRuntime)
+    monkeypatch.setattr(codex_runtime_module, "_WindowsCacheRuntimeAdapter", FixedCache)
+    monkeypatch.setattr(codex_runtime_module.os, "name", "nt")
+    monkeypatch.setenv(
+        "LOCALAPPDATA", str((profile / "AppData" / "Local").resolve()),
+    )
+    lease = codex_runtime_module.LockedPrivateCodex(
+        path=path.resolve(strict=True),
+        identity=identity,
+        sha256=digest,
+        source_identity=identity,
+        _cache_root=path.parent.parent.resolve(strict=True),
+        _cache_adapter=FixedCache(poison=True),  # type: ignore[arg-type]
+        _descriptor=41,
+        _runtime_adapter=FixedRuntime(poison=True),  # type: ignore[arg-type]
+    )
+
+    codex_runtime_module.verify_locked_private_codex_for_execution(lease)
 
 
 def _install_fake_smoke_process(

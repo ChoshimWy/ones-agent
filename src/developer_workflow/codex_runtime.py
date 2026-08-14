@@ -128,32 +128,25 @@ class _StagingLease:
     @classmethod
     def acquire(
         cls,
-        directory: Path,
+        root: Path,
+        token: str,
         adapter: _CacheRuntimeAdapter,
         *,
         create: bool = True,
     ) -> _StagingLease:
-        sibling = directory.parent / f"{directory.name}.lock"
-        paths = (sibling,) if create else (sibling, directory / ".stage.lock")
-        stream = None
+        if not _is_stage_token(token):
+            raise ValueError("private runtime staging token is invalid")
+        path = root / f".lease-{token}"
         rename_safe = os.name == "nt" and isinstance(
             adapter, _WindowsCacheRuntimeAdapter,
         )
-        path = paths[0]
-        for candidate in paths:
-            path = candidate
-            try:
-                stream = _open_staging_lease(
-                    path, create=create, native_windows=rename_safe,
-                )
-                break
-            except FileNotFoundError:
-                if candidate == paths[-1]:
-                    raise
-        assert stream is not None
+        stream = _open_staging_lease(
+            path, create=create, native_windows=rename_safe,
+        )
+        record = f"ones-dev-stage-v2:{token}\n".encode("ascii")
         try:
             if create:
-                _write_all(stream, b"ones-dev-stage-v1\n")
+                _write_all(stream, record)
                 stream.flush()
                 os.fsync(stream.fileno())
                 adapter.protect_private_file(path)
@@ -161,7 +154,7 @@ class _StagingLease:
             stream.seek(0)
             _lock_staging_descriptor(stream.fileno())
             stream.seek(0)
-            if stream.read(64) != b"ones-dev-stage-v1\n":
+            if stream.read(96) != record:
                 raise OSError("private runtime staging lease is invalid")
             stream.seek(0)
             return cls(
@@ -386,6 +379,104 @@ class LockedPrivateCodex:
             self._runtime_adapter.close(self._descriptor)  # type: ignore[arg-type]
         else:
             self._descriptor.close()  # type: ignore[attr-defined]
+
+
+def verify_locked_private_codex_for_execution(
+    lease: LockedPrivateCodex,
+) -> None:
+    """Authorize execution using fresh OS checks, never lease callbacks."""
+
+    if (
+        os.name != "nt"
+        or type(lease) is not LockedPrivateCodex
+        or lease._closed
+        or type(lease._runtime_adapter) is not _WindowsRuntimeAdapter
+        or type(lease._cache_adapter) is not _WindowsCacheRuntimeAdapter
+    ):
+        raise OSError("private Codex OS verification failed")
+    runtime = _WindowsRuntimeAdapter()
+    cache = _WindowsCacheRuntimeAdapter(_runtime_adapter=runtime)
+    try:
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if (
+            type(local_app_data) is not str
+            or not local_app_data
+            or "\x00" in local_app_data
+            or not Path(local_app_data).is_absolute()
+        ):
+            raise OSError("private Codex OS verification failed")
+        expected_root = (
+            Path(local_app_data) / "ones-dev" / "codex-runtime"
+        ).resolve(strict=True)
+        path = lease.path.resolve(strict=True)
+        root = lease._cache_root.resolve(strict=True)
+        if (
+            root != expected_root
+            or path.parent.parent != root
+            or path.parent.name != lease.sha256
+            or path.name.casefold() != "codex.exe"
+            or not _is_sha256(lease.sha256)
+        ):
+            raise OSError("private Codex OS verification failed")
+        cache.validate_cache_ancestor_chain(root)
+        cache.validate_private_directory(root.parent)
+        cache.validate_private_directory(root)
+        cache.validate_private_directory(path.parent)
+        cache.validate_private_file(path)
+        quarantine = root / (
+            f"{_QUARANTINE_PREFIX}{lease.sha256}{_QUARANTINE_SUFFIX}"
+        )
+        try:
+            quarantine.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            raise OSError("private Codex OS verification failed")
+
+        descriptor = lease._descriptor
+        if not runtime.is_disk_regular_non_reparse(descriptor):  # type: ignore[arg-type]
+            raise OSError("private Codex OS verification failed")
+        initial = runtime.identity(descriptor)  # type: ignore[arg-type]
+        final_path = runtime.final_path(descriptor)  # type: ignore[arg-type]
+        if (
+            initial != lease.identity
+            or not runtime.same_file(final_path, path)
+        ):
+            raise OSError("private Codex OS verification failed")
+
+        manifest_path = path.parent / "manifest.json"
+        manifest_identity = cache.validate_private_file(manifest_path)
+        manifest = _read_strict_manifest(manifest_path, cache)
+        if (
+            cache.validate_private_file(manifest_path) != manifest_identity
+            or not _is_valid_manifest(manifest, lease.sha256)
+            or _source_identity_from_manifest(manifest) != lease.source_identity
+            or manifest["size"] != initial.size
+        ):
+            raise OSError("private Codex OS verification failed")
+
+        runtime.rewind(descriptor)  # type: ignore[arg-type]
+        if _hash_runtime_descriptor(runtime, descriptor) != lease.sha256:
+            raise OSError("private Codex OS verification failed")
+        if runtime.identity(descriptor) != initial:  # type: ignore[arg-type]
+            raise OSError("private Codex OS verification failed")
+        if (
+            runtime.verify_publisher(descriptor, final_path)  # type: ignore[arg-type]
+            != OPENAI_AUTHENTICODE_PUBLISHER
+            or runtime.identity(descriptor) != initial  # type: ignore[arg-type]
+            or not runtime.same_file(
+                runtime.final_path(descriptor), path,  # type: ignore[arg-type]
+            )
+        ):
+            raise OSError("private Codex OS verification failed")
+        cache.validate_private_file(path)
+        try:
+            quarantine.lstat()
+        except FileNotFoundError:
+            return
+        raise OSError("private Codex OS verification failed")
+    except (AttributeError, OSError, TypeError, ValueError):
+        raise OSError("private Codex OS verification failed") from None
 
 
 def _runtime_attestation_mac(
@@ -679,7 +770,8 @@ class CodexRuntimePreparer:
         *,
         quarantine: Path | None = None,
     ) -> Path:
-        staging = root / f".staging-{uuid.uuid4().hex}"
+        staging_token = uuid.uuid4().hex
+        staging = root / f".staging-{staging_token}"
         final_directory = root / source_sha256
         write_ahead = root / (
             f"{_QUARANTINE_PREFIX}{source_sha256}{_QUARANTINE_SUFFIX}"
@@ -693,9 +785,12 @@ class CodexRuntimePreparer:
         primary_traceback = None
         staging_lease: _StagingLease | None = None
         try:
+            staging_lease = _StagingLease.acquire(
+                root, staging_token, adapter,
+            )
+            adapter.fsync_directory(root)
             staging.mkdir(exist_ok=False)
             adapter.prepare_private_directory(staging)
-            staging_lease = _StagingLease.acquire(staging, adapter)
             temporary = staging / f"codex-{uuid.uuid4().hex}.tmp"
             digest = hashlib.sha256()
             copied = 0
@@ -764,35 +859,31 @@ class CodexRuntimePreparer:
                         raise
                     _remove_owned_tree(final_directory)
                     adapter.fsync_directory(root)
-                    if not staging_lease._rename_safe:
+                    os.replace(staging, final_directory)
+                    published_final = final_directory
+                    if staging_lease._rename_safe:
+                        staging_lease.path.unlink()
+                        staging_lease.close()
+                    else:
                         lease_path = staging_lease.path
                         staging_lease.close()
-                        staging_lease = None
                         lease_path.unlink()
-                    os.replace(staging, final_directory)
-                    if staging_lease is not None:
-                        staging_lease.path.unlink()
-                    if staging_lease is not None:
-                        staging_lease.close()
-                        staging_lease = None
-                    published_final = final_directory
+                    staging_lease = None
                     adapter.fsync_directory(root)
                     result = self._validate_cache_directory(
                         final_directory, sha256, adapter, smoke=False,
                     )
             else:
-                if not staging_lease._rename_safe:
+                os.replace(staging, final_directory)
+                published_final = final_directory
+                if staging_lease._rename_safe:
+                    staging_lease.path.unlink()
+                    staging_lease.close()
+                else:
                     lease_path = staging_lease.path
                     staging_lease.close()
-                    staging_lease = None
                     lease_path.unlink()
-                os.replace(staging, final_directory)
-                if staging_lease is not None:
-                    staging_lease.path.unlink()
-                if staging_lease is not None:
-                    staging_lease.close()
-                    staging_lease = None
-                published_final = final_directory
+                staging_lease = None
                 adapter.fsync_directory(root)
                 result = self._validate_cache_directory(
                     final_directory, sha256, adapter, smoke=False,
@@ -873,7 +964,7 @@ class CodexRuntimePreparer:
                 staging_lease.close()
                 if (
                     lease_path.parent == root
-                    and lease_path.name == f"{staging.name}.lock"
+                    and lease_path.name == f".lease-{staging_token}"
                 ):
                     lease_path.unlink(missing_ok=True)
             except BaseException as error:
@@ -1117,7 +1208,71 @@ class CodexRuntimePreparer:
     def _cleanup_stale_owned_entries(
         self, root: Path, adapter: _CacheRuntimeAdapter,
     ) -> None:
-        for candidate in tuple(root.iterdir()):
+        entries = tuple(root.iterdir())
+        leased_tokens: set[str] = set()
+        for candidate in entries:
+            name = candidate.name
+            if not name.startswith(".lease-"):
+                continue
+            token = name[len(".lease-") :]
+            if not _is_stage_token(token):
+                continue
+            leased_tokens.add(token)
+            lease: _StagingLease | None = None
+            try:
+                adapter.validate_private_file(candidate)
+                lease = _StagingLease.acquire(
+                    root, token, adapter, create=False,
+                )
+            except BlockingIOError:
+                continue
+            except BaseException as error:
+                if _is_priority_failure(error):
+                    raise
+                if not isinstance(error, (OSError, ValueError)):
+                    raise
+                continue
+            stage = root / f".staging-{token}"
+            stage_safe = True
+            try:
+                try:
+                    stage.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    adapter.validate_private_directory(stage)
+                    children = tuple(stage.iterdir())
+                    if any(
+                        not _is_owned_staging_child(child)
+                        for child in children
+                    ):
+                        stage_safe = False
+                    else:
+                        for child in children:
+                            adapter.validate_private_file(child)
+                        cleanup = _attempt_owned_cleanup((stage,))
+                        if cleanup is not None:
+                            raise cleanup
+            except BaseException as error:
+                stage_safe = False
+                if _is_priority_failure(error):
+                    raise
+                if not isinstance(error, (OSError, ValueError)):
+                    raise
+            finally:
+                lease.close()
+            if not stage_safe:
+                continue
+            try:
+                candidate.unlink()
+                adapter.fsync_directory(root)
+            except BaseException as error:
+                if _is_priority_failure(error):
+                    raise
+                if not isinstance(error, OSError):
+                    raise
+
+        for candidate in entries:
             name = candidate.name
             random_stage = (
                 name.startswith(".staging-")
@@ -1129,38 +1284,25 @@ class CodexRuntimePreparer:
                 and all(character in "0123456789abcdef" for character in name)
             )
             if random_stage:
+                token = name[len(".staging-") :]
+                if token in leased_tokens:
+                    continue
                 try:
                     adapter.validate_private_directory(candidate)
-                    lease = _StagingLease.acquire(
-                        candidate, adapter, create=False,
-                    )
-                except BlockingIOError:
-                    continue
-                except BaseException as error:
-                    if _is_priority_failure(error):
-                        raise
-                    if not isinstance(error, (OSError, ValueError)):
-                        raise
-                    continue
-                try:
                     children = tuple(candidate.iterdir())
                     if any(not _is_owned_staging_child(child) for child in children):
                         continue
                     for child in children:
                         adapter.validate_private_file(child)
-                finally:
-                    lease.close()
-                cleanup = _attempt_owned_cleanup((candidate,))
-                if cleanup is not None:
-                    if _is_priority_failure(cleanup):
+                    cleanup = _attempt_owned_cleanup((candidate,))
+                    if cleanup is not None:
                         raise cleanup
-                    continue
-                if lease.path.parent == root:
-                    try:
-                        lease.path.unlink()
-                    except FileNotFoundError:
-                        pass
-                adapter.fsync_directory(root)
+                    adapter.fsync_directory(root)
+                except BaseException as error:
+                    if _is_priority_failure(error):
+                        raise
+                    if not isinstance(error, (OSError, ValueError)):
+                        raise
                 continue
             if not deterministic_name:
                 continue
@@ -1328,6 +1470,14 @@ def _unlock_staging_descriptor(descriptor: int) -> None:
     import fcntl
 
     fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
+def _is_stage_token(value: str) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 32
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _is_owned_staging_child(path: Path) -> bool:

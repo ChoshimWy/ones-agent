@@ -29,6 +29,7 @@ from .codex_runtime import (
     LockedPrivateCodex,
     NativeCodexIdentity,
     _PreparedCodexRuntime,
+    verify_locked_private_codex_for_execution,
 )
 from .contracts import (
     AcceptanceCoverage,
@@ -193,7 +194,12 @@ class CodexCommand:
         return [*self.prefix, *arguments]
 
     def close(self) -> None:
-        self._lease.close()
+        try:
+            lease = self._lease
+        except AttributeError:
+            return
+        if type(lease) is LockedPrivateCodex:
+            lease.close()
 
     def __copy__(self) -> CodexCommand:
         return self
@@ -1485,15 +1491,25 @@ class CodexRunner:
             raise UnsafeCodexRunError("prompt contains credential material")
         self._write_prompt(run_directory / "codex-prompt.txt", prompt_bytes)
         resolved_command = self.command_resolver()
-        if (
-            type(resolved_command) is not CodexCommand
-            or not resolved_command._is_attested()
-        ):
+        if type(resolved_command) is not CodexCommand:
             _raise_codex_executable_unavailable()
         execution_error: BaseException | None = None
         execution_traceback = None
         completed: subprocess.CompletedProcess[str] | None = None
         try:
+            if not resolved_command._is_attested():
+                _raise_codex_executable_unavailable()
+            verification_failed = False
+            try:
+                verify_locked_private_codex_for_execution(
+                    resolved_command._lease,
+                )
+            except BaseException as error:
+                if _is_priority_failure(error) or not isinstance(error, OSError):
+                    raise
+                verification_failed = True
+            if verification_failed:
+                _raise_codex_executable_unavailable()
             command = resolved_command.argv(
                 "exec", "--cd", str(effective_cwd), "--sandbox", sandbox,
                 "--output-schema", str(self.schema_path), "-",

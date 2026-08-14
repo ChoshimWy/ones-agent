@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import traceback
+from unittest import mock
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 
@@ -40,6 +41,23 @@ from src.developer_workflow.repository_group import PreparedRepository
 
 OID = "a" * 40
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+
+
+def _verify_test_execution_lease(lease: object) -> None:
+    if not lease.verify():  # type: ignore[attr-defined]
+        raise OSError("test execution lease is invalid")
+
+
+class _TestingCodexRunner(CodexRunner):
+    """Explicit test-only verifier seam; production CodexRunner is untouched."""
+
+    def _invoke(self, *args: object, **kwargs: object) -> tuple[str, tuple[str, ...]]:
+        with mock.patch.object(
+            codex_runner_module,
+            "verify_locked_private_codex_for_execution",
+            _verify_test_execution_lease,
+        ):
+            return super()._invoke(*args, **kwargs)  # type: ignore[arg-type]
 
 
 class _TinyLockedRuntime:
@@ -293,6 +311,7 @@ def test_command_mac_rejects_object_setattr_mutation_before_executor(
             prompt="safe prompt",
         )
     assert not executor.calls
+    assert command._lease._closed
 
 
 @pytest.mark.parametrize(
@@ -380,6 +399,114 @@ def test_reflection_cannot_issue_runtime_without_verified_locked_handle(
             nonce=runtime_module._RUNTIME_ATTESTATION_NONCE,
         )
     valid._lease.close()  # type: ignore[attr-defined]
+
+
+def test_production_os_verifier_rejects_test_adapter_lease(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.codex_runtime as runtime_module
+
+    command = _attested_command(tmp_path)
+    try:
+        with pytest.raises(OSError, match="OS verification"):
+            runtime_module.verify_locked_private_codex_for_execution(
+                command._lease,
+            )
+    finally:
+        command.close()
+
+
+def test_production_invoke_rejects_reflection_issued_fake_adapter_lease(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.codex_runtime as runtime_module
+
+    original = _verified_runtime(tmp_path)
+    reflected = runtime_module._PreparedCodexRuntime._issue(
+        original.path,  # type: ignore[attr-defined]
+        original.identity,  # type: ignore[attr-defined]
+        original.sha256,  # type: ignore[attr-defined]
+        original._cache_root,  # type: ignore[attr-defined]
+        original._lease,  # type: ignore[attr-defined]
+        nonce=runtime_module._RUNTIME_ATTESTATION_NONCE,
+    )
+    command = codex_runner_module.CodexCommand._from_runtime(reflected)
+    executor = FakeExecutor()
+    runner = CodexRunner(
+        run_root=(tmp_path / "runs").resolve(),
+        repository=FakeRepository(),
+        command_executor=executor,
+        command_resolver=lambda: command,
+    )
+
+    with pytest.raises(codex_runner_module.CodexProcessStartError):
+        runner.run(
+            _prepared(tmp_path), _mapping(tmp_path), run_id="reflected-lease",
+            prompt="safe prompt",
+        )
+    assert not executor.calls
+    assert command._lease._closed
+
+
+@pytest.mark.parametrize("mode", ["invalid", "backend", "control"])
+@pytest.mark.parametrize("cleanup_error", [OSError("close"), MemoryError("close")])
+def test_invoke_closes_lease_once_with_primary_cleanup_priority(
+    tmp_path: Path,
+    mode: str,
+    cleanup_error: BaseException,
+) -> None:
+    import src.developer_workflow.codex_runtime as runtime_module
+
+    command = _attested_command(tmp_path)
+    original_descriptor = command._lease._descriptor
+
+    class CountingDescriptor:
+        calls = 0
+
+        def fileno(self) -> int:
+            return original_descriptor.fileno()
+
+        def close(self) -> None:
+            self.calls += 1
+            raise cleanup_error
+
+    descriptor = CountingDescriptor()
+    object.__setattr__(command._lease, "_descriptor", descriptor)
+    object.__setattr__(
+        command._lease,
+        "_seal",
+        runtime_module._private_lease_mac(command._lease),
+    )
+    if mode == "invalid":
+        object.__setattr__(command, "prefix", ("invalid",))
+        primary_type: type[BaseException] = codex_runner_module.CodexProcessStartError
+        executor = FakeExecutor()
+    elif mode == "backend":
+        primary_type = codex_runner_module.CodexExecutionError
+        executor = FakeExecutor(error=RuntimeError("backend"))
+    else:
+        primary_type = KeyboardInterrupt
+        executor = FakeExecutor(error=KeyboardInterrupt())  # type: ignore[arg-type]
+    runner = _TestingCodexRunner(
+        run_root=(tmp_path / f"runs-{mode}").resolve(),
+        repository=FakeRepository(),
+        command_executor=executor,
+        command_resolver=lambda: command,
+    )
+    expected = (
+        MemoryError
+        if isinstance(cleanup_error, MemoryError) and mode != "control"
+        else primary_type
+    )
+    try:
+        with pytest.raises(expected):
+            runner.run(
+                _prepared(tmp_path), _mapping(tmp_path),
+                run_id=f"close-{mode}", prompt="safe prompt",
+            )
+        assert descriptor.calls == 1
+    finally:
+        original_descriptor.close()
 
 
 def test_runner_rejects_forged_unattested_command_before_executor(
@@ -521,7 +648,7 @@ class FakeExecutor:
 
 
 def _runner(root: Path, executor: FakeExecutor, repository: FakeRepository | None = None) -> CodexRunner:
-    return CodexRunner(
+    return _TestingCodexRunner(
         run_root=(root / "runs").resolve(), repository=repository or FakeRepository(),
         command_executor=executor,
         command_resolver=lambda: _attested_command(root),
@@ -538,7 +665,7 @@ def test_runner_holds_execution_lease_through_executor_then_closes_it(
             assert command._lease.verify()
             return super().__call__(*args, **kwargs)  # type: ignore[arg-type]
 
-    runner = CodexRunner(
+    runner = _TestingCodexRunner(
         run_root=(tmp_path / "runs").resolve(),
         repository=FakeRepository(),
         command_executor=CheckingExecutor(),
@@ -560,7 +687,7 @@ def test_default_runner_fails_closed_when_private_runtime_preparation_fails(
         "prepare_verified",
         lambda self: (_ for _ in ()).throw(OSError("unavailable")),
     )
-    runner = CodexRunner(
+    runner = _TestingCodexRunner(
         run_root=(tmp_path / "runs").resolve(),
         repository=FakeRepository(),
         command_executor=executor,
@@ -1640,7 +1767,7 @@ def test_run_accepts_explicit_local_test_and_read_only_commands(
 
 
 def test_run_rejects_oversized_prompt_and_output(tmp_path: Path) -> None:
-    runner = CodexRunner(
+    runner = _TestingCodexRunner(
         run_root=(tmp_path / "runs").resolve(), repository=FakeRepository(),
         command_executor=FakeExecutor(), max_prompt_bytes=8,
         command_resolver=lambda: _attested_command(tmp_path),
@@ -1649,7 +1776,7 @@ def test_run_rejects_oversized_prompt_and_output(tmp_path: Path) -> None:
         runner.run(_prepared(tmp_path), _mapping(tmp_path), run_id="run-1", prompt="too long prompt")
 
     executor = FakeExecutor(json.dumps(_payload(summary="x" * 500)))
-    runner = CodexRunner(
+    runner = _TestingCodexRunner(
         run_root=(tmp_path / "other-runs").resolve(), repository=FakeRepository(),
         command_executor=executor, max_output_bytes=100,
         command_resolver=lambda: _attested_command(tmp_path),
