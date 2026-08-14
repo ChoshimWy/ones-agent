@@ -1183,24 +1183,27 @@ def test_sandbox_cleanup_attempts_every_owned_resource_and_preserves_priority(
 
     secret = "task3-cleanup-secret"
     command = _attested_sandbox_command(tmp_path)
-    original_rmtree = requirement_module.shutil.rmtree
+    original_delete = requirement_module._SandboxDirectoryLease.delete_owned_tree
     original_close = CodexCommand.close
     events: list[str] = []
 
     def backend(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise RuntimeError("ordinary child failure")
 
-    def cleanup(path: Path) -> None:
-        events.append(f"cleanup:{path.name}")
-        original_rmtree(path)
+    def cleanup(lease: object) -> bool:
+        events.append(f"cleanup:{lease.path.name}")  # type: ignore[attr-defined]
+        result = original_delete(lease)  # type: ignore[arg-type]
         if len([event for event in events if event.startswith("cleanup:")]) == 1:
             raise cleanup_failure
+        return result
 
     def close(item: CodexCommand) -> None:
         events.append("close")
         original_close(item)
 
-    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(
+        requirement_module._SandboxDirectoryLease, "delete_owned_tree", cleanup
+    )
     monkeypatch.setattr(CodexCommand, "close", close)
     executor = SandboxCommandExecutor(
         permission_profile="managed",
@@ -1226,7 +1229,7 @@ def test_sandbox_cleanup_attempts_every_owned_resource_and_preserves_priority(
             *tmp_path.parent.glob(".ones-sandbox-probes-*"),
         ):
             if candidate.exists():
-                original_rmtree(candidate)
+                requirement_module.shutil.rmtree(candidate)
 
     assert len([event for event in events if event.startswith("cleanup:")]) == 2
     assert events[-1] == "close"
@@ -1256,25 +1259,28 @@ def test_sandbox_primary_priority_beats_cleanup_and_close_priority_and_scrubs_lo
     cleanup_failure = MemoryError()
     close_failure = SystemExit()
     command = _attested_sandbox_command(tmp_path)
-    original_rmtree = requirement_module.shutil.rmtree
+    original_delete = requirement_module._SandboxDirectoryLease.delete_owned_tree
     original_close = CodexCommand.close
     events: list[str] = []
 
     def backend(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise primary
 
-    def cleanup(path: Path) -> None:
-        events.append(f"cleanup:{path.name}")
-        original_rmtree(path)
+    def cleanup(lease: object) -> bool:
+        events.append(f"cleanup:{lease.path.name}")  # type: ignore[attr-defined]
+        result = original_delete(lease)  # type: ignore[arg-type]
         if len([event for event in events if event.startswith("cleanup:")]) == 1:
             raise cleanup_failure
+        return result
 
     def close(item: CodexCommand) -> None:
         events.append("close")
         original_close(item)
         raise close_failure
 
-    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(
+        requirement_module._SandboxDirectoryLease, "delete_owned_tree", cleanup
+    )
     monkeypatch.setattr(CodexCommand, "close", close)
     executor = SandboxCommandExecutor(
         permission_profile="managed",
@@ -1300,7 +1306,7 @@ def test_sandbox_primary_priority_beats_cleanup_and_close_priority_and_scrubs_lo
             *tmp_path.parent.glob(".ones-sandbox-probes-*"),
         ):
             if candidate.exists():
-                original_rmtree(candidate)
+                requirement_module.shutil.rmtree(candidate)
 
     assert caught.value is primary
     assert len([event for event in events if event.startswith("cleanup:")]) == 2
@@ -1321,22 +1327,25 @@ def test_sandbox_close_priority_beats_ordinary_cleanup_without_skipping_resource
 
     close_failure = GeneratorExit()
     command = _attested_sandbox_command(tmp_path)
-    original_rmtree = requirement_module.shutil.rmtree
+    original_delete = requirement_module._SandboxDirectoryLease.delete_owned_tree
     original_close = CodexCommand.close
     events: list[str] = []
 
-    def cleanup(path: Path) -> None:
-        events.append(f"cleanup:{path.name}")
-        original_rmtree(path)
+    def cleanup(lease: object) -> bool:
+        events.append(f"cleanup:{lease.path.name}")  # type: ignore[attr-defined]
+        result = original_delete(lease)  # type: ignore[arg-type]
         if len([event for event in events if event.startswith("cleanup:")]) == 1:
             raise RuntimeError("ordinary cleanup failure")
+        return result
 
     def close(item: CodexCommand) -> None:
         events.append("close")
         original_close(item)
         raise close_failure
 
-    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(
+        requirement_module._SandboxDirectoryLease, "delete_owned_tree", cleanup
+    )
     monkeypatch.setattr(CodexCommand, "close", close)
     executor = SandboxCommandExecutor(
         permission_profile="managed",
@@ -1362,7 +1371,7 @@ def test_sandbox_close_priority_beats_ordinary_cleanup_without_skipping_resource
             *tmp_path.parent.glob(".ones-sandbox-probes-*"),
         ):
             if candidate.exists():
-                original_rmtree(candidate)
+                requirement_module.shutil.rmtree(candidate)
 
     assert caught.value is close_failure
     assert len([event for event in events if event.startswith("cleanup:")]) == 2
@@ -1477,15 +1486,19 @@ def test_sandbox_temp_identity_swap_fails_closed_without_deleting_replacement(
         permission_profile="managed", codex_command=command, backend_executor=backend
     )
 
-    with pytest.raises(Exception, match="identity|changed|unsafe"):
+    with pytest.raises(Exception, match="identity|changed|unsafe|capability"):
         executor(
             ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
         )
 
     replacements = list(tmp_path.glob(".ones-sandbox-*"))
     try:
-        assert len(replacements) == 1
-        assert (replacements[0] / "foreign.txt").read_text("utf-8") == foreign_marker
+        if os.name == "nt":
+            assert swapped is False
+            assert replacements == []
+        else:
+            assert len(replacements) == 1
+            assert (replacements[0] / "foreign.txt").read_text("utf-8") == foreign_marker
     finally:
         for replacement in replacements:
             requirement_module.shutil.rmtree(replacement)
@@ -1537,6 +1550,7 @@ def test_sandbox_cwd_identity_swap_fails_before_next_backend_and_preserves_repla
             requirement_module.shutil.rmtree(moved)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows lease blocks replacement")
 def test_sandbox_directory_nofollow_lease_detects_path_replacement_without_deleting_it(
     tmp_path: Path,
 ) -> None:
@@ -1562,6 +1576,257 @@ def test_sandbox_directory_nofollow_lease_detects_path_replacement_without_delet
         requirement_module.shutil.rmtree(moved)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows share-mode contract")
+def test_windows_sandbox_directory_lease_blocks_rename_and_delete_but_allows_child_io(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    root = tmp_path / "leased-root"
+    renamed = tmp_path / "renamed-root"
+    root.mkdir()
+    lease = requirement_module._open_sandbox_directory_nofollow(
+        root, require_owner=True
+    )
+    try:
+        with pytest.raises(OSError):
+            root.rename(renamed)
+        with pytest.raises(OSError):
+            root.rmdir()
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                "from pathlib import Path; Path('child.txt').write_text('ok')",
+            ],
+            cwd=root,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+        assert completed.returncode == 0
+        assert (root / "child.txt").read_text("utf-8") == "ok"
+    finally:
+        lease.close()
+        for candidate in (root, renamed):
+            if candidate.exists():
+                requirement_module.shutil.rmtree(candidate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows native identity contract")
+def test_windows_sandbox_lease_rejects_handle_path_identity_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    root = tmp_path / "identity-root"
+    root.mkdir()
+    original_identity = requirement_module._windows_sandbox_handle_identity
+
+    def mismatched(handle: int, **kwargs: object) -> tuple[int, int, int, int]:
+        identity = original_identity(handle, **kwargs)
+        return identity[0], identity[1] + 1, identity[2], identity[3]
+
+    monkeypatch.setattr(
+        requirement_module, "_windows_sandbox_handle_identity", mismatched
+    )
+
+    with pytest.raises(OSError, match="identity"):
+        requirement_module._open_sandbox_directory_nofollow(root)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows backend lease gate")
+def test_windows_sandbox_backend_cannot_swap_cwd_while_guard_is_live(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "guarded-worktree"
+    renamed = tmp_path / "renamed-worktree"
+    worktree.mkdir()
+    attempted = False
+    blocked = False
+    restrictive = _simulated_restrictive_sandbox_backend([])
+
+    def backend(
+        argv: list[str], *, cwd: Path, env: dict[str, str], **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal attempted, blocked
+        completed = restrictive(argv, cwd=cwd, env=env, **kwargs)
+        if not attempted:
+            attempted = True
+            try:
+                worktree.rename(renamed)
+            except OSError:
+                blocked = True
+        return completed
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=backend,
+    )
+
+    completed = executor(
+        ["tool"], cwd=worktree, env={}, timeout=1, max_output_bytes=1024
+    )
+
+    assert completed.returncode == 0
+    assert attempted and blocked
+    assert worktree.is_dir()
+    assert not renamed.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows cleanup lease gate")
+def test_windows_cleanup_attacker_cannot_replace_owned_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    original_delete = requirement_module._SandboxDirectoryLease.delete_owned_tree
+    blocked: list[Path] = []
+
+    def delete_with_attack(
+        lease: object,
+    ) -> bool:
+        path = lease.path  # type: ignore[attr-defined]
+        replacement = path.with_name(path.name + "-replacement")
+        def attack() -> bool:
+            try:
+                path.rename(replacement)
+            except OSError:
+                return True
+            return False
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            attack_blocked = pool.submit(attack).result(timeout=10)
+        if attack_blocked:
+            blocked.append(path)
+        return original_delete(lease)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        requirement_module._SandboxDirectoryLease,
+        "delete_owned_tree",
+        delete_with_attack,
+    )
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=_simulated_restrictive_sandbox_backend([]),
+    )
+
+    completed = executor(
+        ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+    )
+
+    assert completed.returncode == 0
+    assert len(blocked) == 2
+    assert not list(tmp_path.glob(".ones-sandbox-*-replacement"))
+    assert not list(tmp_path.parent.glob(".ones-sandbox-probes-*-replacement"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows reparse cleanup contract")
+def test_windows_handle_cleanup_deletes_reparse_link_only_without_traversal(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    root = tmp_path / "owned-root"
+    external = tmp_path / "external-root"
+    root.mkdir()
+    external.mkdir()
+    marker = external / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    link = root / "external-link"
+    try:
+        link.symlink_to(external, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks require local Windows developer privileges")
+    lease = requirement_module._open_sandbox_directory_nofollow(
+        root, require_owner=True, delete_on_cleanup=True
+    )
+
+    deleted = lease.delete_owned_tree()
+
+    assert deleted is True
+    assert not root.exists()
+    assert marker.read_text("utf-8") == "keep"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle-bound deletion contract")
+def test_sandbox_owned_cleanup_never_falls_back_to_path_rmtree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    monkeypatch.setattr(
+        requirement_module.shutil,
+        "rmtree",
+        lambda path: pytest.fail(f"path cleanup forbidden: {path}"),
+    )
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=_simulated_restrictive_sandbox_backend([]),
+    )
+
+    completed = executor(
+        ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+    )
+
+    assert completed.returncode == 0
+    assert not list(tmp_path.glob(".ones-sandbox-*"))
+    assert not list(tmp_path.parent.glob(".ones-sandbox-probes-*"))
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows disposition contract")
+def test_windows_disposition_failure_safely_retains_owned_root_and_closes_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    command = _attested_sandbox_command(tmp_path)
+    original_close = CodexCommand.close
+    closes = 0
+
+    def command_close(item: CodexCommand) -> None:
+        nonlocal closes
+        closes += 1
+        original_close(item)
+
+    monkeypatch.setattr(CodexCommand, "close", command_close)
+    monkeypatch.setattr(
+        requirement_module,
+        "_windows_mark_handle_for_delete",
+        lambda handle: (_ for _ in ()).throw(OSError("disposition unavailable")),
+    )
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=_simulated_restrictive_sandbox_backend([]),
+    )
+
+    with pytest.raises(Exception, match="cleanup failed"):
+        executor(
+            ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+        )
+
+    retained = [
+        *tmp_path.glob(".ones-sandbox-*"),
+        *tmp_path.parent.glob(".ones-sandbox-probes-*"),
+    ]
+    try:
+        assert len(retained) == 2
+        assert closes == 1
+    finally:
+        monkeypatch.undo()
+        for root in retained:
+            requirement_module.shutil.rmtree(root)
+
+
 def test_sandbox_executor_binds_cwd_ancestors_and_owned_temps_to_nofollow_leases(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1572,10 +1837,14 @@ def test_sandbox_executor_binds_cwd_ancestors_and_owned_temps_to_nofollow_leases
     original_open = requirement_module._open_sandbox_directory_nofollow
 
     def open_lease(
-        path: Path, *, require_owner: bool = False,
+        path: Path, *, require_owner: bool = False, delete_on_cleanup: bool = False,
     ) -> object:
         opened.append((path, require_owner))
-        return original_open(path, require_owner=require_owner)
+        return original_open(
+            path,
+            require_owner=require_owner,
+            delete_on_cleanup=delete_on_cleanup,
+        )
 
     monkeypatch.setattr(
         requirement_module, "_open_sandbox_directory_nofollow", open_lease
@@ -1677,21 +1946,23 @@ def test_sandbox_state_provider_priority_failure_still_cleans_and_closes(
 
     command = _attested_sandbox_command(tmp_path)
     original_close = CodexCommand.close
-    original_rmtree = requirement_module.shutil.rmtree
+    original_delete = requirement_module._SandboxDirectoryLease.delete_owned_tree
     events: list[str] = []
 
     def provider(cwd: Path) -> SandboxStatePolicy:
         raise failure
 
-    def cleanup(path: Path) -> None:
-        events.append(f"cleanup:{path.name}")
-        original_rmtree(path)
+    def cleanup(lease: object) -> bool:
+        events.append(f"cleanup:{lease.path.name}")  # type: ignore[attr-defined]
+        return original_delete(lease)  # type: ignore[arg-type]
 
     def close(item: CodexCommand) -> None:
         events.append("close")
         original_close(item)
 
-    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(
+        requirement_module._SandboxDirectoryLease, "delete_owned_tree", cleanup
+    )
     monkeypatch.setattr(CodexCommand, "close", close)
     executor = SandboxCommandExecutor(
         sandbox_state_provider=provider,

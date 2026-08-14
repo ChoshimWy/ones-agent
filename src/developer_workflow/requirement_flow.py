@@ -415,7 +415,9 @@ class _SandboxByHandleFileInformation(ctypes.Structure):
     ]
 
 
-def _windows_sandbox_handle_identity(handle: int) -> _SandboxDirectoryIdentity:
+def _windows_sandbox_handle_identity(
+    handle: int, *, require_directory: bool = True, allow_reparse: bool = False
+) -> _SandboxDirectoryIdentity:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     get_info = kernel32.GetFileInformationByHandle
     get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_SandboxByHandleFileInformation)]
@@ -425,7 +427,9 @@ def _windows_sandbox_handle_identity(handle: int) -> _SandboxDirectoryIdentity:
         raise ctypes.WinError(ctypes.get_last_error())
     reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
     directory = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
-    if info.dwFileAttributes & reparse or not info.dwFileAttributes & directory:
+    if (info.dwFileAttributes & reparse and not allow_reparse) or (
+        require_directory and not info.dwFileAttributes & directory
+    ):
         raise OSError("sandbox directory handle is unsafe")
     file_index = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
     return (
@@ -444,6 +448,7 @@ class _SandboxDirectoryLease:
     descriptor: int | None = None
     windows_handle: int | None = None
     require_owner: bool = False
+    delete_on_cleanup: bool = False
     closed: bool = False
 
     def _current_handle_identity(self) -> _SandboxDirectoryIdentity:
@@ -479,9 +484,23 @@ class _SandboxDirectoryLease:
         elif self.descriptor is not None:
             os.close(self.descriptor)
 
+    def delete_owned_tree(self) -> bool:
+        if not self.delete_on_cleanup:
+            raise OSError("sandbox directory lease cannot delete")
+        self.validate_path()
+        if self.windows_handle is None:
+            # POSIX has no portable delete-by-open-directory-handle primitive.
+            # Retaining the still-identified directory is safer than a pathname race.
+            return False
+        _windows_delete_directory_children(self.path)
+        self.validate_path()
+        _windows_mark_handle_for_delete(self.windows_handle)
+        self.close()
+        return True
+
 
 def _open_sandbox_directory_nofollow(
-    path: Path, *, require_owner: bool = False
+    path: Path, *, require_owner: bool = False, delete_on_cleanup: bool = False
 ) -> _SandboxDirectoryLease:
     path_identity = _sandbox_directory_identity(path, require_owner=require_owner)
     if os.name == "nt":
@@ -499,8 +518,8 @@ def _open_sandbox_directory_nofollow(
         create_file.restype = wintypes.HANDLE
         handle = create_file(
             str(path),
-            0x0080,
-            0x00000001 | 0x00000002 | 0x00000004,
+            0x0001 | 0x0080 | (0x00010000 if delete_on_cleanup else 0),
+            0x00000001,
             None,
             3,
             0x02000000 | 0x00200000,
@@ -510,6 +529,8 @@ def _open_sandbox_directory_nofollow(
             raise ctypes.WinError(ctypes.get_last_error())
         try:
             handle_identity = _windows_sandbox_handle_identity(handle)
+            if handle_identity[:2] != path_identity[:2]:
+                raise OSError("sandbox directory identity changed")
             get_final_path = kernel32.GetFinalPathNameByHandleW
             get_final_path.argtypes = [
                 wintypes.HANDLE,
@@ -539,6 +560,7 @@ def _open_sandbox_directory_nofollow(
                 handle_identity=handle_identity,
                 windows_handle=int(handle),
                 require_owner=require_owner,
+                delete_on_cleanup=delete_on_cleanup,
             )
         except BaseException:
             close_handle = kernel32.CloseHandle
@@ -567,10 +589,143 @@ def _open_sandbox_directory_nofollow(
             handle_identity=handle_identity,
             descriptor=descriptor,
             require_owner=require_owner,
+            delete_on_cleanup=delete_on_cleanup,
         )
     except BaseException:
         os.close(descriptor)
         raise
+
+
+class _SandboxFileDispositionInformation(ctypes.Structure):
+    _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+
+class _SandboxFileDispositionInformationEx(ctypes.Structure):
+    _fields_ = [("Flags", wintypes.DWORD)]
+
+
+def _windows_mark_handle_for_delete(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    set_information = kernel32.SetFileInformationByHandle
+    set_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    ]
+    set_information.restype = wintypes.BOOL
+    extended = _SandboxFileDispositionInformationEx(0x00000001 | 0x00000002 | 0x00000010)
+    if set_information(
+        handle,
+        21,
+        ctypes.byref(extended),
+        ctypes.sizeof(extended),
+    ):
+        return
+    basic = _SandboxFileDispositionInformation(True)
+    if not set_information(
+        handle,
+        4,
+        ctypes.byref(basic),
+        ctypes.sizeof(basic),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_cleanup_entry_identity(path: Path) -> _SandboxDirectoryIdentity:
+    metadata = path.stat(follow_symlinks=False)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode, attributes
+
+
+def _windows_open_cleanup_entry(
+    path: Path,
+) -> tuple[int, _SandboxDirectoryIdentity, int]:
+    initial = _windows_cleanup_entry_identity(path)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x0080 | 0x00010000,
+        0x00000001,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = _windows_sandbox_handle_identity(
+            handle, require_directory=False, allow_reparse=True
+        )
+        if (
+            information[:2] != initial[:2]
+            or _windows_cleanup_entry_identity(path) != initial
+        ):
+            raise OSError("sandbox cleanup entry identity changed")
+        return int(handle), initial, information[2]
+    except BaseException:
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = [wintypes.HANDLE]
+        close_handle.restype = wintypes.BOOL
+        close_handle(handle)
+        raise
+
+
+def _windows_close_cleanup_handle(handle: int) -> None:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    if not close_handle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_delete_cleanup_entry(path: Path) -> None:
+    handle, identity, attributes = _windows_open_cleanup_entry(path)
+    primary: BaseException | None = None
+    try:
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        directory = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+        if attributes & directory and not attributes & reparse:
+            with os.scandir(path) as entries:
+                children = tuple(Path(entry.path) for entry in entries)
+            for child in children:
+                _windows_delete_cleanup_entry(child)
+        if _windows_cleanup_entry_identity(path) != identity:
+            raise OSError("sandbox cleanup entry identity changed")
+        _windows_mark_handle_for_delete(handle)
+    except BaseException as error:
+        primary = error
+    close_failure: BaseException | None = None
+    try:
+        _windows_close_cleanup_handle(handle)
+    except BaseException as error:
+        close_failure = error
+    selected = _select_sandbox_resource_failure(
+        primary,
+        [close_failure] if close_failure is not None else [],
+    )
+    if selected is not None:
+        raise selected
+
+
+def _windows_delete_directory_children(path: Path) -> None:
+    with os.scandir(path) as entries:
+        children = tuple(Path(entry.path) for entry in entries)
+    for child in children:
+        _windows_delete_cleanup_entry(child)
 
 
 def _sandbox_directory_identity(
@@ -661,7 +816,7 @@ class _SandboxDirectoryGuard:
             if _sandbox_directory_identity(path, require_owner=True) != owned.identity:
                 raise OSError("owned sandbox directory identity changed")
             owned.lease = _open_sandbox_directory_nofollow(
-                path, require_owner=True
+                path, require_owner=True, delete_on_cleanup=True
             )
             self._validate_anchors()
 
@@ -695,20 +850,15 @@ class _SandboxDirectoryGuard:
                 safe_to_delete = True
             except BaseException as error:
                 errors.append(error)
-            if owned.lease is not None:
+            if safe_to_delete and owned.lease is not None:
                 try:
-                    owned.lease.close()
+                    owned.lease.delete_owned_tree()
                 except BaseException as error:
                     safe_to_delete = False
                     errors.append(error)
-            if safe_to_delete:
+            if owned.lease is not None and not owned.lease.closed:
                 try:
-                    if (
-                        _sandbox_directory_identity(owned.path, require_owner=True)
-                        != owned.identity
-                    ):
-                        raise OSError("owned sandbox directory identity changed")
-                    shutil.rmtree(owned.path)
+                    owned.lease.close()
                 except BaseException as error:
                     errors.append(error)
         for lease in self._anchors:
