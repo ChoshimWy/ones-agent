@@ -6,6 +6,7 @@ isolated worktree.  Publication is deliberately outside this boundary.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -79,6 +80,42 @@ class RequirementFlowError(RuntimeError):
 
 class RequirementSourceError(RequirementFlowError):
     """A requirement or Wiki source cannot be safely verified."""
+
+
+def _is_sandbox_priority_failure(error: BaseException) -> bool:
+    return isinstance(
+        error,
+        (
+            MemoryError,
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+        ),
+    )
+
+
+def _select_sandbox_resource_failure(
+    primary: BaseException | None,
+    cleanup: list[BaseException],
+) -> BaseException | None:
+    if primary is not None and _is_sandbox_priority_failure(primary):
+        return primary
+    for error in cleanup:
+        if _is_sandbox_priority_failure(error):
+            return error
+    if primary is not None:
+        return primary
+    if cleanup:
+        return RequirementFlowError("sandbox capability probe cleanup failed")
+    return None
+
+
+def _raise_sanitized_sandbox_failure(error: BaseException) -> None:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    raise error from None
 
 
 class RequirementGateway(Protocol):
@@ -479,29 +516,29 @@ class SandboxCommandExecutor:
             "from pathlib import Path; import sys; "
             "Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')",
         ]
-        try:
-            isolation_parent.mkdir(exist_ok=True)
-            if isolation_parent.is_symlink() or not isolation_parent.is_dir():
-                raise OSError("sandbox isolation root is unsafe")
-            isolation_root.mkdir()
-            outside_root.mkdir()
-        except Exception:
-            for owned in (isolation_root, outside_root):
-                try:
-                    if owned.is_symlink():
-                        owned.unlink()
-                    elif owned.exists():
-                        shutil.rmtree(owned)
-                except OSError:
-                    pass
-            if parent_created:
-                try:
-                    isolation_parent.rmdir()
-                except OSError:
-                    pass
-            raise RequirementFlowError("sandbox capability probe could not be prepared") from None
         active_codex_command: CodexCommand | None = None
+        isolation_parent_owned = False
+        isolation_root_owned = False
+        outside_root_owned = False
+        completed: subprocess.CompletedProcess[str] | None = None
+        primary: BaseException | None = None
         try:
+            try:
+                if parent_created:
+                    isolation_parent.mkdir()
+                    isolation_parent_owned = True
+                if isolation_parent.is_symlink() or not isolation_parent.is_dir():
+                    raise OSError("sandbox isolation root is unsafe")
+                isolation_root.mkdir()
+                isolation_root_owned = True
+                outside_root.mkdir()
+                outside_root_owned = True
+            except BaseException as error:
+                if _is_sandbox_priority_failure(error):
+                    raise
+                raise RequirementFlowError(
+                    "sandbox capability probe could not be prepared"
+                ) from None
             active_codex_command = self._verified_codex_command()
             wrapped_prefix = active_codex_command.argv(*wrapped_arguments)
             protected_git_keys = {
@@ -565,32 +602,47 @@ class SandboxCommandExecutor:
                 listener.close()
             if network_probe.returncode != 23:
                 raise RequirementFlowError("sandbox capability probe did not prove network denial")
-            return invoke(command, probe=False, input_bytes=stdin)
-        finally:
-            cleanup_failed = False
-            for owned, expected_parent in (
-                (isolation_root, isolation_parent),
-                (outside_root, canonical_cwd.parent),
-            ):
-                try:
-                    if owned.parent != expected_parent:
-                        raise OSError("owned sandbox path changed")
-                    if owned.is_symlink():
-                        owned.unlink()
-                    elif owned.exists():
-                        shutil.rmtree(owned)
-                except OSError:
-                    cleanup_failed = True
-            if parent_created:
-                try:
-                    isolation_parent.rmdir()
-                except OSError:
-                    if isolation_parent.exists():
-                        cleanup_failed = True
-            if active_codex_command is not None:
+            completed = invoke(command, probe=False, input_bytes=stdin)
+        except BaseException as error:
+            primary = error
+
+        cleanup_errors: list[BaseException] = []
+        for owned, expected_parent, was_owned in (
+            (isolation_root, isolation_parent, isolation_root_owned),
+            (outside_root, canonical_cwd.parent, outside_root_owned),
+        ):
+            if not was_owned:
+                continue
+            try:
+                if owned.parent != expected_parent:
+                    raise OSError("owned sandbox path changed")
+                if owned.is_symlink():
+                    owned.unlink()
+                elif owned.exists():
+                    shutil.rmtree(owned)
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if isolation_parent_owned:
+            try:
+                if isolation_parent.parent != canonical_cwd:
+                    raise OSError("owned sandbox path changed")
+                isolation_parent.rmdir()
+            except BaseException as error:
+                cleanup_errors.append(error)
+        if active_codex_command is not None:
+            try:
                 active_codex_command.close()
-            if cleanup_failed:
-                raise RequirementFlowError("sandbox capability probe cleanup failed") from None
+            except BaseException as error:
+                cleanup_errors.append(error)
+
+        selected_failure = _select_sandbox_resource_failure(primary, cleanup_errors)
+        if selected_failure is not None:
+            failure = selected_failure
+            del command, env, stdin, sandbox_env, wrapped_arguments, wrapped_prefix
+            del invoke, active_codex_command, primary, cleanup_errors, selected_failure
+            _raise_sanitized_sandbox_failure(failure)
+        assert completed is not None
+        return completed
 
 
 @dataclass(slots=True)

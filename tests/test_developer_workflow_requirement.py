@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -1042,6 +1043,251 @@ def test_sandbox_executor_fails_closed_when_runtime_preparation_fails(
         )
     assert "private detail" not in str(caught.value)
     assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    [
+        OSError("cleanup-os"),
+        RuntimeError("cleanup-runtime"),
+        MemoryError(),
+        asyncio.CancelledError(),
+        KeyboardInterrupt(),
+        SystemExit(),
+        GeneratorExit(),
+    ],
+)
+def test_sandbox_cleanup_attempts_every_owned_resource_and_preserves_priority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: BaseException,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    secret = "task3-cleanup-secret"
+    command = _attested_sandbox_command(tmp_path)
+    original_rmtree = requirement_module.shutil.rmtree
+    original_close = CodexCommand.close
+    events: list[str] = []
+
+    def backend(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise RuntimeError("ordinary child failure")
+
+    def cleanup(path: Path) -> None:
+        events.append(f"cleanup:{path.name}")
+        original_rmtree(path)
+        if len([event for event in events if event.startswith("cleanup:")]) == 1:
+            raise cleanup_failure
+
+    def close(item: CodexCommand) -> None:
+        events.append("close")
+        original_close(item)
+
+    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(CodexCommand, "close", close)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=backend,
+    )
+
+    try:
+        with pytest.raises(BaseException) as caught:
+            executor(
+                ["tool", secret],
+                cwd=tmp_path.resolve(),
+                env={"PATH": "", "ONES_TOKEN": secret},
+                timeout=10,
+                max_output_bytes=1024,
+            )
+    finally:
+        monkeypatch.undo()
+        if command._is_attested():
+            original_close(command)
+        for candidate in (
+            tmp_path / ".ones-sandbox",
+            *tmp_path.parent.glob(".ones-sandbox-probes-*"),
+        ):
+            if candidate.exists():
+                original_rmtree(candidate)
+
+    assert len([event for event in events if event.startswith("cleanup:")]) == 2
+    assert events[-1] == "close"
+    if isinstance(
+        cleanup_failure,
+        (
+            MemoryError,
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+        ),
+    ):
+        assert caught.value is cleanup_failure
+    else:
+        assert isinstance(caught.value, Exception)
+        assert "capability probe failed" in str(caught.value)
+
+
+def test_sandbox_primary_priority_beats_cleanup_and_close_priority_and_scrubs_locals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    secret = "task3-primary-secret"
+    primary = KeyboardInterrupt()
+    cleanup_failure = MemoryError()
+    close_failure = SystemExit()
+    command = _attested_sandbox_command(tmp_path)
+    original_rmtree = requirement_module.shutil.rmtree
+    original_close = CodexCommand.close
+    events: list[str] = []
+
+    def backend(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise primary
+
+    def cleanup(path: Path) -> None:
+        events.append(f"cleanup:{path.name}")
+        original_rmtree(path)
+        if len([event for event in events if event.startswith("cleanup:")]) == 1:
+            raise cleanup_failure
+
+    def close(item: CodexCommand) -> None:
+        events.append("close")
+        original_close(item)
+        raise close_failure
+
+    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(CodexCommand, "close", close)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=backend,
+    )
+
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            executor(
+                ["tool", secret],
+                cwd=tmp_path.resolve(),
+                env={"PATH": "", "ONES_TOKEN": secret},
+                timeout=10,
+                max_output_bytes=1024,
+            )
+    finally:
+        monkeypatch.undo()
+        if command._is_attested():
+            original_close(command)
+        for candidate in (
+            tmp_path / ".ones-sandbox",
+            *tmp_path.parent.glob(".ones-sandbox-probes-*"),
+        ):
+            if candidate.exists():
+                original_rmtree(candidate)
+
+    assert caught.value is primary
+    assert len([event for event in events if event.startswith("cleanup:")]) == 2
+    assert events[-1] == "close"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    trace = caught.value.__traceback__
+    while trace is not None:
+        if Path(trace.tb_frame.f_code.co_filename).name == "requirement_flow.py":
+            assert secret not in repr(trace.tb_frame.f_locals)
+        trace = trace.tb_next
+
+
+def test_sandbox_close_priority_beats_ordinary_cleanup_without_skipping_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    close_failure = GeneratorExit()
+    command = _attested_sandbox_command(tmp_path)
+    original_rmtree = requirement_module.shutil.rmtree
+    original_close = CodexCommand.close
+    events: list[str] = []
+
+    def cleanup(path: Path) -> None:
+        events.append(f"cleanup:{path.name}")
+        original_rmtree(path)
+        if len([event for event in events if event.startswith("cleanup:")]) == 1:
+            raise RuntimeError("ordinary cleanup failure")
+
+    def close(item: CodexCommand) -> None:
+        events.append("close")
+        original_close(item)
+        raise close_failure
+
+    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(CodexCommand, "close", close)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=_simulated_restrictive_sandbox_backend([]),
+    )
+
+    try:
+        with pytest.raises(GeneratorExit) as caught:
+            executor(
+                ["tool", "run"],
+                cwd=tmp_path.resolve(),
+                env={"PATH": ""},
+                timeout=10,
+                max_output_bytes=1024,
+            )
+    finally:
+        monkeypatch.undo()
+        if command._is_attested():
+            original_close(command)
+        for candidate in (
+            tmp_path / ".ones-sandbox",
+            *tmp_path.parent.glob(".ones-sandbox-probes-*"),
+        ):
+            if candidate.exists():
+                original_rmtree(candidate)
+
+    assert caught.value is close_failure
+    assert len([event for event in events if event.startswith("cleanup:")]) == 2
+    assert events[-1] == "close"
+
+
+def test_sandbox_never_cleans_a_probe_path_it_did_not_create(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    probe_id = "foreign-owned-probe"
+    foreign = tmp_path.parent / f".ones-sandbox-probes-{probe_id}"
+    foreign.mkdir()
+    marker = foreign / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    command = _attested_sandbox_command(tmp_path)
+    monkeypatch.setattr(
+        requirement_module.uuid,
+        "uuid4",
+        lambda: type("FixedUuid", (), {"hex": probe_id})(),
+    )
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    try:
+        with pytest.raises(Exception, match="could not be prepared"):
+            executor(
+                ["tool", "run"],
+                cwd=tmp_path.resolve(),
+                env={"PATH": ""},
+                timeout=10,
+                max_output_bytes=1024,
+            )
+        assert marker.read_text(encoding="utf-8") == "keep"
+    finally:
+        command.close()
+        marker.unlink(missing_ok=True)
+        foreign.rmdir()
 
 
 def test_sandbox_state_provider_must_prove_policy_and_never_leaks_on_error(

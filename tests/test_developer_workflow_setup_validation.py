@@ -241,6 +241,25 @@ def test_profile_catalog_propagates_memory_failure_from_doctor(tmp_path: Path) -
         catalog.list_profiles()
 
 
+def test_profile_catalog_propagates_generator_exit_from_doctor(tmp_path: Path) -> None:
+    failure = GeneratorExit()
+
+    def doctor(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise failure
+
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=doctor,
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+
+    with pytest.raises(GeneratorExit) as caught:
+        catalog.list_profiles()
+    assert caught.value is failure
+
+
 def test_profile_catalog_propagates_memory_failure_from_sandbox(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
@@ -1266,3 +1285,70 @@ async def test_codex_probe_never_runs_capability_executor_in_source(tmp_path: Pa
         CodexProbeInput(profile="managed", worktree=tmp_path)
     )
     assert result.category == "ok"
+
+
+@pytest.mark.asyncio
+async def test_codex_probe_propagates_memory_from_real_catalog_call_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        executor_factory=lambda profile: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+    failure = MemoryError()
+
+    def require_selected(
+        self: ManagedProfileCatalog,
+        selected: str,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        del self, selected, timeout_seconds
+        raise failure
+
+    monkeypatch.setattr(ManagedProfileCatalog, "require_selected", require_selected)
+    validator = SetupValidator._testing(
+        codex_auth_metadata=_Auth(),
+        profile_catalog=catalog,
+    )
+
+    with pytest.raises(MemoryError) as caught:
+        await validator.probe_codex(
+            CodexProbeInput(profile="managed", worktree=tmp_path)
+        )
+    assert caught.value is failure
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [
+        MemoryError,
+        asyncio.CancelledError,
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+    ],
+)
+async def test_codex_probe_propagates_every_priority_failure(
+    tmp_path: Path,
+    failure_type: type[BaseException],
+) -> None:
+    failure = failure_type()
+
+    class Catalog:
+        async def require_selected(self, selected: str) -> str:
+            del self, selected
+            raise failure
+
+    validator = SetupValidator._testing(
+        codex_auth_metadata=_Auth(),
+        profile_catalog=Catalog(),
+    )
+
+    with pytest.raises(failure_type) as caught:
+        await validator.probe_codex(
+            CodexProbeInput(profile="managed", worktree=tmp_path)
+        )
+    assert caught.value is failure

@@ -92,6 +92,19 @@ class GitExecutableUnavailableError(RuntimeError):
     """The read-only repository probe cannot start the Git executable."""
 
 
+def _is_probe_priority_failure(error: BaseException) -> bool:
+    return isinstance(
+        error,
+        (
+            MemoryError,
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+        ),
+    )
+
+
 def _raise_git_executable_unavailable() -> None:
     raise GitExecutableUnavailableError("Git executable is unavailable") from None
 
@@ -759,10 +772,7 @@ class ManagedProfileCatalog:
                 raise ValueError
             return config
         except BaseException as error:
-            if isinstance(
-                error,
-                (MemoryError, KeyboardInterrupt, SystemExit, asyncio.CancelledError),
-            ):
+            if _is_probe_priority_failure(error):
                 raise
             raise SetupValidationError("Codex profile discovery is unavailable") from None
 
@@ -1275,7 +1285,7 @@ class SetupValidator:
                     await _invoke(self.profile_catalog.require_selected, probe.profile)
             return _result(SetupStep.CODEX)
         except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            if _is_probe_priority_failure(error):
                 raise
             return _result(SetupStep.CODEX, _failure_category(error, default="sandbox"))
 
