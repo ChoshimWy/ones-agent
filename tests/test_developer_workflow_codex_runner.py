@@ -4,15 +4,12 @@ import asyncio
 import json
 import math
 import os
-import shutil
-import stat
 import subprocess
 import sys
 import time
 import traceback
 from dataclasses import FrozenInstanceError
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -41,23 +38,12 @@ OID = "a" * 40
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def _which_from(mapping: dict[str, str | None]):
-    return lambda name: mapping.get(name)
-
-
-def _canonical_test_validator(path: Path) -> Path:
-    if "missing" in str(path):
-        raise FileNotFoundError
-    return path.resolve(strict=False)
-
-
 def test_codex_command_keeps_an_immutable_validated_prefix() -> None:
-    command = codex_runner_module.CodexCommand(("C:\\Tools\\node.exe", "C:\\Tools\\codex.js"))
+    command = codex_runner_module.CodexCommand((r"C:\private\codex.exe",))
 
     assert command.argv("exec", "--version") == [
-        "C:\\Tools\\node.exe", "C:\\Tools\\codex.js", "exec", "--version",
+        r"C:\private\codex.exe", "exec", "--version",
     ]
-    assert command.prefix == ("C:\\Tools\\node.exe", "C:\\Tools\\codex.js")
     with pytest.raises(FrozenInstanceError):
         command.prefix = ("replacement",)  # type: ignore[misc]
 
@@ -70,573 +56,60 @@ def test_codex_command_rejects_empty_or_nul_prefix(prefix: tuple[str, ...]) -> N
 
 @pytest.mark.parametrize("argument", ["", "bad\x00argument"])
 def test_codex_command_rejects_empty_or_nul_arguments(argument: str) -> None:
-    command = codex_runner_module.CodexCommand(("codex",))
+    command = codex_runner_module.CodexCommand((r"C:\private\codex.exe",))
     with pytest.raises(ValueError):
         command.argv(argument)
 
 
-def test_windows_resolver_prefers_a_validated_direct_executable() -> None:
-    executable = str(Path("C:/Program Files/OpenAI/codex.exe"))
-    command = codex_runner_module.resolve_codex_command(
-        which=_which_from({"codex.exe": executable, "codex.cmd": "C:/npm/codex.cmd"}),
-        platform="win32",
-        path_validator=_canonical_test_validator,
-    )
+def test_task_2a_resolver_never_returns_or_executes_an_external_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
 
-    assert command.prefix == (str(Path(executable).resolve(strict=False)),)
+    class Locked:
+        def close(self) -> None:
+            events.append("closed")
 
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("Node, JS, cmd, ps1, and shell execution is forbidden")
 
-def test_windows_resolver_uses_only_node_and_js_from_the_standard_npm_layout() -> None:
-    shim = Path("C:/nvm4w/nodejs/codex.cmd")
-    validated: list[Path] = []
-
-    def validator(path: Path) -> Path:
-        validated.append(path)
-        return path.resolve(strict=False)
-
-    command = codex_runner_module.resolve_codex_command(
-        which=_which_from({"codex.exe": None, "codex.cmd": str(shim)}),
-        platform="win32",
-        path_validator=validator,
-    )
-
-    root = shim.resolve(strict=False).parent
-    assert command.prefix == (
-        str(root / "node.exe"),
-        str(root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"),
-    )
-    assert validated == [shim, root / "node.exe", root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"]
-    assert all(not item.casefold().endswith((".cmd", ".ps1")) for item in command.prefix)
-
-
-def test_windows_resolver_falls_back_from_an_unsafe_exe_to_safe_npm_layout() -> None:
-    shim = Path("C:/nvm4w/nodejs/codex.cmd")
-
-    def validator(path: Path) -> Path:
-        if path.name.casefold() == "codex.exe":
-            raise PermissionError("unsafe executable")
-        return path.resolve(strict=False)
-
-    command = codex_runner_module.resolve_codex_command(
-        which=_which_from({"codex.exe": "C:/unsafe/codex.exe", "codex.cmd": str(shim)}),
-        platform="win32",
-        path_validator=validator,
-    )
-
-    assert command.prefix[0].casefold().endswith("node.exe")
-    assert command.prefix[1].casefold().endswith("codex.js")
-
-
-@pytest.mark.parametrize("missing_name", ["node.exe", "codex.js"])
-def test_windows_resolver_rejects_incomplete_npm_layout(missing_name: str) -> None:
-    shim = Path("C:/nvm4w/nodejs/codex.cmd")
-
-    def validator(path: Path) -> Path:
-        if path.name.casefold() == missing_name:
-            raise FileNotFoundError("layout incomplete")
-        return path.resolve(strict=False)
+    monkeypatch.setattr(codex_runner_module.subprocess, "Popen", forbidden)
+    monkeypatch.setattr(codex_runner_module.subprocess, "run", forbidden)
+    monkeypatch.setattr(codex_runner_module.os, "system", forbidden)
 
     with pytest.raises(
         codex_runner_module.CodexProcessStartError,
         match="^Codex executable is unavailable$",
-    ):
+    ) as caught:
         codex_runner_module.resolve_codex_command(
-            which=_which_from({"codex.exe": None, "codex.cmd": str(shim)}),
-            platform="win32",
-            path_validator=validator,
+            _discover=lambda: Locked(),  # type: ignore[arg-type]
         )
 
+    assert events == ["closed"]
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
-@pytest.mark.parametrize(
-    ("query", "replacement"),
-    [
-        ("codex.exe", "C:/unsafe/codex.ps1"),
-        ("codex.exe", "C:/unsafe/codex"),
-        ("node.exe", "C:/unsafe/codex.cmd"),
-        ("codex.js", "C:/unsafe/codex.ps1"),
-    ],
-)
-def test_windows_resolver_never_returns_a_shell_shim_prefix(
-    query: str, replacement: str,
-) -> None:
-    shim = Path("C:/nvm4w/nodejs/codex.cmd")
 
-    def validator(path: Path) -> Path:
-        if path.name.casefold() == query:
-            return Path(replacement).resolve(strict=False)
-        return path.resolve(strict=False)
+def test_resolver_sanitizes_discovery_failure_and_project_traceback_locals() -> None:
+    callable_canary = "discover-callable-canary"
+    failure_canary = "native-path-failure-canary"
 
-    try:
-        command = codex_runner_module.resolve_codex_command(
-            which=_which_from({"codex.exe": "C:/unsafe/codex.exe", "codex.cmd": str(shim)}),
-            platform="win32",
-            path_validator=validator,
-        )
-    except codex_runner_module.CodexProcessStartError:
-        return
-    assert all(
-        not component.casefold().endswith((".cmd", ".ps1"))
-        and Path(component).suffix.casefold() in {".exe", ".js"}
-        for component in command.prefix
-    )
+    class Discovery:
+        def __repr__(self) -> str:
+            return f"<{callable_canary}>"
 
-
-def test_posix_resolver_requires_a_validated_executable(monkeypatch: pytest.MonkeyPatch) -> None:
-    executable = Path("/opt/openai/bin/codex")
-    monkeypatch.setattr(codex_runner_module.os, "access", lambda path, mode: path == executable.resolve())
-
-    command = codex_runner_module.resolve_codex_command(
-        which=_which_from({"codex": str(executable)}),
-        platform="linux",
-        path_validator=_canonical_test_validator,
-    )
-
-    assert command.prefix == (str(executable.resolve()),)
-
-
-def test_posix_resolver_rejects_a_non_executable_file(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(codex_runner_module.os, "access", lambda path, mode: False)
-    with pytest.raises(codex_runner_module.CodexProcessStartError):
-        codex_runner_module.resolve_codex_command(
-            which=_which_from({"codex": "/opt/openai/bin/codex"}),
-            platform="linux",
-            path_validator=_canonical_test_validator,
-        )
-
-
-def test_codex_component_rejects_non_regular_file(tmp_path: Path) -> None:
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(tmp_path)
-
-
-def test_codex_component_rejects_nul_path() -> None:
-    with pytest.raises((OSError, ValueError)):
-        codex_runner_module._validate_codex_component(Path("bad\x00canary"))
-
-
-def test_codex_component_rejects_current_worktree_file() -> None:
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(Path(__file__).resolve())
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows extended path boundary")
-def test_codex_component_rejects_extended_path_alias_of_current_worktree_file(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = Path(codex_runner_module.__file__).resolve()
-    alias = Path("\\\\?\\" + str(candidate))
-    worktree = candidate.parents[2]
-    assert os.path.samefile(alias, candidate)
-    assert not alias.resolve(strict=True).is_relative_to(worktree)
-    user_sid = "S-1-5-21-user"
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
-    monkeypatch.setattr(
-        codex_runner_module,
-        "_windows_descriptor",
-        lambda path: (user_sid, ((user_sid, 0x001F01FF, 0, 0),), True),
-    )
-
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(alias)
-
-
-def test_codex_component_rejects_reparse_metadata(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = tmp_path / "codex.exe"
-    candidate.write_bytes(b"binary")
-    real_lstat = Path.lstat
-
-    def reparse_lstat(path: Path):
-        metadata = real_lstat(path)
-        if path == candidate:
-            return SimpleNamespace(
-                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
-                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
-                st_mode=metadata.st_mode, st_file_attributes=0x400,
-            )
-        return metadata
-
-    monkeypatch.setattr(Path, "lstat", reparse_lstat)
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-def test_codex_component_rejects_identity_race(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = tmp_path / "codex.exe"
-    candidate.write_bytes(b"binary")
-    real_lstat = Path.lstat
-    calls = 0
-
-    def racing_lstat(path: Path):
-        nonlocal calls
-        metadata = real_lstat(path)
-        if path == candidate:
-            calls += 1
-            if calls >= 2:
-                return SimpleNamespace(
-                    st_dev=metadata.st_dev, st_ino=metadata.st_ino,
-                    st_size=metadata.st_size + 1, st_mtime_ns=metadata.st_mtime_ns,
-                    st_mode=metadata.st_mode, st_file_attributes=0,
-                )
-        return metadata
-
-    monkeypatch.setattr(Path, "lstat", racing_lstat)
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
-def test_codex_component_rejects_unlisted_windows_acl_principal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = tmp_path / "codex.exe"
-    candidate.write_bytes(b"binary")
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: "S-1-5-21-user")
-    monkeypatch.setattr(
-        codex_runner_module,
-        "_windows_descriptor",
-        lambda path: (
-            "S-1-5-21-user",
-            (("S-1-5-21-unlisted", 0x001F01FF, 0, 0),),
-            True,
-        ),
-    )
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
-def test_codex_component_rejects_trusted_leaf_beneath_broadly_writable_parent(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = (tmp_path / "bin" / "codex.exe").resolve()
-    candidate.parent.mkdir()
-    candidate.write_bytes(b"binary")
-    user_sid = "S-1-5-21-user"
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
-
-    def descriptor(path: Path):
-        if path == candidate.parent:
-            return (
-                user_sid,
-                (("S-1-5-11", 0x001301BF, 0, 0),),
-                True,
-            )
-        return user_sid, ((user_sid, 0x001F01FF, 0, 0),), True
-
-    monkeypatch.setattr(codex_runner_module, "_windows_descriptor", descriptor)
-
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
-@pytest.mark.parametrize("principal", ["S-1-5-11", "S-1-5-32-545"])
-@pytest.mark.parametrize(
-    "unsafe_right",
-    [
-        0x00000002,  # FILE_ADD_FILE
-        0x00000004,  # FILE_ADD_SUBDIRECTORY
-        0x00000010,  # FILE_WRITE_EA
-        0x00000040,  # FILE_DELETE_CHILD
-        0x00000100,  # FILE_WRITE_ATTRIBUTES
-        0x00010000,  # DELETE
-        0x00040000,  # WRITE_DAC
-        0x00080000,  # WRITE_OWNER
-        0x10000000,  # GENERIC_ALL
-        0x40000000,  # GENERIC_WRITE
-    ],
-)
-def test_codex_component_rejects_any_effective_untrusted_ancestor_write_right(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    principal: str,
-    unsafe_right: int,
-) -> None:
-    candidate = (tmp_path / "bin" / "codex.exe").resolve()
-    candidate.parent.mkdir()
-    candidate.write_bytes(b"binary")
-    user_sid = "S-1-5-21-user"
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
-
-    def descriptor(path: Path):
-        entries = (
-            ((principal, unsafe_right, 0x10, 0),)
-            if path == candidate.parent
-            else ((user_sid, 0x001F01FF, 0, 0),)
-        )
-        return user_sid, entries, True
-
-    monkeypatch.setattr(codex_runner_module, "_windows_descriptor", descriptor)
-
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows identity boundary")
-def test_codex_component_rejects_ancestor_size_and_mtime_identity_race(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = (tmp_path / "bin" / "codex.exe").resolve()
-    candidate.parent.mkdir()
-    candidate.write_bytes(b"binary")
-    user_sid = "S-1-5-21-user"
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
-    monkeypatch.setattr(
-        codex_runner_module,
-        "_windows_descriptor",
-        lambda path: (user_sid, ((user_sid, 0x001F01FF, 0, 0),), True),
-    )
-    real_lstat = Path.lstat
-    ancestor_calls = 0
-
-    def racing_lstat(path: Path):
-        nonlocal ancestor_calls
-        metadata = real_lstat(path)
-        if path == candidate.parent:
-            ancestor_calls += 1
-            if ancestor_calls >= 2:
-                return SimpleNamespace(
-                    st_dev=metadata.st_dev,
-                    st_ino=metadata.st_ino,
-                    st_size=metadata.st_size + 1,
-                    st_mtime_ns=metadata.st_mtime_ns + 1,
-                    st_mode=metadata.st_mode,
-                    st_file_attributes=0,
-                )
-        return metadata
-
-    monkeypatch.setattr(Path, "lstat", racing_lstat)
-
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
-def test_codex_component_accepts_fixed_trustedinstaller_and_read_only_principals(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = (tmp_path / "codex.exe").resolve()
-    candidate.write_bytes(b"binary")
-    trusted_installer = (
-        "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
-    )
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: "S-1-5-21-user")
-    monkeypatch.setattr(
-        codex_runner_module,
-        "_windows_descriptor",
-        lambda path: (
-            trusted_installer,
-            (
-                (trusted_installer, 0x001F01FF, 0, 0),
-                ("S-1-15-3-package-capability", 0x001200A9, 0, 0),
-            ),
-            True,
-        ),
-    )
-
-    assert codex_runner_module._validate_codex_component(candidate) == candidate
-
-
-@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
-@pytest.mark.parametrize("add_right", [0x00000002, 0x00000004])
-def test_codex_component_allows_add_only_right_on_higher_ancestor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, add_right: int,
-) -> None:
-    candidate = (tmp_path / "higher" / "immediate" / "codex.exe").resolve()
-    candidate.parent.mkdir(parents=True)
-    candidate.write_bytes(b"binary")
-    user_sid = "S-1-5-21-user"
-    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
-
-    def descriptor(path: Path):
-        entries = (
-            (("S-1-5-11", add_right, 0x10, 0),)
-            if path == candidate.parent.parent
-            else ((user_sid, 0x001F01FF, 0, 0),)
-        )
-        return user_sid, entries, True
-
-    monkeypatch.setattr(codex_runner_module, "_windows_descriptor", descriptor)
-
-    assert codex_runner_module._validate_codex_component(candidate) == candidate
-
-
-_REAL_WINDOWS_SAFE_EXECUTABLE = Path(
-    os.environ.get("SystemRoot", r"C:\Windows")
-) / "System32" / "where.exe"
-
-
-@pytest.mark.skipif(
-    os.name != "nt" or not _REAL_WINDOWS_SAFE_EXECUTABLE.is_file(),
-    reason="protected Windows where.exe is unavailable",
-)
-def test_real_windows_protected_executable_passes_default_validator() -> None:
-    assert codex_runner_module._validate_codex_component(
-        _REAL_WINDOWS_SAFE_EXECUTABLE
-    ) == _REAL_WINDOWS_SAFE_EXECUTABLE.resolve()
-
-
-def _real_posix_safe_executable() -> Path:
-    raw = shutil.which("true")
-    if raw is None:
-        pytest.skip("a protected POSIX true executable is unavailable")
-    return Path(raw).resolve(strict=True)
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
-def test_posix_safe_owner_and_mode_pass_default_validator() -> None:
-    candidate = _real_posix_safe_executable()
-    metadata = candidate.lstat()
-    assert metadata.st_uid in {0, os.geteuid()}
-    assert stat.S_IMODE(metadata.st_mode) & 0o022 == 0
-
-    assert codex_runner_module._validate_codex_component(candidate) == candidate
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
-def test_posix_wrong_owner_fails_default_validator(monkeypatch: pytest.MonkeyPatch) -> None:
-    candidate = _real_posix_safe_executable()
-    real_lstat = Path.lstat
-
-    def wrong_owner_lstat(path: Path):
-        metadata = real_lstat(path)
-        if path == candidate:
-            return SimpleNamespace(
-                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
-                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
-                st_mode=metadata.st_mode, st_uid=max(1, os.geteuid() + 1),
-                st_file_attributes=0,
-            )
-        return metadata
-
-    monkeypatch.setattr(Path, "lstat", wrong_owner_lstat)
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
-def test_posix_group_or_world_writable_file_fails_default_validator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = _real_posix_safe_executable()
-    real_lstat = Path.lstat
-
-    def writable_lstat(path: Path):
-        metadata = real_lstat(path)
-        if path == candidate:
-            return SimpleNamespace(
-                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
-                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
-                st_mode=metadata.st_mode | 0o022, st_uid=metadata.st_uid,
-                st_file_attributes=0,
-            )
-        return metadata
-
-    monkeypatch.setattr(Path, "lstat", writable_lstat)
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
-def test_posix_writable_ancestor_fails_default_validator(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    candidate = _real_posix_safe_executable()
-    writable_ancestor = candidate.parent
-    real_lstat = Path.lstat
-
-    def writable_ancestor_lstat(path: Path):
-        metadata = real_lstat(path)
-        if path == writable_ancestor:
-            return SimpleNamespace(
-                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
-                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
-                st_mode=metadata.st_mode | 0o022, st_uid=metadata.st_uid,
-                st_file_attributes=0,
-            )
-        return metadata
-
-    monkeypatch.setattr(Path, "lstat", writable_ancestor_lstat)
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(candidate)
-
-
-@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
-def test_posix_symlink_ancestor_fails_default_validator(tmp_path: Path) -> None:
-    real_directory = tmp_path / "real"
-    real_directory.mkdir()
-    executable = real_directory / "codex"
-    executable.write_bytes(b"binary")
-    executable.chmod(0o700)
-    alias_directory = tmp_path / "alias"
-    alias_directory.symlink_to(real_directory, target_is_directory=True)
-
-    with pytest.raises(OSError):
-        codex_runner_module._validate_codex_component(alias_directory / "codex")
-
-
-def test_resolver_sanitizes_all_ordinary_discovery_and_validation_failures() -> None:
-    canary = "candidate-canary"
-    calls = 0
-
-    def validator(path: Path) -> Path:
-        nonlocal calls
-        calls += 1
-        raise RuntimeError(f"unsafe path {canary}: {path}")
+        def __call__(self) -> object:
+            raise OSError(f"C:/sensitive/{failure_canary}/codex.exe")
 
     with pytest.raises(codex_runner_module.CodexProcessStartError) as caught:
-        codex_runner_module.resolve_codex_command(
-            which=_which_from({
-                "codex.exe": f"C:/sensitive/{canary}/codex.exe",
-                "codex.cmd": f"C:/sensitive/{canary}/codex.cmd",
-            }),
-            platform="win32",
-            path_validator=validator,
-        )
+        codex_runner_module.resolve_codex_command(_discover=Discovery())
 
-    assert calls == 2
     assert str(caught.value) == "Codex executable is unavailable"
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     rendered = "".join(traceback.format_exception(caught.value))
-    assert canary not in rendered
-
-
-def test_resolver_scrubs_callable_canaries_from_project_traceback_locals() -> None:
-    which_canary = "which-repr-canary"
-    validator_canary = "validator-repr-canary"
-    candidate_canary = "candidate-path-canary"
-    failure_canary = "failure-repr-canary"
-
-    class CanaryWhich:
-        def __repr__(self) -> str:
-            return f"<{which_canary}:{candidate_canary}>"
-
-        def __call__(self, name: str) -> str:
-            return f"C:/sensitive/{candidate_canary}/{name}"
-
-    class CanaryFailure(Exception):
-        def __repr__(self) -> str:
-            return f"<{failure_canary}>"
-
-    class CanaryValidator:
-        def __repr__(self) -> str:
-            return f"<{validator_canary}>"
-
-        def __call__(self, path: Path) -> Path:
-            raise CanaryFailure("validation failed")
-
-    with pytest.raises(codex_runner_module.CodexProcessStartError) as caught:
-        codex_runner_module.resolve_codex_command(
-            which=CanaryWhich(),
-            platform="win32",
-            path_validator=CanaryValidator(),
-        )
-
+    assert callable_canary not in rendered
+    assert failure_canary not in rendered
     captured = traceback.TracebackException.from_exception(
         caught.value, capture_locals=True
     )
@@ -647,12 +120,8 @@ def test_resolver_scrubs_callable_canaries_from_project_traceback_locals() -> No
         if Path(frame.filename).resolve() == module_path
         for value in (frame.locals or {}).values()
     )
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
-    for canary in (
-        which_canary, validator_canary, candidate_canary, failure_canary,
-    ):
-        assert canary not in project_locals
+    assert callable_canary not in project_locals
+    assert failure_canary not in project_locals
 
 
 @pytest.mark.parametrize(
@@ -663,37 +132,11 @@ def test_resolver_scrubs_callable_canaries_from_project_traceback_locals() -> No
     ],
 )
 def test_resolver_preserves_memory_and_control_flow(control_flow: BaseException) -> None:
-    def validator(path: Path) -> Path:
+    def discover() -> object:
         raise control_flow
 
     with pytest.raises(type(control_flow)):
-        codex_runner_module.resolve_codex_command(
-            which=_which_from({"codex.exe": "C:/safe/codex.exe"}),
-            platform="win32",
-            path_validator=validator,
-        )
-
-
-_REAL_NPM_CODEX = Path(r"C:\nvm4w\nodejs\codex.cmd")
-_REAL_NPM_NODE = Path(r"C:\nvm4w\nodejs\node.exe")
-_REAL_NPM_ENTRY = Path(r"C:\nvm4w\nodejs\node_modules\@openai\codex\bin\codex.js")
-
-
-@pytest.mark.skipif(
-    os.name != "nt" or not all(
-        path.is_file() for path in (_REAL_NPM_CODEX, _REAL_NPM_NODE, _REAL_NPM_ENTRY)
-    ),
-    reason="specific C:\\nvm4w\\nodejs npm Codex layout is unavailable",
-)
-def test_real_windows_standard_npm_layout_is_rejected_when_broadly_writable() -> None:
-    with pytest.raises(
-        codex_runner_module.CodexProcessStartError,
-        match="^Codex executable is unavailable$",
-    ):
-        codex_runner_module.resolve_codex_command(
-            which=_which_from({"codex.exe": None, "codex.cmd": str(_REAL_NPM_CODEX)}),
-            platform="win32",
-        )
+        codex_runner_module.resolve_codex_command(_discover=discover)
 
 
 def test_codex_auth_source_accepts_environment_auth_without_returning_secret() -> None:
@@ -812,7 +255,29 @@ def _runner(root: Path, executor: FakeExecutor, repository: FakeRepository | Non
     return CodexRunner(
         run_root=(root / "runs").resolve(), repository=repository or FakeRepository(),
         command_executor=executor,
+        command_resolver=lambda: codex_runner_module.CodexCommand(
+            (r"C:\private\codex.exe",)
+        ),
     )
+
+
+def test_default_runner_fails_closed_before_bare_path_execution(tmp_path: Path) -> None:
+    executor = FakeExecutor()
+    runner = CodexRunner(
+        run_root=(tmp_path / "runs").resolve(),
+        repository=FakeRepository(),
+        command_executor=executor,
+    )
+
+    with pytest.raises(
+        codex_runner_module.CodexProcessStartError,
+        match="^Codex executable is unavailable$",
+    ):
+        runner.run(
+            _prepared(tmp_path), _mapping(tmp_path),
+            run_id="run-1", prompt="safe prompt",
+        )
+    assert not executor.calls
 
 
 def _prepared_group(root: Path) -> tuple[RepositoryGroupMapping, tuple[PreparedRepository, ...]]:
@@ -932,7 +397,8 @@ def test_run_uses_noninteractive_command_safe_environment_and_persisted_prompt(t
     command, cwd, env, timeout, _, stdin = executor.calls[0]
     schema = Path(command[command.index("--output-schema") + 1])
     assert command == [
-        "codex", "exec", "--cd", str(prepared.path), "--sandbox", "workspace-write",
+        r"C:\private\codex.exe", "exec", "--cd", str(prepared.path),
+        "--sandbox", "workspace-write",
         "--output-schema", str(schema), "-",
     ]
     assert schema.is_file()
@@ -1878,6 +1344,9 @@ def test_run_rejects_oversized_prompt_and_output(tmp_path: Path) -> None:
     runner = CodexRunner(
         run_root=(tmp_path / "runs").resolve(), repository=FakeRepository(),
         command_executor=FakeExecutor(), max_prompt_bytes=8,
+        command_resolver=lambda: codex_runner_module.CodexCommand(
+            (r"C:\private\codex.exe",)
+        ),
     )
     with pytest.raises(UnsafeCodexRunError, match="prompt"):
         runner.run(_prepared(tmp_path), _mapping(tmp_path), run_id="run-1", prompt="too long prompt")
@@ -1886,6 +1355,9 @@ def test_run_rejects_oversized_prompt_and_output(tmp_path: Path) -> None:
     runner = CodexRunner(
         run_root=(tmp_path / "other-runs").resolve(), repository=FakeRepository(),
         command_executor=executor, max_output_bytes=100,
+        command_resolver=lambda: codex_runner_module.CodexCommand(
+            (r"C:\private\codex.exe",)
+        ),
     )
     with pytest.raises(CodexOutputError, match="output limit"):
         runner.run(_prepared(tmp_path), _mapping(tmp_path), run_id="run-2", prompt="safe")
