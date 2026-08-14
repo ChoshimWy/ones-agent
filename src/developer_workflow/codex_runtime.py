@@ -118,8 +118,274 @@ class LockedNativeCodex:
         self._adapter.close(self.descriptor)
 
 
+@dataclass(slots=True, repr=False)
+class _StagingLease:
+    path: Path
+    _stream: object = field(repr=False)
+    _rename_safe: bool = field(default=False, repr=False)
+    _closed: bool = field(default=False, repr=False)
+
+    @classmethod
+    def acquire(
+        cls,
+        directory: Path,
+        adapter: _CacheRuntimeAdapter,
+        *,
+        create: bool = True,
+    ) -> _StagingLease:
+        sibling = directory.parent / f"{directory.name}.lock"
+        paths = (sibling,) if create else (sibling, directory / ".stage.lock")
+        stream = None
+        rename_safe = os.name == "nt" and isinstance(
+            adapter, _WindowsCacheRuntimeAdapter,
+        )
+        path = paths[0]
+        for candidate in paths:
+            path = candidate
+            try:
+                stream = _open_staging_lease(
+                    path, create=create, native_windows=rename_safe,
+                )
+                break
+            except FileNotFoundError:
+                if candidate == paths[-1]:
+                    raise
+        assert stream is not None
+        try:
+            if create:
+                _write_all(stream, b"ones-dev-stage-v1\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+                adapter.protect_private_file(path)
+            adapter.validate_private_file(path)
+            stream.seek(0)
+            _lock_staging_descriptor(stream.fileno())
+            stream.seek(0)
+            if stream.read(64) != b"ones-dev-stage-v1\n":
+                raise OSError("private runtime staging lease is invalid")
+            stream.seek(0)
+            return cls(
+                path=path, _stream=stream, _rename_safe=rename_safe,
+            )
+        except BaseException:
+            stream.close()
+            raise
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._stream.seek(0)  # type: ignore[attr-defined]
+            _unlock_staging_descriptor(self._stream.fileno())  # type: ignore[attr-defined]
+        finally:
+            self._stream.close()  # type: ignore[attr-defined]
+
+
 _RUNTIME_ATTESTATION_NONCE = object()
 _RUNTIME_ATTESTATION_SECRET = secrets.token_bytes(32)
+_PRIVATE_LEASE_SECRET = secrets.token_bytes(32)
+
+
+def _private_lease_mac(lease: LockedPrivateCodex) -> bytes:
+    snapshot = json.dumps(
+        [
+            "locked-private-codex-v1",
+            str(lease.path),
+            str(lease._cache_root),
+            lease.sha256,
+            *_identity_manifest(lease.identity).values(),
+            *_identity_manifest(lease.source_identity).values(),
+            id(lease._descriptor),
+            id(lease._runtime_adapter),
+            id(lease._cache_adapter),
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8", "strict")
+    return hmac.digest(_PRIVATE_LEASE_SECRET, snapshot, "sha256")
+
+
+@dataclass(slots=True, repr=False)
+class LockedPrivateCodex:
+    """A verified cache executable whose underlying file remains locked."""
+
+    path: Path
+    identity: NativeCodexIdentity
+    sha256: str
+    source_identity: NativeCodexIdentity
+    _cache_root: Path = field(repr=False)
+    _cache_adapter: _CacheRuntimeAdapter = field(repr=False)
+    _descriptor: object = field(repr=False)
+    _runtime_adapter: _RuntimeAdapter | None = field(repr=False, default=None)
+    _seal: bytes = field(default=b"", repr=False)
+    _closed: bool = field(default=False, repr=False)
+
+    @classmethod
+    def _acquire(
+        cls,
+        path: Path,
+        sha256: str,
+        cache_root: Path,
+        adapter: _CacheRuntimeAdapter,
+    ) -> LockedPrivateCodex:
+        canonical = path.resolve(strict=True)
+        canonical_root = cache_root.resolve(strict=True)
+        adapter.validate_cache_ancestor_chain(canonical_root)
+        adapter.validate_private_directory(canonical_root.parent)
+        adapter.validate_private_directory(canonical_root)
+        adapter.validate_private_directory(canonical.parent)
+        adapter.validate_private_file(canonical)
+        runtime = (
+            adapter._runtime  # type: ignore[attr-defined]
+            if type(adapter) is _WindowsCacheRuntimeAdapter
+            else None
+        )
+        descriptor: object
+        if runtime is not None:
+            descriptor = runtime.open_locked(canonical)
+        else:
+            descriptor = canonical.open("rb", buffering=0)
+        lease: LockedPrivateCodex | None = None
+        primary: BaseException | None = None
+        try:
+            if runtime is not None:
+                if not runtime.is_disk_regular_non_reparse(descriptor):  # type: ignore[arg-type]
+                    raise OSError("private Codex executable is unsafe")
+                identity = runtime.identity(descriptor)  # type: ignore[arg-type]
+                final_path = runtime.final_path(descriptor)  # type: ignore[arg-type]
+                if not runtime.same_file(final_path, canonical):
+                    raise OSError("private Codex executable changed")
+                publisher = runtime.verify_publisher(  # type: ignore[arg-type]
+                    descriptor, final_path,
+                )
+                runtime.rewind(descriptor)  # type: ignore[arg-type]
+                digest = _hash_runtime_descriptor(runtime, descriptor)
+                stable = runtime.identity(descriptor)  # type: ignore[arg-type]
+            else:
+                stream = descriptor
+                metadata = os.fstat(stream.fileno())  # type: ignore[attr-defined]
+                identity = NativeCodexIdentity(
+                    metadata.st_dev, metadata.st_ino, metadata.st_size,
+                    metadata.st_mtime_ns,
+                )
+                publisher = adapter.inspect_private_executable(canonical)[1]
+                stream.seek(0)  # type: ignore[attr-defined]
+                digest = _hash_stream(stream)
+                after = os.fstat(stream.fileno())  # type: ignore[attr-defined]
+                stable = NativeCodexIdentity(
+                    after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns,
+                )
+            manifest_path = canonical.parent / "manifest.json"
+            initial_manifest_identity = adapter.validate_private_file(
+                manifest_path,
+            )
+            manifest = _read_strict_manifest(manifest_path, adapter)
+            if (
+                adapter.validate_private_file(manifest_path)
+                != initial_manifest_identity
+            ):
+                raise OSError("manifest changed")
+            source_identity = _source_identity_from_manifest(manifest)
+            if (
+                publisher != OPENAI_AUTHENTICODE_PUBLISHER
+                or stable != identity
+                or digest != sha256
+                or not _is_valid_manifest(manifest, sha256)
+                or source_identity is None
+                or identity.size != manifest["size"]
+            ):
+                raise OSError("private Codex runtime is unavailable")
+            lease = cls(
+                path=canonical,
+                identity=identity,
+                sha256=sha256,
+                source_identity=source_identity,
+                _cache_root=canonical_root,
+                _cache_adapter=adapter,
+                _descriptor=descriptor,
+                _runtime_adapter=runtime,
+            )
+            lease._seal = _private_lease_mac(lease)
+        except BaseException as error:
+            primary = error
+        if primary is not None:
+            try:
+                if runtime is not None:
+                    runtime.close(descriptor)  # type: ignore[arg-type]
+                else:
+                    descriptor.close()  # type: ignore[attr-defined]
+            except BaseException as cleanup:
+                if _is_priority_failure(cleanup) and not _is_priority_failure(primary):
+                    raise cleanup
+            raise primary
+        assert lease is not None
+        return lease
+
+    def verify(self) -> bool:
+        try:
+            if self._closed:
+                return False
+            if not hmac.compare_digest(self._seal, _private_lease_mac(self)):
+                return False
+            self._cache_adapter.validate_cache_ancestor_chain(self._cache_root)
+            self._cache_adapter.validate_private_directory(self._cache_root.parent)
+            self._cache_adapter.validate_private_directory(self._cache_root)
+            self._cache_adapter.validate_private_directory(self.path.parent)
+            self._cache_adapter.validate_private_file(self.path)
+            manifest_path = self.path.parent / "manifest.json"
+            initial_manifest_identity = self._cache_adapter.validate_private_file(
+                manifest_path,
+            )
+            manifest = _read_strict_manifest(
+                manifest_path, self._cache_adapter,
+            )
+            if (
+                self._cache_adapter.validate_private_file(manifest_path)
+                != initial_manifest_identity
+            ):
+                return False
+            if (
+                self.path.resolve(strict=True) != self.path
+                or self.path.parent.parent != self._cache_root
+                or self.path.parent.name != self.sha256
+                or not _is_valid_manifest(manifest, self.sha256)
+                or _source_identity_from_manifest(manifest) != self.source_identity
+            ):
+                return False
+            if self._runtime_adapter is not None:
+                runtime = self._runtime_adapter
+                return (
+                    runtime.is_disk_regular_non_reparse(self._descriptor)  # type: ignore[arg-type]
+                    and runtime.identity(self._descriptor) == self.identity  # type: ignore[arg-type]
+                    and runtime.same_file(
+                        runtime.final_path(self._descriptor), self.path,  # type: ignore[arg-type]
+                    )
+                )
+            metadata = os.fstat(self._descriptor.fileno())  # type: ignore[attr-defined]
+            current = NativeCodexIdentity(
+                metadata.st_dev, metadata.st_ino, metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+            path_metadata = self.path.stat(follow_symlinks=False)
+            path_identity = NativeCodexIdentity(
+                path_metadata.st_dev,
+                path_metadata.st_ino,
+                path_metadata.st_size,
+                path_metadata.st_mtime_ns,
+            )
+            return current == self.identity == path_identity
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._runtime_adapter is not None:
+            self._runtime_adapter.close(self._descriptor)  # type: ignore[arg-type]
+        else:
+            self._descriptor.close()  # type: ignore[attr-defined]
 
 
 def _runtime_attestation_mac(
@@ -151,6 +417,7 @@ class _PreparedCodexRuntime:
     identity: NativeCodexIdentity
     sha256: str
     _cache_root: Path = field(repr=False)
+    _lease: LockedPrivateCodex = field(repr=False)
     _seal: bytes = field(repr=False)
     _nonce: object = field(repr=False)
 
@@ -164,6 +431,7 @@ class _PreparedCodexRuntime:
         identity: NativeCodexIdentity,
         sha256: str,
         cache_root: Path,
+        lease: LockedPrivateCodex,
         *,
         nonce: object,
     ) -> _PreparedCodexRuntime:
@@ -185,6 +453,12 @@ class _PreparedCodexRuntime:
                 )
             )
             or identity.size < 0
+            or type(lease) is not LockedPrivateCodex
+            or not lease.verify()
+            or lease.path != canonical
+            or lease.identity != identity
+            or lease.sha256 != sha256
+            or lease._cache_root != canonical_root
             or canonical.parent.name != sha256
             or canonical.parent.parent != canonical_root
         ):
@@ -197,6 +471,7 @@ class _PreparedCodexRuntime:
         object.__setattr__(instance, "identity", identity)
         object.__setattr__(instance, "sha256", sha256)
         object.__setattr__(instance, "_cache_root", canonical_root)
+        object.__setattr__(instance, "_lease", lease)
         object.__setattr__(instance, "_seal", seal)
         object.__setattr__(instance, "_nonce", nonce)
         return instance
@@ -209,6 +484,12 @@ class _PreparedCodexRuntime:
                 or type(self.identity) is not NativeCodexIdentity
                 or not _is_sha256(self.sha256)
                 or not isinstance(self._cache_root, Path)
+                or type(self._lease) is not LockedPrivateCodex
+                or not self._lease.verify()
+                or self._lease.path != self.path
+                or self._lease.identity != self.identity
+                or self._lease.sha256 != self.sha256
+                or self._lease._cache_root != self._cache_root
                 or type(self._seal) is not bytes
                 or self.path.resolve(strict=True) != self.path
                 or self._cache_root.resolve(strict=True) != self._cache_root
@@ -235,7 +516,10 @@ class _PreparedCodexRuntime:
 
 
 _CACHE_SCHEMA_KEYS = frozenset(
-    {"publisher", "schema_version", "sha256", "size", "target"}
+    {
+        "publisher", "schema_version", "sha256", "size", "source_identity",
+        "target",
+    }
 )
 _QUARANTINE_SCHEMA_KEYS = frozenset({"schema_version", "sha256"})
 _QUARANTINE_PREFIX = ".quarantine-"
@@ -286,33 +570,47 @@ class CodexRuntimePreparer:
             if _is_priority_failure(error) or not isinstance(error, OSError):
                 raise
             if cached:
-                return cached[sorted(cached)[-1]]
+                return cached[sorted(cached)[-1]][0]
             raise OSError("private Codex runtime is unavailable") from None
         result: Path | None = None
         primary: BaseException | None = None
         primary_traceback = None
         try:
             try:
-                source_sha256 = self._hash_locked_source(locked)
-                matching = cached.get(source_sha256)
-                if source_sha256 in quarantined and source_sha256 not in rebuildable:
-                    raise OSError("private Codex runtime is quarantined")
-                result = (
-                    matching
-                    if matching is not None
-                    else self._stage_locked_source(
-                        root,
-                        locked,
-                        source_sha256,
-                        adapter,
-                        quarantine=rebuildable.get(source_sha256),
+                identity_matches = [
+                    (digest, path)
+                    for digest, (path, source_identity) in cached.items()
+                    if source_identity == locked.identity
+                ]
+                if (
+                    identity_matches
+                    and locked.current_identity() == locked.identity
+                ):
+                    result = sorted(identity_matches)[-1][1]
+                else:
+                    source_sha256 = self._hash_locked_source(locked)
+                    matching = cached.get(source_sha256)
+                    if (
+                        source_sha256 in quarantined
+                        and source_sha256 not in rebuildable
+                    ):
+                        raise OSError("private Codex runtime is quarantined")
+                    result = (
+                        matching[0]
+                        if matching is not None
+                        else self._stage_locked_source(
+                            root,
+                            locked,
+                            source_sha256,
+                            adapter,
+                            quarantine=rebuildable.get(source_sha256),
+                        )
                     )
-                )
             except BaseException as error:
                 if _is_priority_failure(error) or not isinstance(error, OSError):
                     raise
                 if cached:
-                    result = cached[sorted(cached)[-1]]
+                    result = cached[sorted(cached)[-1]][0]
                 else:
                     raise OSError(
                         "private Codex runtime is unavailable"
@@ -341,25 +639,22 @@ class CodexRuntimePreparer:
     def prepare_verified(self) -> _PreparedCodexRuntime:
         path = self.prepare()
         adapter = self._cache_adapter or _WindowsCacheRuntimeAdapter()
-        adapter.validate_private_file(path)
-        identity, publisher = adapter.inspect_private_executable(path)
         sha256 = path.parent.name
-        if (
-            publisher != OPENAI_AUTHENTICODE_PUBLISHER
-            or identity.size != path.stat(follow_symlinks=False).st_size
-            or _hash_file(path) != sha256
-        ):
-            raise OSError("private Codex runtime is unavailable")
-        final_identity, final_publisher = adapter.inspect_private_executable(path)
-        if final_identity != identity or final_publisher != publisher:
-            raise OSError("private Codex runtime is unavailable")
-        return _PreparedCodexRuntime._issue(
-            path,
-            identity,
-            sha256,
-            path.parent.parent,
-            nonce=_RUNTIME_ATTESTATION_NONCE,
+        lease = LockedPrivateCodex._acquire(
+            path, sha256, path.parent.parent, adapter,
         )
+        try:
+            return _PreparedCodexRuntime._issue(
+                path,
+                lease.identity,
+                sha256,
+                path.parent.parent,
+                lease,
+                nonce=_RUNTIME_ATTESTATION_NONCE,
+            )
+        except BaseException:
+            lease.close()
+            raise
 
     def _hash_locked_source(self, locked: LockedNativeCodex) -> str:
         digest = hashlib.sha256()
@@ -396,9 +691,11 @@ class CodexRuntimePreparer:
         result: Path | None = None
         primary: BaseException | None = None
         primary_traceback = None
+        staging_lease: _StagingLease | None = None
         try:
             staging.mkdir(exist_ok=False)
             adapter.prepare_private_directory(staging)
+            staging_lease = _StagingLease.acquire(staging, adapter)
             temporary = staging / f"codex-{uuid.uuid4().hex}.tmp"
             digest = hashlib.sha256()
             copied = 0
@@ -430,6 +727,7 @@ class CodexRuntimePreparer:
                 "schema_version": 1,
                 "sha256": sha256,
                 "size": copied,
+                "source_identity": _identity_manifest(locked.identity),
                 "target": "codex.exe",
             }
             manifest_temp = staging / f"manifest-{uuid.uuid4().hex}.tmp"
@@ -466,14 +764,34 @@ class CodexRuntimePreparer:
                         raise
                     _remove_owned_tree(final_directory)
                     adapter.fsync_directory(root)
+                    if not staging_lease._rename_safe:
+                        lease_path = staging_lease.path
+                        staging_lease.close()
+                        staging_lease = None
+                        lease_path.unlink()
                     os.replace(staging, final_directory)
+                    if staging_lease is not None:
+                        staging_lease.path.unlink()
+                    if staging_lease is not None:
+                        staging_lease.close()
+                        staging_lease = None
                     published_final = final_directory
                     adapter.fsync_directory(root)
                     result = self._validate_cache_directory(
                         final_directory, sha256, adapter, smoke=False,
                     )
             else:
+                if not staging_lease._rename_safe:
+                    lease_path = staging_lease.path
+                    staging_lease.close()
+                    staging_lease = None
+                    lease_path.unlink()
                 os.replace(staging, final_directory)
+                if staging_lease is not None:
+                    staging_lease.path.unlink()
+                if staging_lease is not None:
+                    staging_lease.close()
+                    staging_lease = None
                 published_final = final_directory
                 adapter.fsync_directory(root)
                 result = self._validate_cache_directory(
@@ -548,7 +866,20 @@ class CodexRuntimePreparer:
             and not clear_started
         ):
             cleanup_paths.append(published_final)
+        lease_cleanup: BaseException | None = None
+        if staging_lease is not None:
+            lease_path = staging_lease.path
+            try:
+                staging_lease.close()
+                if (
+                    lease_path.parent == root
+                    and lease_path.name == f"{staging.name}.lock"
+                ):
+                    lease_path.unlink(missing_ok=True)
+            except BaseException as error:
+                lease_cleanup = error
         cleanup = _attempt_owned_cleanup(tuple(cleanup_paths))
+        cleanup = _prefer_cleanup_error(cleanup, lease_cleanup)
         cleanup = _prefer_cleanup_error(cleanup, marker_probe_error)
         cleanup = _prefer_cleanup_error(cleanup, concurrent_probe_error)
         cleanup = _prefer_cleanup_error(cleanup, quarantine_error)
@@ -603,8 +934,8 @@ class CodexRuntimePreparer:
         adapter: _CacheRuntimeAdapter,
         *,
         excluded: set[str] | frozenset[str] = frozenset(),
-    ) -> dict[str, Path]:
-        valid: dict[str, Path] = {}
+    ) -> dict[str, tuple[Path, NativeCodexIdentity]]:
+        valid: dict[str, tuple[Path, NativeCodexIdentity]] = {}
         try:
             candidates = tuple(root.iterdir())
         except OSError:
@@ -617,9 +948,23 @@ class CodexRuntimePreparer:
             ) or digest in excluded:
                 continue
             try:
-                valid[digest] = self._validate_cache_directory(
-                    directory, digest, adapter,
+                path = self._validate_cache_directory(directory, digest, adapter)
+                manifest_path = directory / "manifest.json"
+                initial_manifest_identity = adapter.validate_private_file(
+                    manifest_path,
                 )
+                manifest = _read_strict_manifest(
+                    manifest_path, adapter,
+                )
+                if (
+                    adapter.validate_private_file(manifest_path)
+                    != initial_manifest_identity
+                ):
+                    raise OSError("manifest changed")
+                source_identity = _source_identity_from_manifest(manifest)
+                if source_identity is None:
+                    raise OSError("invalid manifest source identity")
+                valid[digest] = path, source_identity
             except BaseException as error:
                 if _is_priority_failure(error) or not isinstance(
                     error, (OSError, ValueError, json.JSONDecodeError)
@@ -784,6 +1129,38 @@ class CodexRuntimePreparer:
                 and all(character in "0123456789abcdef" for character in name)
             )
             if random_stage:
+                try:
+                    adapter.validate_private_directory(candidate)
+                    lease = _StagingLease.acquire(
+                        candidate, adapter, create=False,
+                    )
+                except BlockingIOError:
+                    continue
+                except BaseException as error:
+                    if _is_priority_failure(error):
+                        raise
+                    if not isinstance(error, (OSError, ValueError)):
+                        raise
+                    continue
+                try:
+                    children = tuple(candidate.iterdir())
+                    if any(not _is_owned_staging_child(child) for child in children):
+                        continue
+                    for child in children:
+                        adapter.validate_private_file(child)
+                finally:
+                    lease.close()
+                cleanup = _attempt_owned_cleanup((candidate,))
+                if cleanup is not None:
+                    if _is_priority_failure(cleanup):
+                        raise cleanup
+                    continue
+                if lease.path.parent == root:
+                    try:
+                        lease.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                adapter.fsync_directory(root)
                 continue
             if not deterministic_name:
                 continue
@@ -842,6 +1219,26 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _hash_stream(stream: object) -> str:
+    digest = hashlib.sha256()
+    while True:
+        chunk = stream.read(1024 * 1024)  # type: ignore[attr-defined]
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
+def _hash_runtime_descriptor(
+    adapter: _RuntimeAdapter, descriptor: object,
+) -> str:
+    digest = hashlib.sha256()
+    while True:
+        chunk = adapter.read(descriptor, 1024 * 1024)  # type: ignore[arg-type]
+        if not chunk:
+            return digest.hexdigest()
+        digest.update(chunk)
+
+
 def _write_all(stream: object, data: bytes) -> None:
     remaining = memoryview(data)
     while remaining:
@@ -851,10 +1248,92 @@ def _write_all(stream: object, data: bytes) -> None:
         remaining = remaining[written:]
 
 
+def _open_staging_lease(
+    path: Path, *, create: bool, native_windows: bool,
+) -> object:
+    if os.name != "nt" or not native_windows:
+        return path.open("x+b" if create else "r+b", buffering=0)
+
+    # Python's CRT open denies directory rename while the file is held.  The
+    # lease must survive the same-volume staging-directory publish, so open it
+    # with delete sharing and use the CRT descriptor only for byte locking.
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    create_file = ctypes.WinDLL("kernel32", use_last_error=True).CreateFileW
+    create_file.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    create_file.restype = wintypes.HANDLE
+    handle = create_file(
+        str(path),
+        0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+        0x1 | 0x2 | 0x4,  # FILE_SHARE_READ | WRITE | DELETE
+        None,
+        1 if create else 3,  # CREATE_NEW | OPEN_EXISTING
+        0x80,  # FILE_ATTRIBUTE_NORMAL
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        error = ctypes.get_last_error()
+        if not create and error in {2, 3}:
+            raise FileNotFoundError(error, os.strerror(error), path)
+        if create and error == 80:
+            raise FileExistsError(error, os.strerror(error), path)
+        raise OSError(error, os.strerror(error), path)
+    try:
+        descriptor = msvcrt.open_osfhandle(
+            int(handle), os.O_RDWR | getattr(os, "O_BINARY", 0),
+        )
+    except BaseException:
+        ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(handle)
+        raise
+    try:
+        return os.fdopen(descriptor, "r+b", buffering=0)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _lock_staging_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError as error:
+            raise BlockingIOError("private runtime staging is active") from error
+        return
+    import fcntl
+
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as error:
+        raise BlockingIOError("private runtime staging is active") from error
+
+
+def _unlock_staging_descriptor(descriptor: int) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+
 def _is_owned_staging_child(path: Path) -> bool:
     name = path.name
     return (
-        name in {"codex.exe", "manifest.json"}
+        name in {".stage.lock", "codex.exe", "manifest.json"}
         or name.startswith("codex-") and name.endswith(".tmp")
         or name.startswith("manifest-") and name.endswith(".tmp")
     )
@@ -909,6 +1388,7 @@ def _read_strict_manifest(
 
 
 def _is_valid_manifest(manifest: dict[str, object], directory_name: str) -> bool:
+    source_identity = _source_identity_from_manifest(manifest)
     return (
         frozenset(manifest) == _CACHE_SCHEMA_KEYS
         and type(manifest.get("schema_version")) is int
@@ -921,7 +1401,37 @@ def _is_valid_manifest(manifest: dict[str, object], directory_name: str) -> bool
         and manifest["target"] == "codex.exe"
         and type(manifest.get("size")) is int
         and manifest["size"] >= 0
+        and source_identity is not None
+        and source_identity.size == manifest["size"]
     )
+
+
+def _identity_manifest(identity: NativeCodexIdentity) -> dict[str, int]:
+    return {
+        "file_index": identity.file_index,
+        "mtime_ns": identity.mtime_ns,
+        "size": identity.size,
+        "volume_serial": identity.volume_serial,
+    }
+
+
+def _source_identity_from_manifest(
+    manifest: dict[str, object],
+) -> NativeCodexIdentity | None:
+    value = manifest.get("source_identity")
+    if type(value) is not dict or frozenset(value) != frozenset(
+        {"file_index", "mtime_ns", "size", "volume_serial"}
+    ):
+        return None
+    if any(type(value.get(key)) is not int for key in value):
+        return None
+    identity = NativeCodexIdentity(
+        volume_serial=value["volume_serial"],
+        file_index=value["file_index"],
+        size=value["size"],
+        mtime_ns=value["mtime_ns"],
+    )
+    return identity if identity.size >= 0 else None
 
 
 def _is_valid_quarantine(record: dict[str, object], digest: str) -> bool:
@@ -1915,15 +2425,8 @@ class _WindowsCacheRuntimeAdapter:
 def _run_bounded_smoke(
     executable: Path, *, environment: dict[str, str], timeout: float,
 ) -> None:
-    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    process = subprocess.Popen(
-        [str(executable), "--version"],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        shell=False,
-        env=environment,
-        creationflags=creationflags,
+    process, tree = _start_smoke_process(
+        [str(executable), "--version"], executable.parent, environment,
     )
     output = bytearray()
     overflow = threading.Event()
@@ -1952,7 +2455,7 @@ def _run_bounded_smoke(
         )
         reader.start()
     except BaseException as error:
-        cleanup_errors = _cleanup_failed_smoke_start(process, reader)
+        cleanup_errors = _cleanup_failed_smoke_start(process, reader, tree)
         selected = _select_smoke_failure(error, [], cleanup_errors)
         assert selected is not None
         raise selected
@@ -1986,7 +2489,7 @@ def _run_bounded_smoke(
     cleanup_errors: list[BaseException] = []
     if failed:
         try:
-            process.kill()
+            _terminate_smoke_process(process, tree)
         except BaseException as error:
             cleanup_errors.append(error)
         try:
@@ -2004,6 +2507,10 @@ def _run_bounded_smoke(
         cleanup_errors.append(error)
     if reader.is_alive():
         cleanup_errors.append(OSError("private Codex smoke reader did not stop"))
+    try:
+        tree.close()
+    except BaseException as error:
+        cleanup_errors.append(error)
 
     operational = list(reader_errors)
     if failed and primary is None and not operational:
@@ -2038,11 +2545,13 @@ def _select_smoke_failure(
 
 
 def _cleanup_failed_smoke_start(
-    process: subprocess.Popen[bytes], reader: threading.Thread | None,
+    process: subprocess.Popen[bytes],
+    reader: threading.Thread | None,
+    tree: object,
 ) -> list[BaseException]:
     errors: list[BaseException] = []
     try:
-        process.kill()
+        _terminate_smoke_process(process, tree)
     except BaseException as error:
         errors.append(error)
     try:
@@ -2059,7 +2568,35 @@ def _cleanup_failed_smoke_start(
             reader.join(timeout=1.0)
         except BaseException as error:
             errors.append(error)
+    try:
+        tree.close()  # type: ignore[attr-defined]
+    except BaseException as error:
+        errors.append(error)
     return errors
+
+
+def _start_smoke_process(
+    command: list[str], cwd: Path, environment: dict[str, str],
+) -> tuple[subprocess.Popen[bytes], object]:
+    # Lazy import avoids a module cycle: the runner imports this preparation
+    # layer, while smoke tests reuse its already-hardened process-tree launcher.
+    from .codex_runner import _start_isolated_process
+
+    return _start_isolated_process(
+        command,
+        cwd=cwd,
+        env=environment,
+        pipe_stdin=False,
+        merge_stderr=True,
+    )
+
+
+def _terminate_smoke_process(
+    process: subprocess.Popen[bytes], tree: object,
+) -> None:
+    from .codex_runner import _terminate
+
+    _terminate(process, tree)  # type: ignore[arg-type]
 
 __all__ = [
     "OPENAI_AUTHENTICODE_PUBLISHER",

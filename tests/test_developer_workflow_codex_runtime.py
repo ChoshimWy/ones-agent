@@ -238,11 +238,116 @@ def test_preparer_streams_source_and_publishes_manifest_last(tmp_path: Path) -> 
         "schema_version": 1,
         "sha256": digest,
         "size": len(source.payload),
+        "source_identity": {
+            "file_index": source.identity.file_index,
+            "mtime_ns": source.identity.mtime_ns,
+            "size": source.identity.size,
+            "volume_serial": source.identity.volume_serial,
+        },
         "target": "codex.exe",
     }
     assert source.closed
     assert source.read_calls > 1
     assert not tuple(root.glob(".staging-*"))
+
+
+def test_manifest_records_source_identity_and_same_identity_reuses_without_read(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    first = FakeLockedSource(b"identity-cache")
+    executable = _prepare_runtime(root, first, FakeCacheAdapter())
+    manifest = json.loads((executable.parent / "manifest.json").read_text("utf-8"))
+
+    assert manifest["source_identity"] == {
+        "file_index": first.identity.file_index,
+        "mtime_ns": first.identity.mtime_ns,
+        "size": first.identity.size,
+        "volume_serial": first.identity.volume_serial,
+    }
+
+    second = FakeLockedSource(b"identity-cache")
+    reused = _prepare_runtime(root, second, FakeCacheAdapter())
+    assert reused == executable
+    assert second.read_calls == 0
+
+
+def test_changed_source_identity_forces_streaming_validation(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    executable = _prepare_runtime(
+        root, FakeLockedSource(b"identity-changed"), FakeCacheAdapter(),
+    )
+    changed = FakeLockedSource(b"identity-changed")
+    changed.identity = NativeCodexIdentity(
+        changed.identity.volume_serial,
+        changed.identity.file_index,
+        changed.identity.size,
+        changed.identity.mtime_ns + 1,
+    )
+
+    reused = _prepare_runtime(root, changed, FakeCacheAdapter())
+
+    assert reused == executable
+    assert changed.read_calls > 0
+
+
+def test_startup_removes_exclusively_lockable_owned_stale_large_stage(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    stale = root / (".staging-" + "d" * 32)
+    stale.mkdir()
+    (stale / ".stage.lock").write_bytes(b"ones-dev-stage-v1\n")
+    with (stale / "codex.exe").open("wb") as stream:
+        stream.truncate(299 * 1024 * 1024)
+
+    executable = _prepare_runtime(
+        root, FakeLockedSource(b"fresh-after-stale"), FakeCacheAdapter(),
+    )
+
+    assert executable.is_file()
+    assert not stale.exists()
+
+
+def test_startup_preserves_actively_locked_owned_stage(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    active = root / (".staging-" + "e" * 32)
+    active.mkdir()
+    adapter = FakeCacheAdapter()
+    lease = codex_runtime_module._StagingLease.acquire(active, adapter)
+    try:
+        executable = _prepare_runtime(
+            root, FakeLockedSource(b"fresh-beside-active"), adapter,
+        )
+        assert executable.is_file()
+        assert active.is_dir()
+    finally:
+        lease.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows delete-share lease invariant")
+def test_windows_staging_lease_survives_directory_publish(tmp_path: Path) -> None:
+    stage = tmp_path / (".staging-" + "f" * 32)
+    final = tmp_path / ("a" * 64)
+    stage.mkdir()
+    lease_path = tmp_path / f"{stage.name}.lock"
+    stream = codex_runtime_module._open_staging_lease(
+        lease_path, create=True, native_windows=True,
+    )
+    try:
+        codex_runtime_module._write_all(stream, b"ones-dev-stage-v1\n")
+        stream.seek(0)
+        codex_runtime_module._lock_staging_descriptor(stream.fileno())
+        os.replace(stage, final)
+        lease_path.unlink()
+        stream.seek(0)
+        codex_runtime_module._unlock_staging_descriptor(stream.fileno())
+    finally:
+        stream.close()
+    assert final.is_dir()
+    assert not lease_path.exists()
 
 
 def test_preparer_smokes_only_valid_manifest_staging_directory(
@@ -953,7 +1058,9 @@ def test_preparer_stages_new_hash_when_source_changes(tmp_path: Path) -> None:
     root = tmp_path / "ones-dev" / "codex-runtime"
     adapter = FakeCacheAdapter()
     old = _prepare_runtime(root, FakeLockedSource(b"version-one"), adapter)
-    new = _prepare_runtime(root, FakeLockedSource(b"version-two"), adapter)
+    changed = FakeLockedSource(b"version-two")
+    changed.identity = NativeCodexIdentity(3, 6, len(changed.payload), 8)
+    new = _prepare_runtime(root, changed, adapter)
 
     assert old != new
     assert old.read_bytes() == b"version-one"
@@ -1454,6 +1561,30 @@ def test_zero_length_destination_write_fails_closed() -> None:
         codex_runtime_module._write_all(StalledWriter(), b"payload")
 
 
+def _install_fake_smoke_process(
+    monkeypatch: pytest.MonkeyPatch,
+    process: object,
+    calls: list[tuple[object, dict[str, object]]] | None = None,
+) -> None:
+    class Tree:
+        def close(self) -> None:
+            return None
+
+    def start(
+        command: list[str], cwd: Path, environment: dict[str, str],
+    ) -> tuple[object, Tree]:
+        if calls is not None:
+            calls.append((command, {"cwd": cwd, "env": environment, "shell": False}))
+        return process, Tree()
+
+    monkeypatch.setattr(codex_runtime_module, "_start_smoke_process", start)
+    monkeypatch.setattr(
+        codex_runtime_module,
+        "_terminate_smoke_process",
+        lambda actual, tree: actual.kill(),
+    )
+
+
 def test_smoke_uses_absolute_native_argv_shell_false_and_bounded_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1469,11 +1600,7 @@ def test_smoke_uses_absolute_native_argv_shell_false_and_bounded_output(
         def kill(self) -> None:
             raise AssertionError("successful smoke must not be killed")
 
-    def popen(argv: object, **kwargs: object) -> FakeProcess:
-        calls.append((argv, kwargs))
-        return FakeProcess()
-
-    monkeypatch.setattr(codex_runtime_module.subprocess, "Popen", popen)
+    _install_fake_smoke_process(monkeypatch, FakeProcess(), calls)
     codex_runtime_module._run_bounded_smoke(
         executable,
         environment={"SYSTEMROOT": "C:/Windows"},
@@ -1500,11 +1627,7 @@ def test_smoke_kills_process_when_output_exceeds_limit(
         def kill(self) -> None:
             killed.append(True)
 
-    monkeypatch.setattr(
-        codex_runtime_module.subprocess,
-        "Popen",
-        lambda *args, **kwargs: FakeProcess(),
-    )
+    _install_fake_smoke_process(monkeypatch, FakeProcess())
     with pytest.raises(OSError, match="smoke test failed"):
         codex_runtime_module._run_bounded_smoke(
             (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
@@ -1548,11 +1671,7 @@ def test_smoke_failure_always_kills_reaps_closes_and_joins(
             events.append("kill")
 
     process = Process()
-    monkeypatch.setattr(
-        codex_runtime_module.subprocess,
-        "Popen",
-        lambda *args, **kwargs: process,
-    )
+    _install_fake_smoke_process(monkeypatch, process)
     expected = (
         OSError if isinstance(primary, subprocess.TimeoutExpired) else type(primary)
     )
@@ -1597,11 +1716,7 @@ def test_smoke_reader_failure_is_propagated_after_process_cleanup(
             events.append("kill")
 
     process = Process()
-    monkeypatch.setattr(
-        codex_runtime_module.subprocess,
-        "Popen",
-        lambda *args, **kwargs: process,
-    )
+    _install_fake_smoke_process(monkeypatch, process)
 
     with pytest.raises(RuntimeError) as caught:
         codex_runtime_module._run_bounded_smoke(
@@ -1633,11 +1748,7 @@ def test_smoke_primary_control_flow_beats_cleanup_memory_error(
         def kill(self) -> None:
             raise MemoryError("cleanup memory")
 
-    monkeypatch.setattr(
-        codex_runtime_module.subprocess,
-        "Popen",
-        lambda *args, **kwargs: Process(),
-    )
+    _install_fake_smoke_process(monkeypatch, Process())
     with pytest.raises(asyncio.CancelledError) as caught:
         codex_runtime_module._run_bounded_smoke(
             (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
@@ -1674,11 +1785,7 @@ def test_smoke_thread_start_failure_still_kills_reaps_and_closes_process(
             return False
 
     process = Process()
-    monkeypatch.setattr(
-        codex_runtime_module.subprocess,
-        "Popen",
-        lambda *args, **kwargs: process,
-    )
+    _install_fake_smoke_process(monkeypatch, process)
     monkeypatch.setattr(
         codex_runtime_module.threading,
         "Thread",

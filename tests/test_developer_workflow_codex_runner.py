@@ -264,6 +264,7 @@ def test_codex_command_copy_preserves_attestation_and_pickle_is_rejected(
     ("field_name", "replacement"),
     [
         ("prefix", (r"C:\\forged\\codex.exe",)),
+        ("_path", Path("C:/forged-cache/0/codex.exe")),
         ("_sha256", "f" * 64),
         ("_identity", NativeCodexIdentity(99, 98, 97, 96)),
         ("_cache_root", Path("C:/forged-cache")),
@@ -320,6 +321,65 @@ def test_command_mac_rejects_nested_identity_mutation(tmp_path: Path) -> None:
     command = _attested_command(tmp_path)
     object.__setattr__(command._identity, "size", command._identity.size + 1)
     assert not command._is_attested()
+
+
+def test_command_requires_open_verified_execution_lease(tmp_path: Path) -> None:
+    command = _attested_command(tmp_path)
+    assert command._lease.verify()  # type: ignore[attr-defined]
+
+    command._lease.close()  # type: ignore[attr-defined]
+    command._lease.close()  # idempotent  # type: ignore[attr-defined]
+
+    assert not command._is_attested()
+    with pytest.raises(TypeError, match="attestation"):
+        command.argv("exec")
+
+
+def test_execution_lease_seal_rejects_reflection_mutation(tmp_path: Path) -> None:
+    command = _attested_command(tmp_path)
+    object.__setattr__(command._lease, "_cache_adapter", object())
+    assert not command._is_attested()
+    with pytest.raises(TypeError, match="attestation"):
+        command.argv("exec")
+    command.close()
+
+
+def test_locked_execution_lease_blocks_or_detects_disk_replacement(
+    tmp_path: Path,
+) -> None:
+    command = _attested_command(tmp_path)
+    target = Path(command.prefix[0])
+    replacement = target.with_name("replacement.exe")
+    replacement.write_bytes(b"not-the-verified-runtime")
+    try:
+        os.replace(replacement, target)
+    except PermissionError:
+        assert command._is_attested()
+    else:
+        assert not command._is_attested()
+        with pytest.raises(TypeError, match="attestation"):
+            command.argv("exec")
+    finally:
+        command.close()
+
+
+def test_reflection_cannot_issue_runtime_without_verified_locked_handle(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.codex_runtime as runtime_module
+
+    valid = _verified_runtime(tmp_path)
+    forged_lease = object.__new__(runtime_module.LockedPrivateCodex)
+    with pytest.raises((AttributeError, TypeError, ValueError)):
+        runtime_module._PreparedCodexRuntime._issue(
+            valid.path,  # type: ignore[attr-defined]
+            valid.identity,  # type: ignore[attr-defined]
+            valid.sha256,  # type: ignore[attr-defined]
+            valid._cache_root,  # type: ignore[attr-defined]
+            forged_lease,
+            nonce=runtime_module._RUNTIME_ATTESTATION_NONCE,
+        )
+    valid._lease.close()  # type: ignore[attr-defined]
 
 
 def test_runner_rejects_forged_unattested_command_before_executor(
@@ -466,6 +526,29 @@ def _runner(root: Path, executor: FakeExecutor, repository: FakeRepository | Non
         command_executor=executor,
         command_resolver=lambda: _attested_command(root),
     )
+
+
+def test_runner_holds_execution_lease_through_executor_then_closes_it(
+    tmp_path: Path,
+) -> None:
+    command = _attested_command(tmp_path)
+
+    class CheckingExecutor(FakeExecutor):
+        def __call__(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            assert command._lease.verify()
+            return super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+
+    runner = CodexRunner(
+        run_root=(tmp_path / "runs").resolve(),
+        repository=FakeRepository(),
+        command_executor=CheckingExecutor(),
+        command_resolver=lambda: command,
+    )
+    runner.run(
+        _prepared(tmp_path), _mapping(tmp_path), run_id="lease-lifetime",
+        prompt="safe prompt",
+    )
+    assert not command._lease.verify()
 
 
 def test_default_runner_fails_closed_when_private_runtime_preparation_fails(

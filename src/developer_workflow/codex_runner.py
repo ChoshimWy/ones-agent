@@ -26,6 +26,7 @@ from jsonschema import Draft202012Validator
 
 from .codex_runtime import (
     CodexRuntimePreparer,
+    LockedPrivateCodex,
     NativeCodexIdentity,
     _PreparedCodexRuntime,
 )
@@ -106,6 +107,7 @@ class CodexCommand:
     _identity: object = field(repr=False)
     _sha256: str = field(repr=False)
     _cache_root: Path = field(repr=False)
+    _lease: LockedPrivateCodex = field(repr=False)
     _seal: bytes = field(repr=False)
     _nonce: object = field(repr=False)
 
@@ -135,6 +137,7 @@ class CodexCommand:
         object.__setattr__(instance, "_identity", runtime.identity)
         object.__setattr__(instance, "_sha256", runtime.sha256)
         object.__setattr__(instance, "_cache_root", runtime._cache_root)
+        object.__setattr__(instance, "_lease", runtime._lease)
         object.__setattr__(instance, "_seal", seal)
         object.__setattr__(instance, "_nonce", _COMMAND_ATTESTATION_NONCE)
         return instance
@@ -153,6 +156,12 @@ class CodexCommand:
                     for character in self._sha256
                 )
                 or not isinstance(self._cache_root, Path)
+                or type(self._lease) is not LockedPrivateCodex
+                or not self._lease.verify()
+                or self._lease.path != self._path
+                or self._lease.identity != self._identity
+                or self._lease.sha256 != self._sha256
+                or self._lease._cache_root != self._cache_root
                 or type(self._seal) is not bytes
                 or self.prefix != (str(self._path),)
                 or self._path.resolve(strict=True) != self._path
@@ -182,6 +191,9 @@ class CodexCommand:
         ):
             raise ValueError("Codex command argument is invalid")
         return [*self.prefix, *arguments]
+
+    def close(self) -> None:
+        self._lease.close()
 
     def __copy__(self) -> CodexCommand:
         return self
@@ -275,6 +287,10 @@ def _is_positive_finite_number(value: Any) -> bool:
         return math.isfinite(value) and value > 0
     except (OverflowError, TypeError, ValueError):
         return False
+
+
+def _is_priority_failure(error: BaseException) -> bool:
+    return isinstance(error, MemoryError) or not isinstance(error, Exception)
 
 
 if os.name == "nt":  # pragma: no cover - definitions are exercised on Windows
@@ -435,7 +451,12 @@ def _resume_suspended_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _start_isolated_process(
-    command: list[str], *, cwd: Path, env: dict[str, str], pipe_stdin: bool = False
+    command: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    pipe_stdin: bool = False,
+    merge_stderr: bool = False,
 ) -> tuple[subprocess.Popen[bytes], _ProcessTreeGuard]:
     creationflags = 0
     if os.name == "nt":
@@ -449,7 +470,7 @@ def _start_isolated_process(
             env=env,
             stdin=subprocess.PIPE if pipe_stdin else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             shell=False,
             creationflags=creationflags,
             start_new_session=os.name != "nt",
@@ -462,37 +483,67 @@ def _start_isolated_process(
         tree = _ProcessTreeGuard(process)
         _resume_suspended_process(process)
         return process, tree
-    except OSError as error:
+    except BaseException as error:
+        cleanup_errors: list[BaseException] = []
         try:
             if tree is not None:
                 tree.terminate()
             else:
                 process.kill()
+        except BaseException as cleanup:
+            cleanup_errors.append(cleanup)
+        try:
             process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
+        except BaseException as cleanup:
+            cleanup_errors.append(cleanup)
             try:
                 process.kill()
+            except BaseException as nested:
+                cleanup_errors.append(nested)
+            try:
                 process.wait(timeout=2)
-            except (OSError, subprocess.TimeoutExpired):
-                pass
-        finally:
-            if tree is not None:
+            except BaseException as nested:
+                cleanup_errors.append(nested)
+        if tree is not None:
+            try:
                 tree.close()
-        raise CodexExecutionError("Codex process could not be isolated") from error
+            except BaseException as cleanup:
+                cleanup_errors.append(cleanup)
+        if _is_priority_failure(error):
+            raise
+        for cleanup in cleanup_errors:
+            if _is_priority_failure(cleanup):
+                raise cleanup
+        if isinstance(error, OSError):
+            raise CodexExecutionError(
+                "Codex process could not be isolated"
+            ) from error
+        raise
 
 
 def _terminate(process: subprocess.Popen[bytes], tree: _ProcessTreeGuard) -> None:
+    failures: list[BaseException] = []
     try:
         tree.terminate()
+    except BaseException as error:
+        failures.append(error)
+    try:
         if process.poll() is None:
             process.wait(timeout=2)
-    except (OSError, subprocess.TimeoutExpired):
+    except BaseException as error:
+        failures.append(error)
         try:
             tree.force_kill()
+        except BaseException as nested:
+            failures.append(nested)
+        try:
             if process.poll() is None:
                 process.wait(timeout=2)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        except BaseException as nested:
+            failures.append(nested)
+    for failure in failures:
+        if _is_priority_failure(failure):
+            raise failure
 
 
 def _bounded_subprocess(
@@ -1439,25 +1490,54 @@ class CodexRunner:
             or not resolved_command._is_attested()
         ):
             _raise_codex_executable_unavailable()
-        command = resolved_command.argv(
-            "exec", "--cd", str(effective_cwd), "--sandbox", sandbox,
-            "--output-schema", str(self.schema_path), "-",
-        )
+        execution_error: BaseException | None = None
+        execution_traceback = None
+        completed: subprocess.CompletedProcess[str] | None = None
         try:
-            completed = self.command_executor(
-                command,
-                cwd=effective_cwd,
-                env=safe_env,
-                timeout=float(timeout_seconds),
-                max_output_bytes=self.max_output_bytes,
-                stdin=prompt_bytes,
+            command = resolved_command.argv(
+                "exec", "--cd", str(effective_cwd), "--sandbox", sandbox,
+                "--output-schema", str(self.schema_path), "-",
             )
-        except subprocess.TimeoutExpired as error:
-            raise CodexTimeoutError("Codex execution timed out") from error
-        except CodexRunnerError:
-            raise
-        except Exception as error:
-            raise CodexExecutionError("Codex process could not be executed") from error
+            try:
+                completed = self.command_executor(
+                    command,
+                    cwd=effective_cwd,
+                    env=safe_env,
+                    timeout=float(timeout_seconds),
+                    max_output_bytes=self.max_output_bytes,
+                    stdin=prompt_bytes,
+                )
+            except subprocess.TimeoutExpired as error:
+                raise CodexTimeoutError("Codex execution timed out") from error
+            except CodexRunnerError:
+                raise
+            except Exception as error:
+                raise CodexExecutionError(
+                    "Codex process could not be executed"
+                ) from error
+        except BaseException as error:
+            execution_error = error
+            execution_traceback = error.__traceback__
+        close_error: BaseException | None = None
+        close_traceback = None
+        try:
+            resolved_command.close()
+        except BaseException as error:
+            close_error = error
+            close_traceback = error.__traceback__
+        if execution_error is not None:
+            if _is_priority_failure(execution_error):
+                raise execution_error.with_traceback(execution_traceback)
+            if close_error is not None and _is_priority_failure(close_error):
+                raise close_error.with_traceback(close_traceback)
+            raise execution_error.with_traceback(execution_traceback)
+        if close_error is not None:
+            if _is_priority_failure(close_error):
+                raise close_error.with_traceback(close_traceback)
+            raise CodexExecutionError(
+                "Codex process could not be executed"
+            ) from None
+        assert completed is not None
         if completed.returncode != 0:
             raise CodexExecutionError("Codex exited unsuccessfully")
         if not isinstance(completed.stdout, str) or not isinstance(completed.stderr, str):
