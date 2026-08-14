@@ -441,6 +441,278 @@ def test_successful_safe_rebuild_clears_valid_tombstone_last(
     assert len(root_fsyncs) >= 2
 
 
+@pytest.mark.parametrize("window", ["before-rename", "after-rename"])
+def test_write_ahead_quarantine_blocks_source_absent_second_instance(
+    tmp_path: Path,
+    window: str,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"write-ahead-window"
+    digest = hashlib.sha256(payload).hexdigest()
+    quarantine = root / f".quarantine-{digest}.json"
+
+    class WindowAdapter(FakeCacheAdapter):
+        probed = False
+        blocked = False
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if path != root or self.probed or not quarantine.is_file():
+                return
+            final_exists = (root / digest / "codex.exe").is_file()
+            if (window == "before-rename") != (not final_exists):
+                return
+            self.probed = True
+
+            def missing() -> LockedNativeCodex:
+                raise OSError("source unavailable during publish")
+
+            try:
+                codex_runtime_module.CodexRuntimePreparer(
+                    cache_root=root,
+                    discover=missing,
+                    _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+                ).prepare()
+            except OSError:
+                self.blocked = True
+
+    adapter = WindowAdapter()
+    executable = _prepare_runtime(root, FakeLockedSource(payload), adapter)
+
+    assert executable == (root / digest / "codex.exe").resolve(strict=True)
+    assert adapter.probed
+    assert adapter.blocked
+    assert not quarantine.exists()
+
+
+def test_successful_write_ahead_publish_allows_later_cache_reuse(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    executable = _prepare_runtime(
+        root, FakeLockedSource(b"committed-write-ahead"), FakeCacheAdapter(),
+    )
+    quarantine = root / f".quarantine-{executable.parent.name}.json"
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("source unavailable after commit")
+
+    reused = codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=missing,
+        _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+    ).prepare()
+
+    assert not quarantine.exists()
+    assert reused == executable
+
+
+@pytest.mark.parametrize(
+    ("cleanup_failure", "expected_type"),
+    [
+        (OSError("quarantine cleanup fsync failed"), OSError),
+        (asyncio.CancelledError(), asyncio.CancelledError),
+    ],
+)
+def test_marker_cleanup_fsync_failure_recreates_write_ahead_before_reuse(
+    tmp_path: Path,
+    cleanup_failure: BaseException,
+    expected_type: type[BaseException],
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"cleanup-fsync-failure"
+    digest = hashlib.sha256(payload).hexdigest()
+    quarantine = root / f".quarantine-{digest}.json"
+
+    class CleanupFailureAdapter(FakeCacheAdapter):
+        saw_write_ahead = False
+        failed_cleanup = False
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if path != root:
+                return
+            final_exists = (root / digest / "codex.exe").is_file()
+            if quarantine.is_file() and not final_exists:
+                self.saw_write_ahead = True
+            if (
+                self.saw_write_ahead
+                and final_exists
+                and not quarantine.exists()
+                and not self.failed_cleanup
+            ):
+                self.failed_cleanup = True
+                raise cleanup_failure
+
+    adapter = CleanupFailureAdapter()
+    with pytest.raises(expected_type):
+        _prepare_runtime(root, FakeLockedSource(payload), adapter)
+
+    assert adapter.saw_write_ahead
+    assert adapter.failed_cleanup
+    assert quarantine.is_file()
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("source unavailable after cleanup failure")
+
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        codex_runtime_module.CodexRuntimePreparer(
+            cache_root=root,
+            discover=missing,
+            _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+        ).prepare()
+
+
+def test_interleaved_source_preparers_never_execute_or_delete_uncommitted_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"interleaved-source"
+    digest = hashlib.sha256(payload).hexdigest()
+    quarantine = root / f".quarantine-{digest}.json"
+    inner_adapter = FakeCacheAdapter()
+    removed_digests: list[str] = []
+    original_remove = codex_runtime_module._remove_owned_tree
+
+    def recording_remove(path: Path) -> None:
+        if len(path.name) == 64:
+            removed_digests.append(path.name)
+        original_remove(path)
+
+    monkeypatch.setattr(codex_runtime_module, "_remove_owned_tree", recording_remove)
+
+    class OuterAdapter(FakeCacheAdapter):
+        inner_result: Path | None = None
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if (
+                path == root
+                and self.inner_result is None
+                and quarantine.is_file()
+                and (root / digest / "codex.exe").is_file()
+            ):
+                self.inner_result = _prepare_runtime(
+                    root, FakeLockedSource(payload), inner_adapter,
+                )
+
+    outer_adapter = OuterAdapter()
+    outer_result = _prepare_runtime(
+        root, FakeLockedSource(payload), outer_adapter,
+    )
+
+    assert outer_adapter.inner_result == outer_result
+    assert outer_result == (root / digest / "codex.exe").resolve(strict=True)
+    assert not removed_digests
+    for adapter in (outer_adapter, inner_adapter):
+        smoke_paths = [
+            Path(event[1][0])
+            for event in adapter.events
+            if event[0] == "smoke"
+        ]
+        assert smoke_paths
+        assert all(path.parent.name.startswith(".staging-") for path in smoke_paths)
+    assert not quarantine.exists()
+
+
+def test_failed_publisher_does_not_delete_concurrently_committed_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"concurrent-commit-wins"
+    digest = hashlib.sha256(payload).hexdigest()
+    quarantine = root / f".quarantine-{digest}.json"
+    inner_adapter = FakeCacheAdapter()
+    removed_digests: list[str] = []
+    original_remove = codex_runtime_module._remove_owned_tree
+
+    def recording_remove(path: Path) -> None:
+        if len(path.name) == 64:
+            removed_digests.append(path.name)
+        original_remove(path)
+
+    monkeypatch.setattr(codex_runtime_module, "_remove_owned_tree", recording_remove)
+
+    class FailingOuterAdapter(FakeCacheAdapter):
+        inner_result: Path | None = None
+        failed = False
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if (
+                path == root
+                and self.inner_result is None
+                and quarantine.is_file()
+                and (root / digest / "codex.exe").is_file()
+            ):
+                self.inner_result = _prepare_runtime(
+                    root, FakeLockedSource(payload), inner_adapter,
+                )
+                self.failed = True
+                raise OSError("outer publisher lost after concurrent commit")
+
+    outer_adapter = FailingOuterAdapter()
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        _prepare_runtime(root, FakeLockedSource(payload), outer_adapter)
+
+    assert outer_adapter.failed
+    assert outer_adapter.inner_result is not None
+    assert outer_adapter.inner_result.is_file()
+    assert not removed_digests
+    assert not quarantine.exists()
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("source unavailable after concurrent commit")
+
+    reused = codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=missing,
+        _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+    ).prepare()
+    assert reused == outer_adapter.inner_result
+
+
+def test_write_ahead_cleanup_probe_cannot_override_primary_control_flow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"cancelled-write-ahead"
+    digest = hashlib.sha256(payload).hexdigest()
+    quarantine = root / f".quarantine-{digest}.json"
+    cancelled = KeyboardInterrupt()
+
+    class CancelAfterRename(FakeCacheAdapter):
+        cancelled = False
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if (
+                path == root
+                and not self.cancelled
+                and quarantine.is_file()
+                and (root / digest / "codex.exe").is_file()
+            ):
+                self.cancelled = True
+                raise cancelled
+
+    original_exists = Path.exists
+
+    def failing_exists(path: Path) -> bool:
+        if path == quarantine:
+            raise MemoryError("marker probe failed")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", failing_exists)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        _prepare_runtime(root, FakeLockedSource(payload), CancelAfterRename())
+
+    assert caught.value is cancelled
+    assert quarantine.is_file()
+
+
 @pytest.mark.parametrize("tombstone_kind", ["corrupt", "symlink", "race"])
 def test_invalid_tombstone_fails_closed_without_reusing_digest(
     tmp_path: Path,

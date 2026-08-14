@@ -385,7 +385,14 @@ class CodexRuntimePreparer:
         quarantine: Path | None = None,
     ) -> Path:
         staging = root / f".staging-{uuid.uuid4().hex}"
+        final_directory = root / source_sha256
+        write_ahead = root / (
+            f"{_QUARANTINE_PREFIX}{source_sha256}{_QUARANTINE_SUFFIX}"
+        )
         published_final: Path | None = None
+        write_ahead_started = False
+        clear_started = False
+        final_validated = False
         result: Path | None = None
         primary: BaseException | None = None
         primary_traceback = None
@@ -442,47 +449,88 @@ class CodexRuntimePreparer:
                 environment=_sanitized_smoke_environment(),
                 timeout=self._smoke_timeout,
             )
-            final_directory = root / sha256
+            write_ahead_started = True
+            self._publish_quarantine(root, sha256, adapter)
             if final_directory.exists():
-                if quarantine is None:
+                adapter.fsync_directory(root)
+                try:
                     result = self._validate_cache_directory(
-                        final_directory, sha256, adapter,
+                        final_directory, sha256, adapter, smoke=False,
                     )
-                else:
+                except BaseException as error:
+                    if _is_priority_failure(error) or not isinstance(
+                        error, (OSError, ValueError, json.JSONDecodeError)
+                    ):
+                        raise
+                    if quarantine is None:
+                        raise
                     _remove_owned_tree(final_directory)
                     adapter.fsync_directory(root)
                     os.replace(staging, final_directory)
                     published_final = final_directory
                     adapter.fsync_directory(root)
-                    final_executable = final_directory / "codex.exe"
-                    self._validate_executable(
-                        final_executable,
-                        sha256=sha256,
-                        size=copied,
-                        adapter=adapter,
+                    result = self._validate_cache_directory(
+                        final_directory, sha256, adapter, smoke=False,
                     )
-                    result = final_executable.resolve(strict=True)
             else:
                 os.replace(staging, final_directory)
                 published_final = final_directory
                 adapter.fsync_directory(root)
-                final_executable = final_directory / "codex.exe"
-                self._validate_executable(
-                    final_executable,
-                    sha256=sha256,
-                    size=copied,
-                    adapter=adapter,
+                result = self._validate_cache_directory(
+                    final_directory, sha256, adapter, smoke=False,
                 )
-                result = final_executable.resolve(strict=True)
-            if quarantine is not None and published_final is not None:
-                self._clear_quarantine(
-                    root, quarantine, sha256=sha256, adapter=adapter,
-                )
+            final_validated = True
+            try:
+                initial_identity = adapter.validate_private_file(write_ahead)
+            except FileNotFoundError:
+                # A concurrent preparer may have durably validated this exact
+                # content-addressed final and removed the shared marker.
+                pass
+            else:
+                record = _read_strict_manifest(write_ahead, adapter)
+                if (
+                    adapter.validate_private_file(write_ahead) != initial_identity
+                    or not _is_valid_quarantine(record, sha256)
+                ):
+                    raise OSError("invalid private runtime quarantine")
+                clear_started = True
+                write_ahead.unlink()
+                adapter.fsync_directory(root)
         except BaseException as error:
             primary = error
             primary_traceback = error.__traceback__
         quarantine_ready = False
-        if published_final is not None and primary is not None:
+        marker_missing_after_concurrent_commit = False
+        marker_probe_error: BaseException | None = None
+        marker_exists = True
+        if write_ahead_started and primary is not None and not clear_started:
+            try:
+                marker_exists = write_ahead.exists()
+            except BaseException as error:
+                marker_probe_error = error
+        concurrent_probe_error: BaseException | None = None
+        if (
+            write_ahead_started
+            and primary is not None
+            and not clear_started
+            and marker_probe_error is None
+            and not marker_exists
+            and final_directory.exists()
+        ):
+            try:
+                adapter.fsync_directory(root)
+                self._validate_cache_directory(
+                    final_directory, source_sha256, adapter, smoke=False,
+                )
+            except BaseException as error:
+                concurrent_probe_error = error
+            else:
+                marker_missing_after_concurrent_commit = True
+        if (
+            write_ahead_started
+            and primary is not None
+            and not marker_missing_after_concurrent_commit
+        ):
             try:
                 self._publish_quarantine(root, source_sha256, adapter)
                 quarantine_ready = True
@@ -493,14 +541,22 @@ class CodexRuntimePreparer:
         else:
             quarantine_error = None
         cleanup_paths = [staging]
-        if quarantine_ready and published_final is not None and primary is not None:
+        if (
+            quarantine_ready
+            and published_final is not None
+            and primary is not None
+            and not clear_started
+        ):
             cleanup_paths.append(published_final)
         cleanup = _attempt_owned_cleanup(tuple(cleanup_paths))
+        cleanup = _prefer_cleanup_error(cleanup, marker_probe_error)
+        cleanup = _prefer_cleanup_error(cleanup, concurrent_probe_error)
         cleanup = _prefer_cleanup_error(cleanup, quarantine_error)
         if (
             published_final is not None
             and primary is not None
             and quarantine_ready
+            and not clear_started
         ):
             if published_final.exists():
                 retry_error = _attempt_owned_cleanup((published_final,))
@@ -654,26 +710,6 @@ class CodexRuntimePreparer:
         assert result is not None
         return result
 
-    def _clear_quarantine(
-        self,
-        root: Path,
-        quarantine: Path,
-        *,
-        sha256: str,
-        adapter: _CacheRuntimeAdapter,
-    ) -> None:
-        if quarantine.parent != root or _quarantine_digest(quarantine.name) != sha256:
-            raise OSError("invalid private runtime quarantine")
-        initial_identity = adapter.validate_private_file(quarantine)
-        record = _read_strict_manifest(quarantine, adapter)
-        if (
-            adapter.validate_private_file(quarantine) != initial_identity
-            or not _is_valid_quarantine(record, sha256)
-        ):
-            raise OSError("invalid private runtime quarantine")
-        quarantine.unlink()
-        adapter.fsync_directory(root)
-
     def _validate_staging_ready(
         self,
         directory: Path,
@@ -700,7 +736,12 @@ class CodexRuntimePreparer:
         )
 
     def _validate_cache_directory(
-        self, directory: Path, digest: str, adapter: _CacheRuntimeAdapter,
+        self,
+        directory: Path,
+        digest: str,
+        adapter: _CacheRuntimeAdapter,
+        *,
+        smoke: bool = True,
     ) -> Path:
         adapter.validate_private_directory(directory)
         manifest_path = directory / "manifest.json"
@@ -717,11 +758,12 @@ class CodexRuntimePreparer:
             size=manifest["size"],
             adapter=adapter,
         )
-        adapter.smoke(
-            executable,
-            environment=_sanitized_smoke_environment(),
-            timeout=self._smoke_timeout,
-        )
+        if smoke:
+            adapter.smoke(
+                executable,
+                environment=_sanitized_smoke_environment(),
+                timeout=self._smoke_timeout,
+            )
         resolved = executable.resolve(strict=True)
         if not resolved.is_relative_to(self._cache_root.resolve(strict=True)):
             raise OSError("cache target escaped")
