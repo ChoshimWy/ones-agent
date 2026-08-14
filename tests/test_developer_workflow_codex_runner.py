@@ -260,6 +260,68 @@ def test_codex_command_copy_preserves_attestation_and_pickle_is_rejected(
         pickle.dumps(command)
 
 
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("prefix", (r"C:\\forged\\codex.exe",)),
+        ("_sha256", "f" * 64),
+        ("_identity", NativeCodexIdentity(99, 98, 97, 96)),
+        ("_cache_root", Path("C:/forged-cache")),
+    ],
+)
+def test_command_mac_rejects_object_setattr_mutation_before_executor(
+    tmp_path: Path,
+    field_name: str,
+    replacement: object,
+) -> None:
+    command = _attested_command(tmp_path)
+    assert command._is_attested()
+    object.__setattr__(command, field_name, replacement)
+    assert not command._is_attested()
+    executor = FakeExecutor()
+    runner = CodexRunner(
+        run_root=(tmp_path / "runs").resolve(),
+        repository=FakeRepository(),
+        command_executor=executor,
+        command_resolver=lambda: command,
+    )
+
+    with pytest.raises(codex_runner_module.CodexProcessStartError):
+        runner.run(
+            _prepared(tmp_path), _mapping(tmp_path), run_id="mutated-command",
+            prompt="safe prompt",
+        )
+    assert not executor.calls
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement"),
+    [
+        ("path", Path("C:/forged-cache/0/codex.exe")),
+        ("sha256", "f" * 64),
+        ("identity", NativeCodexIdentity(99, 98, 97, 96)),
+        ("_cache_root", Path("C:/forged-cache")),
+    ],
+)
+def test_runtime_mac_rejects_object_setattr_mutation(
+    tmp_path: Path,
+    field_name: str,
+    replacement: object,
+) -> None:
+    runtime = _verified_runtime(tmp_path)
+    assert runtime._is_attested()  # type: ignore[attr-defined]
+    object.__setattr__(runtime, field_name, replacement)
+    assert not runtime._is_attested()  # type: ignore[attr-defined]
+    with pytest.raises(TypeError, match="attestation"):
+        codex_runner_module.CodexCommand._from_runtime(runtime)
+
+
+def test_command_mac_rejects_nested_identity_mutation(tmp_path: Path) -> None:
+    command = _attested_command(tmp_path)
+    object.__setattr__(command._identity, "size", command._identity.size + 1)
+    assert not command._is_attested()
+
+
 def test_runner_rejects_forged_unattested_command_before_executor(
     tmp_path: Path,
 ) -> None:

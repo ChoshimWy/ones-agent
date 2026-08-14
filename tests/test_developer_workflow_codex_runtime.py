@@ -298,6 +298,8 @@ def test_postpublish_fsync_failure_removes_attempted_final_and_allows_retry(
     root = tmp_path / "ones-dev" / "codex-runtime"
 
     class PostPublishFailureAdapter(FakeCacheAdapter):
+        root_failed = False
+
         def fsync_directory(self, path: Path) -> None:
             super().fsync_directory(path)
             manifest_exists = (path / "manifest.json").is_file()
@@ -309,7 +311,13 @@ def test_postpublish_fsync_failure_removes_attempted_final_and_allows_retry(
                 ".staging-"
             ) and manifest_exists:
                 raise OSError("post-manifest fsync")
-            if failure_point == "root_fsync" and path == root and final_exists:
+            if (
+                failure_point == "root_fsync"
+                and path == root
+                and final_exists
+                and not self.root_failed
+            ):
+                self.root_failed = True
                 raise OSError("post-rename root fsync")
 
     adapter = PostPublishFailureAdapter()
@@ -328,12 +336,15 @@ def test_postrename_cleanup_retries_transient_final_delete_failure(
     root = tmp_path / "ones-dev" / "codex-runtime"
 
     class RootFailure(FakeCacheAdapter):
+        failed = False
+
         def fsync_directory(self, path: Path) -> None:
             super().fsync_directory(path)
-            if path == root and any(
+            if path == root and not self.failed and any(
                 child.is_dir() and len(child.name) == 64
                 for child in root.iterdir()
             ):
+                self.failed = True
                 raise OSError("root fsync failed")
 
     original = codex_runtime_module._remove_owned_tree
@@ -352,6 +363,199 @@ def test_postrename_cleanup_retries_transient_final_delete_failure(
         _prepare_runtime(root, FakeLockedSource(), RootFailure())
     assert final_attempts >= 2
     assert not tuple(path for path in root.iterdir() if len(path.name) == 64)
+
+
+def test_persistent_postpublish_delete_failure_tombstones_digest_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"quarantined-runtime"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    class FirstPublishFsyncFails(FakeCacheAdapter):
+        failed = False
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if (
+                path == root
+                and not self.failed
+                and (root / digest / "manifest.json").is_file()
+            ):
+                self.failed = True
+                raise OSError("published directory was not durable")
+
+    original_remove = codex_runtime_module._remove_owned_tree
+
+    def never_remove_final(path: Path) -> None:
+        if path.name == digest:
+            raise OSError("persistent final delete failure")
+        original_remove(path)
+
+    monkeypatch.setattr(
+        codex_runtime_module, "_remove_owned_tree", never_remove_final,
+    )
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        _prepare_runtime(root, FakeLockedSource(payload), FirstPublishFsyncFails())
+
+    quarantine = root / f".quarantine-{digest}.json"
+    assert quarantine.is_file()
+    assert json.loads(quarantine.read_text("utf-8")) == {
+        "schema_version": 1,
+        "sha256": digest,
+    }
+    assert (root / digest / "codex.exe").is_file()
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("source is unavailable")
+
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        codex_runtime_module.CodexRuntimePreparer(
+            cache_root=root,
+            discover=missing,
+            _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+        ).prepare()
+
+
+def test_successful_safe_rebuild_clears_valid_tombstone_last(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"safe-rebuild"
+    digest = hashlib.sha256(payload).hexdigest()
+    stale = root / digest
+    stale.mkdir(parents=True)
+    (stale / "codex.exe").write_bytes(b"failed-publication")
+    (stale / "manifest.json").write_text("{}", encoding="utf-8")
+    quarantine = root / f".quarantine-{digest}.json"
+    quarantine.write_text(
+        json.dumps({"schema_version": 1, "sha256": digest}), encoding="utf-8",
+    )
+    adapter = FakeCacheAdapter()
+
+    executable = _prepare_runtime(root, FakeLockedSource(payload), adapter)
+
+    assert executable.read_bytes() == payload
+    assert not quarantine.exists()
+    root_fsyncs = [event for event in adapter.events if event == ("fsync-directory", root)]
+    assert len(root_fsyncs) >= 2
+
+
+@pytest.mark.parametrize("tombstone_kind", ["corrupt", "symlink", "race"])
+def test_invalid_tombstone_fails_closed_without_reusing_digest(
+    tmp_path: Path,
+    tombstone_kind: str,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    payload = b"blocked-cache"
+    executable = _prepare_runtime(root, FakeLockedSource(payload), FakeCacheAdapter())
+    digest = executable.parent.name
+    tombstone = root / f".quarantine-{digest}.json"
+    adapter = FakeCacheAdapter()
+    if tombstone_kind == "symlink":
+        target = tmp_path / "outside.json"
+        target.write_text(
+            json.dumps({"schema_version": 1, "sha256": digest}), encoding="utf-8",
+        )
+        try:
+            tombstone.symlink_to(target)
+        except OSError as error:
+            pytest.skip(f"symlink creation unavailable: {error}")
+    else:
+        tombstone.write_text(
+            "{" if tombstone_kind == "corrupt" else json.dumps(
+                {"schema_version": 1, "sha256": digest}
+            ),
+            encoding="utf-8",
+        )
+    if tombstone_kind == "race":
+        original_validate = adapter.validate_private_file
+        calls = 0
+
+        def racing_validate(path: Path) -> tuple[int, int]:
+            nonlocal calls
+            identity = original_validate(path)
+            if path == tombstone:
+                calls += 1
+                if calls > 1:
+                    return identity[0], identity[1] + 1
+            return identity
+
+        adapter.validate_private_file = racing_validate  # type: ignore[method-assign]
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("source is unavailable")
+
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        codex_runtime_module.CodexRuntimePreparer(
+            cache_root=root,
+            discover=missing,
+            _cache_adapter=adapter,  # type: ignore[arg-type]
+        ).prepare()
+
+
+def test_tombstone_content_cannot_quarantine_a_different_digest(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    first = _prepare_runtime(root, FakeLockedSource(b"blocked"), FakeCacheAdapter())
+    second = _prepare_runtime(root, FakeLockedSource(b"still-valid"), FakeCacheAdapter())
+    tombstone = root / f".quarantine-{first.parent.name}.json"
+    tombstone.write_text(
+        json.dumps({"schema_version": 1, "sha256": second.parent.name}),
+        encoding="utf-8",
+    )
+
+    def missing() -> LockedNativeCodex:
+        raise OSError("source is unavailable")
+
+    reused = codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=missing,
+        _cache_adapter=FakeCacheAdapter(),  # type: ignore[arg-type]
+    ).prepare()
+
+    assert reused == second
+
+
+@pytest.mark.parametrize(
+    ("primary", "cleanup", "expected"),
+    [
+        (KeyboardInterrupt(), MemoryError(), KeyboardInterrupt),
+        (OSError("publish failed"), KeyboardInterrupt(), KeyboardInterrupt),
+    ],
+)
+def test_quarantine_publish_preserves_control_and_cleanup_priority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+    cleanup: BaseException,
+    expected: type[BaseException],
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    adapter = FakeCacheAdapter()
+
+    def fail_protection(path: Path) -> None:
+        raise primary
+
+    original_unlink = Path.unlink
+
+    def fail_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name.endswith(".tmp"):
+            raise cleanup
+        original_unlink(path, *args, **kwargs)
+
+    adapter.protect_private_file = fail_protection  # type: ignore[method-assign]
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    preparer = codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(expected) as caught:
+        preparer._publish_quarantine(root, "a" * 64, adapter)  # type: ignore[arg-type]
+    expected_instance = primary if isinstance(primary, expected) else cleanup
+    assert caught.value is expected_instance
 
 
 @pytest.mark.parametrize("stale_kind", ["random", "deterministic"])
@@ -730,6 +934,8 @@ def test_windows_cache_ancestor_rejects_untrusted_replacement_rights(
             owner="S-1-5-18",
             entries=(("S-1-1-0", dangerous_mask, 0, 0),),
             user_sid="S-1-5-21-current",
+            dacl_protected=False,
+            trusted_installer_allowed=False,
         )
 
 
@@ -742,6 +948,8 @@ def test_windows_cache_ancestor_allows_read_add_only_and_inherit_only_rights() -
             ("S-1-5-11", 0xE0010000, 0x08, 0),
         ),
         user_sid="S-1-5-21-current",
+        dacl_protected=False,
+        trusted_installer_allowed=False,
     )
 
 
@@ -751,7 +959,128 @@ def test_windows_cache_ancestor_rejects_unknown_ace_shape() -> None:
             owner="S-1-5-18",
             entries=(("S-1-1-0", 0x1F01FF, 0, 5),),
             user_sid="S-1-5-21-current",
+            dacl_protected=False,
+            trusted_installer_allowed=False,
         )
+
+
+def test_trusted_installer_is_rejected_for_arbitrary_cache_ancestor() -> None:
+    with pytest.raises(OSError, match="ancestor"):
+        codex_runtime_module._validate_windows_cache_ancestor_acl(
+            owner=codex_runtime_module._TRUSTED_INSTALLER_SID,
+            entries=((codex_runtime_module._TRUSTED_INSTALLER_SID, 0x1F01FF, 0, 0),),
+            user_sid="S-1-5-21-current",
+            dacl_protected=True,
+            trusted_installer_allowed=False,
+        )
+
+
+def test_trusted_installer_is_allowed_only_for_verified_system_ancestor() -> None:
+    codex_runtime_module._validate_windows_cache_ancestor_acl(
+        owner=codex_runtime_module._TRUSTED_INSTALLER_SID,
+        entries=((codex_runtime_module._TRUSTED_INSTALLER_SID, 0x1F01FF, 0, 0),),
+        user_sid="S-1-5-21-current",
+        dacl_protected=True,
+        trusted_installer_allowed=True,
+    )
+
+
+@pytest.mark.parametrize(
+    ("dacl_protected", "trusted_installer_allowed"),
+    [(1, False), (True, 1)],
+)
+def test_cache_ancestor_acl_rejects_non_boolean_policy_context(
+    dacl_protected: object,
+    trusted_installer_allowed: object,
+) -> None:
+    with pytest.raises(OSError, match="ancestor"):
+        codex_runtime_module._validate_windows_cache_ancestor_acl(
+            owner="S-1-5-18",
+            entries=(("S-1-5-18", 0x1F01FF, 0, 0),),
+            user_sid="S-1-5-21-current",
+            dacl_protected=dacl_protected,  # type: ignore[arg-type]
+            trusted_installer_allowed=trusted_installer_allowed,  # type: ignore[arg-type]
+        )
+
+
+def test_unprotected_ancestor_rejects_inherited_untrusted_modify_rights() -> None:
+    with pytest.raises(OSError, match="ancestor"):
+        codex_runtime_module._validate_windows_cache_ancestor_acl(
+            owner="S-1-5-18",
+            entries=(("S-1-1-0", 0x001301BF, 0x10, 0),),
+            user_sid="S-1-5-21-current",
+            dacl_protected=False,
+            trusted_installer_allowed=False,
+        )
+
+
+@pytest.mark.parametrize(
+    ("owner", "entries", "protected"),
+    [
+        (
+            codex_runtime_module._TRUSTED_INSTALLER_SID,
+            ((codex_runtime_module._TRUSTED_INSTALLER_SID, 0x1F01FF, 0, 0),),
+            True,
+        ),
+        (
+            "S-1-5-21-current",
+            (("S-1-5-21-current", 0x1F01FF, 0, 0),),
+            False,
+        ),
+    ],
+)
+def test_private_runtime_directory_acl_rejects_ti_and_unprotected_dacl(
+    owner: str,
+    entries: tuple[tuple[str, int, int, int], ...],
+    protected: bool,
+) -> None:
+    with pytest.raises(OSError, match="directory"):
+        codex_runtime_module._validate_windows_private_directory_acl(
+            owner=owner,
+            entries=entries,
+            user_sid="S-1-5-21-current",
+            dacl_protected=protected,
+        )
+
+
+def test_private_runtime_directory_acl_rejects_non_boolean_protected_flag() -> None:
+    user_sid = "S-1-5-21-current"
+    with pytest.raises(OSError, match="directory"):
+        codex_runtime_module._validate_windows_private_directory_acl(
+            owner=user_sid,
+            entries=((user_sid, 0x1F01FF, 0x03, 0),),
+            user_sid=user_sid,
+            dacl_protected=1,  # type: ignore[arg-type]
+        )
+
+
+def test_spoofed_profile_environment_cannot_enable_trusted_installer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    redirected_profile = tmp_path / "redirected-profile"
+    redirected_local = redirected_profile / "AppData" / "Local"
+    redirected_local.mkdir(parents=True)
+    root = redirected_local / "ones-dev" / "codex-runtime"
+    monkeypatch.setenv("USERPROFILE", str(redirected_profile))
+    monkeypatch.setenv("LOCALAPPDATA", str(redirected_local))
+
+    assert not codex_runtime_module._trusted_installer_allowed_for_ancestor(
+        redirected_local, root,
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real Windows profile ACL chain")
+def test_real_standard_profile_ancestor_chain_is_safe_without_staging() -> None:
+    profile = codex_runtime_module._windows_current_profile_directory()
+    standard_local = profile / "AppData" / "Local"
+    if not standard_local.is_dir():
+        pytest.skip("standard non-redirected Local AppData is unavailable")
+    root = standard_local / "ones-dev" / "codex-runtime"
+    adapter = codex_runtime_module._WindowsCacheRuntimeAdapter()
+
+    adapter.validate_cache_ancestor_chain(root)
+
+    assert profile.is_dir()
 
 
 def test_unsafe_cache_ancestor_fails_before_creating_private_root(

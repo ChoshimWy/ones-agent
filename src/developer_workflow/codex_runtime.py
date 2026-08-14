@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+import secrets
 import shutil
 import stat
 import subprocess
@@ -117,6 +119,30 @@ class LockedNativeCodex:
 
 
 _RUNTIME_ATTESTATION_NONCE = object()
+_RUNTIME_ATTESTATION_SECRET = secrets.token_bytes(32)
+
+
+def _runtime_attestation_mac(
+    path: Path,
+    identity: NativeCodexIdentity,
+    sha256: str,
+    cache_root: Path,
+) -> bytes:
+    snapshot = json.dumps(
+        [
+            "prepared-codex-runtime-v1",
+            str(cache_root),
+            str(path),
+            sha256,
+            identity.volume_serial,
+            identity.file_index,
+            identity.size,
+            identity.mtime_ns,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8", "strict")
+    return hmac.digest(_RUNTIME_ATTESTATION_SECRET, snapshot, "sha256")
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
@@ -124,6 +150,8 @@ class _PreparedCodexRuntime:
     path: Path
     identity: NativeCodexIdentity
     sha256: str
+    _cache_root: Path = field(repr=False)
+    _seal: bytes = field(repr=False)
     _nonce: object = field(repr=False)
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -135,29 +163,66 @@ class _PreparedCodexRuntime:
         path: Path,
         identity: NativeCodexIdentity,
         sha256: str,
+        cache_root: Path,
         *,
         nonce: object,
     ) -> _PreparedCodexRuntime:
         if nonce is not _RUNTIME_ATTESTATION_NONCE:
             raise TypeError("invalid Codex runtime attestation")
         canonical = path.resolve(strict=True)
+        canonical_root = cache_root.resolve(strict=True)
         if (
             canonical.name.casefold() != "codex.exe"
-            or type(sha256) is not str
-            or len(sha256) != 64
-            or any(character not in "0123456789abcdef" for character in sha256)
+            or not _is_sha256(sha256)
+            or type(identity) is not NativeCodexIdentity
+            or any(
+                type(value) is not int
+                for value in (
+                    identity.volume_serial,
+                    identity.file_index,
+                    identity.size,
+                    identity.mtime_ns,
+                )
+            )
             or identity.size < 0
+            or canonical.parent.name != sha256
+            or canonical.parent.parent != canonical_root
         ):
             raise ValueError("invalid Codex runtime attestation")
+        seal = _runtime_attestation_mac(
+            canonical, identity, sha256, canonical_root,
+        )
         instance = object.__new__(cls)
         object.__setattr__(instance, "path", canonical)
         object.__setattr__(instance, "identity", identity)
         object.__setattr__(instance, "sha256", sha256)
+        object.__setattr__(instance, "_cache_root", canonical_root)
+        object.__setattr__(instance, "_seal", seal)
         object.__setattr__(instance, "_nonce", nonce)
         return instance
 
     def _is_attested(self) -> bool:
-        return self._nonce is _RUNTIME_ATTESTATION_NONCE
+        try:
+            if (
+                self._nonce is not _RUNTIME_ATTESTATION_NONCE
+                or not isinstance(self.path, Path)
+                or type(self.identity) is not NativeCodexIdentity
+                or not _is_sha256(self.sha256)
+                or not isinstance(self._cache_root, Path)
+                or type(self._seal) is not bytes
+                or self.path.resolve(strict=True) != self.path
+                or self._cache_root.resolve(strict=True) != self._cache_root
+                or self.path.name.casefold() != "codex.exe"
+                or self.path.parent.name != self.sha256
+                or self.path.parent.parent != self._cache_root
+            ):
+                return False
+            expected = _runtime_attestation_mac(
+                self.path, self.identity, self.sha256, self._cache_root,
+            )
+            return hmac.compare_digest(self._seal, expected)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
 
     def __copy__(self) -> _PreparedCodexRuntime:
         return self
@@ -172,6 +237,9 @@ class _PreparedCodexRuntime:
 _CACHE_SCHEMA_KEYS = frozenset(
     {"publisher", "schema_version", "sha256", "size", "target"}
 )
+_QUARANTINE_SCHEMA_KEYS = frozenset({"schema_version", "sha256"})
+_QUARANTINE_PREFIX = ".quarantine-"
+_QUARANTINE_SUFFIX = ".json"
 
 
 class CodexRuntimePreparer:
@@ -207,7 +275,10 @@ class CodexRuntimePreparer:
         adapter = self._cache_adapter or _WindowsCacheRuntimeAdapter()
         root = self._prepare_root(adapter)
         self._cleanup_stale_owned_entries(root, adapter)
-        cached = self._valid_cached_executables(root, adapter)
+        quarantined, rebuildable = self._scan_quarantines(root, adapter)
+        cached = self._valid_cached_executables(
+            root, adapter, excluded=quarantined,
+        )
         discovery = self._discover or discover_locked_native_codex
         try:
             locked = discovery()
@@ -224,11 +295,17 @@ class CodexRuntimePreparer:
             try:
                 source_sha256 = self._hash_locked_source(locked)
                 matching = cached.get(source_sha256)
+                if source_sha256 in quarantined and source_sha256 not in rebuildable:
+                    raise OSError("private Codex runtime is quarantined")
                 result = (
                     matching
                     if matching is not None
                     else self._stage_locked_source(
-                        root, locked, source_sha256, adapter
+                        root,
+                        locked,
+                        source_sha256,
+                        adapter,
+                        quarantine=rebuildable.get(source_sha256),
                     )
                 )
             except BaseException as error:
@@ -280,6 +357,7 @@ class CodexRuntimePreparer:
             path,
             identity,
             sha256,
+            path.parent.parent,
             nonce=_RUNTIME_ATTESTATION_NONCE,
         )
 
@@ -303,6 +381,8 @@ class CodexRuntimePreparer:
         locked: LockedNativeCodex,
         source_sha256: str,
         adapter: _CacheRuntimeAdapter,
+        *,
+        quarantine: Path | None = None,
     ) -> Path:
         staging = root / f".staging-{uuid.uuid4().hex}"
         published_final: Path | None = None
@@ -364,9 +444,24 @@ class CodexRuntimePreparer:
             )
             final_directory = root / sha256
             if final_directory.exists():
-                result = self._validate_cache_directory(
-                    final_directory, sha256, adapter,
-                )
+                if quarantine is None:
+                    result = self._validate_cache_directory(
+                        final_directory, sha256, adapter,
+                    )
+                else:
+                    _remove_owned_tree(final_directory)
+                    adapter.fsync_directory(root)
+                    os.replace(staging, final_directory)
+                    published_final = final_directory
+                    adapter.fsync_directory(root)
+                    final_executable = final_directory / "codex.exe"
+                    self._validate_executable(
+                        final_executable,
+                        sha256=sha256,
+                        size=copied,
+                        adapter=adapter,
+                    )
+                    result = final_executable.resolve(strict=True)
             else:
                 os.replace(staging, final_directory)
                 published_final = final_directory
@@ -379,16 +474,33 @@ class CodexRuntimePreparer:
                     adapter=adapter,
                 )
                 result = final_executable.resolve(strict=True)
+            if quarantine is not None and published_final is not None:
+                self._clear_quarantine(
+                    root, quarantine, sha256=sha256, adapter=adapter,
+                )
         except BaseException as error:
             primary = error
             primary_traceback = error.__traceback__
-        cleanup_paths = [staging]
+        quarantine_ready = False
         if published_final is not None and primary is not None:
+            try:
+                self._publish_quarantine(root, source_sha256, adapter)
+                quarantine_ready = True
+            except BaseException as error:
+                quarantine_error = error
+            else:
+                quarantine_error = None
+        else:
+            quarantine_error = None
+        cleanup_paths = [staging]
+        if quarantine_ready and published_final is not None and primary is not None:
             cleanup_paths.append(published_final)
         cleanup = _attempt_owned_cleanup(tuple(cleanup_paths))
+        cleanup = _prefer_cleanup_error(cleanup, quarantine_error)
         if (
             published_final is not None
             and primary is not None
+            and quarantine_ready
         ):
             if published_final.exists():
                 retry_error = _attempt_owned_cleanup((published_final,))
@@ -430,7 +542,11 @@ class CodexRuntimePreparer:
         return prepared
 
     def _valid_cached_executables(
-        self, root: Path, adapter: _CacheRuntimeAdapter,
+        self,
+        root: Path,
+        adapter: _CacheRuntimeAdapter,
+        *,
+        excluded: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, Path]:
         valid: dict[str, Path] = {}
         try:
@@ -442,7 +558,7 @@ class CodexRuntimePreparer:
             if not (
                 len(digest) == 64
                 and all(character in "0123456789abcdef" for character in digest)
-            ):
+            ) or digest in excluded:
                 continue
             try:
                 valid[digest] = self._validate_cache_directory(
@@ -454,6 +570,109 @@ class CodexRuntimePreparer:
                 ):
                     raise
         return valid
+
+    def _scan_quarantines(
+        self, root: Path, adapter: _CacheRuntimeAdapter,
+    ) -> tuple[set[str], dict[str, Path]]:
+        blocked: set[str] = set()
+        valid: dict[str, Path] = {}
+        for candidate in tuple(root.iterdir()):
+            digest = _quarantine_digest(candidate.name)
+            if digest is None:
+                continue
+            blocked.add(digest)
+            try:
+                initial_identity = adapter.validate_private_file(candidate)
+                record = _read_strict_manifest(candidate, adapter)
+                if (
+                    adapter.validate_private_file(candidate) != initial_identity
+                    or not _is_valid_quarantine(record, digest)
+                ):
+                    raise OSError("invalid private runtime quarantine")
+                valid[digest] = candidate
+            except BaseException as error:
+                if _is_priority_failure(error) or not isinstance(
+                    error, (OSError, ValueError, json.JSONDecodeError)
+                ):
+                    raise
+        return blocked, valid
+
+    def _publish_quarantine(
+        self, root: Path, digest: str, adapter: _CacheRuntimeAdapter,
+    ) -> Path:
+        if not _is_sha256(digest):
+            raise OSError("invalid private runtime quarantine")
+        final = root / f"{_QUARANTINE_PREFIX}{digest}{_QUARANTINE_SUFFIX}"
+        temporary = root / (
+            f"{_QUARANTINE_PREFIX}{digest}-{uuid.uuid4().hex}.tmp"
+        )
+        result: Path | None = None
+        primary: BaseException | None = None
+        primary_traceback = None
+        try:
+            with temporary.open("x", encoding="utf-8", newline="\n") as stream:
+                json.dump(
+                    {"schema_version": 1, "sha256": digest},
+                    stream,
+                    ensure_ascii=True,
+                    sort_keys=True,
+                )
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            adapter.protect_private_file(temporary)
+            os.replace(temporary, final)
+            adapter.fsync_directory(root)
+            initial_identity = adapter.validate_private_file(final)
+            record = _read_strict_manifest(final, adapter)
+            if (
+                adapter.validate_private_file(final) != initial_identity
+                or not _is_valid_quarantine(record, digest)
+            ):
+                raise OSError("invalid private runtime quarantine")
+            result = final
+        except BaseException as error:
+            primary = error
+            primary_traceback = error.__traceback__
+        cleanup: BaseException | None = None
+        cleanup_traceback = None
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        except BaseException as error:
+            cleanup = error
+            cleanup_traceback = error.__traceback__
+        if primary is not None:
+            if _is_priority_failure(primary):
+                raise primary.with_traceback(primary_traceback)
+            if cleanup is not None and _is_priority_failure(cleanup):
+                raise cleanup.with_traceback(cleanup_traceback)
+            raise primary.with_traceback(primary_traceback)
+        if cleanup is not None:
+            raise cleanup.with_traceback(cleanup_traceback)
+        assert result is not None
+        return result
+
+    def _clear_quarantine(
+        self,
+        root: Path,
+        quarantine: Path,
+        *,
+        sha256: str,
+        adapter: _CacheRuntimeAdapter,
+    ) -> None:
+        if quarantine.parent != root or _quarantine_digest(quarantine.name) != sha256:
+            raise OSError("invalid private runtime quarantine")
+        initial_identity = adapter.validate_private_file(quarantine)
+        record = _read_strict_manifest(quarantine, adapter)
+        if (
+            adapter.validate_private_file(quarantine) != initial_identity
+            or not _is_valid_quarantine(record, sha256)
+        ):
+            raise OSError("invalid private runtime quarantine")
+        quarantine.unlink()
+        adapter.fsync_directory(root)
 
     def _validate_staging_ready(
         self,
@@ -608,6 +827,24 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+def _is_sha256(value: object) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _quarantine_digest(name: str) -> str | None:
+    if not (
+        name.startswith(_QUARANTINE_PREFIX)
+        and name.endswith(_QUARANTINE_SUFFIX)
+    ):
+        return None
+    digest = name[len(_QUARANTINE_PREFIX) : -len(_QUARANTINE_SUFFIX)]
+    return digest if _is_sha256(digest) else None
+
+
 def _invalid_json_constant(value: str) -> None:
     raise ValueError("invalid manifest constant")
 
@@ -642,6 +879,16 @@ def _is_valid_manifest(manifest: dict[str, object], directory_name: str) -> bool
         and manifest["target"] == "codex.exe"
         and type(manifest.get("size")) is int
         and manifest["size"] >= 0
+    )
+
+
+def _is_valid_quarantine(record: dict[str, object], digest: str) -> bool:
+    return (
+        frozenset(record) == _QUARANTINE_SCHEMA_KEYS
+        and type(record.get("schema_version")) is int
+        and record["schema_version"] == 1
+        and type(record.get("sha256")) is str
+        and record["sha256"] == digest
     )
 
 
@@ -1341,13 +1588,18 @@ def _validate_windows_cache_ancestor_acl(
     owner: str,
     entries: tuple[tuple[str, int, int, int], ...],
     user_sid: str,
+    dacl_protected: bool,
+    trusted_installer_allowed: bool,
 ) -> None:
+    if type(dacl_protected) is not bool or type(trusted_installer_allowed) is not bool:
+        raise OSError("private runtime ancestor ACL is unsafe")
     trusted = {
         user_sid,
         _SYSTEM_SID,
         _ADMINISTRATORS_SID,
-        _TRUSTED_INSTALLER_SID,
     }
+    if trusted_installer_allowed:
+        trusted.add(_TRUSTED_INSTALLER_SID)
     if owner not in trusted:
         raise OSError("private runtime ancestor owner is unsafe")
     for sid, mask, flags, ace_type in entries:
@@ -1359,6 +1611,92 @@ def _validate_windows_cache_ancestor_acl(
             continue
         if mask & _ANCESTOR_REPLACEMENT_RIGHTS:
             raise OSError("private runtime ancestor ACL is unsafe")
+
+
+def _validate_windows_private_directory_acl(
+    *,
+    owner: str,
+    entries: tuple[tuple[str, int, int, int], ...],
+    user_sid: str,
+    dacl_protected: bool,
+) -> None:
+    if type(dacl_protected) is not bool:
+        raise OSError("private runtime directory ACL is unsafe")
+    trusted = {user_sid, _SYSTEM_SID, _ADMINISTRATORS_SID}
+    full_control = 0x001F01FF
+    principals = {sid for sid, _, _, _ in entries}
+    if (
+        owner != user_sid
+        or not dacl_protected
+        or user_sid not in principals
+        or not principals <= trusted
+        or any(
+            ace_type != 0
+            or flags & 0x10
+            or flags & 0x03 != 0x03
+            or mask & full_control != full_control
+            for _, mask, flags, ace_type in entries
+        )
+    ):
+        raise OSError("private runtime directory ACL is unsafe")
+
+
+def _windows_current_profile_directory() -> Path:
+    if os.name != "nt":
+        raise OSError("Windows profile directory is unavailable")
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    userenv = ctypes.WinDLL("userenv", use_last_error=True)
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    advapi.OpenProcessToken.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.HANDLE),
+    ]
+    advapi.OpenProcessToken.restype = wintypes.BOOL
+    userenv.GetUserProfileDirectoryW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPWSTR,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    userenv.GetUserProfileDirectoryW.restype = wintypes.BOOL
+    token = wintypes.HANDLE()
+    if not advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        length = wintypes.DWORD()
+        userenv.GetUserProfileDirectoryW(token, None, ctypes.byref(length))
+        if length.value == 0:
+            raise ctypes.WinError(ctypes.get_last_error())
+        buffer = ctypes.create_unicode_buffer(length.value)
+        if not userenv.GetUserProfileDirectoryW(
+            token, buffer, ctypes.byref(length),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return Path(buffer.value).resolve(strict=True)
+    finally:
+        kernel.CloseHandle(token)
+
+
+def _trusted_installer_allowed_for_ancestor(current: Path, root: Path) -> bool:
+    if current.parent == current:
+        return True
+    try:
+        canonical_profile = _windows_current_profile_directory()
+        standard_local = (canonical_profile / "AppData" / "Local").resolve(
+            strict=True,
+        )
+        return (
+            root.parent.parent.resolve(strict=True) == standard_local
+            and (current == standard_local or current in standard_local.parents)
+        )
+    except OSError:
+        return False
 
 
 class _WindowsCacheRuntimeAdapter:
@@ -1389,7 +1727,13 @@ class _WindowsCacheRuntimeAdapter:
                 raise OSError("private runtime ancestor is unstable")
             descriptor = _windows_descriptor(canonical)
             _validate_windows_cache_ancestor_acl(
-                owner=descriptor[0], entries=descriptor[1], user_sid=user_sid,
+                owner=descriptor[0],
+                entries=descriptor[1],
+                user_sid=user_sid,
+                dacl_protected=descriptor[2],
+                trusted_installer_allowed=(
+                    _trusted_installer_allowed_for_ancestor(canonical, root)
+                ),
             )
             after = current.stat(follow_symlinks=False)
             if (
@@ -1410,15 +1754,28 @@ class _WindowsCacheRuntimeAdapter:
             raise OSError("private runtime directory is unsafe") from None
 
     def validate_private_directory(self, path: Path) -> None:
-        from .private_paths import PrivatePathError, prepare_private_directory
+        from .private_paths import (
+            PrivatePathError,
+            _current_user_sid,
+            _windows_descriptor,
+            prepare_private_directory,
+        )
 
         try:
             before = path.stat(follow_symlinks=False)
             prepared = prepare_private_directory(path)
+            descriptor = _windows_descriptor(prepared)
+            _validate_windows_private_directory_acl(
+                owner=descriptor[0],
+                entries=descriptor[1],
+                user_sid=_current_user_sid(),
+                dacl_protected=descriptor[2],
+            )
             after = prepared.stat(follow_symlinks=False)
             if (
                 not stat.S_ISDIR(after.st_mode)
                 or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or _windows_descriptor(prepared) != descriptor
             ):
                 raise OSError("private runtime directory is unsafe")
         except (OSError, PrivatePathError):

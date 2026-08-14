@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hmac
 import math
 import os
 import re
 import signal
+import secrets
 import shlex
 import stat
 import subprocess
@@ -22,7 +24,11 @@ from urllib.parse import unquote, urlsplit
 
 from jsonschema import Draft202012Validator
 
-from .codex_runtime import CodexRuntimePreparer, _PreparedCodexRuntime
+from .codex_runtime import (
+    CodexRuntimePreparer,
+    NativeCodexIdentity,
+    _PreparedCodexRuntime,
+)
 from .contracts import (
     AcceptanceCoverage,
     CodexResult,
@@ -63,6 +69,32 @@ class CodexOutputError(CodexRunnerError):
 
 
 _COMMAND_ATTESTATION_NONCE = object()
+_COMMAND_ATTESTATION_SECRET = secrets.token_bytes(32)
+
+
+def _command_attestation_mac(
+    prefix: tuple[str, ...],
+    path: Path,
+    identity: NativeCodexIdentity,
+    sha256: str,
+    cache_root: Path,
+) -> bytes:
+    snapshot = json.dumps(
+        [
+            "codex-command-v1",
+            list(prefix),
+            str(path),
+            sha256,
+            str(cache_root),
+            identity.volume_serial,
+            identity.file_index,
+            identity.size,
+            identity.mtime_ns,
+        ],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8", "strict")
+    return hmac.digest(_COMMAND_ATTESTATION_SECRET, snapshot, "sha256")
 
 
 @dataclass(frozen=True, slots=True, init=False, repr=False)
@@ -70,8 +102,11 @@ class CodexCommand:
     """An immutable argv prefix produced by the private runtime staging layer."""
 
     prefix: tuple[str, ...]
+    _path: Path = field(repr=False)
     _identity: object = field(repr=False)
     _sha256: str = field(repr=False)
+    _cache_root: Path = field(repr=False)
+    _seal: bytes = field(repr=False)
     _nonce: object = field(repr=False)
 
     def __init__(self, *args: object, **kwargs: object) -> None:
@@ -86,17 +121,61 @@ class CodexCommand:
             or runtime.path.name.casefold() != "codex.exe"
         ):
             raise TypeError("Codex runtime attestation is invalid")
+        prefix = (str(runtime.path),)
+        seal = _command_attestation_mac(
+            prefix,
+            runtime.path,
+            runtime.identity,
+            runtime.sha256,
+            runtime._cache_root,
+        )
         instance = object.__new__(cls)
-        object.__setattr__(instance, "prefix", (str(runtime.path),))
+        object.__setattr__(instance, "prefix", prefix)
+        object.__setattr__(instance, "_path", runtime.path)
         object.__setattr__(instance, "_identity", runtime.identity)
         object.__setattr__(instance, "_sha256", runtime.sha256)
+        object.__setattr__(instance, "_cache_root", runtime._cache_root)
+        object.__setattr__(instance, "_seal", seal)
         object.__setattr__(instance, "_nonce", _COMMAND_ATTESTATION_NONCE)
         return instance
 
     def _is_attested(self) -> bool:
-        return self._nonce is _COMMAND_ATTESTATION_NONCE
+        try:
+            if (
+                self._nonce is not _COMMAND_ATTESTATION_NONCE
+                or type(self.prefix) is not tuple
+                or not isinstance(self._path, Path)
+                or type(self._identity) is not NativeCodexIdentity
+                or type(self._sha256) is not str
+                or len(self._sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in self._sha256
+                )
+                or not isinstance(self._cache_root, Path)
+                or type(self._seal) is not bytes
+                or self.prefix != (str(self._path),)
+                or self._path.resolve(strict=True) != self._path
+                or self._cache_root.resolve(strict=True) != self._cache_root
+                or self._path.name.casefold() != "codex.exe"
+                or self._path.parent.name != self._sha256
+                or self._path.parent.parent != self._cache_root
+            ):
+                return False
+            expected = _command_attestation_mac(
+                self.prefix,
+                self._path,
+                self._identity,
+                self._sha256,
+                self._cache_root,
+            )
+            return hmac.compare_digest(self._seal, expected)
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
 
     def argv(self, *arguments: str) -> list[str]:
+        if not self._is_attested():
+            raise TypeError("Codex command attestation is invalid")
         if any(
             type(argument) is not str or not argument or "\x00" in argument
             for argument in arguments
