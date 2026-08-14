@@ -26,7 +26,11 @@ from urllib.parse import urlsplit
 
 from pydantic import ConfigDict, Field, StrictStr, field_validator, model_validator
 
-from .codex_runner import _bounded_subprocess, validate_codex_auth_source
+from .codex_runner import (
+    CodexExecutionError,
+    _bounded_subprocess,
+    validate_codex_auth_source,
+)
 from .contracts import WorkflowModel
 from .private_paths import (
     _ADMINISTRATORS_SID,
@@ -816,7 +820,20 @@ class ReadOnlyRepositoryInspector:
                 max_output_bytes=self.max_output_bytes,
             )
         except FileNotFoundError:
-            git_unavailable = True
+            if argv and argv[0] == "git" and cwd.is_dir():
+                git_unavailable = True
+            else:
+                raise
+        except CodexExecutionError as error:
+            if (
+                argv
+                and argv[0] == "git"
+                and isinstance(error.__cause__, FileNotFoundError)
+                and cwd.is_dir()
+            ):
+                git_unavailable = True
+            else:
+                raise
         if git_unavailable:
             _raise_git_executable_unavailable()
         if completed.returncode != 0:

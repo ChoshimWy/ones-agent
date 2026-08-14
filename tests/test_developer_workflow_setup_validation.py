@@ -545,6 +545,138 @@ def test_repository_inspector_sanitizes_missing_git_executable(
     assert canary not in repr(raised.value)
 
 
+def test_repository_inspector_sanitizes_real_wrapped_missing_git_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    private_root = tmp_path / "private"
+    hooks = private_root / "hooks"
+    hooks.mkdir(parents=True)
+    inspector = ReadOnlyRepositoryInspector()
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("GIT_PYTHON_GIT_EXECUTABLE", raising=False)
+    environment = inspector._environment(private_root, hooks)
+    for key in tuple(environment):
+        if key.casefold() in {"path", "git_python_git_executable"}:
+            environment.pop(key)
+    environment["PATH"] = ""
+    monkeypatch.setattr(
+        ReadOnlyRepositoryInspector,
+        "_environment",
+        lambda self, private_root, hooks: dict(environment),
+    )
+
+    with pytest.raises(GitExecutableUnavailableError) as raised:
+        inspector._run(
+            ["git", "--version"],
+            cwd=private_root,
+            private_root=private_root,
+            hooks=hooks,
+            timeout=2,
+        )
+
+    assert str(raised.value) == "Git executable is unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+
+
+def _raise_wrapped_execution_error(cause: OSError) -> None:
+    from src.developer_workflow.codex_runner import CodexExecutionError
+
+    try:
+        raise cause
+    except OSError as error:
+        raise CodexExecutionError("wrapped process start failure") from error
+
+
+def test_repository_inspector_preserves_wrapped_non_file_not_found_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+    from src.developer_workflow.codex_runner import CodexExecutionError
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    cause = PermissionError("permission denied")
+    monkeypatch.setattr(
+        validation_module,
+        "_bounded_subprocess",
+        lambda *args, **kwargs: _raise_wrapped_execution_error(cause),
+    )
+
+    with pytest.raises(CodexExecutionError) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["git", "--version"],
+            cwd=Path.cwd(),
+            private_root=Path.cwd(),
+            hooks=Path.cwd(),
+            timeout=1,
+        )
+
+    assert raised.value.__cause__ is cause
+    assert not isinstance(raised.value, GitExecutableUnavailableError)
+
+
+def test_repository_inspector_preserves_wrapped_missing_non_git_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+    from src.developer_workflow.codex_runner import CodexExecutionError
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    cause = FileNotFoundError("missing executable")
+    monkeypatch.setattr(
+        validation_module,
+        "_bounded_subprocess",
+        lambda *args, **kwargs: _raise_wrapped_execution_error(cause),
+    )
+
+    with pytest.raises(CodexExecutionError) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["not-git", "--version"],
+            cwd=Path.cwd(),
+            private_root=Path.cwd(),
+            hooks=Path.cwd(),
+            timeout=1,
+        )
+
+    assert raised.value.__cause__ is cause
+    assert not isinstance(raised.value, GitExecutableUnavailableError)
+
+
+@pytest.mark.parametrize("invalid_cwd", ["missing", "file"])
+def test_repository_inspector_preserves_wrapped_missing_error_for_invalid_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_cwd: str,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+    from src.developer_workflow.codex_runner import CodexExecutionError
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    cwd = tmp_path / invalid_cwd
+    if invalid_cwd == "file":
+        cwd.write_text("not a directory", encoding="utf-8")
+    cause = FileNotFoundError("missing path")
+    monkeypatch.setattr(
+        validation_module,
+        "_bounded_subprocess",
+        lambda *args, **kwargs: _raise_wrapped_execution_error(cause),
+    )
+
+    with pytest.raises(CodexExecutionError) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["git", "--version"],
+            cwd=cwd,
+            private_root=tmp_path,
+            hooks=tmp_path,
+            timeout=1,
+        )
+
+    assert raised.value.__cause__ is cause
+    assert not isinstance(raised.value, GitExecutableUnavailableError)
+
+
 @pytest.mark.parametrize(
     "error",
     [
