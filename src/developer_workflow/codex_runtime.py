@@ -89,11 +89,19 @@ def _final_path_has_fixed_layout(
     return adapter.same_file(final_root, locator_root)
 
 
-def _current_repository_roots() -> tuple[Path, ...]:
+def _current_repository_roots(adapter: _RuntimeAdapter) -> tuple[Path, ...]:
     worktree = Path(__file__).resolve(strict=True).parents[2]
-    roots = [worktree]
+    candidates = [worktree]
     if worktree.parent.name.casefold() == ".worktrees":
-        roots.append(worktree.parent.parent.resolve(strict=True))
+        candidates.append(worktree.parent.parent.resolve(strict=True))
+    candidates.append(Path.cwd())
+    roots: list[Path] = []
+    for candidate in candidates:
+        if not adapter.same_file(candidate, candidate):
+            raise OSError("unstable repository root identity")
+        if any(adapter.same_file(candidate, existing) for existing in roots):
+            continue
+        roots.append(candidate)
     return tuple(roots)
 
 
@@ -114,6 +122,10 @@ def _inside_repository_by_identity(
 
 def _is_priority_failure(error: BaseException) -> bool:
     return isinstance(error, MemoryError) or not isinstance(error, Exception)
+
+
+def _is_expected_runtime_failure(error: BaseException) -> bool:
+    return isinstance(error, OSError)
 
 
 def _raise_native_codex_unavailable() -> None:
@@ -139,12 +151,16 @@ def _discover_locked_native_codex_raw(
 
     expected = locator.parent / NATIVE_CODEX_RELATIVE_PATH
     adapter = adapter_override if adapter_override is not None else _WindowsRuntimeAdapter()
-    roots = _current_repository_roots() if repository_roots is None else repository_roots
     descriptor = adapter.open_locked(expected)
     primary_error: BaseException | None = None
     primary_traceback = None
     locked: LockedNativeCodex | None = None
     try:
+        roots = (
+            _current_repository_roots(adapter)
+            if repository_roots is None
+            else repository_roots
+        )
         if not adapter.is_disk_regular_non_reparse(descriptor):
             raise OSError("native Codex payload is unavailable")
         initial_identity = adapter.identity(descriptor)
@@ -188,8 +204,14 @@ def _discover_locked_native_codex_raw(
 
     if _is_priority_failure(primary_error):
         raise primary_error.with_traceback(primary_traceback)
-    if cleanup_error is not None and _is_priority_failure(cleanup_error):
-        raise cleanup_error.with_traceback(cleanup_traceback)
+    if not _is_expected_runtime_failure(primary_error):
+        raise primary_error.with_traceback(primary_traceback)
+    if cleanup_error is not None:
+        if (
+            _is_priority_failure(cleanup_error)
+            or not _is_expected_runtime_failure(cleanup_error)
+        ):
+            raise cleanup_error.with_traceback(cleanup_traceback)
     raise primary_error.with_traceback(primary_traceback)
 
 
@@ -209,7 +231,7 @@ def discover_locked_native_codex(
             adapter_override=_adapter,
         )
     except BaseException as error:
-        if _is_priority_failure(error):
+        if _is_priority_failure(error) or not _is_expected_runtime_failure(error):
             raise
         failed = True
     if failed:
@@ -494,7 +516,11 @@ def _publisher_from_trust_state(state: object) -> str:
     return _certificate_publisher(signer.contents.pasCertChain[0].pCert)
 
 
-def _verify_wintrust_publisher(descriptor: int, path: Path) -> str:
+def _raise_signature_not_trusted() -> None:
+    raise OSError("native Codex signature is not trusted") from None
+
+
+def _verify_wintrust_publisher_raw(descriptor: int, path: Path) -> str:
     action = _GUID(
         0x00AAC56B, 0xCD44, 0x11D0,
         (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE),
@@ -510,18 +536,65 @@ def _verify_wintrust_publisher(descriptor: int, path: Path) -> str:
     trust_data.pFile = ctypes.pointer(file_info)
     trust_data.dwStateAction = 1
     trust_data.dwProvFlags = 0x00001000
+    publisher: str | None = None
+    primary_error: BaseException | None = None
+    primary_traceback = None
     try:
         result = _wintrust.WinVerifyTrust(
             wintypes.HWND(_INVALID_HANDLE_VALUE), ctypes.byref(action), ctypes.byref(trust_data)
         )
         if result != 0:
             raise OSError(result & 0xFFFFFFFF, "native Codex signature is not trusted")
-        return _publisher_from_trust_state(trust_data.hWVTStateData)
-    finally:
+        publisher = _publisher_from_trust_state(trust_data.hWVTStateData)
+        if type(publisher) is not str or not publisher:
+            raise OSError("native Codex signature publisher is invalid")
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+
+    cleanup_error: BaseException | None = None
+    cleanup_traceback = None
+    try:
         trust_data.dwStateAction = 2
-        _wintrust.WinVerifyTrust(
+        close_result = _wintrust.WinVerifyTrust(
             wintypes.HWND(_INVALID_HANDLE_VALUE), ctypes.byref(action), ctypes.byref(trust_data)
         )
+        if close_result != 0:
+            raise OSError(close_result & 0xFFFFFFFF, "could not close Codex trust state")
+    except BaseException as error:
+        cleanup_error = error
+        cleanup_traceback = error.__traceback__
+
+    if primary_error is not None:
+        if (
+            _is_priority_failure(primary_error)
+            or not _is_expected_runtime_failure(primary_error)
+        ):
+            raise primary_error.with_traceback(primary_traceback)
+        if cleanup_error is not None and (
+            _is_priority_failure(cleanup_error)
+            or not _is_expected_runtime_failure(cleanup_error)
+        ):
+            raise cleanup_error.with_traceback(cleanup_traceback)
+        raise primary_error.with_traceback(primary_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error.with_traceback(cleanup_traceback)
+    assert publisher is not None
+    return publisher
+
+
+def _verify_wintrust_publisher(descriptor: int, path: Path) -> str:
+    failed = False
+    try:
+        return _verify_wintrust_publisher_raw(descriptor, path)
+    except BaseException as error:
+        if _is_priority_failure(error) or not _is_expected_runtime_failure(error):
+            raise
+        failed = True
+    if failed:
+        del descriptor, path
+        _raise_signature_not_trusted()
+    raise AssertionError("unreachable")
 
 __all__ = [
     "OPENAI_AUTHENTICODE_PUBLISHER",

@@ -139,6 +139,36 @@ def test_resolver_preserves_memory_and_control_flow(control_flow: BaseException)
         codex_runner_module.resolve_codex_command(_discover=discover)
 
 
+@pytest.mark.parametrize("error_type", [AssertionError, TypeError, AttributeError])
+def test_resolver_preserves_internal_discovery_failures(
+    error_type: type[Exception],
+) -> None:
+    internal = error_type("internal-discovery-canary")
+
+    def discover() -> object:
+        raise internal
+
+    with pytest.raises(error_type) as caught:
+        codex_runner_module.resolve_codex_command(_discover=discover)
+
+    assert caught.value is internal
+
+
+def test_resolver_preserves_internal_locked_handle_close_failure() -> None:
+    internal = TypeError("internal-close-canary")
+
+    class Locked:
+        def close(self) -> None:
+            raise internal
+
+    with pytest.raises(TypeError) as caught:
+        codex_runner_module.resolve_codex_command(
+            _discover=lambda: Locked(),  # type: ignore[arg-type]
+        )
+
+    assert caught.value is internal
+
+
 def test_codex_auth_source_accepts_environment_auth_without_returning_secret() -> None:
     assert validate_codex_auth_source(
         {"CODEX_API_KEY": "runtime-only-codex-auth"}

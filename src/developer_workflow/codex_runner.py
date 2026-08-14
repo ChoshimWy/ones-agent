@@ -103,7 +103,11 @@ def resolve_codex_command(
     try:
         locked = _discover()
     except BaseException as error:
-        if isinstance(error, MemoryError) or not isinstance(error, Exception):
+        if (
+            isinstance(error, MemoryError)
+            or not isinstance(error, Exception)
+            or not isinstance(error, OSError)
+        ):
             raise
         failed = True
     if not failed:
@@ -111,7 +115,11 @@ def resolve_codex_command(
             assert locked is not None
             locked.close()
         except BaseException as error:
-            if isinstance(error, MemoryError) or not isinstance(error, Exception):
+            if (
+                isinstance(error, MemoryError)
+                or not isinstance(error, Exception)
+                or not isinstance(error, OSError)
+            ):
                 raise
         failed = True
     if failed:

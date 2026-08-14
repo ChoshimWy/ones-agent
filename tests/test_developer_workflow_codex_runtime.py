@@ -237,6 +237,77 @@ def test_repository_containment_identity_error_fails_closed() -> None:
     assert adapter.closed == [71]
 
 
+def test_default_repository_roots_reject_payload_beneath_current_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = (tmp_path / "external-workspace").resolve()
+    root = workspace / "installed"
+    root.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    adapter = FakeRuntimeAdapter(root)
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert adapter.closed == [71]
+
+
+def test_default_repository_root_identity_race_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = (tmp_path / "racing-workspace").resolve()
+    root = workspace / "installed"
+    root.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    adapter = FakeRuntimeAdapter(root)
+    original_same_file = adapter.same_file
+
+    def racing_same_file(left: Path, right: Path) -> bool:
+        if left == workspace or right == workspace:
+            raise FileNotFoundError("cwd-identity-race-canary")
+        return original_same_file(left, right)
+
+    adapter.same_file = racing_same_file  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+
+@pytest.mark.parametrize("error_type", [AssertionError, TypeError, AttributeError])
+def test_internal_runtime_failures_propagate_after_close(
+    error_type: type[Exception],
+) -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    internal = error_type("internal-runtime-canary")
+    adapter.verify_error = internal
+
+    with pytest.raises(error_type) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is internal
+    assert adapter.closed == [71]
+
+
+def test_internal_cleanup_failure_beats_expected_runtime_failure() -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    internal = TypeError("internal-close-canary")
+    adapter.verify_error = OSError("expected-trust-failure")
+    adapter.close_error = internal
+
+    with pytest.raises(TypeError) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is internal
+    assert adapter.closed == [71]
+
+
 def test_rejects_identity_race_after_signature_verification() -> None:
     root = Path("C:/npm")
     adapter = FakeRuntimeAdapter(root)
@@ -442,6 +513,174 @@ def test_wintrust_signer_failure_closes_state_and_preserves_original(
         codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
 
     assert caught.value is signer_failure
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+def test_wintrust_success_with_close_failure_is_fixed_and_does_not_return_publisher(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[int] = []
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+            return 0
+        return 0x80004005
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(
+        codex_runtime_module,
+        "_publisher_from_trust_state",
+        lambda state: OPENAI_AUTHENTICODE_PUBLISHER,
+    )
+
+    with pytest.raises(OSError) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert str(caught.value) == "native Codex signature is not trusted"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+def test_wintrust_verify_and_close_failures_are_fixed_and_close_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[int] = []
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        return 0x800B0100 if trust_data.dwStateAction == 1 else 0x80004005
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+
+    with pytest.raises(OSError) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert str(caught.value) == "native Codex signature is not trusted"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+def test_wintrust_ordinary_signer_and_close_failures_are_fixed_and_scrubbed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    signer_canary = "signer-path-canary"
+    actions: list[int] = []
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+            return 0
+        return 0x80004005
+
+    def fail_signer(state: object) -> str:
+        raise OSError(signer_canary)
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(codex_runtime_module, "_publisher_from_trust_state", fail_signer)
+
+    with pytest.raises(OSError) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert str(caught.value) == "native Codex signature is not trusted"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert signer_canary not in "".join(traceback.format_exception(caught.value))
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+@pytest.mark.parametrize("primary_type", _PRIORITY_FAILURES)
+def test_wintrust_primary_memory_or_control_beats_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_type: type[BaseException],
+) -> None:
+    actions: list[int] = []
+    primary = primary_type("trust-primary-control")
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+            return 0
+        return 0x80004005
+
+    def fail_signer(state: object) -> str:
+        raise primary
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(codex_runtime_module, "_publisher_from_trust_state", fail_signer)
+
+    with pytest.raises(primary_type) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert caught.value is primary
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+@pytest.mark.parametrize("error_type", [AssertionError, TypeError, AttributeError])
+def test_wintrust_internal_signer_failure_propagates_after_close(
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[Exception],
+) -> None:
+    actions: list[int] = []
+    internal = error_type("internal-signer-canary")
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+            return 0
+        return 0x80004005
+
+    def fail_signer(state: object) -> str:
+        raise internal
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(codex_runtime_module, "_publisher_from_trust_state", fail_signer)
+
+    with pytest.raises(error_type) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert caught.value is internal
     assert actions == [1, 2]
 
 
