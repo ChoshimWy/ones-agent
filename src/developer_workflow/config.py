@@ -53,32 +53,6 @@ class SandboxPermissionProfileSource(str, Enum):
 BUILTIN_WORKSPACE_PROFILE = "ones-dev-workspace"
 
 
-def _sanitized_validation_error(
-    model: type[WorkflowModel], error: ValidationError
-) -> ValidationError:
-    known_fields = set(model.model_fields)
-    safe_errors = [
-        {
-            "type": "value_error",
-            "loc": (
-                (item["loc"][0],)
-                if item["loc"]
-                and isinstance(item["loc"][0], str)
-                and item["loc"][0] in known_fields
-                else ("<redacted>",)
-            ),
-            "input": "<redacted>",
-            "ctx": {"error": ValueError("input is invalid")},
-        }
-        for item in error.errors(
-            include_url=False,
-            include_context=False,
-            include_input=False,
-        )
-    ]
-    return ValidationError.from_exception_data(model.__name__, safe_errors)
-
-
 def _is_profile_source_validation_error(error: ValidationError) -> bool:
     return any(
         item["loc"]
@@ -165,14 +139,21 @@ class DeveloperWorkflowConfig(WorkflowModel):
     publishing: PublishingConfig
 
     def __init__(self, **data: Any) -> None:
+        sanitize_error = False
         try:
             super().__init__(**data)
         except ValidationError as error:
             if _is_profile_source_validation_error(error):
-                raise _sanitized_validation_error(type(self), error) from None
-            raise
+                sanitize_error = True
+            else:
+                raise
+        if sanitize_error:
+            raise _profile_source_validation_error(type(self))
 
     def __setattr__(self, name: str, value: Any) -> None:
+        if self.model_config.get("frozen"):
+            super().__setattr__(name, value)
+            return
         if name in {
             "sandbox_permission_profile",
             "sandbox_permission_profile_source",
@@ -195,17 +176,27 @@ class DeveloperWorkflowConfig(WorkflowModel):
             super().__setattr__(name, value)
         except ValidationError as error:
             if _is_profile_source_validation_error(error):
-                raise _sanitized_validation_error(type(self), error) from None
-            raise
+                sanitize_error = True
+            else:
+                raise
+        else:
+            sanitize_error = False
+        if sanitize_error:
+            raise _profile_source_validation_error(type(self))
 
     @classmethod
     def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        sanitize_error = False
         try:
-            return super().model_validate(obj, *args, **kwargs)
+            result = super().model_validate(obj, *args, **kwargs)
         except ValidationError as error:
             if _is_profile_source_validation_error(error):
-                raise _sanitized_validation_error(cls, error) from None
-            raise
+                sanitize_error = True
+            else:
+                raise
+        if sanitize_error:
+            raise _profile_source_validation_error(cls)
+        return result
 
     @field_validator("sandbox_permission_profile")
     @classmethod

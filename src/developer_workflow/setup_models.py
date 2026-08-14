@@ -103,37 +103,55 @@ class SetupModel(WorkflowModel):
     )
 
     def __init__(self, **data: Any) -> None:
+        sanitized_error: ValidationError | None = None
         try:
             super().__init__(**data)
         except ValidationError as error:
-            raise _sanitized_validation_error(type(self), error) from None
+            sanitized_error = _sanitized_validation_error(type(self), error)
+        if sanitized_error is not None:
+            raise sanitized_error
 
     def __setattr__(self, name: str, value: Any) -> None:
+        sanitized_error: ValidationError | None = None
         try:
             super().__setattr__(name, value)
         except ValidationError as error:
-            raise _sanitized_validation_error(type(self), error) from None
+            sanitized_error = _sanitized_validation_error(type(self), error)
+        if sanitized_error is not None:
+            raise sanitized_error
 
     @classmethod
     def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        sanitized_error: ValidationError | None = None
         try:
-            return super().model_validate(obj, *args, **kwargs)
+            result = super().model_validate(obj, *args, **kwargs)
         except ValidationError as error:
-            raise _sanitized_validation_error(cls, error) from None
+            sanitized_error = _sanitized_validation_error(cls, error)
+        if sanitized_error is not None:
+            raise sanitized_error
+        return result
 
     @classmethod
     def model_validate_json(cls, json_data: Any, *args: Any, **kwargs: Any) -> Any:
+        sanitized_error: ValidationError | None = None
         try:
-            return super().model_validate_json(json_data, *args, **kwargs)
+            result = super().model_validate_json(json_data, *args, **kwargs)
         except ValidationError as error:
-            raise _sanitized_validation_error(cls, error) from None
+            sanitized_error = _sanitized_validation_error(cls, error)
+        if sanitized_error is not None:
+            raise sanitized_error
+        return result
 
     @classmethod
     def model_validate_strings(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        sanitized_error: ValidationError | None = None
         try:
-            return super().model_validate_strings(obj, *args, **kwargs)
+            result = super().model_validate_strings(obj, *args, **kwargs)
         except ValidationError as error:
-            raise _sanitized_validation_error(cls, error) from None
+            sanitized_error = _sanitized_validation_error(cls, error)
+        if sanitized_error is not None:
+            raise sanitized_error
+        return result
 
 
 def _validated_text(value: str, field_name: str, *, maximum: int = 4096) -> str:

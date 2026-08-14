@@ -323,6 +323,28 @@ def test_workflow_draft_rejects_builtin_source_without_a_builtin_profile() -> No
 
 
 @pytest.mark.parametrize(
+    ("profile", "source", "canary"),
+    [
+        ("profile-canary", "builtin_workspace", "profile-canary"),
+        ("managed-dev", "source-canary", "source-canary"),
+    ],
+)
+def test_workflow_draft_provenance_errors_detach_the_original_exception(
+    profile: str, source: str, canary: str
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        WorkflowDraft(
+            sandbox_permission_profile=profile,
+            sandbox_permission_profile_source=source,
+        )
+
+    error = captured.value
+    assert canary not in repr(error.errors())
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+
+@pytest.mark.parametrize(
     ("field_name", "value"),
     [
         ("sandbox_permission_profile", "ones-dev-workspace"),
@@ -339,6 +361,32 @@ def test_workflow_draft_profile_source_assignment_is_atomic(
         setattr(draft, field_name, value)
 
     assert draft.model_dump(mode="json") == before
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("sandbox_permission_profile", "ones-dev-workspace"),
+        ("sandbox_permission_profile_source", "builtin_workspace"),
+    ],
+)
+def test_committed_workflow_provenance_assignment_remains_frozen(
+    tmp_path: Path, field_name: str, value: str
+) -> None:
+    active = ActiveSetup(
+        generation="a" * 32,
+        runtime=_public_config(),
+        workflow=_workflow_config(tmp_path),
+        credential_kinds=(SecretKind.ONES_PASSWORD,),
+    )
+    workflow = active.workflow
+    before = workflow.model_dump(mode="json")
+
+    with pytest.raises(ValidationError) as captured:
+        setattr(workflow, field_name, value)
+
+    assert captured.value.errors()[0]["type"] == "frozen_instance"
+    assert workflow.model_dump(mode="json") == before
 
 
 def test_extra_field_name_is_redacted_from_validation_location() -> None:

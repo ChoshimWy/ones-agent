@@ -376,9 +376,9 @@ def test_sandbox_permission_profile_source_rejections_redact_structured_errors(
 
     error = captured.value
     public_forms = (str(error), repr(error), repr(error.errors()))
-    chained_forms = (repr(error.__cause__), repr(error.__context__))
     assert all(canary not in form for canary in canaries for form in public_forms)
-    assert all(canary not in form for canary in canaries for form in chained_forms)
+    assert error.__cause__ is None
+    assert error.__context__ is None
 
 
 @pytest.mark.parametrize(
