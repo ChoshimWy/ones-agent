@@ -8,8 +8,10 @@ import os
 import re
 import signal
 import shlex
+import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -21,6 +23,13 @@ from typing import Any, Protocol
 from urllib.parse import unquote, urlsplit
 
 from jsonschema import Draft202012Validator
+
+from .private_paths import (
+    _ADMINISTRATORS_SID,
+    _SYSTEM_SID,
+    _current_user_sid,
+    _windows_descriptor,
+)
 
 from .contracts import (
     AcceptanceCoverage,
@@ -59,6 +68,286 @@ class CodexTimeoutError(CodexExecutionError):
 
 class CodexOutputError(CodexRunnerError):
     """Codex returned invalid or unsafe structured output."""
+
+
+@dataclass(frozen=True, slots=True)
+class CodexCommand:
+    """A validated executable prefix which is always safe to pass without a shell."""
+
+    prefix: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.prefix) is not tuple
+            or not self.prefix
+            or any(
+                type(component) is not str or not component or "\x00" in component
+                for component in self.prefix
+            )
+        ):
+            raise ValueError("Codex command prefix is invalid")
+
+    def argv(self, *arguments: str) -> list[str]:
+        if any(
+            type(argument) is not str or not argument or "\x00" in argument
+            for argument in arguments
+        ):
+            raise ValueError("Codex command argument is invalid")
+        return [*self.prefix, *arguments]
+
+
+_TRUSTED_INSTALLER_SID = (
+    "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464"
+)
+_WINDOWS_WRITE_MASK = (
+    0x00000002  # FILE_WRITE_DATA
+    | 0x00000004  # FILE_APPEND_DATA
+    | 0x00000010  # FILE_WRITE_EA
+    | 0x00000040  # FILE_DELETE_CHILD
+    | 0x00000100  # FILE_WRITE_ATTRIBUTES
+    | 0x00010000  # DELETE
+    | 0x00040000  # WRITE_DAC
+    | 0x00080000  # WRITE_OWNER
+    | 0x10000000  # GENERIC_ALL
+    | 0x40000000  # GENERIC_WRITE
+)
+_WINDOWS_ANCESTOR_MUTATION_MASK = _WINDOWS_WRITE_MASK & ~(
+    0x00000002  # FILE_ADD_FILE cannot replace an existing child.
+    | 0x00000004  # FILE_ADD_SUBDIRECTORY cannot replace an existing child.
+    | 0x00000010  # FILE_WRITE_EA
+    | 0x00000100  # FILE_WRITE_ATTRIBUTES
+)
+
+
+def _same_path(left: Path, right: Path) -> bool:
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(
+        os.path.abspath(right)
+    )
+
+
+def _current_repository_roots() -> tuple[Path, ...]:
+    worktree = Path(__file__).resolve(strict=True).parents[2]
+    roots = [worktree]
+    if worktree.parent.name.casefold() == ".worktrees":
+        roots.append(worktree.parent.parent.resolve(strict=True))
+    return tuple(roots)
+
+
+def _validate_windows_codex_acl(path: Path, *, mutation_mask: int) -> None:
+    owner, entries, _protected = _windows_descriptor(path)
+    user_sid = _current_user_sid()
+    trusted_writers = {
+        user_sid,
+        _SYSTEM_SID,
+        _ADMINISTRATORS_SID,
+        _TRUSTED_INSTALLER_SID,
+    }
+    if (
+        owner not in trusted_writers
+        or not entries
+        or any(
+            ace_type not in {0, 9}
+            or mask & mutation_mask and sid not in trusted_writers
+            for sid, mask, flags, ace_type in entries
+            if not flags & 0x08  # INHERIT_ONLY_ACE is not effective on this path.
+        )
+    ):
+        raise OSError("untrusted executable ACL")
+
+
+def _component_identity(metadata: os.stat_result) -> tuple[int, int, int, int]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _component_is_reparse(metadata: os.stat_result) -> bool:
+    return stat.S_ISLNK(metadata.st_mode) or bool(
+        getattr(metadata, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
+
+
+def _validate_codex_permissions(
+    path: Path, metadata: os.stat_result, *, ancestor: bool = False
+) -> None:
+    if os.name == "nt":
+        _validate_windows_codex_acl(
+            path,
+            mutation_mask=(
+                _WINDOWS_ANCESTOR_MUTATION_MASK if ancestor else _WINDOWS_WRITE_MASK
+            ),
+        )
+    elif (
+        metadata.st_uid not in {0, os.geteuid()}
+        or stat.S_IMODE(metadata.st_mode) & 0o022
+    ):
+        raise OSError("unsafe executable ownership")
+
+
+def _validate_codex_ancestors(path: Path) -> None:
+    current = path.parent
+    while True:
+        before = current.lstat()
+        if _component_is_reparse(before) or not stat.S_ISDIR(before.st_mode):
+            raise OSError("unsafe executable ancestor")
+        canonical = current.resolve(strict=True)
+        if not _same_path(canonical, current):
+            raise OSError("unsafe executable ancestor")
+        _validate_codex_permissions(canonical, before, ancestor=True)
+        after = canonical.lstat()
+        if (
+            _component_is_reparse(after)
+            or not stat.S_ISDIR(after.st_mode)
+            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+        ):
+            raise OSError("unstable executable ancestor")
+        if canonical.parent == canonical:
+            return
+        current = canonical.parent
+
+
+def _validate_codex_component(path: Path) -> Path:
+    """Return one canonical, stable, regular component outside this repository."""
+
+    candidate = Path(path)
+    if not candidate.is_absolute() or "\x00" in str(candidate):
+        raise OSError("unsafe executable path")
+    before = candidate.lstat()
+    if _component_is_reparse(before) or not stat.S_ISREG(before.st_mode):
+        raise OSError("unsafe executable path")
+    canonical = candidate.resolve(strict=True)
+    if not _same_path(canonical, candidate):
+        raise OSError("unsafe executable path")
+    if any(canonical.is_relative_to(root) for root in _current_repository_roots()):
+        raise OSError("unsafe executable path")
+    _validate_codex_permissions(canonical, before)
+    _validate_codex_ancestors(canonical)
+    after = canonical.lstat()
+    if (
+        _component_is_reparse(after)
+        or not stat.S_ISREG(after.st_mode)
+        or _component_identity(before) != _component_identity(after)
+    ):
+        raise OSError("unstable executable identity")
+    return canonical
+
+
+def _validated_component(
+    raw: object, path_validator: Callable[[Path], Path]
+) -> Path:
+    if type(raw) is not str or not raw or "\x00" in raw:
+        raise OSError("invalid executable discovery result")
+    canonical = path_validator(Path(raw))
+    if (
+        not isinstance(canonical, Path)
+        or not canonical.is_absolute()
+        or "\x00" in str(canonical)
+    ):
+        raise OSError("invalid executable validation result")
+    return canonical
+
+
+def _attempt_codex_candidate(operation: Callable[[], CodexCommand]) -> CodexCommand | None:
+    try:
+        return operation()
+    except MemoryError:
+        raise
+    except Exception:
+        return None
+
+
+def _resolve_windows_codex_command(
+    which: Callable[[str], str | None], path_validator: Callable[[Path], Path]
+) -> CodexCommand:
+    def direct() -> CodexCommand:
+        raw = which("codex.exe")
+        if type(raw) is not str or Path(raw).name.casefold() != "codex.exe":
+            raise OSError("invalid direct executable")
+        executable = _validated_component(raw, path_validator)
+        if executable.name.casefold() != "codex.exe":
+            raise OSError("invalid direct executable")
+        return CodexCommand((str(executable),))
+
+    if (command := _attempt_codex_candidate(direct)) is not None:
+        return command
+
+    def npm() -> CodexCommand:
+        raw = which("codex.cmd")
+        if type(raw) is not str or Path(raw).name.casefold() != "codex.cmd":
+            raise OSError("invalid npm locator")
+        locator = _validated_component(raw, path_validator)
+        if locator.name.casefold() != "codex.cmd":
+            raise OSError("invalid npm locator")
+        root = locator.parent
+        expected_node = root / "node.exe"
+        expected_entry = (
+            root / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
+        )
+        node = _validated_component(str(expected_node), path_validator)
+        entry = _validated_component(str(expected_entry), path_validator)
+        if (
+            node.name.casefold() != "node.exe"
+            or entry.name.casefold() != "codex.js"
+            or not _same_path(node, expected_node)
+            or not _same_path(entry, expected_entry)
+        ):
+            raise OSError("invalid npm layout")
+        return CodexCommand((str(node), str(entry)))
+
+    command = _attempt_codex_candidate(npm)
+    if command is None:
+        raise OSError("no safe Codex executable")
+    return command
+
+
+def _resolve_posix_codex_command(
+    which: Callable[[str], str | None], path_validator: Callable[[Path], Path]
+) -> CodexCommand:
+    executable = _validated_component(which("codex"), path_validator)
+    if not os.access(executable, os.X_OK):
+        raise OSError("Codex executable is not executable")
+    return CodexCommand((str(executable),))
+
+
+def _resolve_codex_command_raw(
+    *,
+    which: Callable[[str], str | None],
+    platform: str,
+    path_validator: Callable[[Path], Path],
+) -> CodexCommand:
+    if platform == "win32":
+        return _resolve_windows_codex_command(which, path_validator)
+    return _resolve_posix_codex_command(which, path_validator)
+
+
+def _raise_codex_executable_unavailable() -> None:
+    raise CodexProcessStartError("Codex executable is unavailable") from None
+
+
+def resolve_codex_command(
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    platform: str = sys.platform,
+    path_validator: Callable[[Path], Path] = _validate_codex_component,
+) -> CodexCommand:
+    """Resolve Codex to a fixed argv prefix without executing a shell shim."""
+
+    failed = False
+    try:
+        return _resolve_codex_command_raw(
+            which=which, platform=platform, path_validator=path_validator
+        )
+    except MemoryError:
+        raise
+    except Exception:
+        failed = True
+    if failed:
+        _raise_codex_executable_unavailable()
+    raise AssertionError("unreachable")
 
 
 class RepositoryGuard(Protocol):
