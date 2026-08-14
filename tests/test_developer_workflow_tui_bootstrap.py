@@ -780,6 +780,73 @@ async def test_setup_prepare_failure_restores_button_and_retry_succeeds() -> Non
         assert screen.query_one("#test-connection").disabled is False
 
 
+@pytest.mark.asyncio
+async def test_missing_git_result_is_fixed_and_repository_probe_can_retry() -> None:
+    from textual.widgets import Button, Static
+
+    from src.developer_workflow.setup_validation import (
+        ConnectionTestResult,
+        SetupStep,
+        ValidationStatus,
+    )
+
+    class MissingGitOnce(_WizardSetupController):
+        attempts = 0
+
+        async def test_step(self, step: object, probe: object = None) -> object:
+            self.attempts += 1
+            self.calls.append((step, probe))
+            result = ConnectionTestResult(
+                step=step,
+                status=(
+                    ValidationStatus.FAILED
+                    if self.attempts == 1
+                    else ValidationStatus.PASSED
+                ),
+                category="git_unavailable" if self.attempts == 1 else "ok",
+            )
+            self._results[step] = result
+            return result
+
+    controller = MissingGitOnce()
+    controller.current_step = SetupStep.REPOSITORIES
+    for step in (SetupStep.PROFILE, SetupStep.ONES):
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        values = {
+            "#repository-key": "primary",
+            "#repository-project-id": "project-1",
+            "#repository-iteration-id": "iteration-1",
+            "#repository-name": "primary",
+            "#repository-path": "C:/safe/repository",
+            "#repository-url": "https://git.example.invalid/team/primary.git",
+            "#repository-branch": "main",
+        }
+        for widget_id, value in values.items():
+            screen.query_one(widget_id).value = value
+
+        await screen.action_test_connection()
+
+        assert screen.is_attached
+        assert str(screen.query_one("#setup-notice", Static).renderable) == (
+            "Git executable is unavailable"
+        )
+        assert screen.query_one("#test-connection", Button).disabled is False
+
+        await screen.action_test_connection()
+
+        assert screen.is_attached
+        assert controller.attempts == 2
+        assert str(screen.query_one("#setup-notice", Static).renderable) == (
+            "Connection test passed"
+        )
+        assert screen.query_one("#test-connection", Button).disabled is False
+
+
 class _SetupController:
     def __init__(self, handle: object | None) -> None:
         self.handle = handle

@@ -38,6 +38,7 @@ from .setup_models import build_setup_step_view, setup_step_label
 
 _RESULT_TEXT = {
     "ok": "Connection test passed",
+    "git_unavailable": "Git executable is unavailable",
     "authentication": "Authentication failed",
     "unreachable": "Host is unreachable",
     "tls": "TLS validation failed",

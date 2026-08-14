@@ -65,6 +65,7 @@ _PRODUCTION_CONSTRUCTION = object()
 _TEST_CONSTRUCTION = object()
 _CATEGORIES = Literal[
     "ok",
+    "git_unavailable",
     "authentication",
     "unreachable",
     "tls",
@@ -74,6 +75,14 @@ _CATEGORIES = Literal[
     "sandbox",
     "invalid_field",
 ]
+
+
+class GitExecutableUnavailableError(RuntimeError):
+    """The read-only repository probe cannot start the Git executable."""
+
+
+def _raise_git_executable_unavailable() -> None:
+    raise GitExecutableUnavailableError("Git executable is unavailable") from None
 
 
 class SetupStep(str, Enum):
@@ -796,13 +805,20 @@ class ReadOnlyRepositoryInspector:
     def _run(
         self, argv: list[str], *, cwd: Path, private_root: Path, hooks: Path, timeout: float
     ) -> str:
-        completed = _bounded_subprocess(
-            argv,
-            cwd=cwd,
-            env=self._environment(private_root, hooks),
-            timeout=timeout,
-            max_output_bytes=self.max_output_bytes,
-        )
+        git_unavailable = False
+        environment = self._environment(private_root, hooks)
+        try:
+            completed = _bounded_subprocess(
+                argv,
+                cwd=cwd,
+                env=environment,
+                timeout=timeout,
+                max_output_bytes=self.max_output_bytes,
+            )
+        except FileNotFoundError:
+            git_unavailable = True
+        if git_unavailable:
+            _raise_git_executable_unavailable()
         if completed.returncode != 0:
             raise RuntimeError("read-only Git probe failed")
         return completed.stdout
@@ -980,6 +996,8 @@ def _result(step: SetupStep, category: _CATEGORIES = "ok") -> ConnectionTestResu
 
 
 def _failure_category(error: Exception, *, default: _CATEGORIES = "unreachable") -> _CATEGORIES:
+    if isinstance(error, GitExecutableUnavailableError):
+        return "git_unavailable"
     name = type(error).__name__.casefold()
     if isinstance(error, (asyncio.TimeoutError, TimeoutError, subprocess.TimeoutExpired)) or "timeout" in name:
         return "timeout"
@@ -1217,6 +1235,7 @@ __all__ = [
     "CodexProbeInput",
     "CodexAuthMetadata",
     "ConnectionTestResult",
+    "GitExecutableUnavailableError",
     "ManagedProfileCatalog",
     "ManagedSandboxExecutorFactory",
     "OnesProbeInput",

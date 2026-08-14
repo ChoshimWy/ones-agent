@@ -516,6 +516,95 @@ def test_read_only_repository_inspector_preserves_source_index_and_status(tmp_pa
     )
 
 
+def test_repository_inspector_sanitizes_missing_git_executable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    canary = "SECRET-GIT-PATH"
+    monkeypatch.setattr(
+        validation_module,
+        "_bounded_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError(canary)),
+    )
+
+    with pytest.raises(GitExecutableUnavailableError) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["git", "status"],
+            cwd=Path.cwd(),
+            private_root=Path.cwd(),
+            hooks=Path.cwd(),
+            timeout=1,
+        )
+
+    assert str(raised.value) == "Git executable is unavailable"
+    assert raised.value.__cause__ is None
+    assert raised.value.__context__ is None
+    assert canary not in str(raised.value)
+    assert canary not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        PermissionError("permission denied"),
+        subprocess.TimeoutExpired(["git"], 1),
+        OSError(24, "too many files"),
+        RuntimeError("probe failed"),
+    ],
+)
+def test_repository_inspector_does_not_misclassify_other_failures(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    monkeypatch.setattr(
+        validation_module,
+        "_bounded_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    with pytest.raises(type(error)) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["git", "status"],
+            cwd=Path.cwd(),
+            private_root=Path.cwd(),
+            hooks=Path.cwd(),
+            timeout=1,
+        )
+
+    assert raised.value is error
+    assert not isinstance(raised.value, GitExecutableUnavailableError)
+
+
+@pytest.mark.parametrize("fatal_type", [KeyboardInterrupt, SystemExit])
+def test_repository_inspector_preserves_control_flow_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    fatal_type: type[BaseException],
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    fatal = fatal_type("control flow")
+    monkeypatch.setattr(
+        validation_module,
+        "_bounded_subprocess",
+        lambda *args, **kwargs: (_ for _ in ()).throw(fatal),
+    )
+
+    with pytest.raises(fatal_type) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["git", "status"],
+            cwd=Path.cwd(),
+            private_root=Path.cwd(),
+            hooks=Path.cwd(),
+            timeout=1,
+        )
+
+    assert raised.value is fatal
+
+
 def test_repository_inspector_never_executes_repo_local_programs(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -654,6 +743,44 @@ class _Inspector:
         self.calls.append(("snapshot", path, timeout)); return self.value
     def ls_remote(self, path, url, *, timeout):
         self.calls.append(("ls_remote", path, url, timeout)); return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", ["snapshot", "ls_remote"])
+async def test_repository_probe_reports_missing_git_without_original_details(
+    failure_stage: str,
+) -> None:
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    canary = "SECRET-GIT-PATH"
+
+    class MissingGitInspector(_Inspector):
+        def snapshot(self, path, *, timeout):
+            if failure_stage == "snapshot":
+                raise GitExecutableUnavailableError("Git executable is unavailable")
+            return super().snapshot(path, timeout=timeout)
+
+        def ls_remote(self, path, url, *, timeout):
+            if failure_stage == "ls_remote":
+                raise GitExecutableUnavailableError("Git executable is unavailable")
+            return super().ls_remote(path, url, timeout=timeout)
+
+    repository = Path.cwd()
+    validator = SetupValidator._testing(repository_inspector=MissingGitInspector())
+
+    result = await validator.probe_repository(
+        RepositoryProbeInput(
+            path=repository,
+            remote_url="https://git.example.invalid/team/repository.git",
+        )
+    )
+
+    assert result == ConnectionTestResult(
+        step=SetupStep.REPOSITORIES,
+        status=ValidationStatus.FAILED,
+        category="git_unavailable",
+    )
+    assert canary not in repr(result)
 
 
 class _Auth:
