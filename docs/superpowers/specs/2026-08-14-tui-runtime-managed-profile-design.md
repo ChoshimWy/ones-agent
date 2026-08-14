@@ -13,7 +13,7 @@
 - 内置配置只能使用固定的 Codex workspace 权限语义，不能由用户自由扩大。
 - 配置必须经过真实能力探测，探测成功后才能进入后续步骤。
 - 不修改用户的 `~/.codex/config.toml`，不修复或放宽其 ACL，也不改变 `PATH`。
-- Windows 上支持通过 npm shim 安装的 Codex，同时保持 `shell=False` 和结构化参数边界。
+- Windows 上支持从标准 npm 安装发现 OpenAI 签名的原生 Codex CLI，并把它准备到应用私有运行时目录；整个链路保持 `shell=False` 和结构化参数边界。
 - 已有的可信 managed profile 发现、选择和验证流程继续工作。
 
 ## 非目标
@@ -70,16 +70,27 @@ extends = ":workspace"
 
 ## 组件设计
 
-### 1. Codex 命令解析器
+### 1. Codex 私有运行时准备器
 
-新增只返回不可变 argv 前缀的解析边界，例如 `CodexCommand(prefix: tuple[str, ...])`。所有 doctor、sandbox probe 和正式运行共用该边界，不再各自执行裸字符串 `codex`。
+新增 `CodexRuntimePreparer` 和只返回不可变 argv 前缀的 `CodexCommand(prefix: tuple[str, ...])`。所有 doctor、sandbox probe 和正式运行共用该边界，不再各自执行裸字符串 `codex`。
 
-Windows 解析顺序：
+Windows 不执行 npm 的 `node.exe`、`codex.js`、`.cmd`、`.ps1` 或 extensionless shim。Node 会沿入口祖先搜索 `node_modules`；即使入口文件本身安全，可写祖先仍能抢先注入平台包，因此 `node.exe + codex.js` 不属于可接受执行链。
 
-1. 可直接安全执行的受信任 `codex.exe`。
-2. 标准 npm 安装布局：定位 `codex.cmd` 仅用于识别安装根，不执行该脚本；验证相邻 Node 可执行文件和 `node_modules/@openai/codex/bin/codex.js` 的规范路径、普通文件和稳定身份，然后构造 `[node.exe, codex.js]`。
+准备器按以下顺序工作：
 
-解析器不调用 shell、不拼接命令字符串、不修改 `PATH`，也不从项目工作区接受任意可执行文件。解析失败返回固定、脱敏的“Codex CLI 不可用”类别。
+1. 检查应用私有缓存中是否已有完整验证的原生 Codex CLI。
+2. 如无可用缓存，定位标准 npm 固定布局中的原生平台二进制：`node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe`。`codex.cmd` 只用于识别标准安装根，不读取或执行其内容。
+3. 使用 Windows `CreateFile` 打开源文件，允许共享读取但禁止共享写入和删除，并在该句柄保持打开期间完成验证和复制。
+4. 拒绝非普通文件、reparse、工作区内候选、打开前后身份变化和非固定布局。
+5. 使用 Windows `WinVerifyTrust` 验证 Authenticode 信任链；签名发布者必须精确为 `OpenAI OpCo, LLC`。允许证书正常轮换，不固定单一证书指纹。
+6. 在 `%LOCALAPPDATA%\ones-dev\codex-runtime` 下创建受保护的 staging 目录。目录禁止继承，只允许当前用户、SYSTEM 和 Administrators 写入。
+7. 从已锁定的源句柄流式复制到随机临时文件，同时计算 SHA-256；目标目录命名为 `<sha256>`。
+8. 复制完成后再次验证目标文件的 SHA-256、Authenticode、发布者、普通文件身份和 ACL，再以原子替换发布为 `<sha256>\codex.exe`。
+9. 使用私有副本执行有界 `--version` smoke；成功后才返回 `CodexCommand((private_codex_exe,))`。
+
+私有缓存包含受保护的最小 manifest：schema version、源稳定身份元数据、目标 SHA-256 和已验证发布者。后续启动在源稳定身份未变化时复核私有副本的 ACL、哈希和签名后直接复用，不重复复制。源发生变化时先完整准备新版本；新版本发布成功前继续保留旧的可信版本。没有安装源但已有通过复核的私有副本时，允许继续使用该副本。
+
+准备器不调用 shell、不拼接命令字符串、不修改 `PATH`，不修改 npm/NVM 文件或 ACL，也不从项目工作区接受任意可执行文件。解析、签名、复制或 smoke 失败返回固定、脱敏的“Codex CLI 不可用”类别。
 
 ### 2. Profile catalog
 
@@ -131,10 +142,12 @@ Profile 测试、RuntimeBootstrapper preflight、Repository/Test runner 必须�
 1. TUI 启动并加载外部 profile 目录。
 2. 目录为空或不可用时，用户点击“创建安全工作区配置”。
 3. TUI 展示固定权限摘要；用户点击明确的 Confirm。
-4. Controller 使用固定 descriptor 和统一 Codex 命令解析器执行真实能力探测。
-5. 探测成功后，Controller 原子保存 `{name, source}` 到 draft；页面自动选中并解锁后续步骤。
-6. 最终配置保存时，SetupStore 持久化来源和名称。
-7. 运行时加载后严格校验 descriptor，并用同一命令构造器执行 preflight 和业务命令。
+4. Controller 调用统一运行时准备器。若尚无可信私有副本，TUI 的确认摘要明确显示将从已安装的 OpenAI 签名二进制准备约 299 MB 的私有副本。
+5. 准备器锁定源、验证签名、流式复制、保护 ACL、复核目标并运行 `--version` smoke。
+6. Controller 使用准备器返回的同一 `CodexCommand` 和固定 descriptor 执行真实能力探测。
+7. 探测成功后，Controller 原子保存 `{name, source}` 到 draft；页面自动选中并解锁后续步骤。
+8. 最终配置保存时，SetupStore 只持久化 profile 来源和名称，不持久化外部可执行路径。
+9. 运行时加载后重新复核私有副本，并用同一命令构造器执行 preflight 和业务命令。
 
 ## 能力探测
 
@@ -151,7 +164,10 @@ Profile 测试、RuntimeBootstrapper preflight、Repository/Test runner 必须�
 ## 错误与生命周期
 
 - 用户取消确认：无状态变化、无 profile 写入。
-- Codex CLI 无法解析：固定提示“Codex CLI is unavailable”，允许 Retry。
+- Codex CLI 无法定位、签名无效、发布者不匹配、私有缓存不安全或 smoke 失败：固定提示“Codex CLI is unavailable”，允许 Retry。
+- 用户取消、TUI 退出或页面卸载：取消 UI 等待并收割后台准备任务；未原子发布的临时文件不成为可用运行时。
+- 源在复制期间被写入、替换或删除：锁定句柄或身份复核失败，固定拒绝；不使用部分副本。
+- staging 写入、磁盘空间、签名复核或原子替换失败：逐项尝试清理本次随机临时文件；清理失败仍不发布 manifest，不影响既有可信版本。
 - Git 不可用：继续使用已有的 `git_unavailable` 可恢复分类，不与 profile 错误混淆。
 - capability probe 失败：固定提示“Safe workspace profile could not be verified”。
 - 超时或取消：保留操作所有权直到后台任务完成或被受管收割；不报告虚假成功。
@@ -164,8 +180,12 @@ Profile 测试、RuntimeBootstrapper preflight、Repository/Test runner 必须�
 
 - 内置定义不可编辑，不能从导入源或环境覆盖。
 - 所有子进程保持 `shell=False`。
-- 不执行 `.cmd`、`.ps1` 或工作区内 shim。
-- 解析和执行之间核对可执行文件/入口脚本身份，竞态时失败关闭。
+- 不执行 Node、JavaScript、`.cmd`、`.ps1`、extensionless shim 或工作区内候选。
+- npm 源目录即使具有宽松 ACL 也不会被直接执行；只有在禁止并发写/删的锁定句柄上验证有效 OpenAI Authenticode 后，内容才可进入私有 staging。
+- 签名检查使用 Windows `WinVerifyTrust` API，不调用 PowerShell；必须同时满足有效系统信任链和固定 OpenAI 发布者身份。
+- 私有运行时根及所有组件拒绝 reparse，使用受保护 DACL，并在每次使用前核对身份、ACL、哈希和签名。
+- 复制采用固定大小缓冲区并在异常出口释放句柄；最终文件只通过同目录原子替换发布。
+- manifest 不存储外部路径、命令输出或凭据；不把不可信 manifest 字段用作文件操作目标。
 - 不写 `~/.codex/config.toml`，不改变其 ACL。
 - profile 来源参与持久化校验、测试和 runtime 构造，不能仅用字符串名称推断。
 - capability probe 和正式 runtime 使用同一 executor factory。
@@ -175,7 +195,11 @@ Profile 测试、RuntimeBootstrapper preflight、Repository/Test runner 必须�
 ### 单元测试
 
 - Profile descriptor 的合法组合、未知来源、名称冲突和旧配置迁移。
-- Windows 直接 exe、标准 npm 布局、恶意/异常 shim、路径竞态和无 Codex。
+- Windows 固定 npm 原生二进制布局、恶意/异常 shim、路径别名、reparse、身份竞态和无 Codex。
+- `WinVerifyTrust` 成功、无效签名、错误发布者、证书轮换和 API 失败；普通错误固定脱敏，Memory/control-flow 原样传播。
+- 源句柄禁止共享写/删；复制期间替换/截断、哈希不一致、短写、磁盘不足、目标签名失败和原子替换失败。
+- 私有目录 DACL、祖先 reparse、目标篡改、manifest 篡改和随机临时文件清理。
+- 首次约 299 MB 复制、相同源复用缓存、源变化准备新版本、失败保留旧版本、仅缓存可用时启动。
 - 内置 profile 生成精确 argv，保持 `shell=False`，无用户输入拼接。
 - managed 与 builtin 两种来源使用正确命令，不互相回退。
 - 公开异常消息及 `cause/context` 脱敏。
@@ -199,9 +223,10 @@ Profile 测试、RuntimeBootstrapper preflight、Repository/Test runner 必须�
 ### 集成测试
 
 - 无预装 profile、无 Git 的冷启动能够进入可操作 Profile 页面。
-- 使用真实 Codex CLI 解析边界完成内置 profile probe。
+- 使用真实安装的 OpenAI 签名原生 Codex，完成私有准备、`--version` smoke 和内置 profile probe；测试不得执行 node/JS/shim。
 - 完成向导、保存、重启后能按来源重建同一 sandbox 配置。
 - 验证用户 Codex 配置文件内容、身份和 ACL 前后不变。
+- 验证 npm/NVM 安装目录内容和 ACL 前后不变，所有正式命令只使用私有副本。
 - 正式 runtime 的 preflight 与配置步骤使用相同 argv/profile descriptor。
 
 ## 验收标准
@@ -210,6 +235,6 @@ Profile 测试、RuntimeBootstrapper preflight、Repository/Test runner 必须�
 2. 用户明确确认后可以在 TUI 内启用并验证固定安全工作区 profile。
 3. 未确认或验证失败时不能进入后续步骤。
 4. 用户 Codex 配置文件及 ACL 不被修改。
-5. Windows npm 安装的 Codex 可被安全执行，整个链路不使用 shell。
+5. Windows npm 安装中的原生 Codex 经有效 OpenAI Authenticode 验证后被复制到受保护私有目录并执行；整个链路不使用 Node、JavaScript、shim 或 shell。
 6. 保存并重启后使用同一 profile 来源和权限语义。
 7. 外部 managed profiles、Git 不可用恢复以及现有首次配置流程无回归。
