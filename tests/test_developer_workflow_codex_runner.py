@@ -4,6 +4,8 @@ import asyncio
 import json
 import math
 import os
+import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -217,6 +219,27 @@ def test_codex_component_rejects_current_worktree_file() -> None:
         codex_runner_module._validate_codex_component(Path(__file__).resolve())
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended path boundary")
+def test_codex_component_rejects_extended_path_alias_of_current_worktree_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = Path(codex_runner_module.__file__).resolve()
+    alias = Path("\\\\?\\" + str(candidate))
+    worktree = candidate.parents[2]
+    assert os.path.samefile(alias, candidate)
+    assert not alias.resolve(strict=True).is_relative_to(worktree)
+    user_sid = "S-1-5-21-user"
+    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
+    monkeypatch.setattr(
+        codex_runner_module,
+        "_windows_descriptor",
+        lambda path: (user_sid, ((user_sid, 0x001F01FF, 0, 0),), True),
+    )
+
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(alias)
+
+
 def test_codex_component_rejects_reparse_metadata(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -416,6 +439,144 @@ def test_codex_component_accepts_fixed_trustedinstaller_and_read_only_principals
     )
 
     assert codex_runner_module._validate_codex_component(candidate) == candidate
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
+@pytest.mark.parametrize("add_right", [0x00000002, 0x00000004])
+def test_codex_component_allows_add_only_right_on_higher_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, add_right: int,
+) -> None:
+    candidate = (tmp_path / "higher" / "immediate" / "codex.exe").resolve()
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"binary")
+    user_sid = "S-1-5-21-user"
+    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
+
+    def descriptor(path: Path):
+        entries = (
+            (("S-1-5-11", add_right, 0x10, 0),)
+            if path == candidate.parent.parent
+            else ((user_sid, 0x001F01FF, 0, 0),)
+        )
+        return user_sid, entries, True
+
+    monkeypatch.setattr(codex_runner_module, "_windows_descriptor", descriptor)
+
+    assert codex_runner_module._validate_codex_component(candidate) == candidate
+
+
+_REAL_WINDOWS_SAFE_EXECUTABLE = Path(
+    os.environ.get("SystemRoot", r"C:\Windows")
+) / "System32" / "where.exe"
+
+
+@pytest.mark.skipif(
+    os.name != "nt" or not _REAL_WINDOWS_SAFE_EXECUTABLE.is_file(),
+    reason="protected Windows where.exe is unavailable",
+)
+def test_real_windows_protected_executable_passes_default_validator() -> None:
+    assert codex_runner_module._validate_codex_component(
+        _REAL_WINDOWS_SAFE_EXECUTABLE
+    ) == _REAL_WINDOWS_SAFE_EXECUTABLE.resolve()
+
+
+def _real_posix_safe_executable() -> Path:
+    raw = shutil.which("true")
+    if raw is None:
+        pytest.skip("a protected POSIX true executable is unavailable")
+    return Path(raw).resolve(strict=True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
+def test_posix_safe_owner_and_mode_pass_default_validator() -> None:
+    candidate = _real_posix_safe_executable()
+    metadata = candidate.lstat()
+    assert metadata.st_uid in {0, os.geteuid()}
+    assert stat.S_IMODE(metadata.st_mode) & 0o022 == 0
+
+    assert codex_runner_module._validate_codex_component(candidate) == candidate
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
+def test_posix_wrong_owner_fails_default_validator(monkeypatch: pytest.MonkeyPatch) -> None:
+    candidate = _real_posix_safe_executable()
+    real_lstat = Path.lstat
+
+    def wrong_owner_lstat(path: Path):
+        metadata = real_lstat(path)
+        if path == candidate:
+            return SimpleNamespace(
+                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
+                st_mode=metadata.st_mode, st_uid=max(1, os.geteuid() + 1),
+                st_file_attributes=0,
+            )
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", wrong_owner_lstat)
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(candidate)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
+def test_posix_group_or_world_writable_file_fails_default_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _real_posix_safe_executable()
+    real_lstat = Path.lstat
+
+    def writable_lstat(path: Path):
+        metadata = real_lstat(path)
+        if path == candidate:
+            return SimpleNamespace(
+                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
+                st_mode=metadata.st_mode | 0o022, st_uid=metadata.st_uid,
+                st_file_attributes=0,
+            )
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", writable_lstat)
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(candidate)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
+def test_posix_writable_ancestor_fails_default_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = _real_posix_safe_executable()
+    writable_ancestor = candidate.parent
+    real_lstat = Path.lstat
+
+    def writable_ancestor_lstat(path: Path):
+        metadata = real_lstat(path)
+        if path == writable_ancestor:
+            return SimpleNamespace(
+                st_dev=metadata.st_dev, st_ino=metadata.st_ino,
+                st_size=metadata.st_size, st_mtime_ns=metadata.st_mtime_ns,
+                st_mode=metadata.st_mode | 0o022, st_uid=metadata.st_uid,
+                st_file_attributes=0,
+            )
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", writable_ancestor_lstat)
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(candidate)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX executable boundary")
+def test_posix_symlink_ancestor_fails_default_validator(tmp_path: Path) -> None:
+    real_directory = tmp_path / "real"
+    real_directory.mkdir()
+    executable = real_directory / "codex"
+    executable.write_bytes(b"binary")
+    executable.chmod(0o700)
+    alias_directory = tmp_path / "alias"
+    alias_directory.symlink_to(real_directory, target_is_directory=True)
+
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(alias_directory / "codex")
 
 
 def test_resolver_sanitizes_all_ordinary_discovery_and_validation_failures() -> None:

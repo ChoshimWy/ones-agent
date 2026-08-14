@@ -111,7 +111,10 @@ _WINDOWS_WRITE_MASK = (
     | 0x10000000  # GENERIC_ALL
     | 0x40000000  # GENERIC_WRITE
 )
-_WINDOWS_ANCESTOR_MUTATION_MASK = _WINDOWS_WRITE_MASK
+_WINDOWS_HIGHER_ANCESTOR_MUTATION_MASK = _WINDOWS_WRITE_MASK & ~(
+    0x00000002  # FILE_ADD_FILE cannot replace an existing path component.
+    | 0x00000004  # FILE_ADD_SUBDIRECTORY cannot replace an existing path component.
+)
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -126,6 +129,35 @@ def _current_repository_roots() -> tuple[Path, ...]:
     if worktree.parent.name.casefold() == ".worktrees":
         roots.append(worktree.parent.parent.resolve(strict=True))
     return tuple(roots)
+
+
+def _stable_samefile(left: Path, right: Path) -> bool:
+    left_before = left.lstat()
+    right_before = right.lstat()
+    same = os.path.samefile(left, right)
+    left_after = left.lstat()
+    right_after = right.lstat()
+    if (
+        _component_identity(left_before) != _component_identity(left_after)
+        or _component_identity(right_before) != _component_identity(right_after)
+        or _component_is_reparse(left_before)
+        or _component_is_reparse(left_after)
+        or _component_is_reparse(right_before)
+        or _component_is_reparse(right_after)
+    ):
+        raise OSError("unstable repository boundary identity")
+    return same
+
+
+def _is_within_current_repository(path: Path) -> bool:
+    roots = _current_repository_roots()
+    current = path
+    while True:
+        if any(_stable_samefile(current, root) for root in roots):
+            return True
+        if current.parent == current:
+            return False
+        current = current.parent
 
 
 def _validate_windows_codex_acl(path: Path, *, mutation_mask: int) -> None:
@@ -167,15 +199,10 @@ def _component_is_reparse(metadata: os.stat_result) -> bool:
 
 
 def _validate_codex_permissions(
-    path: Path, metadata: os.stat_result, *, ancestor: bool = False
+    path: Path, metadata: os.stat_result, *, mutation_mask: int = _WINDOWS_WRITE_MASK
 ) -> None:
     if os.name == "nt":
-        _validate_windows_codex_acl(
-            path,
-            mutation_mask=(
-                _WINDOWS_ANCESTOR_MUTATION_MASK if ancestor else _WINDOWS_WRITE_MASK
-            ),
-        )
+        _validate_windows_codex_acl(path, mutation_mask=mutation_mask)
     elif (
         metadata.st_uid not in {0, os.geteuid()}
         or stat.S_IMODE(metadata.st_mode) & 0o022
@@ -185,6 +212,7 @@ def _validate_codex_permissions(
 
 def _validate_codex_ancestors(path: Path) -> None:
     current = path.parent
+    immediate = True
     while True:
         before = current.lstat()
         if _component_is_reparse(before) or not stat.S_ISDIR(before.st_mode):
@@ -192,7 +220,15 @@ def _validate_codex_ancestors(path: Path) -> None:
         canonical = current.resolve(strict=True)
         if not _same_path(canonical, current):
             raise OSError("unsafe executable ancestor")
-        _validate_codex_permissions(canonical, before, ancestor=True)
+        _validate_codex_permissions(
+            canonical,
+            before,
+            mutation_mask=(
+                _WINDOWS_WRITE_MASK
+                if immediate
+                else _WINDOWS_HIGHER_ANCESTOR_MUTATION_MASK
+            ),
+        )
         after = canonical.lstat()
         if (
             _component_is_reparse(after)
@@ -203,6 +239,7 @@ def _validate_codex_ancestors(path: Path) -> None:
         if canonical.parent == canonical:
             return
         current = canonical.parent
+        immediate = False
 
 
 def _validate_codex_component(path: Path) -> Path:
@@ -217,7 +254,7 @@ def _validate_codex_component(path: Path) -> Path:
     canonical = candidate.resolve(strict=True)
     if not _same_path(canonical, candidate):
         raise OSError("unsafe executable path")
-    if any(canonical.is_relative_to(root) for root in _current_repository_roots()):
+    if _is_within_current_repository(canonical):
         raise OSError("unsafe executable path")
     _validate_codex_permissions(canonical, before)
     _validate_codex_ancestors(canonical)
