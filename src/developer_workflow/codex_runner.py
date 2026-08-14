@@ -49,6 +49,10 @@ class CodexExecutionError(CodexRunnerError):
     """Codex could not be executed successfully."""
 
 
+class CodexProcessStartError(CodexExecutionError):
+    """The requested executable could not be started."""
+
+
 class CodexTimeoutError(CodexExecutionError):
     """Codex exceeded its execution deadline."""
 
@@ -286,7 +290,7 @@ def _start_isolated_process(
             start_new_session=os.name != "nt",
         )
     except OSError as error:
-        raise CodexExecutionError("Codex process could not be started") from error
+        raise CodexProcessStartError("Codex process could not be started") from error
 
     tree: _ProcessTreeGuard | None = None
     try:
@@ -1459,6 +1463,6 @@ class CodexRunner:
 
 
 __all__ = [
-    "CodexExecutionError", "CodexOutputError", "CodexRunner", "CodexRunnerError",
-    "CodexTimeoutError", "UnsafeCodexRunError",
+    "CodexExecutionError", "CodexOutputError", "CodexProcessStartError",
+    "CodexRunner", "CodexRunnerError", "CodexTimeoutError", "UnsafeCodexRunError",
 ]

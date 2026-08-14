@@ -581,13 +581,13 @@ def test_repository_inspector_sanitizes_real_wrapped_missing_git_executable(
     assert raised.value.__context__ is None
 
 
-def _raise_wrapped_execution_error(cause: OSError) -> None:
-    from src.developer_workflow.codex_runner import CodexExecutionError
+def _raise_wrapped_start_error(cause: OSError) -> None:
+    from src.developer_workflow.codex_runner import CodexProcessStartError
 
     try:
         raise cause
     except OSError as error:
-        raise CodexExecutionError("wrapped process start failure") from error
+        raise CodexProcessStartError("wrapped process start failure") from error
 
 
 def test_repository_inspector_preserves_wrapped_non_file_not_found_error(
@@ -601,7 +601,7 @@ def test_repository_inspector_preserves_wrapped_non_file_not_found_error(
     monkeypatch.setattr(
         validation_module,
         "_bounded_subprocess",
-        lambda *args, **kwargs: _raise_wrapped_execution_error(cause),
+        lambda *args, **kwargs: _raise_wrapped_start_error(cause),
     )
 
     with pytest.raises(CodexExecutionError) as raised:
@@ -617,6 +617,39 @@ def test_repository_inspector_preserves_wrapped_non_file_not_found_error(
     assert not isinstance(raised.value, GitExecutableUnavailableError)
 
 
+def test_repository_inspector_preserves_isolation_file_not_found_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+    from src.developer_workflow.codex_runner import CodexExecutionError
+    from src.developer_workflow.setup_validation import GitExecutableUnavailableError
+
+    cause = FileNotFoundError("missing isolation resource")
+    isolation_error = CodexExecutionError("Codex process could not be isolated")
+
+    def fail_isolation(*args: object, **kwargs: object) -> None:
+        try:
+            raise cause
+        except FileNotFoundError as error:
+            raise isolation_error from error
+
+    monkeypatch.setattr(validation_module, "_bounded_subprocess", fail_isolation)
+
+    with pytest.raises(CodexExecutionError) as raised:
+        ReadOnlyRepositoryInspector()._run(
+            ["git", "--version"],
+            cwd=Path.cwd(),
+            private_root=Path.cwd(),
+            hooks=Path.cwd(),
+            timeout=1,
+        )
+
+    assert type(raised.value) is CodexExecutionError
+    assert raised.value is isolation_error
+    assert raised.value.__cause__ is cause
+    assert not isinstance(raised.value, GitExecutableUnavailableError)
+
+
 def test_repository_inspector_preserves_wrapped_missing_non_git_executable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -628,7 +661,7 @@ def test_repository_inspector_preserves_wrapped_missing_non_git_executable(
     monkeypatch.setattr(
         validation_module,
         "_bounded_subprocess",
-        lambda *args, **kwargs: _raise_wrapped_execution_error(cause),
+        lambda *args, **kwargs: _raise_wrapped_start_error(cause),
     )
 
     with pytest.raises(CodexExecutionError) as raised:
@@ -661,7 +694,7 @@ def test_repository_inspector_preserves_wrapped_missing_error_for_invalid_cwd(
     monkeypatch.setattr(
         validation_module,
         "_bounded_subprocess",
-        lambda *args, **kwargs: _raise_wrapped_execution_error(cause),
+        lambda *args, **kwargs: _raise_wrapped_start_error(cause),
     )
 
     with pytest.raises(CodexExecutionError) as raised:

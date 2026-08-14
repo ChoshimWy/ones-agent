@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 from pydantic import ConfigDict, Field, StrictStr, field_validator, model_validator
 
 from .codex_runner import (
-    CodexExecutionError,
+    CodexProcessStartError,
     _bounded_subprocess,
     validate_codex_auth_source,
 )
@@ -824,7 +824,7 @@ class ReadOnlyRepositoryInspector:
                 git_unavailable = True
             else:
                 raise
-        except CodexExecutionError as error:
+        except CodexProcessStartError as error:
             if (
                 argv
                 and argv[0] == "git"

@@ -484,6 +484,29 @@ def test_default_executor_rejects_invalid_timeout_before_process_start(
         )
 
 
+def test_process_start_file_not_found_uses_structured_sanitized_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import src.developer_workflow.codex_runner as module
+    from src.developer_workflow.codex_runner import CodexProcessStartError
+
+    canary = "SECRET-CODEX-EXECUTABLE-PATH"
+    cause = FileNotFoundError(canary)
+    monkeypatch.setattr(
+        module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(cause),
+    )
+
+    with pytest.raises(CodexProcessStartError) as raised:
+        module._start_isolated_process(["codex"], cwd=tmp_path, env={"PATH": ""})
+
+    assert isinstance(raised.value, CodexExecutionError)
+    assert str(raised.value) == "Codex process could not be started"
+    assert raised.value.__cause__ is cause
+    assert canary not in str(raised.value)
+
+
 def test_run_wraps_unexpected_executor_error_without_leaking_details(tmp_path: Path) -> None:
     with pytest.raises(CodexExecutionError) as caught:
         _runner(tmp_path, FakeExecutor(error=RuntimeError("credential-in-error"))).run(
