@@ -12,9 +12,11 @@ from typing import Any
 import pytest
 
 from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_PROFILE,
     DeveloperWorkflowConfig,
     PublishingConfig,
     PublishingProvider,
+    SandboxPermissionProfileSource,
 )
 from src.developer_workflow.contracts import RepositoryMapping
 from src.developer_workflow.credential_store import CredentialStoreError
@@ -206,6 +208,253 @@ async def test_managed_profile_cancel_is_propagated_and_worker_is_owned() -> Non
     release.set()
     await controller.aclose()
     assert controller._catalog_tasks == set()
+
+
+class _BuiltinCatalog(FakeCatalog):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = Event()
+        self.release = Event()
+        self.block = False
+        self.failure: BaseException | None = None
+        self.active = 0
+        self.max_active = 0
+
+    def verify_builtin_workspace_profile(self) -> str:
+        self.calls += 1
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        try:
+            self.entered.set()
+            if self.block:
+                self.release.wait(2)
+            if self.failure is not None:
+                raise self.failure
+            return BUILTIN_WORKSPACE_PROFILE
+        finally:
+            self.active -= 1
+
+
+def _builtin_controller(
+    tmp_path: Path, catalog: _BuiltinCatalog, *, cleanup_timeout: float = 0.1,
+) -> SetupController:
+    bootstrap = FakeBootstrap()
+    bootstrap.catalog = catalog
+    return SetupController(
+        profile_id="managed-profile",
+        store=FakeStore(),
+        runtime_builder=FakeRuntimeBuilder(),
+        runtime_bootstrap=bootstrap,
+        draft=SetupDraft(workflow=_workflow(tmp_path)),
+        cleanup_timeout=cleanup_timeout,
+    )
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_commits_only_after_successful_probe(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    catalog.block = True
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft.workflow
+    revision = controller.revision
+
+    task = asyncio.create_task(controller.confirm_builtin_workspace_profile())
+    assert await asyncio.to_thread(catalog.entered.wait, 1)
+    assert controller.draft.workflow == original
+    assert controller.revision == revision
+    catalog.release.set()
+
+    assert await task == BUILTIN_WORKSPACE_PROFILE
+    assert controller.draft.workflow.sandbox_permission_profile == BUILTIN_WORKSPACE_PROFILE
+    assert (
+        controller.draft.workflow.sandbox_permission_profile_source
+        is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+    )
+    assert controller.revision == revision + 1
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_rejects_stale_revision_without_overwriting_edit(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    catalog.block = True
+    controller = _builtin_controller(tmp_path, catalog)
+    task = asyncio.create_task(controller.confirm_builtin_workspace_profile())
+    assert await asyncio.to_thread(catalog.entered.wait, 1)
+    changed = controller.draft.workflow.model_copy(deep=True)
+    changed.run_root = tmp_path / "changed-runs"
+    controller.apply_workflow(changed, changed_step=SetupStep.PRIVATE_PATHS)
+    catalog.release.set()
+
+    with pytest.raises(
+        SetupActionError, match="configuration changed during validation"
+    ) as caught:
+        await task
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert controller.draft.workflow.run_root == tmp_path / "changed-runs"
+    assert controller.draft.workflow.sandbox_permission_profile == "managed-profile"
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_failure_is_fixed_and_does_not_mutate_draft(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    secret = "controller-builtin-secret-canary"
+    catalog.failure = RuntimeError(secret)
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+    revision = controller.revision
+
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ) as caught:
+        await controller.confirm_builtin_workspace_profile()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in repr(caught.value)
+    traceback = caught.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_globals.get("__name__") == (
+            "src.developer_workflow.setup_controller"
+        ):
+            assert secret not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+    assert controller.draft == original
+    assert controller.revision == revision
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_cancel_and_late_result_never_mutate(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    catalog.block = True
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+    revision = controller.revision
+    task = asyncio.create_task(controller.confirm_builtin_workspace_profile())
+    assert await asyncio.to_thread(catalog.entered.wait, 1)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert controller._catalog_tasks
+    catalog.release.set()
+    await controller.aclose()
+    assert controller._catalog_tasks == set()
+    assert controller.draft == original
+    assert controller.revision == revision
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_close_during_probe_cancels_without_mutation(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    catalog.block = True
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+    task = asyncio.create_task(controller.confirm_builtin_workspace_profile())
+    assert await asyncio.to_thread(catalog.entered.wait, 1)
+
+    controller.close()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    catalog.release.set()
+    await controller.aclose()
+    assert controller.closed
+    assert controller.draft == original
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_repeat_reprobes_and_invalidates_downstream(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    controller = _builtin_controller(tmp_path, catalog)
+    controller._results = {
+        step: _result(step) for step in controller.STEPS
+    }
+
+    assert await controller.confirm_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
+    assert all(
+        controller.result_for(step).status is ValidationStatus.NOT_CONFIGURED
+        for step in controller.STEPS
+    )
+    revision = controller.revision
+    assert await controller.confirm_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
+    assert catalog.calls == 2
+    assert controller.revision == revision + 1
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_confirmation_is_single_flight(
+    tmp_path: Path,
+) -> None:
+    catalog = _BuiltinCatalog()
+    catalog.block = True
+    controller = _builtin_controller(tmp_path, catalog)
+    first = asyncio.create_task(controller.confirm_builtin_workspace_profile())
+    assert await asyncio.to_thread(catalog.entered.wait, 1)
+    second = asyncio.create_task(controller.confirm_builtin_workspace_profile())
+    await asyncio.sleep(0)
+    assert catalog.calls == 1
+    catalog.release.set()
+
+    assert await first == BUILTIN_WORKSPACE_PROFILE
+    assert await second == BUILTIN_WORKSPACE_PROFILE
+    assert catalog.calls == 2
+    assert catalog.max_active == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [MemoryError, GeneratorExit],
+)
+async def test_builtin_profile_confirmation_propagates_priority_failures(
+    tmp_path: Path, failure_type: type[BaseException],
+) -> None:
+    catalog = _BuiltinCatalog()
+    failure = failure_type()
+    catalog.failure = failure
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+
+    with pytest.raises(failure_type) as caught:
+        await controller.confirm_builtin_workspace_profile()
+    assert caught.value is failure
+    assert controller.draft == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+async def test_builtin_profile_confirmation_propagates_control_flow_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    catalog = _BuiltinCatalog()
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+    failure = failure_type()
+    real_shield = asyncio.shield
+
+    async def raise_after_probe(task: asyncio.Task[object]) -> object:
+        await real_shield(task)
+        raise failure
+
+    monkeypatch.setattr(asyncio, "shield", raise_after_probe)
+    with pytest.raises(failure_type) as caught:
+        await controller.confirm_builtin_workspace_profile()
+    assert caught.value is failure
+    assert controller.draft == original
 
 
 class Handle:

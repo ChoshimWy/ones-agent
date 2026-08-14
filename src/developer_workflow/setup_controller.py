@@ -11,7 +11,11 @@ from typing import Any, Callable, Mapping, Protocol
 import unicodedata
 from uuid import uuid4
 
-from .config import DeveloperWorkflowConfig
+from .config import (
+    BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
+    SandboxPermissionProfileSource,
+)
 from .contracts import RepositoryGroupMapping, RepositoryMapping
 from .setup_import import ImportDetection, import_selected
 from .setup_models import (
@@ -46,6 +50,30 @@ class SetupActionError(RuntimeError):
 
 class _ConfigurationChanged(RuntimeError):
     """Internal CAS failure without draft or credential details."""
+
+
+def _is_setup_priority_failure(error: BaseException) -> bool:
+    return isinstance(
+        error,
+        (
+            MemoryError,
+            asyncio.CancelledError,
+            KeyboardInterrupt,
+            SystemExit,
+            GeneratorExit,
+        ),
+    )
+
+
+def _raise_sanitized_action_exception(error: BaseException) -> None:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    raise error from None
+
+
+def _raise_sanitized_action_failure(message: str) -> None:
+    _raise_sanitized_action_exception(SetupActionError(message))
 
 
 _NO_HANDLE = object()
@@ -288,7 +316,7 @@ class SetupController:
         self._finalizing = False
         self._background_close_tasks: set[asyncio.Future[None]] = set()
         self._abandoned_build_tasks: set[asyncio.Task[object]] = set()
-        self._catalog_tasks: set[asyncio.Task[tuple[str, ...]]] = set()
+        self._catalog_tasks: set[asyncio.Task[Any]] = set()
         self._catalog_owner_task: asyncio.Task[Any] | None = None
 
     @property
@@ -347,7 +375,87 @@ class SetupController:
                 raise
             raise SetupActionError("managed profiles are unavailable") from None
 
-    def _finish_catalog_task(self, task: asyncio.Task[tuple[str, ...]]) -> None:
+    async def confirm_builtin_workspace_profile(self) -> str:
+        """Probe, then atomically bind, the fixed runtime workspace profile."""
+
+        verified_profile: object | None = None
+        priority_failure: BaseException | None = None
+        ordinary_failure = False
+        revision = -1
+        async with self._operation_lock:
+            self._ensure_mutable()
+            owner = asyncio.current_task()
+            self._operation_task = owner
+            self._catalog_owner_task = owner
+            revision = self._revision
+            probe_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self._profile_catalog.verify_builtin_workspace_profile
+                )
+            )
+            try:
+                verified_profile = await asyncio.shield(probe_task)
+            except asyncio.CancelledError:
+                self._catalog_tasks.add(probe_task)
+                probe_task.add_done_callback(self._finish_catalog_task)
+                raise
+            except BaseException as error:
+                if _is_setup_priority_failure(error):
+                    priority_failure = error
+                else:
+                    ordinary_failure = True
+            finally:
+                if self._operation_task is owner:
+                    self._operation_task = None
+                if self._catalog_owner_task is owner:
+                    self._catalog_owner_task = None
+
+            if priority_failure is not None:
+                failure = priority_failure
+                del probe_task, priority_failure, verified_profile
+                _raise_sanitized_action_exception(failure)
+            if ordinary_failure or verified_profile != BUILTIN_WORKSPACE_PROFILE:
+                del probe_task, priority_failure, verified_profile
+                _raise_sanitized_action_failure(
+                    "built-in workspace profile is unavailable"
+                )
+            self._ensure_mutable()
+            if revision != self._revision:
+                del probe_task, verified_profile
+                _raise_sanitized_action_failure(
+                    "configuration changed during validation"
+                )
+            candidate_data = self._draft.workflow.model_dump(
+                mode="python", round_trip=True
+            )
+            candidate_data.update(
+                {
+                    "sandbox_permission_profile": BUILTIN_WORKSPACE_PROFILE,
+                    "sandbox_permission_profile_source": (
+                        SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+                    ),
+                }
+            )
+            try:
+                candidate = WorkflowDraft.model_validate(candidate_data)
+                self.apply_workflow(
+                    candidate,
+                    changed_step=SetupStep.PROFILE,
+                )
+            except BaseException as error:
+                if _is_setup_priority_failure(error):
+                    raise
+                ordinary_failure = True
+            finally:
+                candidate_data.clear()
+            if ordinary_failure:
+                del probe_task, verified_profile
+                _raise_sanitized_action_failure(
+                    "built-in workspace profile is unavailable"
+                )
+        return BUILTIN_WORKSPACE_PROFILE
+
+    def _finish_catalog_task(self, task: asyncio.Task[Any]) -> None:
         self._catalog_tasks.discard(task)
         if task.cancelled():
             return

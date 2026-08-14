@@ -401,6 +401,229 @@ def test_sandbox_factories_bind_managed_and_builtin_sources(tmp_path: Path) -> N
         BuiltinWorkspaceSandboxExecutorFactory(codex_preparer=preparer)("managed")
 
 
+def test_builtin_workspace_verification_uses_fixed_executor_and_private_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    shared_preparer = object()
+    factory_preparers: list[object] = []
+    factory_profiles: list[str] = []
+    calls: list[tuple[tuple[str, ...], Path, dict[str, str], float, int]] = []
+
+    class Executor:
+        def __call__(
+            self, command, *, cwd, env, timeout, max_output_bytes,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append(
+                (tuple(command), cwd, dict(env), timeout, max_output_bytes)
+            )
+            return subprocess.CompletedProcess(command, 0, "sandbox-preflight\n", "")
+
+    class Factory:
+        def __init__(self, *, codex_preparer: object) -> None:
+            factory_preparers.append(codex_preparer)
+
+        def __call__(self, profile: str) -> Executor:
+            factory_profiles.append(profile)
+            return Executor()
+
+    prepared: list[Path] = []
+
+    def prepare(path: Path) -> Path:
+        path.mkdir()
+        prepared.append(path)
+        return path.resolve(strict=True)
+
+    monkeypatch.setattr(
+        validation_module, "BuiltinWorkspaceSandboxExecutorFactory", Factory
+    )
+    monkeypatch.setattr(validation_module, "prepare_private_directory", prepare)
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("managed factory must not run"),
+        file_security=lambda path, admin: True,
+        codex_runtime_preparer=shared_preparer,  # type: ignore[arg-type]
+        timeout_seconds=0.5,
+    )
+
+    assert catalog.verify_builtin_workspace_profile(timeout_seconds=0.25) == (
+        BUILTIN_WORKSPACE_PROFILE
+    )
+    assert factory_preparers == [shared_preparer]
+    assert factory_profiles == [BUILTIN_WORKSPACE_PROFILE]
+    assert len(calls) == 1
+    command, root, environment, timeout, max_output_bytes = calls[0]
+    assert command == tuple(sandbox_preflight_command())
+    assert 0 < timeout <= 0.25
+    assert max_output_bytes == 64 * 1024
+    assert all(
+        marker not in key.casefold()
+        for key in environment
+        for marker in ("token", "secret", "password", "key")
+    )
+    assert root == prepared[0]
+    assert root != tmp_path
+    assert not root.exists()
+
+
+def test_builtin_workspace_verification_sanitizes_ordinary_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    secret = "builtin-probe-secret-canary"
+
+    class Executor:
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            backend_secret = secret
+            raise RuntimeError(backend_secret)
+
+    monkeypatch.setattr(
+        validation_module,
+        "BuiltinWorkspaceSandboxExecutorFactory",
+        lambda **kwargs: lambda profile: Executor(),
+    )
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("managed factory must not run"),
+        file_security=lambda path, admin: True,
+        codex_runtime_preparer=object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        SetupValidationError, match="built-in workspace profile is unavailable"
+    ) as caught:
+        catalog.verify_builtin_workspace_profile()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in repr(caught.value)
+    traceback = caught.value.__traceback__
+    while traceback is not None:
+        if traceback.tb_frame.f_globals.get("__name__") == (
+            "src.developer_workflow.setup_validation"
+        ):
+            assert secret not in repr(traceback.tb_frame.f_locals)
+        traceback = traceback.tb_next
+
+
+def test_builtin_workspace_verification_requires_zero_returncode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    class Executor:
+        def __call__(self, command, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 13, "", "denied")
+
+    monkeypatch.setattr(
+        validation_module,
+        "BuiltinWorkspaceSandboxExecutorFactory",
+        lambda **kwargs: lambda profile: Executor(),
+    )
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("managed factory must not run"),
+        file_security=lambda path, admin: True,
+        codex_runtime_preparer=object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(
+        SetupValidationError, match="built-in workspace profile is unavailable"
+    ):
+        catalog.verify_builtin_workspace_profile()
+
+
+@pytest.mark.parametrize(
+    "failure_type",
+    [MemoryError, asyncio.CancelledError, KeyboardInterrupt, SystemExit, GeneratorExit],
+)
+def test_builtin_workspace_verification_propagates_priority_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    failure = failure_type()
+
+    class Executor:
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            raise failure
+
+    monkeypatch.setattr(
+        validation_module,
+        "BuiltinWorkspaceSandboxExecutorFactory",
+        lambda **kwargs: lambda profile: Executor(),
+    )
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("managed factory must not run"),
+        file_security=lambda path, admin: True,
+        codex_runtime_preparer=object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(failure_type) as caught:
+        catalog.verify_builtin_workspace_profile()
+    assert caught.value is failure
+
+
+def test_builtin_workspace_priority_failure_beats_ordinary_root_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    failure = MemoryError()
+    raw_root = tmp_path / "capability-root"
+
+    class TemporaryRoot:
+        def __init__(self, **kwargs: object) -> None:
+            raw_root.mkdir()
+
+        def __enter__(self) -> str:
+            return str(raw_root)
+
+        def __exit__(self, *args: object) -> None:
+            raise RuntimeError("cleanup-secret-canary")
+
+    class Executor:
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            raise failure
+
+    monkeypatch.setattr(validation_module.tempfile, "TemporaryDirectory", TemporaryRoot)
+    monkeypatch.setattr(
+        validation_module,
+        "prepare_private_directory",
+        lambda path: path.mkdir() or path.resolve(strict=True),
+    )
+    monkeypatch.setattr(
+        validation_module,
+        "BuiltinWorkspaceSandboxExecutorFactory",
+        lambda **kwargs: lambda profile: Executor(),
+    )
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("managed factory must not run"),
+        file_security=lambda path, admin: True,
+        codex_runtime_preparer=object(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(MemoryError) as caught:
+        catalog.verify_builtin_workspace_profile()
+    assert caught.value is failure
+
+
 class _CapabilityExecutor:
     calls: list[tuple[tuple[str, ...], Path]]
 

@@ -747,6 +747,95 @@ class ManagedProfileCatalog:
             raise SetupValidationError("managed profile capability root is unavailable") from None
         return tuple(available)
 
+    def verify_builtin_workspace_profile(
+        self, *, timeout_seconds: float | None = None
+    ) -> str:
+        """Prove the fixed runtime-only workspace profile through the real sandbox."""
+
+        total = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        primary_failure: BaseException | None = None
+        cleanup_failure: BaseException | None = None
+        executor: Any = None
+        completed: subprocess.CompletedProcess[str] | None = None
+        temporary_root: Any = None
+        preparer: Any = None
+        factory: Any = None
+        raw_root: object | None = None
+        probe_root: Path | None = None
+        remaining: float | None = None
+        try:
+            if (
+                isinstance(total, bool)
+                or not isinstance(total, (int, float))
+                or not math.isfinite(total)
+                or total <= 0
+            ):
+                raise ValueError
+            deadline = time.monotonic() + total
+            preparer = self.codex_runtime_preparer
+            if preparer is None:
+                preparer = CodexRuntimePreparer()
+            factory = BuiltinWorkspaceSandboxExecutorFactory(
+                codex_preparer=preparer
+            )
+            executor = factory(BUILTIN_WORKSPACE_PROFILE)
+            temporary_root = tempfile.TemporaryDirectory(
+                prefix="ones-builtin-profile-probe-"
+            )
+            raw_root = temporary_root.__enter__()
+            probe_root = prepare_private_directory(Path(raw_root) / "private")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError
+            completed = executor(
+                sandbox_preflight_command(),
+                cwd=probe_root,
+                env=_clean_doctor_environment(),
+                timeout=remaining,
+                max_output_bytes=64 * 1024,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError
+        except BaseException as error:
+            primary_failure = error
+        if temporary_root is not None:
+            try:
+                temporary_root.__exit__(
+                    type(primary_failure) if primary_failure is not None else None,
+                    primary_failure,
+                    (
+                        primary_failure.__traceback__
+                        if primary_failure is not None
+                        else None
+                    ),
+                )
+            except BaseException as error:
+                cleanup_failure = error
+        priority_failure = next(
+            (
+                failure
+                for failure in (primary_failure, cleanup_failure)
+                if failure is not None and _is_probe_priority_failure(failure)
+            ),
+            None,
+        )
+        if priority_failure is not None:
+            failure = priority_failure
+            del primary_failure, cleanup_failure, priority_failure
+            del executor, completed, temporary_root, preparer, factory
+            del raw_root, probe_root, remaining
+            _raise_sanitized_setup_failure(failure)
+        if primary_failure is not None or cleanup_failure is not None:
+            del primary_failure, cleanup_failure, priority_failure
+            del executor, completed, temporary_root, preparer, factory
+            del raw_root, probe_root, remaining
+            _raise_sanitized_setup_failure(
+                SetupValidationError(
+                    "built-in workspace profile is unavailable"
+                )
+            )
+        return BUILTIN_WORKSPACE_PROFILE
+
     def require_selected(
         self, selected: str, *, timeout_seconds: float | None = None
     ) -> str:
