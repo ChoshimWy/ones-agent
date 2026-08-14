@@ -112,30 +112,38 @@ def _inside_repository_by_identity(
         current = current.parent
 
 
-def discover_locked_native_codex(
-    *,
-    which: Callable[[str], str | None] = shutil.which,
-    repository_roots: tuple[Path, ...] | None = None,
-    _adapter: _RuntimeAdapter | None = None,
-) -> LockedNativeCodex:
-    """Return a verified native payload while retaining its source handle lock."""
+def _is_priority_failure(error: BaseException) -> bool:
+    return isinstance(error, MemoryError) or not isinstance(error, Exception)
 
+
+def _raise_native_codex_unavailable() -> None:
+    raise OSError("native Codex payload is unavailable") from None
+
+
+def _discover_locked_native_codex_raw(
+    *,
+    which: Callable[[str], str | None],
+    repository_roots: tuple[Path, ...] | None,
+    adapter_override: _RuntimeAdapter | None,
+) -> LockedNativeCodex:
     raw_locator = which("codex.cmd")
     if (
         type(raw_locator) is not str
         or not raw_locator
         or "\x00" in raw_locator
     ):
-        raise OSError("native Codex payload is unavailable")
+        _raise_native_codex_unavailable()
     locator = Path(raw_locator)
     if not locator.is_absolute() or locator.name.casefold() != "codex.cmd":
-        raise OSError("native Codex payload is unavailable")
+        _raise_native_codex_unavailable()
 
     expected = locator.parent / NATIVE_CODEX_RELATIVE_PATH
-    adapter = _adapter if _adapter is not None else _WindowsRuntimeAdapter()
+    adapter = adapter_override if adapter_override is not None else _WindowsRuntimeAdapter()
     roots = _current_repository_roots() if repository_roots is None else repository_roots
     descriptor = adapter.open_locked(expected)
-    retained = False
+    primary_error: BaseException | None = None
+    primary_traceback = None
+    locked: LockedNativeCodex | None = None
     try:
         if not adapter.is_disk_regular_non_reparse(descriptor):
             raise OSError("native Codex payload is unavailable")
@@ -162,11 +170,52 @@ def discover_locked_native_codex(
             publisher=publisher,
             _adapter=adapter,
         )
-        retained = True
+    except BaseException as error:
+        primary_error = error
+        primary_traceback = error.__traceback__
+
+    if primary_error is None:
+        assert locked is not None
         return locked
-    finally:
-        if not retained:
-            adapter.close(descriptor)
+
+    cleanup_error: BaseException | None = None
+    cleanup_traceback = None
+    try:
+        adapter.close(descriptor)
+    except BaseException as error:
+        cleanup_error = error
+        cleanup_traceback = error.__traceback__
+
+    if _is_priority_failure(primary_error):
+        raise primary_error.with_traceback(primary_traceback)
+    if cleanup_error is not None and _is_priority_failure(cleanup_error):
+        raise cleanup_error.with_traceback(cleanup_traceback)
+    raise primary_error.with_traceback(primary_traceback)
+
+
+def discover_locked_native_codex(
+    *,
+    which: Callable[[str], str | None] = shutil.which,
+    repository_roots: tuple[Path, ...] | None = None,
+    _adapter: _RuntimeAdapter | None = None,
+) -> LockedNativeCodex:
+    """Return a verified native payload while retaining its source handle lock."""
+
+    failed = False
+    try:
+        return _discover_locked_native_codex_raw(
+            which=which,
+            repository_roots=repository_roots,
+            adapter_override=_adapter,
+        )
+    except BaseException as error:
+        if _is_priority_failure(error):
+            raise
+        failed = True
+    if failed:
+        del which, repository_roots, _adapter
+        _raise_native_codex_unavailable()
+    raise AssertionError("unreachable")
 
 
 if os.name == "nt":

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
+import traceback
 from pathlib import Path
 
 import pytest
 
+import src.developer_workflow.codex_runtime as codex_runtime_module
 from src.developer_workflow.codex_runtime import (
     NATIVE_CODEX_RELATIVE_PATH,
     OPENAI_AUTHENTICODE_PUBLISHER,
@@ -31,6 +34,7 @@ class FakeRuntimeAdapter:
         self.repository_alias: Path | None = None
         self.open_error: BaseException | None = None
         self.verify_error: BaseException | None = None
+        self.close_error: BaseException | None = None
         self.verified: list[tuple[int, Path]] = []
 
     def open_locked(self, path: Path) -> int:
@@ -68,6 +72,8 @@ class FakeRuntimeAdapter:
 
     def close(self, descriptor: int) -> None:
         self.closed.append(descriptor)
+        if self.close_error is not None:
+            raise self.close_error
 
     def same_file(self, left: Path, right: Path) -> bool:
         self.same_file_pairs.append((left, right))
@@ -172,7 +178,7 @@ def test_rejects_missing_fixed_payload() -> None:
     root = Path("C:/npm")
     adapter = FakeRuntimeAdapter(root)
     adapter.open_error = FileNotFoundError("missing payload canary")
-    with pytest.raises(FileNotFoundError):
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
         _discover(root, adapter)
     assert adapter.closed == []
 
@@ -226,7 +232,7 @@ def test_repository_containment_identity_error_fails_closed() -> None:
         return original_same_file(left, right)
 
     adapter.same_file = racing_same_file  # type: ignore[method-assign]
-    with pytest.raises(FileNotFoundError, match="ancestor raced"):
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
         _discover(root, adapter, repository_roots=(repository,))
     assert adapter.closed == [71]
 
@@ -265,6 +271,100 @@ def test_rejects_invalid_signature_or_wintrust_failure_and_closes_once() -> None
     assert adapter.closed == [71]
 
 
+_PRIORITY_FAILURES = (
+    MemoryError,
+    asyncio.CancelledError,
+    KeyboardInterrupt,
+    SystemExit,
+    GeneratorExit,
+)
+
+
+@pytest.mark.parametrize("primary_type", _PRIORITY_FAILURES)
+def test_primary_memory_or_control_flow_beats_ordinary_close_failure(
+    primary_type: type[BaseException],
+) -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    primary = primary_type("primary-control")
+    adapter.verify_error = primary
+    adapter.close_error = OSError("ordinary-close-canary")
+
+    with pytest.raises(primary_type) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is primary
+    assert adapter.closed == [71]
+
+
+@pytest.mark.parametrize("cleanup_type", _PRIORITY_FAILURES)
+def test_close_memory_or_control_flow_beats_ordinary_primary_failure(
+    cleanup_type: type[BaseException],
+) -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    cleanup = cleanup_type("cleanup-control")
+    adapter.verify_error = OSError("ordinary-primary-canary")
+    adapter.close_error = cleanup
+
+    with pytest.raises(cleanup_type) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is cleanup
+    assert adapter.closed == [71]
+
+
+@pytest.mark.parametrize("primary_type", _PRIORITY_FAILURES)
+@pytest.mark.parametrize("cleanup_type", _PRIORITY_FAILURES)
+def test_primary_memory_or_control_flow_beats_cleanup_control_flow(
+    primary_type: type[BaseException],
+    cleanup_type: type[BaseException],
+) -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    primary = primary_type("primary-control")
+    adapter.verify_error = primary
+    adapter.close_error = cleanup_type("cleanup-control")
+
+    with pytest.raises(primary_type) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is primary
+    assert adapter.closed == [71]
+
+
+def test_ordinary_primary_and_close_failures_are_fixed_and_scrubbed() -> None:
+    primary_canary = "ordinary-primary-path-canary"
+    cleanup_canary = "ordinary-close-path-canary"
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    adapter.verify_error = OSError(primary_canary)
+    adapter.close_error = OSError(cleanup_canary)
+
+    with pytest.raises(OSError) as caught:
+        _discover(root, adapter)
+
+    assert str(caught.value) == "native Codex payload is unavailable"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert adapter.closed == [71]
+    rendered = "".join(traceback.format_exception(caught.value))
+    assert primary_canary not in rendered
+    assert cleanup_canary not in rendered
+    captured = traceback.TracebackException.from_exception(
+        caught.value, capture_locals=True
+    )
+    module_path = Path(codex_runtime_module.__file__).resolve()
+    project_locals = "\n".join(
+        value
+        for frame in captured.stack
+        if Path(frame.filename).resolve() == module_path
+        for value in (frame.locals or {}).values()
+    )
+    assert primary_canary not in project_locals
+    assert cleanup_canary not in project_locals
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows file sharing semantics")
 def test_real_windows_locked_handle_blocks_write_and_delete_until_close(
     tmp_path: Path,
@@ -287,21 +387,86 @@ def test_real_windows_locked_handle_blocks_write_and_delete_until_close(
         assert stream.read(6) == b"signed"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+def test_wintrust_verify_failure_closes_trust_state_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[int] = []
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        return 0x800B0100 if trust_data.dwStateAction == 1 else 0
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+
+    with pytest.raises(OSError, match="native Codex signature is not trusted") as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+def test_wintrust_signer_failure_closes_state_and_preserves_original(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[int] = []
+    signer_failure = RuntimeError("signer-read-canary")
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+        return 0
+
+    def fail_signer(state: object) -> str:
+        raise signer_failure
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(codex_runtime_module, "_publisher_from_trust_state", fail_signer)
+
+    with pytest.raises(RuntimeError) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert caught.value is signer_failure
+    assert actions == [1, 2]
+
+
+_REAL_CODEX_LOCATOR = shutil.which("codex.cmd")
 _REAL_NATIVE_CODEX = (
-    Path(r"C:\nvm4w\nodejs") / NATIVE_CODEX_RELATIVE_PATH
+    Path(_REAL_CODEX_LOCATOR).parent / NATIVE_CODEX_RELATIVE_PATH
+    if _REAL_CODEX_LOCATOR is not None
+    else None
 )
 
 
 @pytest.mark.skipif(
-    os.name != "nt" or not _REAL_NATIVE_CODEX.is_file(),
+    os.name != "nt"
+    or _REAL_NATIVE_CODEX is None
+    or not _REAL_NATIVE_CODEX.is_file(),
     reason="signed native npm Codex payload is unavailable",
 )
 def test_real_windows_native_payload_has_trusted_openai_publisher() -> None:
+    assert _REAL_CODEX_LOCATOR is not None
+    expected = Path(_REAL_CODEX_LOCATOR).parent / NATIVE_CODEX_RELATIVE_PATH
     locked = discover_locked_native_codex(
-        which=lambda name: shutil.which(name),
+        which=lambda name: _REAL_CODEX_LOCATOR if name == "codex.cmd" else None,
     )
     try:
         assert locked.publisher == OPENAI_AUTHENTICODE_PUBLISHER
-        assert locked.size == _REAL_NATIVE_CODEX.stat().st_size
+        assert locked.size == expected.stat().st_size
     finally:
         locked.close()
