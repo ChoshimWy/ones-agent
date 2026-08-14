@@ -36,6 +36,13 @@ class FakeRuntimeAdapter:
         self.verify_error: BaseException | None = None
         self.close_error: BaseException | None = None
         self.verified: list[tuple[int, Path]] = []
+        self.marker_errors: dict[Path, BaseException] = {}
+        self.marker_calls: list[Path] = []
+        self.marker_identity_race: Path | None = None
+        self.marker_identity_calls: dict[Path, int] = {}
+        self.resolved_repository_path: Path | None = None
+        self.repository_identity_race: Path | None = None
+        self.repository_identity_calls: dict[Path, int] = {}
 
     def open_locked(self, path: Path) -> int:
         self.opened.append(path)
@@ -80,6 +87,33 @@ class FakeRuntimeAdapter:
         if self.repository_alias is not None and right == self.repository_alias:
             return left == self.final or left in self.final.parents
         return _normalized(left) == _normalized(right)
+
+    def repository_marker(
+        self, root: Path,
+    ) -> tuple[str, tuple[int, int, int, int]] | None:
+        self.marker_calls.append(root)
+        if root in self.marker_errors:
+            raise self.marker_errors[root]
+        marker = root / ".git"
+        if marker.is_dir():
+            marker_kind = "directory"
+        elif marker.is_file():
+            marker_kind = "file"
+        else:
+            return None
+        calls = self.marker_identity_calls.get(root, 0)
+        self.marker_identity_calls[root] = calls + 1
+        generation = 2 if root == self.marker_identity_race and calls else 1
+        return marker_kind, (generation, hash(_normalized(marker)), 0, 0)
+
+    def resolve_repository_path(self, path: Path) -> Path:
+        return self.resolved_repository_path or path.resolve(strict=True)
+
+    def repository_path_identity(self, path: Path) -> tuple[int, int, int, int]:
+        calls = self.repository_identity_calls.get(path, 0)
+        self.repository_identity_calls[path] = calls + 1
+        generation = 2 if path == self.repository_identity_race and calls else 1
+        return generation, hash(_normalized(path)), 0, 0
 
 
 def _normalized(path: Path) -> str:
@@ -278,6 +312,148 @@ def test_default_repository_root_identity_race_fails_closed(
         )
 
 
+@pytest.mark.parametrize("marker_kind", ["directory", "file"])
+def test_default_roots_protect_nearest_repository_root_from_subdirectory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_kind: str,
+) -> None:
+    repository = (tmp_path / f"external-{marker_kind}-repository").resolve()
+    cwd = repository / "nested" / "work"
+    root = repository / "sibling-install"
+    cwd.mkdir(parents=True)
+    root.mkdir()
+    marker = repository / ".git"
+    if marker_kind == "directory":
+        marker.mkdir()
+    else:
+        marker.write_text("gitdir: ../metadata/worktree", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(root)
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert repository in adapter.marker_calls
+    assert adapter.closed == [71]
+
+
+@pytest.mark.parametrize("marker_error", [
+    PermissionError("marker-permission-canary"),
+    OSError("marker-replacement-canary"),
+])
+def test_default_repository_marker_error_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    marker_error: OSError,
+) -> None:
+    repository = (tmp_path / "external-racing-repository").resolve()
+    cwd = repository / "nested"
+    root = repository / "sibling-install"
+    cwd.mkdir(parents=True)
+    root.mkdir()
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(root)
+    adapter.marker_errors[repository] = marker_error
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$") as caught:
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert adapter.closed == [71]
+
+
+def test_default_roots_follow_physical_cwd_alias_to_repository(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lexical_cwd = (tmp_path / "junction-alias" / "nested").resolve()
+    repository = (tmp_path / "physical-repository").resolve()
+    physical_cwd = repository / "nested"
+    root = repository / "sibling-install"
+    lexical_cwd.mkdir(parents=True)
+    physical_cwd.mkdir(parents=True)
+    root.mkdir()
+    (repository / ".git").mkdir()
+    monkeypatch.chdir(lexical_cwd)
+    adapter = FakeRuntimeAdapter(root)
+    adapter.resolved_repository_path = physical_cwd
+    original_same_file = adapter.same_file
+
+    def alias_aware_same_file(left: Path, right: Path) -> bool:
+        if {_normalized(left), _normalized(right)} == {
+            _normalized(lexical_cwd),
+            _normalized(physical_cwd),
+        }:
+            return True
+        return original_same_file(left, right)
+
+    adapter.same_file = alias_aware_same_file  # type: ignore[method-assign]
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert repository in adapter.marker_calls
+    assert adapter.closed == [71]
+
+
+def test_default_repository_parent_chain_identity_race_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = (tmp_path / "racing-parent-repository").resolve()
+    cwd = repository / "nested" / "work"
+    root = (tmp_path / "external-install").resolve()
+    cwd.mkdir(parents=True)
+    root.mkdir()
+    (repository / ".git").mkdir()
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(root)
+    adapter.repository_identity_race = repository / "nested"
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$") as caught:
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert adapter.closed == [71]
+
+
+def test_default_repository_marker_identity_race_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = (tmp_path / "racing-marker-repository").resolve()
+    cwd = repository / "nested"
+    root = (tmp_path / "external-install").resolve()
+    cwd.mkdir(parents=True)
+    root.mkdir()
+    (repository / ".git").mkdir()
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(root)
+    adapter.marker_identity_race = repository
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$") as caught:
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert adapter.closed == [71]
+
+
 @pytest.mark.parametrize("error_type", [AssertionError, TypeError, AttributeError])
 def test_internal_runtime_failures_propagate_after_close(
     error_type: type[Exception],
@@ -382,6 +558,46 @@ def test_close_memory_or_control_flow_beats_ordinary_primary_failure(
         _discover(root, adapter)
 
     assert caught.value is cleanup
+    assert adapter.closed == [71]
+
+
+@pytest.mark.parametrize("primary_type", [AssertionError, TypeError, AttributeError])
+@pytest.mark.parametrize("cleanup_type", _PRIORITY_FAILURES)
+def test_close_memory_or_control_flow_beats_internal_primary_failure(
+    primary_type: type[Exception],
+    cleanup_type: type[BaseException],
+) -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    adapter.verify_error = primary_type("internal-primary-canary")
+    cleanup = cleanup_type("cleanup-control")
+    adapter.close_error = cleanup
+
+    with pytest.raises(cleanup_type) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is cleanup
+    assert cleanup.__cause__ is None
+    assert cleanup.__context__ is None
+    assert adapter.closed == [71]
+
+
+@pytest.mark.parametrize("primary_type", [AssertionError, TypeError, AttributeError])
+def test_internal_primary_failure_beats_ordinary_close_failure(
+    primary_type: type[Exception],
+) -> None:
+    root = Path("C:/npm")
+    adapter = FakeRuntimeAdapter(root)
+    primary = primary_type("internal-primary-canary")
+    adapter.verify_error = primary
+    adapter.close_error = OSError("ordinary-close-canary")
+
+    with pytest.raises(primary_type) as caught:
+        _discover(root, adapter)
+
+    assert caught.value is primary
+    assert primary.__cause__ is None
+    assert primary.__context__ is None
     assert adapter.closed == [71]
 
 
@@ -681,6 +897,83 @@ def test_wintrust_internal_signer_failure_propagates_after_close(
         codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
 
     assert caught.value is internal
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+@pytest.mark.parametrize("primary_type", [AssertionError, TypeError, AttributeError])
+@pytest.mark.parametrize("cleanup_type", _PRIORITY_FAILURES)
+def test_wintrust_close_memory_or_control_beats_internal_signer_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_type: type[Exception],
+    cleanup_type: type[BaseException],
+) -> None:
+    actions: list[int] = []
+    primary = primary_type("internal-signer-canary")
+    cleanup = cleanup_type("trust-close-control")
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+            return 0
+        raise cleanup
+
+    def fail_signer(state: object) -> str:
+        raise primary
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(codex_runtime_module, "_publisher_from_trust_state", fail_signer)
+
+    with pytest.raises(cleanup_type) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert caught.value is cleanup
+    assert cleanup.__cause__ is None
+    assert cleanup.__context__ is None
+    assert actions == [1, 2]
+
+
+@pytest.mark.skipif(os.name != "nt", reason="WinTrust API is Windows-only")
+@pytest.mark.parametrize("primary_type", [AssertionError, TypeError, AttributeError])
+def test_wintrust_internal_signer_failure_beats_ordinary_close_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    primary_type: type[Exception],
+) -> None:
+    actions: list[int] = []
+    primary = primary_type("internal-signer-canary")
+
+    def fake_winverifytrust(hwnd: object, action: object, data: object) -> int:
+        trust_data = codex_runtime_module.ctypes.cast(
+            data,
+            codex_runtime_module.ctypes.POINTER(codex_runtime_module._WINTRUST_DATA),
+        ).contents
+        actions.append(trust_data.dwStateAction)
+        if trust_data.dwStateAction == 1:
+            trust_data.hWVTStateData = 99
+            return 0
+        raise OSError("ordinary-close-canary")
+
+    def fail_signer(state: object) -> str:
+        raise primary
+
+    monkeypatch.setattr(
+        codex_runtime_module._wintrust, "WinVerifyTrust", fake_winverifytrust
+    )
+    monkeypatch.setattr(codex_runtime_module, "_publisher_from_trust_state", fail_signer)
+
+    with pytest.raises(primary_type) as caught:
+        codex_runtime_module._verify_wintrust_publisher(73, Path("C:/fixed/codex.exe"))
+
+    assert caught.value is primary
+    assert primary.__cause__ is None
+    assert primary.__context__ is None
     assert actions == [1, 2]
 
 

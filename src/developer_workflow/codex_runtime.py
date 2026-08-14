@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +44,14 @@ class _RuntimeAdapter(Protocol):
     def close(self, descriptor: int) -> None: ...
 
     def same_file(self, left: Path, right: Path) -> bool: ...
+
+    def repository_marker(
+        self, root: Path,
+    ) -> tuple[str, tuple[int, int, int, int]] | None: ...
+
+    def resolve_repository_path(self, path: Path) -> Path: ...
+
+    def repository_path_identity(self, path: Path) -> tuple[int, int, int, int]: ...
 
 
 @dataclass(slots=True, repr=False)
@@ -89,12 +98,53 @@ def _final_path_has_fixed_layout(
     return adapter.same_file(final_root, locator_root)
 
 
+def _nearest_current_repository_root(adapter: _RuntimeAdapter) -> Path:
+    lexical_cwd = Path.cwd()
+    physical_cwd = adapter.resolve_repository_path(lexical_cwd)
+    if not adapter.same_file(lexical_cwd, physical_cwd):
+        raise OSError("unstable current repository identity")
+
+    checked: list[
+        tuple[
+            Path,
+            tuple[int, int, int, int],
+            tuple[str, tuple[int, int, int, int]] | None,
+        ]
+    ] = []
+    current = physical_cwd
+    repository_root: Path | None = None
+    while True:
+        path_identity = adapter.repository_path_identity(current)
+        marker = adapter.repository_marker(current)
+        checked.append((current, path_identity, marker))
+        if marker is not None:
+            marker_kind, _ = marker
+            if marker_kind not in {"directory", "file"}:
+                raise OSError("invalid repository marker")
+            repository_root = current
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+
+    final_cwd = adapter.resolve_repository_path(Path.cwd())
+    if not adapter.same_file(physical_cwd, final_cwd):
+        raise OSError("unstable current repository identity")
+    for path, initial_identity, initial_marker in reversed(checked):
+        if (
+            adapter.repository_path_identity(path) != initial_identity
+            or adapter.repository_marker(path) != initial_marker
+        ):
+            raise OSError("unstable repository parent identity")
+    return repository_root if repository_root is not None else physical_cwd
+
+
 def _current_repository_roots(adapter: _RuntimeAdapter) -> tuple[Path, ...]:
     worktree = Path(__file__).resolve(strict=True).parents[2]
     candidates = [worktree]
     if worktree.parent.name.casefold() == ".worktrees":
         candidates.append(worktree.parent.parent.resolve(strict=True))
-    candidates.append(Path.cwd())
+    candidates.append(_nearest_current_repository_root(adapter))
     roots: list[Path] = []
     for candidate in candidates:
         if not adapter.same_file(candidate, candidate):
@@ -204,13 +254,12 @@ def _discover_locked_native_codex_raw(
 
     if _is_priority_failure(primary_error):
         raise primary_error.with_traceback(primary_traceback)
+    if cleanup_error is not None and _is_priority_failure(cleanup_error):
+        raise cleanup_error.with_traceback(cleanup_traceback)
     if not _is_expected_runtime_failure(primary_error):
         raise primary_error.with_traceback(primary_traceback)
     if cleanup_error is not None:
-        if (
-            _is_priority_failure(cleanup_error)
-            or not _is_expected_runtime_failure(cleanup_error)
-        ):
+        if not _is_expected_runtime_failure(cleanup_error):
             raise cleanup_error.with_traceback(cleanup_traceback)
     raise primary_error.with_traceback(primary_traceback)
 
@@ -392,6 +441,10 @@ def _raise_last_windows_error(operation: str) -> None:
     raise OSError(error, operation)
 
 
+def _stat_identity(value: os.stat_result) -> tuple[int, int, int, int]:
+    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+
+
 class _WindowsRuntimeAdapter:
     def __init__(self) -> None:
         if os.name != "nt":
@@ -487,6 +540,59 @@ class _WindowsRuntimeAdapter:
                 raise OSError("unstable native Codex path identity")
         return same
 
+    def repository_marker(
+        self, root: Path,
+    ) -> tuple[str, tuple[int, int, int, int]] | None:
+        marker = root / ".git"
+        before_root = root.stat(follow_symlinks=False)
+        try:
+            before_marker = marker.stat(follow_symlinks=False)
+        except FileNotFoundError:
+            after_root = root.stat(follow_symlinks=False)
+            try:
+                marker.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                if _stat_identity(before_root) != _stat_identity(after_root):
+                    raise OSError("unstable repository marker identity")
+                return None
+            raise OSError("unstable repository marker identity") from None
+
+        attributes = getattr(before_marker, "st_file_attributes", 0)
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise OSError("invalid repository marker")
+        if stat.S_ISDIR(before_marker.st_mode):
+            marker_kind = "directory"
+        elif stat.S_ISREG(before_marker.st_mode):
+            marker_kind = "file"
+        else:
+            raise OSError("invalid repository marker")
+
+        after_marker = marker.stat(follow_symlinks=False)
+        after_root = root.stat(follow_symlinks=False)
+        if (
+            _stat_identity(before_root) != _stat_identity(after_root)
+            or _stat_identity(before_marker) != _stat_identity(after_marker)
+        ):
+            raise OSError("unstable repository marker identity")
+        return marker_kind, _stat_identity(after_marker)
+
+    def resolve_repository_path(self, path: Path) -> Path:
+        before = path.stat(follow_symlinks=False)
+        resolved = path.resolve(strict=True)
+        if not self.same_file(path, resolved):
+            raise OSError("unstable current repository identity")
+        after = path.stat(follow_symlinks=False)
+        if _stat_identity(before) != _stat_identity(after):
+            raise OSError("unstable current repository identity")
+        return resolved
+
+    def repository_path_identity(self, path: Path) -> tuple[int, int, int, int]:
+        value = path.stat(follow_symlinks=False)
+        attributes = getattr(value, "st_file_attributes", 0)
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT or not stat.S_ISDIR(value.st_mode):
+            raise OSError("invalid repository parent")
+        return _stat_identity(value)
+
 
 def _certificate_publisher(certificate: object) -> str:
     oid = ctypes.c_char_p(b"2.5.4.10")
@@ -566,15 +672,13 @@ def _verify_wintrust_publisher_raw(descriptor: int, path: Path) -> str:
         cleanup_traceback = error.__traceback__
 
     if primary_error is not None:
-        if (
-            _is_priority_failure(primary_error)
-            or not _is_expected_runtime_failure(primary_error)
-        ):
+        if _is_priority_failure(primary_error):
             raise primary_error.with_traceback(primary_traceback)
-        if cleanup_error is not None and (
-            _is_priority_failure(cleanup_error)
-            or not _is_expected_runtime_failure(cleanup_error)
-        ):
+        if cleanup_error is not None and _is_priority_failure(cleanup_error):
+            raise cleanup_error.with_traceback(cleanup_traceback)
+        if not _is_expected_runtime_failure(primary_error):
+            raise primary_error.with_traceback(primary_traceback)
+        if cleanup_error is not None and not _is_expected_runtime_failure(cleanup_error):
             raise cleanup_error.with_traceback(cleanup_traceback)
         raise primary_error.with_traceback(primary_traceback)
     if cleanup_error is not None:
