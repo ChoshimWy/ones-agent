@@ -105,6 +105,27 @@ def _is_probe_priority_failure(error: BaseException) -> bool:
     )
 
 
+def _select_doctor_failure(
+    primary: BaseException | None, close_failure: BaseException | None
+) -> BaseException | None:
+    if primary is not None and _is_probe_priority_failure(primary):
+        return primary
+    if close_failure is not None and _is_probe_priority_failure(close_failure):
+        return close_failure
+    if primary is not None:
+        return primary
+    if close_failure is not None:
+        return SetupValidationError("Codex doctor cleanup failed")
+    return None
+
+
+def _raise_sanitized_setup_failure(error: BaseException) -> None:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    raise error from None
+
+
 def _raise_git_executable_unavailable() -> None:
     raise GitExecutableUnavailableError("Git executable is unavailable") from None
 
@@ -308,10 +329,24 @@ class SubprocessDoctorRunner:
         if argv != ["doctor", "--json"] or kwargs.get("shell") is not False:
             raise SetupValidationError("Codex doctor command is invalid")
         command = self._verified_command()
+        completed: subprocess.CompletedProcess[str] | None = None
+        primary: BaseException | None = None
         try:
-            return self.backend_runner(command.argv("doctor", "--json"), **kwargs)
-        finally:
+            completed = self.backend_runner(command.argv("doctor", "--json"), **kwargs)
+        except BaseException as error:
+            primary = error
+        close_failure: BaseException | None = None
+        try:
             command.close()
+        except BaseException as error:
+            close_failure = error
+        selected = _select_doctor_failure(primary, close_failure)
+        if selected is not None:
+            failure = selected
+            del argv, kwargs, command, completed, primary, close_failure, selected
+            _raise_sanitized_setup_failure(failure)
+        assert completed is not None
+        return completed
 
 
 @dataclass(slots=True)

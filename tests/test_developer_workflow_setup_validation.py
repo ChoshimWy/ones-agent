@@ -225,6 +225,113 @@ def test_subprocess_doctor_propagates_memory_failure_without_starting_process(
         )
 
 
+def test_subprocess_doctor_primary_priority_beats_close_and_scrubs_locals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "doctor-primary-secret-canary"
+    primary = MemoryError()
+    close_failure = SystemExit()
+    command = _attested_command(tmp_path)
+    original_close = CodexCommand.close
+    closes = 0
+
+    def close(item: CodexCommand) -> None:
+        nonlocal closes
+        closes += 1
+        original_close(item)
+        raise close_failure
+
+    monkeypatch.setattr(CodexCommand, "close", close)
+    runner = SubprocessDoctorRunner(
+        command_provider=lambda: command,
+        backend_runner=lambda *args, **kwargs: (_ for _ in ()).throw(primary),
+    )
+
+    with pytest.raises(MemoryError) as caught:
+        runner(
+            ["doctor", "--json"],
+            cwd=tmp_path.resolve(),
+            env={"ONES_TOKEN": secret},
+            timeout=2,
+            max_output_bytes=1024,
+            shell=False,
+        )
+
+    assert caught.value is primary
+    assert closes == 1
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    trace = caught.value.__traceback__
+    while trace is not None:
+        if Path(trace.tb_frame.f_code.co_filename).name == "setup_validation.py":
+            assert secret not in repr(trace.tb_frame.f_locals)
+        trace = trace.tb_next
+
+
+def test_subprocess_doctor_close_priority_beats_ordinary_backend_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = RuntimeError("ordinary backend")
+    close_failure = KeyboardInterrupt()
+    command = _attested_command(tmp_path)
+    original_close = CodexCommand.close
+    closes = 0
+
+    def close(item: CodexCommand) -> None:
+        nonlocal closes
+        closes += 1
+        original_close(item)
+        raise close_failure
+
+    monkeypatch.setattr(CodexCommand, "close", close)
+    runner = SubprocessDoctorRunner(
+        command_provider=lambda: command,
+        backend_runner=lambda *args, **kwargs: (_ for _ in ()).throw(primary),
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        runner(
+            ["doctor", "--json"], cwd=tmp_path, env={}, timeout=2,
+            max_output_bytes=1024, shell=False,
+        )
+
+    assert caught.value is close_failure
+    assert closes == 1
+
+
+def test_subprocess_doctor_ordinary_close_failure_is_fixed_and_sanitized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "doctor-close-secret-canary"
+    command = _attested_command(tmp_path)
+    original_close = CodexCommand.close
+
+    def close(item: CodexCommand) -> None:
+        original_close(item)
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(CodexCommand, "close", close)
+    runner = SubprocessDoctorRunner(
+        command_provider=lambda: command,
+        backend_runner=lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, "{}", ""
+        ),
+    )
+
+    with pytest.raises(SetupValidationError, match="cleanup failed") as caught:
+        runner(
+            ["doctor", "--json"], cwd=tmp_path, env={"ONES_TOKEN": secret},
+            timeout=2, max_output_bytes=1024, shell=False,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert secret not in repr(caught.value)
+
+
 def test_profile_catalog_propagates_memory_failure_from_doctor(tmp_path: Path) -> None:
     def doctor(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
         raise MemoryError()

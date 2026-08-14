@@ -7,6 +7,7 @@ isolated worktree.  Publication is deliberately outside this boundary.
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import hashlib
 import json
 import math
@@ -15,14 +16,17 @@ import re
 import shlex
 import shutil
 import socket
+import stat
 import subprocess
 import sys
+import threading
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from ctypes import wintypes
 
 from src.contracts import RequirementRecord, WikiPageSnapshot
 
@@ -66,6 +70,7 @@ from .group_evidence import (
     assert_group_snapshots_equal,
     run_group_commands,
 )
+from .private_paths import _current_user_sid, _is_link_or_reparse, _windows_descriptor
 from .state_store import ConcurrentRunUpdateError
 from .test_evidence import (
     FinalTestEvidenceError,
@@ -228,6 +233,67 @@ def _sandbox_state_has_secret_key(value: Any) -> bool:
     return False
 
 
+def _sandbox_wrapped_arguments(
+    *,
+    permission_profile: str | None,
+    permission_profile_source: SandboxPermissionProfileSource,
+    sandbox_state_provider: SandboxStateProvider | None,
+    canonical_cwd: Path,
+) -> list[str]:
+    arguments: list[str] = []
+    if permission_profile_source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE:
+        arguments.extend(["-c", BUILTIN_WORKSPACE_OVERRIDE])
+    arguments.append("sandbox")
+    if permission_profile is not None:
+        arguments.extend(
+            [
+                "--permission-profile",
+                permission_profile,
+                "--include-managed-config",
+                "-C",
+                str(canonical_cwd),
+            ]
+        )
+        return arguments
+
+    assert sandbox_state_provider is not None
+    try:
+        policy = sandbox_state_provider(canonical_cwd)
+    except BaseException as error:
+        if _is_sandbox_priority_failure(error):
+            raise
+        raise RequirementFlowError("sandbox state provider failed") from None
+    try:
+        roots = tuple(root.resolve(strict=False) for root in policy.writable_roots)
+        if (
+            policy.working_directory.resolve(strict=False) != canonical_cwd
+            or roots != (canonical_cwd,)
+            or policy.network_disabled is not True
+            or not isinstance(policy.payload, dict)
+            or _sandbox_state_has_secret_key(policy.payload)
+        ):
+            raise RequirementFlowError("sandbox state does not prove required policy")
+        try:
+            state_json = json.dumps(
+                policy.payload,
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except BaseException as error:
+            if _is_sandbox_priority_failure(error):
+                raise
+            raise RequirementFlowError("sandbox state is not serializable") from None
+        if len(state_json.encode("utf-8", "strict")) > 1024 * 1024 or "\x00" in state_json:
+            raise RequirementFlowError("sandbox state exceeds its safe boundary")
+        arguments.extend(["--sandbox-state-json", state_json])
+        return arguments
+    finally:
+        policy = None
+        if "state_json" in locals():
+            state_json = ""
+
+
 @dataclass(slots=True)
 class CodexRequirementAdapter:
     """Production bridge from requirement phases to the bounded Task 6 runner."""
@@ -331,7 +397,335 @@ def sandbox_preflight_command() -> list[str]:
     return [sys.executable, "-I", "-c", "print('sandbox-preflight')"]
 
 
+_SandboxDirectoryIdentity = tuple[int, int, int, int]
+
+
+class _SandboxByHandleFileInformation(ctypes.Structure):
+    _fields_ = [
+        ("dwFileAttributes", wintypes.DWORD),
+        ("ftCreationTime", wintypes.FILETIME),
+        ("ftLastAccessTime", wintypes.FILETIME),
+        ("ftLastWriteTime", wintypes.FILETIME),
+        ("dwVolumeSerialNumber", wintypes.DWORD),
+        ("nFileSizeHigh", wintypes.DWORD),
+        ("nFileSizeLow", wintypes.DWORD),
+        ("nNumberOfLinks", wintypes.DWORD),
+        ("nFileIndexHigh", wintypes.DWORD),
+        ("nFileIndexLow", wintypes.DWORD),
+    ]
+
+
+def _windows_sandbox_handle_identity(handle: int) -> _SandboxDirectoryIdentity:
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(_SandboxByHandleFileInformation)]
+    get_info.restype = wintypes.BOOL
+    info = _SandboxByHandleFileInformation()
+    if not get_info(handle, ctypes.byref(info)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    directory = getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10)
+    if info.dwFileAttributes & reparse or not info.dwFileAttributes & directory:
+        raise OSError("sandbox directory handle is unsafe")
+    file_index = (int(info.nFileIndexHigh) << 32) | int(info.nFileIndexLow)
+    return (
+        int(info.dwVolumeSerialNumber),
+        file_index,
+        int(info.dwFileAttributes),
+        int(info.nNumberOfLinks),
+    )
+
+
 @dataclass(slots=True)
+class _SandboxDirectoryLease:
+    path: Path
+    path_identity: _SandboxDirectoryIdentity
+    handle_identity: _SandboxDirectoryIdentity
+    descriptor: int | None = None
+    windows_handle: int | None = None
+    require_owner: bool = False
+    closed: bool = False
+
+    def _current_handle_identity(self) -> _SandboxDirectoryIdentity:
+        if self.closed:
+            raise OSError("sandbox directory lease is closed")
+        if self.windows_handle is not None:
+            return _windows_sandbox_handle_identity(self.windows_handle)
+        assert self.descriptor is not None
+        metadata = os.fstat(self.descriptor)
+        if not stat.S_ISDIR(metadata.st_mode):
+            raise OSError("sandbox directory handle is unsafe")
+        return metadata.st_dev, metadata.st_ino, metadata.st_mode, 0
+
+    def validate_path(self) -> None:
+        if (
+            self._current_handle_identity() != self.handle_identity
+            or _sandbox_directory_identity(self.path, require_owner=self.require_owner)
+            != self.path_identity
+        ):
+            raise OSError("sandbox directory identity changed")
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.windows_handle is not None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            if not close_handle(self.windows_handle):
+                raise ctypes.WinError(ctypes.get_last_error())
+        elif self.descriptor is not None:
+            os.close(self.descriptor)
+
+
+def _open_sandbox_directory_nofollow(
+    path: Path, *, require_owner: bool = False
+) -> _SandboxDirectoryLease:
+    path_identity = _sandbox_directory_identity(path, require_owner=require_owner)
+    if os.name == "nt":
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = [
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        ]
+        create_file.restype = wintypes.HANDLE
+        handle = create_file(
+            str(path),
+            0x0080,
+            0x00000001 | 0x00000002 | 0x00000004,
+            None,
+            3,
+            0x02000000 | 0x00200000,
+            None,
+        )
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            handle_identity = _windows_sandbox_handle_identity(handle)
+            get_final_path = kernel32.GetFinalPathNameByHandleW
+            get_final_path.argtypes = [
+                wintypes.HANDLE,
+                wintypes.LPWSTR,
+                wintypes.DWORD,
+                wintypes.DWORD,
+            ]
+            get_final_path.restype = wintypes.DWORD
+            buffer = ctypes.create_unicode_buffer(32768)
+            length = get_final_path(handle, buffer, len(buffer), 0)
+            if not length or length >= len(buffer):
+                raise OSError("sandbox directory final path is unsafe")
+            final_path = buffer.value
+            if final_path.startswith("\\\\?\\UNC\\"):
+                final_path = "\\\\" + final_path[8:]
+            elif final_path.startswith("\\\\?\\"):
+                final_path = final_path[4:]
+            if os.path.normcase(os.path.abspath(final_path)) != os.path.normcase(
+                os.path.abspath(path)
+            ):
+                raise OSError("sandbox directory final path is unsafe")
+            if _sandbox_directory_identity(path, require_owner=require_owner) != path_identity:
+                raise OSError("sandbox directory identity changed")
+            return _SandboxDirectoryLease(
+                path=path,
+                path_identity=path_identity,
+                handle_identity=handle_identity,
+                windows_handle=int(handle),
+                require_owner=require_owner,
+            )
+        except BaseException:
+            close_handle = kernel32.CloseHandle
+            close_handle.argtypes = [wintypes.HANDLE]
+            close_handle.restype = wintypes.BOOL
+            close_handle(handle)
+            raise
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    descriptor = os.open(path, flags)
+    try:
+        opened = os.fstat(descriptor)
+        handle_identity = (opened.st_dev, opened.st_ino, opened.st_mode, 0)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or _sandbox_directory_identity(path, require_owner=require_owner) != path_identity
+            or handle_identity[:2] != path_identity[:2]
+        ):
+            raise OSError("sandbox directory identity changed")
+        return _SandboxDirectoryLease(
+            path=path,
+            path_identity=path_identity,
+            handle_identity=handle_identity,
+            descriptor=descriptor,
+            require_owner=require_owner,
+        )
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _sandbox_directory_identity(
+    path: Path, *, require_owner: bool = False
+) -> _SandboxDirectoryIdentity:
+    metadata = path.stat(follow_symlinks=False)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        stat.S_ISLNK(metadata.st_mode)
+        or attributes & reparse
+        or not stat.S_ISDIR(metadata.st_mode)
+        or _is_link_or_reparse(path)
+    ):
+        raise OSError("sandbox directory is unsafe")
+    if require_owner:
+        if os.name == "nt":
+            if _windows_descriptor(path)[0] != _current_user_sid():
+                raise OSError("sandbox directory owner is unsafe")
+        elif metadata.st_uid != os.geteuid():
+            raise OSError("sandbox directory owner is unsafe")
+    return metadata.st_dev, metadata.st_ino, metadata.st_mode, attributes
+
+
+@dataclass(slots=True)
+class _OwnedSandboxDirectory:
+    path: Path
+    parent: Path
+    parent_identity: _SandboxDirectoryIdentity
+    identity: _SandboxDirectoryIdentity
+    lease: _SandboxDirectoryLease | None = None
+
+
+@dataclass(slots=True)
+class _SandboxDirectoryGuard:
+    lexical_cwd: Path
+    probe_id: str
+    canonical_cwd: Path = field(init=False)
+    isolation_root: Path = field(init=False)
+    outside_root: Path = field(init=False)
+    _anchor_snapshots: tuple[tuple[Path, _SandboxDirectoryIdentity], ...] = field(
+        init=False
+    )
+    _anchors: list[_SandboxDirectoryLease] = field(default_factory=list, init=False)
+    _owned: list[_OwnedSandboxDirectory] = field(default_factory=list, init=False)
+
+    def __post_init__(self) -> None:
+        canonical = self.lexical_cwd.resolve(strict=True)
+        if not canonical.is_dir():
+            raise OSError("sandbox worktree is unavailable")
+        anchors: list[tuple[Path, _SandboxDirectoryIdentity]] = []
+        current = canonical
+        while True:
+            anchors.append((current, _sandbox_directory_identity(current)))
+            if current.parent == current:
+                break
+            current = current.parent
+        self.canonical_cwd = canonical
+        self.isolation_root = canonical / f".ones-sandbox-{self.probe_id}"
+        self.outside_root = canonical.parent / f".ones-sandbox-probes-{self.probe_id}"
+        self._anchor_snapshots = tuple(anchors)
+
+    def _validate_anchors(self) -> None:
+        if len(self._anchors) != len(self._anchor_snapshots):
+            raise OSError("sandbox worktree identity changed")
+        for lease in self._anchors:
+            lease.validate_path()
+
+    def prepare(self) -> None:
+        for path, identity in self._anchor_snapshots:
+            if _sandbox_directory_identity(path) != identity:
+                raise OSError("sandbox worktree identity changed")
+            self._anchors.append(_open_sandbox_directory_nofollow(path))
+        self._validate_anchors()
+        for path, parent in (
+            (self.isolation_root, self.canonical_cwd),
+            (self.outside_root, self.canonical_cwd.parent),
+        ):
+            parent_identity = _sandbox_directory_identity(parent)
+            path.mkdir()
+            owned = _OwnedSandboxDirectory(
+                path=path,
+                parent=parent,
+                parent_identity=parent_identity,
+                identity=_sandbox_directory_identity(path),
+            )
+            self._owned.append(owned)
+            if _sandbox_directory_identity(path, require_owner=True) != owned.identity:
+                raise OSError("owned sandbox directory identity changed")
+            owned.lease = _open_sandbox_directory_nofollow(
+                path, require_owner=True
+            )
+            self._validate_anchors()
+
+    def validate(self) -> None:
+        self._validate_anchors()
+        for owned in self._owned:
+            if (
+                owned.lease is None
+                or owned.path.parent != owned.parent
+                or _sandbox_directory_identity(owned.parent) != owned.parent_identity
+                or _sandbox_directory_identity(owned.path, require_owner=True)
+                != owned.identity
+            ):
+                raise OSError("owned sandbox directory identity changed")
+            owned.lease.validate_path()
+
+    def cleanup(self) -> list[BaseException]:
+        errors: list[BaseException] = []
+        for owned in self._owned:
+            safe_to_delete = False
+            try:
+                if (
+                    owned.lease is None
+                    or owned.path.parent != owned.parent
+                    or _sandbox_directory_identity(owned.parent) != owned.parent_identity
+                    or _sandbox_directory_identity(owned.path, require_owner=True)
+                    != owned.identity
+                ):
+                    raise OSError("owned sandbox directory identity changed")
+                owned.lease.validate_path()
+                safe_to_delete = True
+            except BaseException as error:
+                errors.append(error)
+            if owned.lease is not None:
+                try:
+                    owned.lease.close()
+                except BaseException as error:
+                    safe_to_delete = False
+                    errors.append(error)
+            if safe_to_delete:
+                try:
+                    if (
+                        _sandbox_directory_identity(owned.path, require_owner=True)
+                        != owned.identity
+                    ):
+                        raise OSError("owned sandbox directory identity changed")
+                    shutil.rmtree(owned.path)
+                except BaseException as error:
+                    errors.append(error)
+        for lease in self._anchors:
+            try:
+                lease.close()
+            except BaseException as error:
+                errors.append(error)
+        return errors
+
+
+@dataclass(slots=True)
+class _SandboxCommandConsumption:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    consumed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class SandboxCommandExecutor:
     """Execute argv through the local Codex command sandbox, never a model call."""
 
@@ -344,9 +738,42 @@ class SandboxCommandExecutor:
     codex_command: CodexCommand | None = field(default=None, repr=False)
     codex_preparer: CodexRuntimePreparer | None = field(default=None, repr=False)
     sandbox_policy_verified: bool = field(default=True, init=False)
-    _codex_command_consumed: bool = field(default=False, init=False, repr=False)
+    _command_consumption: _SandboxCommandConsumption = field(
+        default_factory=_SandboxCommandConsumption, init=False, repr=False, compare=False
+    )
+    _security_snapshot: tuple[object, ...] = field(
+        default=(), init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
+        self._validate_configuration(check_snapshot=False)
+        if self.codex_command is None and self.codex_preparer is None:
+            object.__setattr__(self, "codex_preparer", CodexRuntimePreparer())
+        object.__setattr__(self, "_security_snapshot", self._configuration_snapshot())
+
+    def _configuration_snapshot(self) -> tuple[object, ...]:
+        return (
+            self.permission_profile,
+            self.permission_profile_source,
+            self.sandbox_state_provider,
+            self.backend_executor,
+            self.codex_command,
+            self.codex_preparer,
+            self.sandbox_policy_verified,
+        )
+
+    def _configuration_matches_snapshot(self) -> bool:
+        current = self._configuration_snapshot()
+        snapshot = self._security_snapshot
+        return (
+            len(snapshot) == len(current)
+            and current[0] == snapshot[0]
+            and all(left is right for left, right in zip(current[1:], snapshot[1:]))
+        )
+
+    def _validate_configuration(self, *, check_snapshot: bool = True) -> None:
+        if check_snapshot and not self._configuration_matches_snapshot():
+            raise ValueError("sandbox security configuration changed")
         if self.permission_profile is not None and re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.permission_profile
         ) is None:
@@ -372,14 +799,19 @@ class SandboxCommandExecutor:
             raise ValueError("sandbox Codex preparer is invalid")
         if self.codex_command is not None and self.codex_preparer is not None:
             raise ValueError("sandbox Codex command source is ambiguous")
-        if self.codex_command is None and self.codex_preparer is None:
-            self.codex_preparer = CodexRuntimePreparer()
+        if not callable(self.backend_executor):
+            raise ValueError("sandbox backend executor is invalid")
+        if self.sandbox_state_provider is not None and not callable(
+            self.sandbox_state_provider
+        ):
+            raise ValueError("sandbox state provider is invalid")
 
     def _verified_codex_command(self) -> CodexCommand:
         if self.codex_command is not None:
-            if self._codex_command_consumed:
-                raise RequirementFlowError("sandbox Codex command is unavailable")
-            self._codex_command_consumed = True
+            with self._command_consumption.lock:
+                if self._command_consumption.consumed:
+                    raise RequirementFlowError("sandbox Codex command is unavailable")
+                self._command_consumption.consumed = True
             return self.codex_command
         assert self.codex_preparer is not None
         return resolve_codex_command(_prepare=self.codex_preparer.prepare_verified)
@@ -394,19 +826,21 @@ class SandboxCommandExecutor:
         max_output_bytes: int,
         stdin: bytes | None = None,
     ) -> subprocess.CompletedProcess[str]:
+        self._validate_configuration()
+        probe_id = uuid.uuid4().hex
         try:
-            canonical_cwd = cwd.resolve(strict=True)
-        except OSError as error:
-            raise RequirementFlowError("sandbox worktree is unavailable") from error
+            directory_guard = _SandboxDirectoryGuard(cwd, probe_id)
+            canonical_cwd = directory_guard.canonical_cwd
+        except BaseException as error:
+            if _is_sandbox_priority_failure(error):
+                raise
+            raise RequirementFlowError("sandbox worktree is unavailable") from None
         if not canonical_cwd.is_dir() or not command or any(
             not isinstance(item, str) or not item or "\x00" in item for item in command
         ):
             raise RequirementFlowError("sandbox command boundary is invalid")
-        probe_id = uuid.uuid4().hex
-        isolation_parent = canonical_cwd / ".ones-sandbox"
-        isolation_root = isolation_parent / probe_id
-        outside_root = canonical_cwd.parent / f".ones-sandbox-probes-{probe_id}"
-        parent_created = not isolation_parent.exists()
+        isolation_root = directory_guard.isolation_root
+        outside_root = directory_guard.outside_root
         sandbox_env = {
             key: value
             for key, value in env.items()
@@ -432,61 +866,28 @@ class SandboxCommandExecutor:
             }
         )
         wrapped_arguments: list[str] = []
-        if (
-            self.permission_profile_source
-            is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
-        ):
-            wrapped_arguments.extend(["-c", BUILTIN_WORKSPACE_OVERRIDE])
-        wrapped_arguments.append("sandbox")
-        if self.permission_profile is not None:
-            wrapped_arguments.extend(
-                [
-                    "--permission-profile",
-                    self.permission_profile,
-                    "--include-managed-config",
-                    "-C",
-                    str(canonical_cwd),
-                ]
-            )
-        else:
-            assert self.sandbox_state_provider is not None
-            policy = self.sandbox_state_provider(canonical_cwd)
-            roots = tuple(root.resolve(strict=False) for root in policy.writable_roots)
-            if (
-                policy.working_directory.resolve(strict=False) != canonical_cwd
-                or roots != (canonical_cwd,)
-                or policy.network_disabled is not True
-                or not isinstance(policy.payload, dict)
-                or _sandbox_state_has_secret_key(policy.payload)
-            ):
-                raise RequirementFlowError("sandbox state does not prove required policy")
-            try:
-                state_json = json.dumps(
-                    policy.payload,
-                    ensure_ascii=True,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                )
-            except (TypeError, ValueError) as error:
-                raise RequirementFlowError("sandbox state is not serializable") from error
-            if len(state_json.encode("utf-8", "strict")) > 1024 * 1024 or "\x00" in state_json:
-                raise RequirementFlowError("sandbox state exceeds its safe boundary")
-            wrapped_arguments.extend(["--sandbox-state-json", state_json])
-
         wrapped_prefix: list[str] | None = None
 
         def invoke(
             child_command: list[str], *, probe: bool, input_bytes: bytes | None = None
         ) -> subprocess.CompletedProcess[str]:
             assert wrapped_prefix is not None
+            try:
+                directory_guard.validate()
+            except BaseException as error:
+                if _is_sandbox_priority_failure(error):
+                    raise
+                raise RequirementFlowError("sandbox directory identity changed") from None
             wrapped = [
                 *wrapped_prefix,
                 "--sandbox-state-disable-network",
                 "--",
                 *child_command,
             ]
+            result: subprocess.CompletedProcess[str] | None = None
+            backend_failure: BaseException | None = None
             try:
-                return self.backend_executor(
+                result = self.backend_executor(
                     wrapped,
                     cwd=canonical_cwd,
                     env=sandbox_env,
@@ -496,15 +897,37 @@ class SandboxCommandExecutor:
                     else max_output_bytes,
                     stdin=input_bytes,
                 )
-            except MemoryError:
-                raise
-            except Exception:
-                message = (
-                    "sandbox capability probe failed"
-                    if probe
-                    else "sandbox command execution failed"
+            except BaseException as error:
+                if _is_sandbox_priority_failure(error):
+                    backend_failure = error
+                else:
+                    message = (
+                        "sandbox capability probe failed"
+                        if probe
+                        else "sandbox command execution failed"
+                    )
+                    backend_failure = RequirementFlowError(message)
+            identity_failure: BaseException | None = None
+            try:
+                directory_guard.validate()
+            except BaseException as error:
+                identity_failure = (
+                    error
+                    if _is_sandbox_priority_failure(error)
+                    else RequirementFlowError("sandbox directory identity changed")
                 )
-                raise RequirementFlowError(message) from None
+            selected = (
+                identity_failure
+                if backend_failure is None and identity_failure is not None
+                else _select_sandbox_resource_failure(
+                    backend_failure,
+                    [identity_failure] if identity_failure is not None else [],
+                )
+            )
+            if selected is not None:
+                raise selected
+            assert result is not None
+            return result
 
         marker_value = f"ones-sandbox-probe-{probe_id}"
         inside_marker = isolation_root / "inside-write.txt"
@@ -517,22 +940,11 @@ class SandboxCommandExecutor:
             "Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')",
         ]
         active_codex_command: CodexCommand | None = None
-        isolation_parent_owned = False
-        isolation_root_owned = False
-        outside_root_owned = False
         completed: subprocess.CompletedProcess[str] | None = None
         primary: BaseException | None = None
         try:
             try:
-                if parent_created:
-                    isolation_parent.mkdir()
-                    isolation_parent_owned = True
-                if isolation_parent.is_symlink() or not isolation_parent.is_dir():
-                    raise OSError("sandbox isolation root is unsafe")
-                isolation_root.mkdir()
-                isolation_root_owned = True
-                outside_root.mkdir()
-                outside_root_owned = True
+                directory_guard.prepare()
             except BaseException as error:
                 if _is_sandbox_priority_failure(error):
                     raise
@@ -540,6 +952,13 @@ class SandboxCommandExecutor:
                     "sandbox capability probe could not be prepared"
                 ) from None
             active_codex_command = self._verified_codex_command()
+            wrapped_arguments = _sandbox_wrapped_arguments(
+                permission_profile=self.permission_profile,
+                permission_profile_source=self.permission_profile_source,
+                sandbox_state_provider=self.sandbox_state_provider,
+                canonical_cwd=canonical_cwd,
+            )
+            directory_guard.validate()
             wrapped_prefix = active_codex_command.argv(*wrapped_arguments)
             protected_git_keys = {
                 "git_config_nosystem",
@@ -606,29 +1025,7 @@ class SandboxCommandExecutor:
         except BaseException as error:
             primary = error
 
-        cleanup_errors: list[BaseException] = []
-        for owned, expected_parent, was_owned in (
-            (isolation_root, isolation_parent, isolation_root_owned),
-            (outside_root, canonical_cwd.parent, outside_root_owned),
-        ):
-            if not was_owned:
-                continue
-            try:
-                if owned.parent != expected_parent:
-                    raise OSError("owned sandbox path changed")
-                if owned.is_symlink():
-                    owned.unlink()
-                elif owned.exists():
-                    shutil.rmtree(owned)
-            except BaseException as error:
-                cleanup_errors.append(error)
-        if isolation_parent_owned:
-            try:
-                if isolation_parent.parent != canonical_cwd:
-                    raise OSError("owned sandbox path changed")
-                isolation_parent.rmdir()
-            except BaseException as error:
-                cleanup_errors.append(error)
+        cleanup_errors = directory_guard.cleanup()
         if active_codex_command is not None:
             try:
                 active_codex_command.close()

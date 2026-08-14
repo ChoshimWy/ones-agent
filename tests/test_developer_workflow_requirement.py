@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import os
 import socket
 import subprocess
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import FrozenInstanceError, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -859,7 +860,8 @@ def test_sandbox_executor_wraps_command_with_explicit_policy_and_empty_home(
     assert "--sandbox-state-disable-network" in command
     assert command[-3:] == ["--", "pytest", "-q"]
     assert cwd == tmp_path.resolve()
-    assert Path(env["HOME"]).parent.name == ".ones-sandbox"
+    assert Path(env["HOME"]).parent == tmp_path.resolve()
+    assert Path(env["HOME"]).name.startswith(".ones-sandbox-")
     assert env["USERPROFILE"] == env["HOME"]
     assert env["TEMP"] == env["HOME"]
     assert not Path(env["HOME"]).exists()
@@ -934,6 +936,121 @@ def test_sandbox_executor_rejects_profile_source_mismatches(
             )
     finally:
         command.close()
+
+
+def test_sandbox_executor_security_configuration_is_immutable_and_rechecked(
+    tmp_path: Path,
+) -> None:
+    command = _attested_sandbox_command(tmp_path)
+    executor = SandboxCommandExecutor(
+        permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        permission_profile_source=SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        executor.permission_profile = "managed"  # type: ignore[misc]
+    object.__setattr__(executor, "permission_profile", "managed")
+    with pytest.raises(ValueError, match="configuration"):
+        executor(
+            ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+        )
+    assert command._is_attested()
+    command.close()
+
+
+def test_sandbox_executor_configuration_snapshot_uses_callable_identity(
+    tmp_path: Path,
+) -> None:
+    class EqualBackend:
+        def __eq__(self, other: object) -> bool:
+            return True
+
+        def __call__(self, *args: object, **kwargs: object) -> object:
+            pytest.fail("mutated backend must not run")
+
+    command = _attested_sandbox_command(tmp_path)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=EqualBackend(),  # type: ignore[arg-type]
+    )
+    object.__setattr__(executor, "backend_executor", EqualBackend())
+
+    with pytest.raises(ValueError, match="configuration"):
+        executor(
+            ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+        )
+    assert command._is_attested()
+    command.close()
+
+
+def test_sandbox_executor_uses_random_exclusive_root_directly_under_physical_cwd(
+    tmp_path: Path,
+) -> None:
+    seen_homes: list[Path] = []
+
+    def backend(
+        argv: list[str], *, cwd: Path, env: dict[str, str], **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        seen_homes.append(Path(env["HOME"]))
+        return _simulated_restrictive_sandbox_backend([])(
+            argv, cwd=cwd, env=env, **kwargs
+        )
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=backend,
+    )
+    executor(
+        ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+    )
+
+    assert seen_homes
+    assert all(path.parent == tmp_path.resolve() for path in seen_homes)
+    assert all(path.name.startswith(".ones-sandbox-") for path in seen_homes)
+    assert not (tmp_path / ".ones-sandbox").exists()
+
+
+def test_sandbox_executor_consumes_injected_command_atomically_across_calls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _attested_sandbox_command(tmp_path)
+    original_close = CodexCommand.close
+    closes = 0
+
+    def close(item: CodexCommand) -> None:
+        nonlocal closes
+        closes += 1
+        original_close(item)
+
+    monkeypatch.setattr(CodexCommand, "close", close)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=_simulated_restrictive_sandbox_backend([]),
+    )
+
+    def run() -> object:
+        try:
+            return executor(
+                ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1,
+                max_output_bytes=1024,
+            )
+        except BaseException as error:
+            return error
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(lambda _: run(), range(2)))
+
+    assert len([item for item in outcomes if isinstance(
+        item, subprocess.CompletedProcess
+    )]) == 1
+    assert len([item for item in outcomes if isinstance(item, Exception)]) == 1
+    assert closes == 1
 
 
 def test_sandbox_executor_rejects_an_empty_attested_prefix_before_backend(
@@ -1290,6 +1407,195 @@ def test_sandbox_never_cleans_a_probe_path_it_did_not_create(
         foreign.rmdir()
 
 
+def test_sandbox_rejects_preexisting_reparse_temp_without_deleting_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    probe_id = "preexisting-reparse"
+    target = tmp_path / "foreign-target"
+    target.mkdir()
+    marker = target / "keep.txt"
+    marker.write_text("keep", encoding="utf-8")
+    candidate = tmp_path / f".ones-sandbox-{probe_id}"
+    try:
+        candidate.symlink_to(target, target_is_directory=True)
+    except OSError:
+        pytest.skip("directory symlinks require local Windows developer privileges")
+    command = _attested_sandbox_command(tmp_path)
+    monkeypatch.setattr(
+        requirement_module.uuid,
+        "uuid4",
+        lambda: type("FixedUuid", (), {"hex": probe_id})(),
+    )
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    try:
+        with pytest.raises(Exception, match="prepared"):
+            executor(
+                ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1,
+                max_output_bytes=1024,
+            )
+        assert candidate.is_symlink()
+        assert marker.read_text("utf-8") == "keep"
+        assert command._is_attested()
+    finally:
+        command.close()
+        candidate.unlink(missing_ok=True)
+
+
+def test_sandbox_temp_identity_swap_fails_closed_without_deleting_replacement(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    foreign_marker = "foreign-temp-owner"
+    swapped = False
+    restrictive = _simulated_restrictive_sandbox_backend([])
+
+    def backend(
+        argv: list[str], *, cwd: Path, env: dict[str, str], **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal swapped
+        completed = restrictive(argv, cwd=cwd, env=env, **kwargs)
+        child = argv[argv.index("--") + 1 :]
+        if not swapped and any("inside-write.txt" in item for item in child):
+            root = Path(env["HOME"])
+            requirement_module.shutil.rmtree(root)
+            root.mkdir()
+            (root / "foreign.txt").write_text(foreign_marker, encoding="utf-8")
+            swapped = True
+        return completed
+
+    command = _attested_sandbox_command(tmp_path)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed", codex_command=command, backend_executor=backend
+    )
+
+    with pytest.raises(Exception, match="identity|changed|unsafe"):
+        executor(
+            ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+        )
+
+    replacements = list(tmp_path.glob(".ones-sandbox-*"))
+    try:
+        assert len(replacements) == 1
+        assert (replacements[0] / "foreign.txt").read_text("utf-8") == foreign_marker
+    finally:
+        for replacement in replacements:
+            requirement_module.shutil.rmtree(replacement)
+
+
+def test_sandbox_cwd_identity_swap_fails_before_next_backend_and_preserves_replacement(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    worktree = tmp_path / "physical-worktree"
+    moved = tmp_path / "moved-owned-worktree"
+    worktree.mkdir()
+    backend_calls = 0
+    restrictive = _simulated_restrictive_sandbox_backend([])
+
+    def backend(
+        argv: list[str], *, cwd: Path, env: dict[str, str], **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        nonlocal backend_calls
+        backend_calls += 1
+        completed = restrictive(argv, cwd=cwd, env=env, **kwargs)
+        if backend_calls == 1:
+            worktree.rename(moved)
+            worktree.mkdir()
+            (worktree / "foreign.txt").write_text("keep", encoding="utf-8")
+        return completed
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=backend,
+    )
+
+    try:
+        with pytest.raises(Exception, match="identity|changed|unsafe|capability"):
+            executor(
+                ["tool"], cwd=worktree, env={}, timeout=1, max_output_bytes=1024
+            )
+        assert backend_calls == 1
+        replacement_marker = worktree / "foreign.txt"
+        if replacement_marker.exists():
+            assert replacement_marker.read_text("utf-8") == "keep"
+        else:
+            assert not moved.exists()
+            assert worktree.is_dir()
+    finally:
+        if moved.exists():
+            requirement_module.shutil.rmtree(moved)
+
+
+def test_sandbox_directory_nofollow_lease_detects_path_replacement_without_deleting_it(
+    tmp_path: Path,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    owned = tmp_path / "leased"
+    moved = tmp_path / "leased-original"
+    owned.mkdir()
+    lease = requirement_module._open_sandbox_directory_nofollow(
+        owned, require_owner=True
+    )
+    owned.rename(moved)
+    owned.mkdir()
+    marker = owned / "foreign.txt"
+    marker.write_text("keep", encoding="utf-8")
+
+    try:
+        with pytest.raises(OSError, match="identity|unsafe"):
+            lease.validate_path()
+        assert marker.read_text("utf-8") == "keep"
+    finally:
+        lease.close()
+        requirement_module.shutil.rmtree(moved)
+
+
+def test_sandbox_executor_binds_cwd_ancestors_and_owned_temps_to_nofollow_leases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    opened: list[tuple[Path, bool]] = []
+    original_open = requirement_module._open_sandbox_directory_nofollow
+
+    def open_lease(
+        path: Path, *, require_owner: bool = False,
+    ) -> object:
+        opened.append((path, require_owner))
+        return original_open(path, require_owner=require_owner)
+
+    monkeypatch.setattr(
+        requirement_module, "_open_sandbox_directory_nofollow", open_lease
+    )
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=_simulated_restrictive_sandbox_backend([]),
+    )
+
+    executor(
+        ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+    )
+
+    assert (tmp_path.resolve(), False) in opened
+    assert len([path for path, owner in opened if owner and path.name.startswith(
+        ".ones-sandbox-"
+    )]) == 2
+
+
 def test_sandbox_state_provider_must_prove_policy_and_never_leaks_on_error(
     tmp_path: Path,
 ) -> None:
@@ -1335,7 +1641,10 @@ def test_sandbox_state_provider_rejects_secret_bearing_payload_keys(
             network_disabled=True,
         )
 
-    executor = SandboxCommandExecutor(sandbox_state_provider=provider)
+    executor = SandboxCommandExecutor(
+        sandbox_state_provider=provider,
+        codex_command=_attested_sandbox_command(tmp_path),
+    )
 
     with pytest.raises(Exception, match="does not prove") as caught:
         executor(
@@ -1347,6 +1656,148 @@ def test_sandbox_state_provider_rejects_secret_bearing_payload_keys(
         )
 
     assert "must-not-appear" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        MemoryError(),
+        asyncio.CancelledError(),
+        KeyboardInterrupt(),
+        SystemExit(),
+        GeneratorExit(),
+    ],
+)
+def test_sandbox_state_provider_priority_failure_still_cleans_and_closes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    command = _attested_sandbox_command(tmp_path)
+    original_close = CodexCommand.close
+    original_rmtree = requirement_module.shutil.rmtree
+    events: list[str] = []
+
+    def provider(cwd: Path) -> SandboxStatePolicy:
+        raise failure
+
+    def cleanup(path: Path) -> None:
+        events.append(f"cleanup:{path.name}")
+        original_rmtree(path)
+
+    def close(item: CodexCommand) -> None:
+        events.append("close")
+        original_close(item)
+
+    monkeypatch.setattr(requirement_module.shutil, "rmtree", cleanup)
+    monkeypatch.setattr(CodexCommand, "close", close)
+    executor = SandboxCommandExecutor(
+        sandbox_state_provider=provider,
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    with pytest.raises(BaseException) as caught:
+        executor(
+            ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+        )
+
+    assert caught.value is failure
+    assert len([event for event in events if event.startswith("cleanup:")]) == 2
+    assert events[-1] == "close"
+
+
+def test_sandbox_state_serialization_failure_is_sanitized_after_all_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    secret = "provider-state-secret-canary"
+    command = _attested_sandbox_command(tmp_path)
+    original_close = CodexCommand.close
+
+    def provider(cwd: Path) -> SandboxStatePolicy:
+        return SandboxStatePolicy(
+            payload={"permissionProfile": secret},
+            working_directory=cwd,
+            writable_roots=(cwd,),
+            network_disabled=True,
+        )
+
+    monkeypatch.setattr(
+        requirement_module.json,
+        "dumps",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError(secret)),
+    )
+    executor = SandboxCommandExecutor(
+        sandbox_state_provider=provider,
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    with pytest.raises(Exception, match="sandbox state") as caught:
+        executor(
+            ["tool", secret],
+            cwd=tmp_path.resolve(),
+            env={"ONES_TOKEN": secret},
+            timeout=1,
+            max_output_bytes=1024,
+        )
+
+    assert not command._is_attested()
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    trace = caught.value.__traceback__
+    while trace is not None:
+        if Path(trace.tb_frame.f_code.co_filename).name == "requirement_flow.py":
+            assert secret not in repr(trace.tb_frame.f_locals)
+        trace = trace.tb_next
+    if command._is_attested():
+        original_close(command)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [MemoryError(), asyncio.CancelledError(), KeyboardInterrupt(), SystemExit(), GeneratorExit()],
+)
+def test_sandbox_state_serialization_priority_failure_is_preserved_after_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+
+    command = _attested_sandbox_command(tmp_path)
+
+    def provider(cwd: Path) -> SandboxStatePolicy:
+        return SandboxStatePolicy(
+            payload={"permissionProfile": "managed"},
+            working_directory=cwd,
+            writable_roots=(cwd,),
+            network_disabled=True,
+        )
+
+    monkeypatch.setattr(
+        requirement_module.json,
+        "dumps",
+        lambda *args, **kwargs: (_ for _ in ()).throw(failure),
+    )
+    executor = SandboxCommandExecutor(
+        sandbox_state_provider=provider,
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    with pytest.raises(BaseException) as caught:
+        executor(
+            ["tool"], cwd=tmp_path.resolve(), env={}, timeout=1, max_output_bytes=1024
+        )
+
+    assert caught.value is failure
+    assert not command._is_attested()
 
 
 def test_sandbox_capability_probe_rejects_a_profile_that_can_write_outside(
