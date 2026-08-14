@@ -341,6 +341,96 @@ def test_default_roots_protect_nearest_repository_root_from_subdirectory(
     assert adapter.closed == [71]
 
 
+def test_default_roots_protect_outer_repository_beyond_nested_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer_repository = (tmp_path / "outer-repository").resolve()
+    inner_repository = outer_repository / "nested-repository"
+    cwd = inner_repository / "work"
+    root = outer_repository / "sibling-install"
+    cwd.mkdir(parents=True)
+    root.mkdir()
+    (outer_repository / ".git").mkdir()
+    (inner_repository / ".git").write_text(
+        "gitdir: ../metadata/nested", encoding="utf-8"
+    )
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(root)
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$"):
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert inner_repository in adapter.marker_calls
+    assert outer_repository in adapter.marker_calls
+    assert adapter.closed == [71]
+
+
+def test_default_roots_collect_every_repository_marker_on_physical_parent_chain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer_repository = (tmp_path / "outer-collection-repository").resolve()
+    inner_repository = outer_repository / "nested-collection-repository"
+    cwd = inner_repository / "work"
+    cwd.mkdir(parents=True)
+    (outer_repository / ".git").mkdir()
+    (inner_repository / ".git").mkdir()
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(tmp_path / "external-install")
+
+    roots = codex_runtime_module._current_repository_roots(adapter)
+
+    assert inner_repository in roots
+    assert outer_repository in roots
+    assert inner_repository in adapter.marker_calls
+    assert outer_repository in adapter.marker_calls
+
+
+def test_outer_repository_marker_permission_error_after_inner_marker_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer_repository = (tmp_path / "outer-permission-repository").resolve()
+    inner_repository = outer_repository / "nested-permission-repository"
+    cwd = inner_repository / "work"
+    root = (tmp_path / "external-install").resolve()
+    cwd.mkdir(parents=True)
+    root.mkdir()
+    (outer_repository / ".git").mkdir()
+    (inner_repository / ".git").mkdir()
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(root)
+    adapter.marker_errors[outer_repository] = PermissionError(
+        "outer-marker-permission-canary"
+    )
+
+    with pytest.raises(OSError, match="^native Codex payload is unavailable$") as caught:
+        discover_locked_native_codex(
+            which=lambda name: str(root / "codex.cmd"),
+            _adapter=adapter,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert outer_repository in adapter.marker_calls
+    assert adapter.closed == [71]
+
+
+def test_no_repository_marker_protects_only_physical_cwd_not_volume_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cwd = (tmp_path / "markerless" / "nested").resolve()
+    cwd.mkdir(parents=True)
+    monkeypatch.chdir(cwd)
+    adapter = FakeRuntimeAdapter(tmp_path / "external-install")
+
+    roots = codex_runtime_module._current_repository_roots(adapter)
+
+    assert cwd in roots
+    assert Path(cwd.anchor) not in roots
+
+
 @pytest.mark.parametrize("marker_error", [
     PermissionError("marker-permission-canary"),
     OSError("marker-replacement-canary"),

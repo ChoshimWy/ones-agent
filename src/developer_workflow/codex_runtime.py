@@ -98,7 +98,7 @@ def _final_path_has_fixed_layout(
     return adapter.same_file(final_root, locator_root)
 
 
-def _nearest_current_repository_root(adapter: _RuntimeAdapter) -> Path:
+def _current_repository_chain_roots(adapter: _RuntimeAdapter) -> tuple[Path, ...]:
     lexical_cwd = Path.cwd()
     physical_cwd = adapter.resolve_repository_path(lexical_cwd)
     if not adapter.same_file(lexical_cwd, physical_cwd):
@@ -112,7 +112,7 @@ def _nearest_current_repository_root(adapter: _RuntimeAdapter) -> Path:
         ]
     ] = []
     current = physical_cwd
-    repository_root: Path | None = None
+    repository_roots: list[Path] = []
     while True:
         path_identity = adapter.repository_path_identity(current)
         marker = adapter.repository_marker(current)
@@ -121,8 +121,7 @@ def _nearest_current_repository_root(adapter: _RuntimeAdapter) -> Path:
             marker_kind, _ = marker
             if marker_kind not in {"directory", "file"}:
                 raise OSError("invalid repository marker")
-            repository_root = current
-            break
+            repository_roots.append(current)
         if current.parent == current:
             break
         current = current.parent
@@ -136,7 +135,7 @@ def _nearest_current_repository_root(adapter: _RuntimeAdapter) -> Path:
             or adapter.repository_marker(path) != initial_marker
         ):
             raise OSError("unstable repository parent identity")
-    return repository_root if repository_root is not None else physical_cwd
+    return tuple(repository_roots) if repository_roots else (physical_cwd,)
 
 
 def _current_repository_roots(adapter: _RuntimeAdapter) -> tuple[Path, ...]:
@@ -144,7 +143,7 @@ def _current_repository_roots(adapter: _RuntimeAdapter) -> tuple[Path, ...]:
     candidates = [worktree]
     if worktree.parent.name.casefold() == ".worktrees":
         candidates.append(worktree.parent.parent.resolve(strict=True))
-    candidates.append(_nearest_current_repository_root(adapter))
+    candidates.extend(_current_repository_chain_roots(adapter))
     roots: list[Path] = []
     for candidate in candidates:
         if not adapter.same_file(candidate, candidate):
