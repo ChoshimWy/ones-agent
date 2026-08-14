@@ -7,9 +7,16 @@ import re
 from enum import Enum
 from pathlib import Path
 from string import Formatter
-from typing import Any
+from typing import Any, Mapping
 
-from pydantic import ConfigDict, Field, StrictInt, field_validator, model_validator
+from pydantic import (
+    ConfigDict,
+    Field,
+    StrictInt,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .contracts import (
     RepositoryGroupMapping,
@@ -44,6 +51,56 @@ class SandboxPermissionProfileSource(str, Enum):
 
 
 BUILTIN_WORKSPACE_PROFILE = "ones-dev-workspace"
+
+
+def _sanitized_validation_error(
+    model: type[WorkflowModel], error: ValidationError
+) -> ValidationError:
+    known_fields = set(model.model_fields)
+    safe_errors = [
+        {
+            "type": "value_error",
+            "loc": (
+                (item["loc"][0],)
+                if item["loc"]
+                and isinstance(item["loc"][0], str)
+                and item["loc"][0] in known_fields
+                else ("<redacted>",)
+            ),
+            "input": "<redacted>",
+            "ctx": {"error": ValueError("input is invalid")},
+        }
+        for item in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )
+    ]
+    return ValidationError.from_exception_data(model.__name__, safe_errors)
+
+
+def _is_profile_source_validation_error(error: ValidationError) -> bool:
+    return any(
+        item["loc"]
+        and item["loc"][0] == "sandbox_permission_profile_source"
+        or str(item.get("ctx", {}).get("error"))
+        == "sandbox permission profile source is invalid"
+        for item in error.errors(include_url=False)
+    )
+
+
+def _profile_source_validation_error(model: type[WorkflowModel]) -> ValidationError:
+    return ValidationError.from_exception_data(
+        model.__name__,
+        [
+            {
+                "type": "value_error",
+                "loc": ("sandbox_permission_profile_source",),
+                "input": "<redacted>",
+                "ctx": {"error": ValueError("input is invalid")},
+            }
+        ],
+    )
 
 
 class PublishingConfig(WorkflowModel):
@@ -107,6 +164,49 @@ class DeveloperWorkflowConfig(WorkflowModel):
     repository_groups: tuple[RepositoryGroupMapping, ...] = Field(default_factory=tuple)
     publishing: PublishingConfig
 
+    def __init__(self, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as error:
+            if _is_profile_source_validation_error(error):
+                raise _sanitized_validation_error(type(self), error) from None
+            raise
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {
+            "sandbox_permission_profile",
+            "sandbox_permission_profile_source",
+        }:
+            profile = (
+                value
+                if name == "sandbox_permission_profile"
+                else self.sandbox_permission_profile
+            )
+            source = (
+                value
+                if name == "sandbox_permission_profile_source"
+                else self.sandbox_permission_profile_source
+            )
+            try:
+                self.validate_sandbox_permission_profile_binding(profile, source)
+            except ValueError:
+                raise _profile_source_validation_error(type(self)) from None
+        try:
+            super().__setattr__(name, value)
+        except ValidationError as error:
+            if _is_profile_source_validation_error(error):
+                raise _sanitized_validation_error(type(self), error) from None
+            raise
+
+    @classmethod
+    def model_validate(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return super().model_validate(obj, *args, **kwargs)
+        except ValidationError as error:
+            if _is_profile_source_validation_error(error):
+                raise _sanitized_validation_error(cls, error) from None
+            raise
+
     @field_validator("sandbox_permission_profile")
     @classmethod
     def validate_sandbox_permission_profile(cls, value: str) -> str:
@@ -118,16 +218,33 @@ class DeveloperWorkflowConfig(WorkflowModel):
 
     @classmethod
     def validate_sandbox_permission_profile_binding(
-        cls, profile: str, source: SandboxPermissionProfileSource
+        cls,
+        profile: str | None,
+        source: SandboxPermissionProfileSource | str,
     ) -> None:
-        if (
-            profile == BUILTIN_WORKSPACE_PROFILE
-            and source is not SandboxPermissionProfileSource.BUILTIN_WORKSPACE
-        ) or (
-            profile != BUILTIN_WORKSPACE_PROFILE
-            and source is not SandboxPermissionProfileSource.MANAGED
-        ):
+        if profile == BUILTIN_WORKSPACE_PROFILE:
+            valid = source == SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        elif profile is None:
+            valid = source == SandboxPermissionProfileSource.MANAGED
+        else:
+            valid = source == SandboxPermissionProfileSource.MANAGED
+        if not valid:
             raise ValueError("sandbox permission profile source is invalid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_sandbox_permission_profile_binding_before(
+        cls, data: Any
+    ) -> Any:
+        if isinstance(data, Mapping):
+            cls.validate_sandbox_permission_profile_binding(
+                data.get("sandbox_permission_profile"),
+                data.get(
+                    "sandbox_permission_profile_source",
+                    SandboxPermissionProfileSource.MANAGED,
+                ),
+            )
+        return data
 
     @model_validator(mode="after")
     def validate_unique_repositories(self) -> DeveloperWorkflowConfig:

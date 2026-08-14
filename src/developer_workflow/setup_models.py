@@ -26,6 +26,7 @@ from .config import (
     DeveloperWorkflowConfig,
     PublishingConfig,
     SandboxPermissionProfileSource,
+    _profile_source_validation_error,
 )
 from .contracts import RepositoryGroupMapping, RepositoryMapping, WorkflowModel
 
@@ -368,6 +369,30 @@ class WorkflowDraft(SetupModel):
     repository_groups: tuple[RepositoryGroupMapping, ...] = Field(default_factory=tuple)
     publishing: PublishingConfig | None = None
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {
+            "sandbox_permission_profile",
+            "sandbox_permission_profile_source",
+        }:
+            profile = (
+                value
+                if name == "sandbox_permission_profile"
+                else self.sandbox_permission_profile
+            )
+            source = (
+                value
+                if name == "sandbox_permission_profile_source"
+                else self.sandbox_permission_profile_source
+            )
+            try:
+                DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+                    profile,
+                    source,
+                )
+            except ValueError:
+                raise _profile_source_validation_error(type(self)) from None
+        super().__setattr__(name, value)
+
     @field_validator("run_root", "mirror_root", "worktree_root")
     @classmethod
     def validate_absolute_paths(cls, value: Path | None, info: Any) -> Path | None:
@@ -380,13 +405,25 @@ class WorkflowDraft(SetupModel):
             return None
         return DeveloperWorkflowConfig.validate_sandbox_permission_profile(value)
 
+    @model_validator(mode="before")
+    @classmethod
+    def validate_sandbox_permission_profile_binding_before(cls, data: Any) -> Any:
+        if isinstance(data, Mapping):
+            DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+                data.get("sandbox_permission_profile"),
+                data.get(
+                    "sandbox_permission_profile_source",
+                    SandboxPermissionProfileSource.MANAGED,
+                ),
+            )
+        return data
+
     @model_validator(mode="after")
     def validate_sandbox_permission_profile_binding(self) -> WorkflowDraft:
-        if self.sandbox_permission_profile is not None:
-            DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
-                self.sandbox_permission_profile,
-                self.sandbox_permission_profile_source,
-            )
+        DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+            self.sandbox_permission_profile,
+            self.sandbox_permission_profile_source,
+        )
         return self
 
 

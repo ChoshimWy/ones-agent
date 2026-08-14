@@ -317,6 +317,30 @@ def test_workflow_draft_rejects_confused_profile_source_bindings(
         )
 
 
+def test_workflow_draft_rejects_builtin_source_without_a_builtin_profile() -> None:
+    with pytest.raises(ValidationError):
+        WorkflowDraft(sandbox_permission_profile_source="builtin_workspace")
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("sandbox_permission_profile", "ones-dev-workspace"),
+        ("sandbox_permission_profile_source", "builtin_workspace"),
+    ],
+)
+def test_workflow_draft_profile_source_assignment_is_atomic(
+    field_name: str, value: str
+) -> None:
+    draft = WorkflowDraft(sandbox_permission_profile="managed-dev")
+    before = draft.model_dump(mode="json")
+
+    with pytest.raises(ValidationError):
+        setattr(draft, field_name, value)
+
+    assert draft.model_dump(mode="json") == before
+
+
 def test_extra_field_name_is_redacted_from_validation_location() -> None:
     with pytest.raises(ValidationError) as captured:
         SetupDocument.model_validate(

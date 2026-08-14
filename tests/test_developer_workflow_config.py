@@ -355,6 +355,51 @@ def test_sandbox_permission_profile_source_rejects_confused_bindings_without_ech
     assert forbidden_input not in str(captured.value)
 
 
+@pytest.mark.parametrize(
+    ("profile", "source", "canaries"),
+    [
+        ("profile-canary", "builtin_workspace", ("profile-canary",)),
+        ("managed-dev", "source-canary", ("source-canary",)),
+    ],
+)
+def test_sandbox_permission_profile_source_rejections_redact_structured_errors(
+    tmp_path: Path, profile: str, source: str, canaries: tuple[str, ...]
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        DeveloperWorkflowConfig.load(
+            _write_config(
+                tmp_path / "ones-dev.json",
+                sandbox_permission_profile=profile,
+                sandbox_permission_profile_source=source,
+            )
+        )
+
+    error = captured.value
+    public_forms = (str(error), repr(error), repr(error.errors()))
+    chained_forms = (repr(error.__cause__), repr(error.__context__))
+    assert all(canary not in form for canary in canaries for form in public_forms)
+    assert all(canary not in form for canary in canaries for form in chained_forms)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("sandbox_permission_profile", "ones-dev-workspace"),
+        ("sandbox_permission_profile_source", "builtin_workspace"),
+    ],
+)
+def test_profile_source_assignment_is_atomic(
+    tmp_path: Path, field_name: str, value: str
+) -> None:
+    config = DeveloperWorkflowConfig.load(_write_config(tmp_path / "ones-dev.json"))
+    before = config.model_dump(mode="json")
+
+    with pytest.raises(ValidationError):
+        setattr(config, field_name, value)
+
+    assert config.model_dump(mode="json") == before
+
+
 def test_config_root_forbids_extra_fields(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="extra_forbidden"):
         DeveloperWorkflowConfig.load(
