@@ -51,6 +51,9 @@ class SandboxPermissionProfileSource(str, Enum):
 
 
 BUILTIN_WORKSPACE_PROFILE = "ones-dev-workspace"
+BUILTIN_WORKSPACE_OVERRIDE = (
+    'permissions.ones-dev-workspace.extends=":workspace"'
+)
 
 
 def _is_profile_source_validation_error(error: ValidationError) -> bool:
@@ -460,6 +463,7 @@ __all__ = [
     "ConfigValidationError",
     "DeveloperWorkflowConfig",
     "BUILTIN_WORKSPACE_PROFILE",
+    "BUILTIN_WORKSPACE_OVERRIDE",
     "PublishingConfig",
     "PublishingProvider",
     "RepositoryMappingNotFound",

@@ -13,8 +13,16 @@ from pathlib import Path
 import pytest
 
 from src.contracts import ProjectRef, RequirementRecord, StatusRef, WikiPageRef, WikiPageSnapshot
-from src.developer_workflow.config import DeveloperWorkflowConfig, PublishingConfig, PublishingProvider
-from src.developer_workflow.codex_runner import CodexRunner
+from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_OVERRIDE,
+    BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
+    PublishingConfig,
+    PublishingProvider,
+    SandboxPermissionProfileSource,
+)
+from src.developer_workflow.codex_runner import CodexCommand, CodexRunner
+from src.developer_workflow.codex_runtime import CodexRuntimePreparer, NativeCodexIdentity
 from src.developer_workflow.command_utils import parse_command_argv
 from src.developer_workflow.contracts import (
     AcceptanceCoverage,
@@ -48,6 +56,83 @@ from src.developer_workflow.state_store import FileRunStore
 NOW = datetime(2026, 8, 10, tzinfo=UTC)
 OID = "a" * 40
 DIFF = "b" * 64
+
+
+class _TinyLockedCodex:
+    def __init__(self) -> None:
+        self.payload = b"task-three-private-codex"
+        self.offset = 0
+        self.identity = NativeCodexIdentity(1, 2, len(self.payload), 3)
+        self.size = len(self.payload)
+
+    def rewind(self) -> None:
+        self.offset = 0
+
+    def read_chunk(self, size: int) -> bytes:
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def current_identity(self) -> NativeCodexIdentity:
+        return self.identity
+
+    def close(self) -> None:
+        return None
+
+
+class _TinyPrivateCache:
+    def prepare_private_directory(self, path: Path) -> Path:
+        path.mkdir(exist_ok=True)
+        return path.resolve(strict=True)
+
+    def validate_private_directory(self, path: Path) -> None:
+        if not path.is_dir():
+            raise OSError("unsafe")
+
+    def validate_cache_ancestor_chain(self, root: Path) -> None:
+        return None
+
+    def protect_private_file(self, path: Path) -> None:
+        return None
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]:
+        metadata = path.stat()
+        return metadata.st_dev, metadata.st_ino
+
+    def read_private_text(self, path: Path) -> str:
+        return path.read_text("utf-8")
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]:
+        metadata = path.stat()
+        return (
+            NativeCodexIdentity(
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+            "OpenAI OpCo, LLC",
+        )
+
+    def fsync_directory(self, path: Path) -> None:
+        return None
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None:
+        return None
+
+
+def _attested_sandbox_command(root: Path) -> CodexCommand:
+    runtime = CodexRuntimePreparer(
+        cache_root=(root / "private-runtime" / "codex-runtime").resolve(),
+        discover=_TinyLockedCodex,
+        _cache_adapter=_TinyPrivateCache(),  # type: ignore[arg-type]
+        chunk_size=4,
+    ).prepare_verified()
+    return CodexCommand._from_runtime(runtime)
 
 
 def _mapping(tmp_path: Path) -> RepositoryMapping:
@@ -654,6 +739,7 @@ def test_subprocess_test_runner_uses_structured_argv_safe_env_and_real_result(
     ] = []
     executor = SandboxCommandExecutor(
         permission_profile="ones-worktree-tests",
+        codex_command=_attested_sandbox_command(tmp_path),
         backend_executor=_simulated_restrictive_sandbox_backend(calls),
     )
 
@@ -697,7 +783,9 @@ def test_structured_pytest_selector_classifies_only_associated_exit_one_as_test_
 
     runner = SubprocessConfiguredTestRunner(
         command_executor=SandboxCommandExecutor(
-            permission_profile="ones-worktree-tests", backend_executor=backend
+            permission_profile="ones-worktree-tests",
+            codex_command=_attested_sandbox_command(tmp_path),
+            backend_executor=backend,
         )
     )
     result = runner.run_argv(
@@ -747,8 +835,12 @@ def test_sandbox_executor_wraps_command_with_explicit_policy_and_empty_home(
             )
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
+    codex_command = _attested_sandbox_command(tmp_path)
+    private_prefix = list(codex_command.prefix)
     sandbox = SandboxCommandExecutor(
-        permission_profile="ones-worktree-tests", backend_executor=backend
+        permission_profile="ones-worktree-tests",
+        codex_command=codex_command,
+        backend_executor=backend,
     )
     runner = SubprocessConfiguredTestRunner(command_executor=sandbox)
 
@@ -756,8 +848,12 @@ def test_sandbox_executor_wraps_command_with_explicit_policy_and_empty_home(
 
     command, cwd, env, stdin = calls[-1]
     assert command[:4] == [
-        "codex", "sandbox", "--permission-profile", "ones-worktree-tests"
+        private_prefix[0],
+        "sandbox",
+        "--permission-profile",
+        "ones-worktree-tests",
     ]
+    assert BUILTIN_WORKSPACE_OVERRIDE not in command
     assert command[command.index("-C") + 1] == str(tmp_path.resolve())
     assert "--sandbox-state-disable-network" in command
     assert command[-3:] == ["--", "pytest", "-q"]
@@ -771,6 +867,181 @@ def test_sandbox_executor_wraps_command_with_explicit_policy_and_empty_home(
     assert "ONES_TOKEN" not in env
     assert stdin is None
     assert result.exit_code == 0
+
+
+def test_builtin_workspace_profile_injects_only_the_fixed_override(
+    tmp_path: Path,
+) -> None:
+    calls: list[tuple[list[str], Path, dict[str, str], float, int, bytes | None]] = []
+    command = _attested_sandbox_command(tmp_path)
+    private_prefix = list(command.prefix)
+    executor = SandboxCommandExecutor(
+        permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        permission_profile_source=SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        codex_command=command,
+        backend_executor=_simulated_restrictive_sandbox_backend(calls),
+    )
+
+    completed = executor(
+        ["pytest", "-q"],
+        cwd=tmp_path.resolve(),
+        env=dict(os.environ),
+        timeout=10,
+        max_output_bytes=64 * 1024,
+    )
+
+    assert completed.returncode == 0
+    assert calls[-1][0] == [
+        *private_prefix,
+        "-c",
+        BUILTIN_WORKSPACE_OVERRIDE,
+        "sandbox",
+        "--permission-profile",
+        BUILTIN_WORKSPACE_PROFILE,
+        "--include-managed-config",
+        "-C",
+        str(tmp_path.resolve()),
+        "--sandbox-state-disable-network",
+        "--",
+        "pytest",
+        "-q",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.MANAGED),
+        ("managed", SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        (None, SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        ("managed", None),
+        ("managed", "unknown"),
+    ],
+)
+def test_sandbox_executor_rejects_profile_source_mismatches(
+    tmp_path: Path,
+    profile: str | None,
+    source: SandboxPermissionProfileSource | str | None,
+) -> None:
+    command = _attested_sandbox_command(tmp_path)
+    try:
+        with pytest.raises(ValueError, match="source"):
+            SandboxCommandExecutor(
+                permission_profile=profile,
+                permission_profile_source=source,  # type: ignore[arg-type]
+                codex_command=command,
+            )
+    finally:
+        command.close()
+
+
+def test_sandbox_executor_rejects_an_empty_attested_prefix_before_backend(
+    tmp_path: Path,
+) -> None:
+    command = _attested_sandbox_command(tmp_path)
+    object.__setattr__(command, "prefix", ())
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+
+    with pytest.raises((TypeError, ValueError), match="attestation|prefix"):
+        executor(
+            ["pytest", "-q"],
+            cwd=tmp_path.resolve(),
+            env={},
+            timeout=10,
+            max_output_bytes=1024,
+        )
+
+
+def test_sandbox_executor_closes_command_once_when_backend_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _attested_sandbox_command(tmp_path)
+    closes: list[CodexCommand] = []
+    original_close = CodexCommand.close
+
+    def close_once(item: CodexCommand) -> None:
+        closes.append(item)
+        original_close(item)
+
+    monkeypatch.setattr(CodexCommand, "close", close_once)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: (_ for _ in ()).throw(OSError("boom")),
+    )
+
+    with pytest.raises(Exception, match="capability probe failed"):
+        executor(
+            ["pytest", "-q"],
+            cwd=tmp_path.resolve(),
+            env={},
+            timeout=10,
+            max_output_bytes=1024,
+        )
+    assert closes == [command]
+
+
+def test_sandbox_executor_propagates_memory_failure_and_closes_command(
+    tmp_path: Path,
+) -> None:
+    command = _attested_sandbox_command(tmp_path)
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=lambda *args, **kwargs: (_ for _ in ()).throw(MemoryError()),
+    )
+
+    with pytest.raises(MemoryError):
+        executor(
+            ["pytest", "-q"],
+            cwd=tmp_path.resolve(),
+            env={},
+            timeout=10,
+            max_output_bytes=1024,
+        )
+    assert not command._is_attested()
+
+
+def test_builtin_workspace_override_is_the_single_fixed_config_constant() -> None:
+    assert BUILTIN_WORKSPACE_OVERRIDE == (
+        'permissions.ones-dev-workspace.extends=":workspace"'
+    )
+
+
+def test_sandbox_executor_fails_closed_when_runtime_preparation_fails(
+    tmp_path: Path,
+) -> None:
+    calls = 0
+
+    class FailingPreparer:
+        def prepare_verified(self) -> object:
+            raise OSError("private detail")
+
+    def backend(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_preparer=FailingPreparer(),  # type: ignore[arg-type]
+        backend_executor=backend,
+    )
+
+    with pytest.raises(Exception, match="Codex executable is unavailable") as caught:
+        executor(
+            ["pytest", "-q"],
+            cwd=tmp_path.resolve(),
+            env={},
+            timeout=10,
+            max_output_bytes=1024,
+        )
+    assert "private detail" not in str(caught.value)
+    assert calls == 0
 
 
 def test_sandbox_state_provider_must_prove_policy_and_never_leaks_on_error(
@@ -790,7 +1061,9 @@ def test_sandbox_state_provider_must_prove_policy_and_never_leaks_on_error(
         raise subprocess.TimeoutExpired([marker], 1)
 
     executor = SandboxCommandExecutor(
-        sandbox_state_provider=provider, backend_executor=backend
+        sandbox_state_provider=provider,
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=backend,
     )
 
     with pytest.raises(Exception, match="sandbox capability probe failed") as caught:
@@ -858,6 +1131,7 @@ def test_sandbox_capability_probe_rejects_a_profile_that_can_write_outside(
 
     executor = SandboxCommandExecutor(
         permission_profile="dangerously-wide-test-profile",
+        codex_command=_attested_sandbox_command(tmp_path),
         backend_executor=dangerously_wide_backend,
     )
     actual_marker = worktree / "actual-command-ran.txt"
@@ -993,7 +1267,9 @@ def test_subprocess_test_runner_rejects_invalid_timeout_before_execution(
 
     runner = SubprocessConfiguredTestRunner(
         command_executor=SandboxCommandExecutor(
-            permission_profile="ones-worktree-tests", backend_executor=executor
+            permission_profile="ones-worktree-tests",
+            codex_command=_attested_sandbox_command(tmp_path),
+            backend_executor=executor,
         ),
         timeout_seconds=timeout,  # type: ignore[arg-type]
     )

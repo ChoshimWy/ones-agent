@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Protocol, TextIO
 from urllib.parse import urlsplit
 
-from .config import DeveloperWorkflowConfig
+from .config import DeveloperWorkflowConfig, SandboxPermissionProfileSource
 from .contracts import DefectCandidate, WorkflowRun, WorkflowState
 from .orchestrator import DeveloperWorkflowOrchestrator
 
@@ -510,7 +510,10 @@ def _validate_sandbox_permission_profile(
 
     with tempfile.TemporaryDirectory(prefix="ones-dev-sandbox-preflight-") as raw:
         cwd = Path(raw).resolve(strict=True)
-        executor = SandboxCommandExecutor(permission_profile=profile)
+        executor = SandboxCommandExecutor(
+            permission_profile=profile,
+            permission_profile_source=SandboxPermissionProfileSource.MANAGED,
+        )
         completed = executor(
             sandbox_preflight_command(),
             cwd=cwd,

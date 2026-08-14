@@ -27,8 +27,20 @@ from src.contracts import RequirementRecord, WikiPageSnapshot
 
 from .approval import ApprovalValidationError, validate_for_approval
 from .command_utils import CommandArgvError, parse_command_argv
-from .codex_runner import CodexRunner, CommandExecutor, _bounded_subprocess
-from .config import DeveloperWorkflowConfig
+from .codex_runner import (
+    CodexCommand,
+    CodexRunner,
+    CommandExecutor,
+    _bounded_subprocess,
+    resolve_codex_command,
+)
+from .codex_runtime import CodexRuntimePreparer
+from .config import (
+    BUILTIN_WORKSPACE_OVERRIDE,
+    BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
+    SandboxPermissionProfileSource,
+)
 from .contracts import (
     ApprovalPackage,
     CodexResult,
@@ -287,22 +299,53 @@ class SandboxCommandExecutor:
     """Execute argv through the local Codex command sandbox, never a model call."""
 
     permission_profile: str | None = None
+    permission_profile_source: SandboxPermissionProfileSource = (
+        SandboxPermissionProfileSource.MANAGED
+    )
     sandbox_state_provider: SandboxStateProvider | None = None
     backend_executor: CommandExecutor = _bounded_subprocess
-    codex_binary: str = "codex"
+    codex_command: CodexCommand | None = field(default=None, repr=False)
+    codex_preparer: CodexRuntimePreparer | None = field(default=None, repr=False)
     sandbox_policy_verified: bool = field(default=True, init=False)
+    _codex_command_consumed: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        if (self.permission_profile is None) == (self.sandbox_state_provider is None):
-            raise ValueError(
-                "exactly one sandbox permission profile or state provider is required"
-            )
         if self.permission_profile is not None and re.fullmatch(
             r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", self.permission_profile
         ) is None:
             raise ValueError("sandbox permission profile is invalid")
-        if not self.codex_binary.strip() or "\x00" in self.codex_binary:
-            raise ValueError("sandbox executable is invalid")
+        if type(self.permission_profile_source) is not SandboxPermissionProfileSource:
+            raise ValueError("sandbox permission profile source is invalid")
+        try:
+            DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+                self.permission_profile,
+                self.permission_profile_source,
+            )
+        except ValueError:
+            raise ValueError("sandbox permission profile source is invalid") from None
+        if (self.permission_profile is None) == (self.sandbox_state_provider is None):
+            raise ValueError(
+                "exactly one sandbox permission profile or state provider is required"
+            )
+        if self.codex_command is not None and type(self.codex_command) is not CodexCommand:
+            raise ValueError("sandbox Codex command is invalid")
+        if self.codex_preparer is not None and not callable(
+            getattr(self.codex_preparer, "prepare_verified", None)
+        ):
+            raise ValueError("sandbox Codex preparer is invalid")
+        if self.codex_command is not None and self.codex_preparer is not None:
+            raise ValueError("sandbox Codex command source is ambiguous")
+        if self.codex_command is None and self.codex_preparer is None:
+            self.codex_preparer = CodexRuntimePreparer()
+
+    def _verified_codex_command(self) -> CodexCommand:
+        if self.codex_command is not None:
+            if self._codex_command_consumed:
+                raise RequirementFlowError("sandbox Codex command is unavailable")
+            self._codex_command_consumed = True
+            return self.codex_command
+        assert self.codex_preparer is not None
+        return resolve_codex_command(_prepare=self.codex_preparer.prepare_verified)
 
     def __call__(
         self,
@@ -351,9 +394,15 @@ class SandboxCommandExecutor:
                 "GCM_INTERACTIVE": "Never",
             }
         )
-        wrapped_prefix = [self.codex_binary, "sandbox"]
+        wrapped_arguments: list[str] = []
+        if (
+            self.permission_profile_source
+            is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ):
+            wrapped_arguments.extend(["-c", BUILTIN_WORKSPACE_OVERRIDE])
+        wrapped_arguments.append("sandbox")
         if self.permission_profile is not None:
-            wrapped_prefix.extend(
+            wrapped_arguments.extend(
                 [
                     "--permission-profile",
                     self.permission_profile,
@@ -385,11 +434,14 @@ class SandboxCommandExecutor:
                 raise RequirementFlowError("sandbox state is not serializable") from error
             if len(state_json.encode("utf-8", "strict")) > 1024 * 1024 or "\x00" in state_json:
                 raise RequirementFlowError("sandbox state exceeds its safe boundary")
-            wrapped_prefix.extend(["--sandbox-state-json", state_json])
+            wrapped_arguments.extend(["--sandbox-state-json", state_json])
+
+        wrapped_prefix: list[str] | None = None
 
         def invoke(
             child_command: list[str], *, probe: bool, input_bytes: bytes | None = None
         ) -> subprocess.CompletedProcess[str]:
+            assert wrapped_prefix is not None
             wrapped = [
                 *wrapped_prefix,
                 "--sandbox-state-disable-network",
@@ -407,6 +459,8 @@ class SandboxCommandExecutor:
                     else max_output_bytes,
                     stdin=input_bytes,
                 )
+            except MemoryError:
+                raise
             except Exception:
                 message = (
                     "sandbox capability probe failed"
@@ -446,7 +500,10 @@ class SandboxCommandExecutor:
                 except OSError:
                     pass
             raise RequirementFlowError("sandbox capability probe could not be prepared") from None
+        active_codex_command: CodexCommand | None = None
         try:
+            active_codex_command = self._verified_codex_command()
+            wrapped_prefix = active_codex_command.argv(*wrapped_arguments)
             protected_git_keys = {
                 "git_config_nosystem",
                 "git_config_global",
@@ -530,6 +587,8 @@ class SandboxCommandExecutor:
                 except OSError:
                     if isolation_parent.exists():
                         cleanup_failed = True
+            if active_codex_command is not None:
+                active_codex_command.close()
             if cleanup_failed:
                 raise RequirementFlowError("sandbox capability probe cleanup failed") from None
 

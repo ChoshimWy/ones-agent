@@ -25,6 +25,7 @@ from src.contracts import (
 )
 from src.developer_workflow import cli
 from src.developer_workflow.approval_rebuilder import WorkflowApprovalRebuilder
+from src.developer_workflow.codex_runtime import CodexRuntimePreparer, NativeCodexIdentity
 from src.developer_workflow.config import DeveloperWorkflowConfig
 from src.developer_workflow.contracts import (
     AcceptanceCoverage,
@@ -52,6 +53,82 @@ from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp, TuiTaskMessa
 from src.developer_workflow.tui.controller import TuiController
 from src.developer_workflow.tui.models import RunActivity
 from src.developer_workflow.tui.run_index import RunIndex
+
+
+class _TinyLockedCodex:
+    def __init__(self) -> None:
+        self.payload = b"task-three-private-codex"
+        self.offset = 0
+        self.identity = NativeCodexIdentity(1, 2, len(self.payload), 3)
+        self.size = len(self.payload)
+
+    def rewind(self) -> None:
+        self.offset = 0
+
+    def read_chunk(self, size: int) -> bytes:
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def current_identity(self) -> NativeCodexIdentity:
+        return self.identity
+
+    def close(self) -> None:
+        return None
+
+
+class _TinyPrivateCache:
+    def prepare_private_directory(self, path: Path) -> Path:
+        path.mkdir(exist_ok=True)
+        return path.resolve(strict=True)
+
+    def validate_private_directory(self, path: Path) -> None:
+        if not path.is_dir():
+            raise OSError("unsafe")
+
+    def validate_cache_ancestor_chain(self, root: Path) -> None:
+        return None
+
+    def protect_private_file(self, path: Path) -> None:
+        return None
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]:
+        metadata = path.stat()
+        return metadata.st_dev, metadata.st_ino
+
+    def read_private_text(self, path: Path) -> str:
+        return path.read_text("utf-8")
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]:
+        metadata = path.stat()
+        return (
+            NativeCodexIdentity(
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+            "OpenAI OpCo, LLC",
+        )
+
+    def fsync_directory(self, path: Path) -> None:
+        return None
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None:
+        return None
+
+
+def _tiny_codex_preparer(root: Path) -> CodexRuntimePreparer:
+    return CodexRuntimePreparer(
+        cache_root=(root / "private-runtime" / "codex-runtime").resolve(),
+        discover=_TinyLockedCodex,
+        _cache_adapter=_TinyPrivateCache(),  # type: ignore[arg-type]
+        chunk_size=4,
+    )
 
 
 def _config_file(tmp_path: Path) -> Path:
@@ -571,7 +648,7 @@ def _group_ui_runtime(tmp_path: Path):
             network_disabled=True,
         ),
         backend_executor=sandbox_backend,
-        codex_binary="codex",
+        codex_preparer=_tiny_codex_preparer(tmp_path),
     )
     store = FileRunStore(config.run_root)
     gateway = Gateway()

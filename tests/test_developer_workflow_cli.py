@@ -14,7 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.developer_workflow.config import DeveloperWorkflowConfig
+from src.developer_workflow.config import (
+    DeveloperWorkflowConfig,
+    SandboxPermissionProfileSource,
+)
 from src.developer_workflow.contracts import (
     ApprovalPackage,
     CommandResult,
@@ -41,6 +44,32 @@ class Terminal(io.StringIO):
 
     def isatty(self) -> bool:
         return self._tty
+
+
+def test_cli_sandbox_preflight_is_explicitly_managed_and_has_no_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.requirement_flow as requirement_module
+    from src.developer_workflow.cli import _validate_sandbox_permission_profile
+
+    constructed: list[dict[str, object]] = []
+
+    class Executor:
+        def __init__(self, **kwargs: object) -> None:
+            constructed.append(kwargs)
+
+        def __call__(self, command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(requirement_module, "SandboxCommandExecutor", Executor)
+    _validate_sandbox_permission_profile("managed", dict(os.environ))
+
+    assert constructed == [
+        {
+            "permission_profile": "managed",
+            "permission_profile_source": SandboxPermissionProfileSource.MANAGED,
+        }
+    ]
 
 
 def _mapping(key: str = "repo") -> RepositoryMapping:

@@ -27,9 +27,16 @@ from urllib.parse import urlsplit
 from pydantic import ConfigDict, Field, StrictStr, field_validator, model_validator
 
 from .codex_runner import (
+    CodexCommand,
     CodexProcessStartError,
     _bounded_subprocess,
+    resolve_codex_command,
     validate_codex_auth_source,
+)
+from .codex_runtime import CodexRuntimePreparer
+from .config import (
+    BUILTIN_WORKSPACE_PROFILE,
+    SandboxPermissionProfileSource,
 )
 from .contracts import WorkflowModel
 from .private_paths import (
@@ -254,8 +261,44 @@ class CodexAuthMetadata(Protocol):
 class SubprocessDoctorRunner:
     """Production doctor adapter with bounded process-tree cleanup."""
 
+    codex_preparer: CodexRuntimePreparer | None = field(default=None, repr=False)
+    command_provider: Callable[[], CodexCommand] | None = field(default=None, repr=False)
+    backend_runner: Callable[..., subprocess.CompletedProcess[str]] = field(
+        default_factory=lambda: _default_doctor_runner,
+        repr=False,
+    )
+
+    def __post_init__(self) -> None:
+        if self.codex_preparer is not None and self.command_provider is not None:
+            raise SetupValidationError("Codex doctor command source is ambiguous")
+        if self.command_provider is not None and not callable(self.command_provider):
+            raise SetupValidationError("Codex doctor command provider is invalid")
+        if self.codex_preparer is not None and not callable(
+            getattr(self.codex_preparer, "prepare_verified", None)
+        ):
+            raise SetupValidationError("Codex doctor preparer is invalid")
+        if not callable(self.backend_runner):
+            raise SetupValidationError("Codex doctor process runner is invalid")
+        if self.codex_preparer is None and self.command_provider is None:
+            object.__setattr__(self, "codex_preparer", CodexRuntimePreparer())
+
+    def _verified_command(self) -> CodexCommand:
+        if self.command_provider is not None:
+            command = self.command_provider()
+            if type(command) is not CodexCommand:
+                raise SetupValidationError("Codex doctor command is invalid")
+            return command
+        assert self.codex_preparer is not None
+        return resolve_codex_command(_prepare=self.codex_preparer.prepare_verified)
+
     def __call__(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
-        return _default_doctor_runner(argv, **kwargs)
+        if argv != ["doctor", "--json"] or kwargs.get("shell") is not False:
+            raise SetupValidationError("Codex doctor command is invalid")
+        command = self._verified_command()
+        try:
+            return self.backend_runner(command.argv("doctor", "--json"), **kwargs)
+        finally:
+            command.close()
 
 
 @dataclass(slots=True)
@@ -265,10 +308,42 @@ class ManagedSandboxExecutorFactory:
     backend_executor: Callable[..., subprocess.CompletedProcess[str]] = field(
         default_factory=lambda: _bounded_subprocess, repr=False
     )
+    codex_preparer: CodexRuntimePreparer | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.codex_preparer is None:
+            self.codex_preparer = CodexRuntimePreparer()
 
     def __call__(self, profile: str) -> SandboxCommandExecutor:
         return SandboxCommandExecutor(
-            permission_profile=profile, backend_executor=self.backend_executor
+            permission_profile=profile,
+            permission_profile_source=SandboxPermissionProfileSource.MANAGED,
+            codex_preparer=self.codex_preparer,
+            backend_executor=self.backend_executor,
+        )
+
+
+@dataclass(slots=True)
+class BuiltinWorkspaceSandboxExecutorFactory:
+    """Construct only the fixed runtime workspace profile sandbox."""
+
+    backend_executor: Callable[..., subprocess.CompletedProcess[str]] = field(
+        default_factory=lambda: _bounded_subprocess, repr=False
+    )
+    codex_preparer: CodexRuntimePreparer | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.codex_preparer is None:
+            self.codex_preparer = CodexRuntimePreparer()
+
+    def __call__(self, profile: str) -> SandboxCommandExecutor:
+        if profile != BUILTIN_WORKSPACE_PROFILE:
+            raise ValueError("sandbox permission profile source is invalid")
+        return SandboxCommandExecutor(
+            permission_profile=profile,
+            permission_profile_source=SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+            codex_preparer=self.codex_preparer,
+            backend_executor=self.backend_executor,
         )
 
 
@@ -544,15 +619,20 @@ class ManagedProfileCatalog:
     file_security: Callable[[Path, bool], bool] = _default_file_security
     timeout_seconds: float = 20.0
     max_output_bytes: int = 1024 * 1024
+    codex_runtime_preparer: CodexRuntimePreparer | None = field(
+        default=None, repr=False
+    )
     _construction_token: object | None = field(default=None, repr=False)
 
     @classmethod
     def production(cls, *, probe_parent: Path | None = None) -> ManagedProfileCatalog:
+        preparer = CodexRuntimePreparer()
         return cls(
-            codex_doctor=SubprocessDoctorRunner(),
+            codex_doctor=SubprocessDoctorRunner(codex_preparer=preparer),
             probe_worktree=probe_parent,
-            executor_factory=ManagedSandboxExecutorFactory(),
+            executor_factory=ManagedSandboxExecutorFactory(codex_preparer=preparer),
             file_security=_default_file_security,
+            codex_runtime_preparer=preparer,
             _construction_token=_PRODUCTION_CONSTRUCTION,
         )
 
@@ -606,10 +686,14 @@ class ManagedProfileCatalog:
                         )
                         if completed.returncode != 0:
                             raise RuntimeError
+                    except MemoryError:
+                        raise
                     except Exception:
                         continue
                     available.append(name)
         except SetupValidationError:
+            raise
+        except MemoryError:
             raise
         except Exception:
             raise SetupValidationError("managed profile capability root is unavailable") from None
@@ -627,7 +711,7 @@ class ManagedProfileCatalog:
     def _config_path_from_doctor(self, *, timeout_seconds: float) -> Path:
         try:
             completed = self.codex_doctor(
-                ["codex", "doctor", "--json"],
+                ["doctor", "--json"],
                 cwd=(self.probe_worktree or Path.cwd()).resolve(strict=True),
                 env=_clean_doctor_environment(),
                 timeout=timeout_seconds,
@@ -675,7 +759,10 @@ class ManagedProfileCatalog:
                 raise ValueError
             return config
         except BaseException as error:
-            if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+            if isinstance(
+                error,
+                (MemoryError, KeyboardInterrupt, SystemExit, asyncio.CancelledError),
+            ):
                 raise
             raise SetupValidationError("Codex profile discovery is unavailable") from None
 
@@ -1217,11 +1304,13 @@ class RuntimeBootstrapper:
 
     catalog: ManagedProfileCatalog
     validator: SetupValidator
+    codex_runtime_preparer: CodexRuntimePreparer
 
     def __init__(
         self,
         catalog: ManagedProfileCatalog,
         validator: SetupValidator,
+        codex_runtime_preparer: CodexRuntimePreparer,
         *,
         _construction_token: object,
     ) -> None:
@@ -1229,6 +1318,7 @@ class RuntimeBootstrapper:
             raise SetupValidationError("runtime bootstrap construction is private")
         object.__setattr__(self, "catalog", catalog)
         object.__setattr__(self, "validator", validator)
+        object.__setattr__(self, "codex_runtime_preparer", codex_runtime_preparer)
 
     @classmethod
     def production(
@@ -1244,11 +1334,18 @@ class RuntimeBootstrapper:
             ones_gateway=ones_gateway,
             provider_transport=provider_transport,
         )
-        return cls(catalog, validator, _construction_token=_PRODUCTION_CONSTRUCTION)
+        assert catalog.codex_runtime_preparer is not None
+        return cls(
+            catalog,
+            validator,
+            catalog.codex_runtime_preparer,
+            _construction_token=_PRODUCTION_CONSTRUCTION,
+        )
 
 
 __all__ = [
     "CodexAuthSourceChecker",
+    "BuiltinWorkspaceSandboxExecutorFactory",
     "CodexProbeInput",
     "CodexAuthMetadata",
     "ConnectionTestResult",

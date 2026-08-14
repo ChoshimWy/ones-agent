@@ -12,6 +12,12 @@ import sys
 import pytest
 from pydantic import ValidationError
 
+from src.developer_workflow.codex_runner import CodexCommand
+from src.developer_workflow.codex_runtime import CodexRuntimePreparer, NativeCodexIdentity
+from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_PROFILE,
+    SandboxPermissionProfileSource,
+)
 from src.developer_workflow.setup_models import SetupValidationError
 from src.developer_workflow.requirement_flow import sandbox_preflight_command
 from src.developer_workflow.setup_validation import (
@@ -28,14 +34,99 @@ from src.developer_workflow.setup_validation import (
     SubprocessDoctorRunner,
     CodexAuthSourceChecker,
     ManagedSandboxExecutorFactory,
+    BuiltinWorkspaceSandboxExecutorFactory,
     ReadOnlyRepositoryInspector,
     ValidationStatus,
 )
 
 
+class _TinyLockedCodex:
+    def __init__(self) -> None:
+        self.payload = b"task-three-private-codex"
+        self.offset = 0
+        self.identity = NativeCodexIdentity(1, 2, len(self.payload), 3)
+        self.size = len(self.payload)
+
+    def rewind(self) -> None:
+        self.offset = 0
+
+    def read_chunk(self, size: int) -> bytes:
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def current_identity(self) -> NativeCodexIdentity:
+        return self.identity
+
+    def close(self) -> None:
+        return None
+
+
+class _TinyPrivateCache:
+    def prepare_private_directory(self, path: Path) -> Path:
+        path.mkdir(exist_ok=True)
+        return path.resolve(strict=True)
+
+    def validate_private_directory(self, path: Path) -> None:
+        if not path.is_dir():
+            raise OSError("unsafe")
+
+    def validate_cache_ancestor_chain(self, root: Path) -> None:
+        return None
+
+    def protect_private_file(self, path: Path) -> None:
+        return None
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]:
+        metadata = path.stat()
+        return metadata.st_dev, metadata.st_ino
+
+    def read_private_text(self, path: Path) -> str:
+        return path.read_text("utf-8")
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]:
+        metadata = path.stat()
+        return (
+            NativeCodexIdentity(
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+            "OpenAI OpCo, LLC",
+        )
+
+    def fsync_directory(self, path: Path) -> None:
+        return None
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None:
+        return None
+
+
+class _TinyPreparer:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def prepare_verified(self) -> object:
+        return CodexRuntimePreparer(
+            cache_root=(self.root / "private-runtime" / "codex-runtime").resolve(),
+            discover=_TinyLockedCodex,
+            _cache_adapter=_TinyPrivateCache(),  # type: ignore[arg-type]
+            chunk_size=4,
+        ).prepare_verified()
+
+
+def _attested_command(root: Path) -> CodexCommand:
+    return CodexCommand._from_runtime(_TinyPreparer(root).prepare_verified())
+
+
 def _doctor(config: Path):
     def run(argv, **kwargs):
-        assert argv == ["codex", "doctor", "--json"]
+        assert argv == ["doctor", "--json"]
         assert kwargs["shell"] is False
         return subprocess.CompletedProcess(
             argv,
@@ -76,6 +167,112 @@ def _doctor(config: Path):
         )
 
     return run
+
+
+def test_subprocess_doctor_uses_only_attested_private_command_and_closes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = _attested_command(tmp_path)
+    private_prefix = list(command.prefix)
+    calls: list[list[str]] = []
+    closes: list[CodexCommand] = []
+    original_close = CodexCommand.close
+
+    def backend(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(argv)
+        assert kwargs["shell"] is False
+        return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+    def close_once(item: CodexCommand) -> None:
+        closes.append(item)
+        original_close(item)
+
+    monkeypatch.setattr(CodexCommand, "close", close_once)
+    runner = SubprocessDoctorRunner(
+        command_provider=lambda: command,
+        backend_runner=backend,
+    )
+
+    completed = runner(
+        ["doctor", "--json"],
+        cwd=tmp_path.resolve(),
+        env={},
+        timeout=2,
+        max_output_bytes=1024,
+        shell=False,
+    )
+
+    assert completed.returncode == 0
+    assert calls == [[*private_prefix, "doctor", "--json"]]
+    assert closes == [command]
+
+
+def test_subprocess_doctor_propagates_memory_failure_without_starting_process(
+    tmp_path: Path,
+) -> None:
+    runner = SubprocessDoctorRunner(
+        command_provider=lambda: (_ for _ in ()).throw(MemoryError()),
+        backend_runner=lambda *args, **kwargs: pytest.fail("backend must not run"),
+    )
+    with pytest.raises(MemoryError):
+        runner(
+            ["doctor", "--json"],
+            cwd=tmp_path.resolve(),
+            env={},
+            timeout=2,
+            max_output_bytes=1024,
+            shell=False,
+        )
+
+
+def test_profile_catalog_propagates_memory_failure_from_doctor(tmp_path: Path) -> None:
+    def doctor(*args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+        raise MemoryError()
+
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=doctor,
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+
+    with pytest.raises(MemoryError):
+        catalog.list_profiles()
+
+
+def test_profile_catalog_propagates_memory_failure_from_sandbox(tmp_path: Path) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
+
+    class Executor:
+        def __call__(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess[str]:
+            raise MemoryError()
+
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=_doctor(config),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: Executor(),
+        file_security=lambda path, admin: True,
+    )
+
+    with pytest.raises(MemoryError):
+        catalog.list_profiles()
+
+
+def test_sandbox_factories_bind_managed_and_builtin_sources(tmp_path: Path) -> None:
+    preparer = _TinyPreparer(tmp_path)
+
+    managed = ManagedSandboxExecutorFactory(codex_preparer=preparer)("managed")
+    builtin = BuiltinWorkspaceSandboxExecutorFactory(codex_preparer=preparer)(
+        BUILTIN_WORKSPACE_PROFILE
+    )
+
+    assert managed.permission_profile_source is SandboxPermissionProfileSource.MANAGED
+    assert builtin.permission_profile_source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+    with pytest.raises(ValueError, match="source"):
+        BuiltinWorkspaceSandboxExecutorFactory(codex_preparer=preparer)("managed")
 
 
 class _CapabilityExecutor:
@@ -451,11 +648,12 @@ def test_production_runtime_wires_only_real_policy_boundaries(
     config = tmp_path / "config.toml"
     config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
     calls: list[tuple[list[str], Path]] = []
+    preparer = _TinyPreparer(tmp_path)
 
     def os_command(command, *, cwd, env, timeout, max_output_bytes, stdin=None):
         calls.append((command, cwd))
-        if command == ["codex", "doctor", "--json"]:
-            return _doctor(config)(command, cwd=cwd, env=env, timeout=timeout,
+        if command[-2:] == ["doctor", "--json"]:
+            return _doctor(config)(command[-2:], cwd=cwd, env=env, timeout=timeout,
                                    max_output_bytes=max_output_bytes, shell=False)
         child = command[command.index("--") + 1 :]
         if any("outside-write.txt" in item for item in child):
@@ -471,15 +669,20 @@ def test_production_runtime_wires_only_real_policy_boundaries(
 
     monkeypatch.setattr(validation_module, "_bounded_subprocess", os_command)
     monkeypatch.setattr(validation_module, "_default_file_security", lambda path, admin: True)
+    monkeypatch.setattr(validation_module, "CodexRuntimePreparer", lambda: preparer)
     runtime = RuntimeBootstrapper.production(probe_parent=tmp_path)
     assert isinstance(runtime.catalog.codex_doctor, SubprocessDoctorRunner)
     assert isinstance(runtime.catalog.executor_factory, ManagedSandboxExecutorFactory)
     assert isinstance(runtime.validator.codex_auth_metadata, CodexAuthSourceChecker)
     assert isinstance(runtime.validator.repository_inspector, ReadOnlyRepositoryInspector)
     assert runtime.validator.profile_catalog is runtime.catalog
+    assert runtime.codex_runtime_preparer is preparer
+    assert runtime.catalog.codex_doctor.codex_preparer is preparer
+    assert runtime.catalog.executor_factory.codex_preparer is preparer
     assert runtime.catalog.require_selected("managed") == "managed"
-    assert any(call[0][:2] == ["codex", "sandbox"] for call in calls)
-    assert all(cwd != tmp_path for command, cwd in calls if command[:2] == ["codex", "sandbox"])
+    assert any(call[0][1] == "sandbox" for call in calls)
+    assert all(cwd != tmp_path for command, cwd in calls if command[1] == "sandbox")
+    assert all(command[0] != "codex" for command, _ in calls)
 
 
 def test_read_only_repository_inspector_preserves_source_index_and_status(tmp_path: Path) -> None:
