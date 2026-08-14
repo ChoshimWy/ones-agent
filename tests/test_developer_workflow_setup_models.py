@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from src.developer_workflow import config as workflow_config
 from src.developer_workflow.config import DeveloperWorkflowConfig, PublishingConfig
 from src.developer_workflow.contracts import RepositoryMapping
 from src.developer_workflow.setup_models import (
@@ -276,6 +277,44 @@ def test_mutable_workflow_assignment_uses_safe_validation_details() -> None:
 
     _assert_validation_error_is_sanitized(captured.value, "TOKEN-SECRET")
     assert captured.value.errors()[0]["loc"] == ("sandbox_permission_profile",)
+
+
+def test_workflow_draft_preserves_profile_source_through_deep_copy_and_json_round_trip() -> None:
+    draft = WorkflowDraft(
+        sandbox_permission_profile="ones-dev-workspace",
+        sandbox_permission_profile_source="builtin_workspace",
+    )
+
+    copied = draft.model_copy(deep=True)
+    payload = copied.model_dump(mode="json")
+    restored = WorkflowDraft.model_validate(payload)
+
+    assert (
+        copied.sandbox_permission_profile_source
+        is workflow_config.SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+    )
+    assert payload["sandbox_permission_profile_source"] == "builtin_workspace"
+    assert (
+        restored.sandbox_permission_profile_source
+        is workflow_config.SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        ("managed-dev", "builtin_workspace"),
+        ("ones-dev-workspace", "managed"),
+    ],
+)
+def test_workflow_draft_rejects_confused_profile_source_bindings(
+    profile: str, source: str
+) -> None:
+    with pytest.raises(ValidationError):
+        WorkflowDraft(
+            sandbox_permission_profile=profile,
+            sandbox_permission_profile_source=source,
+        )
 
 
 def test_extra_field_name_is_redacted_from_validation_location() -> None:

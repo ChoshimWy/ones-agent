@@ -22,7 +22,11 @@ from pydantic import (
     model_validator,
 )
 
-from .config import DeveloperWorkflowConfig, PublishingConfig
+from .config import (
+    DeveloperWorkflowConfig,
+    PublishingConfig,
+    SandboxPermissionProfileSource,
+)
 from .contracts import RepositoryGroupMapping, RepositoryMapping, WorkflowModel
 
 
@@ -355,6 +359,9 @@ class WorkflowDraft(SetupModel):
     mirror_root: Path | None = None
     worktree_root: Path | None = None
     sandbox_permission_profile: StrictStr | None = None
+    sandbox_permission_profile_source: SandboxPermissionProfileSource = (
+        SandboxPermissionProfileSource.MANAGED
+    )
     max_codex_attempts: StrictInt = Field(default=3, ge=1, le=10)
     tui_max_concurrency: StrictInt = Field(default=3, ge=1, le=8)
     repositories: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
@@ -372,6 +379,15 @@ class WorkflowDraft(SetupModel):
         if value is None:
             return None
         return DeveloperWorkflowConfig.validate_sandbox_permission_profile(value)
+
+    @model_validator(mode="after")
+    def validate_sandbox_permission_profile_binding(self) -> WorkflowDraft:
+        if self.sandbox_permission_profile is not None:
+            DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+                self.sandbox_permission_profile,
+                self.sandbox_permission_profile_source,
+            )
+        return self
 
 
 class SetupDraft(SetupModel):

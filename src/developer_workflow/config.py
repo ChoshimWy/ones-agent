@@ -38,6 +38,14 @@ class PublishingProvider(str, Enum):
     LOCAL_FAKE = "local_fake"
 
 
+class SandboxPermissionProfileSource(str, Enum):
+    MANAGED = "managed"
+    BUILTIN_WORKSPACE = "builtin_workspace"
+
+
+BUILTIN_WORKSPACE_PROFILE = "ones-dev-workspace"
+
+
 class PublishingConfig(WorkflowModel):
     provider: PublishingProvider
     default_target_branch: str = "main"
@@ -84,12 +92,15 @@ class PublishingConfig(WorkflowModel):
 
 
 class DeveloperWorkflowConfig(WorkflowModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
     run_root: Path
     worktree_root: Path
     mirror_root: Path
     sandbox_permission_profile: str
+    sandbox_permission_profile_source: SandboxPermissionProfileSource = (
+        SandboxPermissionProfileSource.MANAGED
+    )
     max_codex_attempts: int = Field(ge=1, le=10)
     tui_max_concurrency: StrictInt = Field(default=3, ge=1, le=8)
     repositories: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
@@ -105,8 +116,25 @@ class DeveloperWorkflowConfig(WorkflowModel):
             )
         return value
 
+    @classmethod
+    def validate_sandbox_permission_profile_binding(
+        cls, profile: str, source: SandboxPermissionProfileSource
+    ) -> None:
+        if (
+            profile == BUILTIN_WORKSPACE_PROFILE
+            and source is not SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ) or (
+            profile != BUILTIN_WORKSPACE_PROFILE
+            and source is not SandboxPermissionProfileSource.MANAGED
+        ):
+            raise ValueError("sandbox permission profile source is invalid")
+
     @model_validator(mode="after")
     def validate_unique_repositories(self) -> DeveloperWorkflowConfig:
+        self.validate_sandbox_permission_profile_binding(
+            self.sandbox_permission_profile,
+            self.sandbox_permission_profile_source,
+        )
         groups = self.normalized_groups()
         keys = [mapping.key for mapping in groups]
         pairs = [(mapping.project_id, mapping.iteration_id) for mapping in groups]
@@ -294,7 +322,9 @@ __all__ = [
     "ConfigSecretError",
     "ConfigValidationError",
     "DeveloperWorkflowConfig",
+    "BUILTIN_WORKSPACE_PROFILE",
     "PublishingConfig",
     "PublishingProvider",
     "RepositoryMappingNotFound",
+    "SandboxPermissionProfileSource",
 ]

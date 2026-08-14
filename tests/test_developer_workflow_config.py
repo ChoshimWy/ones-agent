@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from src.developer_workflow import config as workflow_config
 from src.developer_workflow.config import (
     ConfigValidationError,
     ConfigSecretError,
@@ -297,6 +298,61 @@ def test_sandbox_permission_profile_is_required(tmp_path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(ConfigValidationError, match="managed Codex permissions profile"):
         DeveloperWorkflowConfig.load(path)
+
+
+def test_legacy_config_without_profile_source_migrates_to_managed(tmp_path: Path) -> None:
+    path = _write_config(tmp_path / "ones-dev.json")
+
+    config = DeveloperWorkflowConfig.load(path)
+
+    assert (
+        config.sandbox_permission_profile_source
+        is workflow_config.SandboxPermissionProfileSource.MANAGED
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        ("managed-dev", "managed"),
+        ("ones-dev-workspace", "builtin_workspace"),
+    ],
+)
+def test_sandbox_permission_profile_source_accepts_exact_bindings(
+    tmp_path: Path, profile: str, source: str
+) -> None:
+    config = DeveloperWorkflowConfig.load(
+        _write_config(
+            tmp_path / "ones-dev.json",
+            sandbox_permission_profile=profile,
+            sandbox_permission_profile_source=source,
+        )
+    )
+
+    assert config.sandbox_permission_profile_source.value == source
+
+
+@pytest.mark.parametrize(
+    ("profile", "source", "forbidden_input"),
+    [
+        ("managed-dev", "builtin_workspace", "managed-dev"),
+        ("ones-dev-workspace", "managed", "ones-dev-workspace"),
+        ("managed-dev", "unknown-source", "unknown-source"),
+    ],
+)
+def test_sandbox_permission_profile_source_rejects_confused_bindings_without_echoing_input(
+    tmp_path: Path, profile: str, source: str, forbidden_input: str
+) -> None:
+    with pytest.raises(ValidationError) as captured:
+        DeveloperWorkflowConfig.load(
+            _write_config(
+                tmp_path / "ones-dev.json",
+                sandbox_permission_profile=profile,
+                sandbox_permission_profile_source=source,
+            )
+        )
+
+    assert forbidden_input not in str(captured.value)
 
 
 def test_config_root_forbids_extra_fields(tmp_path: Path) -> None:
