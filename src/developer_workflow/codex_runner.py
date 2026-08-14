@@ -111,12 +111,7 @@ _WINDOWS_WRITE_MASK = (
     | 0x10000000  # GENERIC_ALL
     | 0x40000000  # GENERIC_WRITE
 )
-_WINDOWS_ANCESTOR_MUTATION_MASK = _WINDOWS_WRITE_MASK & ~(
-    0x00000002  # FILE_ADD_FILE cannot replace an existing child.
-    | 0x00000004  # FILE_ADD_SUBDIRECTORY cannot replace an existing child.
-    | 0x00000010  # FILE_WRITE_EA
-    | 0x00000100  # FILE_WRITE_ATTRIBUTES
-)
+_WINDOWS_ANCESTOR_MUTATION_MASK = _WINDOWS_WRITE_MASK
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -202,7 +197,7 @@ def _validate_codex_ancestors(path: Path) -> None:
         if (
             _component_is_reparse(after)
             or not stat.S_ISDIR(after.st_mode)
-            or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+            or _component_identity(before) != _component_identity(after)
         ):
             raise OSError("unstable executable ancestor")
         if canonical.parent == canonical:
@@ -346,6 +341,7 @@ def resolve_codex_command(
     except Exception:
         failed = True
     if failed:
+        del which, platform, path_validator
         _raise_codex_executable_unavailable()
     raise AssertionError("unreachable")
 

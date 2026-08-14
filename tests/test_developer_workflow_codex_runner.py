@@ -311,6 +311,88 @@ def test_codex_component_rejects_trusted_leaf_beneath_broadly_writable_parent(
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
+@pytest.mark.parametrize("principal", ["S-1-5-11", "S-1-5-32-545"])
+@pytest.mark.parametrize(
+    "unsafe_right",
+    [
+        0x00000002,  # FILE_ADD_FILE
+        0x00000004,  # FILE_ADD_SUBDIRECTORY
+        0x00000010,  # FILE_WRITE_EA
+        0x00000040,  # FILE_DELETE_CHILD
+        0x00000100,  # FILE_WRITE_ATTRIBUTES
+        0x00010000,  # DELETE
+        0x00040000,  # WRITE_DAC
+        0x00080000,  # WRITE_OWNER
+        0x10000000,  # GENERIC_ALL
+        0x40000000,  # GENERIC_WRITE
+    ],
+)
+def test_codex_component_rejects_any_effective_untrusted_ancestor_write_right(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    principal: str,
+    unsafe_right: int,
+) -> None:
+    candidate = (tmp_path / "bin" / "codex.exe").resolve()
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"binary")
+    user_sid = "S-1-5-21-user"
+    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
+
+    def descriptor(path: Path):
+        entries = (
+            ((principal, unsafe_right, 0x10, 0),)
+            if path == candidate.parent
+            else ((user_sid, 0x001F01FF, 0, 0),)
+        )
+        return user_sid, entries, True
+
+    monkeypatch.setattr(codex_runner_module, "_windows_descriptor", descriptor)
+
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(candidate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows identity boundary")
+def test_codex_component_rejects_ancestor_size_and_mtime_identity_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = (tmp_path / "bin" / "codex.exe").resolve()
+    candidate.parent.mkdir()
+    candidate.write_bytes(b"binary")
+    user_sid = "S-1-5-21-user"
+    monkeypatch.setattr(codex_runner_module, "_current_user_sid", lambda: user_sid)
+    monkeypatch.setattr(
+        codex_runner_module,
+        "_windows_descriptor",
+        lambda path: (user_sid, ((user_sid, 0x001F01FF, 0, 0),), True),
+    )
+    real_lstat = Path.lstat
+    ancestor_calls = 0
+
+    def racing_lstat(path: Path):
+        nonlocal ancestor_calls
+        metadata = real_lstat(path)
+        if path == candidate.parent:
+            ancestor_calls += 1
+            if ancestor_calls >= 2:
+                return SimpleNamespace(
+                    st_dev=metadata.st_dev,
+                    st_ino=metadata.st_ino,
+                    st_size=metadata.st_size + 1,
+                    st_mtime_ns=metadata.st_mtime_ns + 1,
+                    st_mode=metadata.st_mode,
+                    st_file_attributes=0,
+                )
+        return metadata
+
+    monkeypatch.setattr(Path, "lstat", racing_lstat)
+
+    with pytest.raises(OSError):
+        codex_runner_module._validate_codex_component(candidate)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows ACL boundary")
 def test_codex_component_accepts_fixed_trustedinstaller_and_read_only_principals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -361,6 +443,55 @@ def test_resolver_sanitizes_all_ordinary_discovery_and_validation_failures() -> 
     assert caught.value.__context__ is None
     rendered = "".join(traceback.format_exception(caught.value))
     assert canary not in rendered
+
+
+def test_resolver_scrubs_callable_canaries_from_project_traceback_locals() -> None:
+    which_canary = "which-repr-canary"
+    validator_canary = "validator-repr-canary"
+    candidate_canary = "candidate-path-canary"
+    failure_canary = "failure-repr-canary"
+
+    class CanaryWhich:
+        def __repr__(self) -> str:
+            return f"<{which_canary}:{candidate_canary}>"
+
+        def __call__(self, name: str) -> str:
+            return f"C:/sensitive/{candidate_canary}/{name}"
+
+    class CanaryFailure(Exception):
+        def __repr__(self) -> str:
+            return f"<{failure_canary}>"
+
+    class CanaryValidator:
+        def __repr__(self) -> str:
+            return f"<{validator_canary}>"
+
+        def __call__(self, path: Path) -> Path:
+            raise CanaryFailure("validation failed")
+
+    with pytest.raises(codex_runner_module.CodexProcessStartError) as caught:
+        codex_runner_module.resolve_codex_command(
+            which=CanaryWhich(),
+            platform="win32",
+            path_validator=CanaryValidator(),
+        )
+
+    captured = traceback.TracebackException.from_exception(
+        caught.value, capture_locals=True
+    )
+    module_path = Path(codex_runner_module.__file__).resolve()
+    project_locals = "\n".join(
+        value
+        for frame in captured.stack
+        if Path(frame.filename).resolve() == module_path
+        for value in (frame.locals or {}).values()
+    )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    for canary in (
+        which_canary, validator_canary, candidate_canary, failure_canary,
+    ):
+        assert canary not in project_locals
 
 
 @pytest.mark.parametrize(
