@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -331,6 +332,7 @@ def test_startup_preserves_actively_locked_owned_stage(tmp_path: Path) -> None:
         cache_root=root,
         discover=FakeLockedSource,
         _cache_adapter=adapter,  # type: ignore[arg-type]
+        _lease_grace_ns=0,
     )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
     assert not lease.path.exists()
 
@@ -356,8 +358,218 @@ def test_external_lease_closes_mkdir_race_window(tmp_path: Path) -> None:
         cache_root=root,
         discover=FakeLockedSource,
         _cache_adapter=adapter,  # type: ignore[arg-type]
+        _lease_grace_ns=0,
     )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
     assert not lease.path.exists()
+
+
+def test_young_prelock_lease_is_not_deleted_and_creator_can_finish(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    adapter = FakeCacheAdapter()
+    token = "6" * 32
+    now = 2_000_000_000_000_000_000
+    prelock = threading.Event()
+    resume = threading.Event()
+    result: list[object] = []
+
+    def before_lock() -> None:
+        prelock.set()
+        assert resume.wait(timeout=5)
+
+    def creator() -> None:
+        try:
+            result.append(codex_runtime_module._StagingLease.acquire(
+                root, token, adapter, created_ns=now,
+                _before_lock=before_lock,
+            ))
+        except BaseException as error:
+            result.append(error)
+
+    thread = threading.Thread(target=creator)
+    thread.start()
+    assert prelock.wait(timeout=5)
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+        _clock_ns=lambda: now + 1_000_000_000,
+        _lease_grace_ns=30_000_000_000,
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+    assert (root / f".lease-{token}").is_file()
+    resume.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(result) == 1
+    assert isinstance(result[0], codex_runtime_module._StagingLease)
+    lease = result[0]
+    try:
+        stage = root / f".staging-{token}"
+        stage.mkdir()
+        codex_runtime_module.CodexRuntimePreparer(
+            cache_root=root,
+            discover=FakeLockedSource,
+            _cache_adapter=adapter,  # type: ignore[arg-type]
+            _clock_ns=lambda: now + 60_000_000_000,
+            _lease_grace_ns=30_000_000_000,
+        )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+        assert stage.is_dir()
+    finally:
+        lease.close()  # type: ignore[attr-defined]
+
+
+def test_old_prelock_creator_fails_if_cleaner_unlinks_first(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    adapter = FakeCacheAdapter()
+    token = "7" * 32
+    now = 2_000_000_000_000_000_000
+    prelock = threading.Event()
+    resume = threading.Event()
+    result: list[object] = []
+
+    def before_lock() -> None:
+        prelock.set()
+        assert resume.wait(timeout=5)
+
+    def creator() -> None:
+        try:
+            lease = codex_runtime_module._StagingLease.acquire(
+                root, token, adapter,
+                created_ns=now - 60_000_000_000,
+                _before_lock=before_lock,
+            )
+        except BaseException as error:
+            result.append(error)
+        else:
+            result.append(lease)
+            (root / f".staging-{token}").mkdir()
+
+    thread = threading.Thread(target=creator)
+    thread.start()
+    assert prelock.wait(timeout=5)
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+        _clock_ns=lambda: now,
+        _lease_grace_ns=30_000_000_000,
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+    assert not (root / f".lease-{token}").exists()
+    resume.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert len(result) == 1 and isinstance(result[0], OSError)
+    assert not (root / f".staging-{token}").exists()
+
+
+def test_staging_lease_record_has_exact_utc_schema(tmp_path: Path) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    token = "5" * 32
+    lease = codex_runtime_module._StagingLease.acquire(
+        root, token, FakeCacheAdapter(), created_ns=123456789,
+    )
+    try:
+        lease._stream.seek(0)
+        record = json.loads(lease._stream.read(512).decode("ascii"))
+        lease._stream.seek(0)
+        assert record == {
+            "created_ns": 123456789,
+            "schema_version": 1,
+            "token": token,
+        }
+    finally:
+        lease.close()
+
+
+def test_cleaner_holds_exclusive_lease_through_stage_removal_and_unlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    adapter = FakeCacheAdapter()
+    token = "4" * 32
+    lease = codex_runtime_module._StagingLease.acquire(
+        root, token, adapter, created_ns=1,
+    )
+    lease.close()
+    stage = root / f".staging-{token}"
+    stage.mkdir()
+    (stage / "codex.exe").write_bytes(b"stale")
+    inside_cleanup = threading.Event()
+    release_cleanup = threading.Event()
+    original_remove = codex_runtime_module._remove_owned_tree
+
+    def gated_remove(path: Path) -> None:
+        if path == stage:
+            inside_cleanup.set()
+            assert release_cleanup.wait(timeout=5)
+        original_remove(path)
+
+    monkeypatch.setattr(codex_runtime_module, "_remove_owned_tree", gated_remove)
+    errors: list[BaseException] = []
+
+    def cleaner() -> None:
+        try:
+            codex_runtime_module.CodexRuntimePreparer(
+                cache_root=root,
+                discover=FakeLockedSource,
+                _cache_adapter=adapter,  # type: ignore[arg-type]
+                _clock_ns=lambda: time.time_ns() + 60_000_000_000,
+                _lease_grace_ns=30_000_000_000,
+            )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=cleaner)
+    thread.start()
+    assert inside_cleanup.wait(timeout=5)
+    with pytest.raises(BlockingIOError):
+        codex_runtime_module._StagingLease.acquire(
+            root, token, adapter, create=False,
+        )
+    release_cleanup.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert not errors
+    assert not stage.exists()
+    assert not (root / f".lease-{token}").exists()
+
+
+def test_missing_lease_unlink_during_cleanup_is_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    adapter = FakeCacheAdapter()
+    token = "3" * 32
+    lease = codex_runtime_module._StagingLease.acquire(
+        root, token, adapter, created_ns=1,
+    )
+    lease.close()
+    lease_path = root / f".lease-{token}"
+    original_unlink = Path.unlink
+
+    def missing_after_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path == lease_path:
+            original_unlink(path)
+            raise FileNotFoundError(path)
+        original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", missing_after_unlink)
+    codex_runtime_module.CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+        _clock_ns=lambda: time.time_ns() + 60_000_000_000,
+        _lease_grace_ns=30_000_000_000,
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+    assert not lease_path.exists()
 
 
 def test_startup_removes_orphan_stage_without_lease(tmp_path: Path) -> None:

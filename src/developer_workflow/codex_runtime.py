@@ -11,6 +11,7 @@ import shutil
 import stat
 import subprocess
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -121,6 +122,8 @@ class LockedNativeCodex:
 @dataclass(slots=True, repr=False)
 class _StagingLease:
     path: Path
+    created_ns: int
+    file_identity: tuple[int, int, int, int]
     _stream: object = field(repr=False)
     _rename_safe: bool = field(default=False, repr=False)
     _closed: bool = field(default=False, repr=False)
@@ -133,17 +136,29 @@ class _StagingLease:
         adapter: _CacheRuntimeAdapter,
         *,
         create: bool = True,
+        created_ns: int | None = None,
+        _before_lock: Callable[[], None] | None = None,
     ) -> _StagingLease:
         if not _is_stage_token(token):
             raise ValueError("private runtime staging token is invalid")
         path = root / f".lease-{token}"
-        rename_safe = os.name == "nt" and isinstance(
-            adapter, _WindowsCacheRuntimeAdapter,
-        )
+        rename_safe = os.name == "nt"
         stream = _open_staging_lease(
             path, create=create, native_windows=rename_safe,
         )
-        record = f"ones-dev-stage-v2:{token}\n".encode("ascii")
+        if create:
+            if created_ns is None:
+                created_ns = time.time_ns()
+            if type(created_ns) is not int or created_ns < 0:
+                stream.close()
+                raise ValueError("private runtime staging time is invalid")
+            record = _staging_lease_record(token, created_ns)
+        else:
+            if created_ns is not None:
+                stream.close()
+                raise ValueError("private runtime staging time is invalid")
+            record = b""
+        locked = False
         try:
             if create:
                 _write_all(stream, record)
@@ -151,17 +166,42 @@ class _StagingLease:
                 os.fsync(stream.fileno())
                 adapter.protect_private_file(path)
             adapter.validate_private_file(path)
+            initial_identity = _staging_file_identity(path)
+            if _descriptor_file_identity(stream) != initial_identity:
+                raise OSError("private runtime staging lease changed")
+            if _before_lock is not None:
+                _before_lock()
             stream.seek(0)
             _lock_staging_descriptor(stream.fileno())
+            locked = True
             stream.seek(0)
-            if stream.read(96) != record:
+            raw = stream.read(512)
+            parsed_created_ns = _parse_staging_lease_record(raw, token)
+            if create and raw != record:
                 raise OSError("private runtime staging lease is invalid")
+            locked_identity = _staging_file_identity(path)
+            if (
+                locked_identity != initial_identity
+                or _descriptor_file_identity(stream) != initial_identity
+                or adapter.validate_private_file(path)
+                != initial_identity[:2]
+            ):
+                raise OSError("private runtime staging lease changed")
             stream.seek(0)
             return cls(
-                path=path, _stream=stream, _rename_safe=rename_safe,
+                path=path,
+                created_ns=parsed_created_ns,
+                file_identity=initial_identity,
+                _stream=stream,
+                _rename_safe=rename_safe,
             )
         except BaseException:
-            stream.close()
+            try:
+                if locked:
+                    stream.seek(0)
+                    _unlock_staging_descriptor(stream.fileno())
+            finally:
+                stream.close()
             raise
 
     def close(self) -> None:
@@ -628,11 +668,19 @@ class CodexRuntimePreparer:
         _cache_adapter: _CacheRuntimeAdapter | None = None,
         chunk_size: int = 1024 * 1024,
         smoke_timeout: float = 5.0,
+        _clock_ns: Callable[[], int] = time.time_ns,
+        _lease_grace_ns: int = 30_000_000_000,
     ) -> None:
         if type(chunk_size) is not int or chunk_size <= 0:
             raise ValueError("chunk size must be a positive integer")
         if not isinstance(smoke_timeout, (int, float)) or smoke_timeout <= 0:
             raise ValueError("smoke timeout must be positive")
+        if (
+            not callable(_clock_ns)
+            or type(_lease_grace_ns) is not int
+            or _lease_grace_ns < 0
+        ):
+            raise ValueError("private runtime lease timing is invalid")
         if cache_root is None:
             local_app_data = os.environ.get("LOCALAPPDATA")
             if not local_app_data:
@@ -645,6 +693,8 @@ class CodexRuntimePreparer:
         self._cache_adapter = _cache_adapter
         self._chunk_size = chunk_size
         self._smoke_timeout = float(smoke_timeout)
+        self._clock_ns = _clock_ns
+        self._lease_grace_ns = _lease_grace_ns
 
     def prepare(self) -> Path:
         adapter = self._cache_adapter or _WindowsCacheRuntimeAdapter()
@@ -786,7 +836,7 @@ class CodexRuntimePreparer:
         staging_lease: _StagingLease | None = None
         try:
             staging_lease = _StagingLease.acquire(
-                root, staging_token, adapter,
+                root, staging_token, adapter, created_ns=self._lease_now_ns(),
             )
             adapter.fsync_directory(root)
             staging.mkdir(exist_ok=False)
@@ -1205,6 +1255,12 @@ class CodexRuntimePreparer:
             raise OSError("cache target escaped")
         return resolved
 
+    def _lease_now_ns(self) -> int:
+        value = self._clock_ns()
+        if type(value) is not int or value < 0:
+            raise OSError("private runtime lease clock is invalid")
+        return value
+
     def _cleanup_stale_owned_entries(
         self, root: Path, adapter: _CacheRuntimeAdapter,
     ) -> None:
@@ -1233,44 +1289,59 @@ class CodexRuntimePreparer:
                     raise
                 continue
             stage = root / f".staging-{token}"
-            stage_safe = True
             try:
+                now_ns = self._lease_now_ns()
+                freshness_ns = max(
+                    lease.created_ns, lease.file_identity[3],
+                )
+                if (
+                    now_ns < freshness_ns
+                    or now_ns - freshness_ns < self._lease_grace_ns
+                ):
+                    continue
+                stage_safe = True
                 try:
-                    stage.lstat()
+                    try:
+                        stage.lstat()
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        adapter.validate_private_directory(stage)
+                        children = tuple(stage.iterdir())
+                        if any(
+                            not _is_owned_staging_child(child)
+                            for child in children
+                        ):
+                            stage_safe = False
+                        else:
+                            for child in children:
+                                adapter.validate_private_file(child)
+                            cleanup = _attempt_owned_cleanup((stage,))
+                            if cleanup is not None:
+                                raise cleanup
+                except BaseException as error:
+                    stage_safe = False
+                    if _is_priority_failure(error):
+                        raise
+                    if not isinstance(error, (OSError, ValueError)):
+                        raise
+                if not stage_safe:
+                    continue
+                if (
+                    _staging_file_identity(candidate) != lease.file_identity
+                    or _descriptor_file_identity(lease._stream)
+                    != lease.file_identity
+                    or adapter.validate_private_file(candidate)
+                    != lease.file_identity[:2]
+                ):
+                    continue
+                try:
+                    candidate.unlink()
                 except FileNotFoundError:
                     pass
-                else:
-                    adapter.validate_private_directory(stage)
-                    children = tuple(stage.iterdir())
-                    if any(
-                        not _is_owned_staging_child(child)
-                        for child in children
-                    ):
-                        stage_safe = False
-                    else:
-                        for child in children:
-                            adapter.validate_private_file(child)
-                        cleanup = _attempt_owned_cleanup((stage,))
-                        if cleanup is not None:
-                            raise cleanup
-            except BaseException as error:
-                stage_safe = False
-                if _is_priority_failure(error):
-                    raise
-                if not isinstance(error, (OSError, ValueError)):
-                    raise
+                adapter.fsync_directory(root)
             finally:
                 lease.close()
-            if not stage_safe:
-                continue
-            try:
-                candidate.unlink()
-                adapter.fsync_directory(root)
-            except BaseException as error:
-                if _is_priority_failure(error):
-                    raise
-                if not isinstance(error, OSError):
-                    raise
 
         for candidate in entries:
             name = candidate.name
@@ -1478,6 +1549,68 @@ def _is_stage_token(value: str) -> bool:
         and len(value) == 32
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _staging_lease_record(token: str, created_ns: int) -> bytes:
+    return (
+        json.dumps(
+            {
+                "created_ns": created_ns,
+                "schema_version": 1,
+                "token": token,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("ascii")
+
+
+def _parse_staging_lease_record(raw: bytes, token: str) -> int:
+    if len(raw) > 512:
+        raise OSError("private runtime staging lease is invalid")
+    try:
+        parsed = json.loads(
+            raw.decode("ascii", "strict"),
+            object_pairs_hook=_strict_json_object,
+            parse_constant=_invalid_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise OSError("private runtime staging lease is invalid") from None
+    if (
+        type(parsed) is not dict
+        or frozenset(parsed) != frozenset(
+            {"created_ns", "schema_version", "token"}
+        )
+        or type(parsed.get("schema_version")) is not int
+        or parsed["schema_version"] != 1
+        or type(parsed.get("created_ns")) is not int
+        or parsed["created_ns"] < 0
+        or type(parsed.get("token")) is not str
+        or parsed["token"] != token
+    ):
+        raise OSError("private runtime staging lease is invalid")
+    if raw != _staging_lease_record(token, parsed["created_ns"]):
+        raise OSError("private runtime staging lease is invalid")
+    return parsed["created_ns"]
+
+
+def _staging_file_identity(path: Path) -> tuple[int, int, int, int]:
+    metadata = path.stat(follow_symlinks=False)
+    attributes = getattr(metadata, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or attributes & reparse
+    ):
+        raise OSError("private runtime staging lease is unsafe")
+    return _stat_identity(metadata)
+
+
+def _descriptor_file_identity(stream: object) -> tuple[int, int, int, int]:
+    return _stat_identity(os.fstat(stream.fileno()))  # type: ignore[attr-defined]
 
 
 def _is_owned_staging_child(path: Path) -> bool:
