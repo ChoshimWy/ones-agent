@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import math
 import os
+import pickle
 import subprocess
 import sys
 import time
@@ -14,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import src.developer_workflow.codex_runner as codex_runner_module
+from src.developer_workflow.codex_runtime import NativeCodexIdentity
 from src.developer_workflow.codex_runner import (
     CodexExecutionError,
     CodexOutputError,
@@ -38,25 +42,112 @@ OID = "a" * 40
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 
-def test_codex_command_keeps_an_immutable_validated_prefix() -> None:
-    command = codex_runner_module.CodexCommand((r"C:\private\codex.exe",))
+class _TinyLockedRuntime:
+    def __init__(self) -> None:
+        self.payload = b"verified-private-codex"
+        self.offset = 0
+        self.identity = NativeCodexIdentity(1, 2, len(self.payload), 3)
+        self.size = len(self.payload)
+
+    def rewind(self) -> None:
+        self.offset = 0
+
+    def read_chunk(self, size: int) -> bytes:
+        chunk = self.payload[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+    def current_identity(self) -> NativeCodexIdentity:
+        return self.identity
+
+    def close(self) -> None:
+        return None
+
+
+class _TinyCacheAdapter:
+    def prepare_private_directory(self, path: Path) -> Path:
+        path.mkdir(exist_ok=True)
+        return path.resolve(strict=True)
+
+    def validate_private_directory(self, path: Path) -> None:
+        if not path.is_dir():
+            raise OSError("unsafe")
+
+    def validate_cache_ancestor_chain(self, root: Path) -> None:
+        return None
+
+    def protect_private_file(self, path: Path) -> None:
+        return None
+
+    def validate_private_file(self, path: Path) -> tuple[int, int]:
+        metadata = path.stat()
+        return metadata.st_dev, metadata.st_ino
+
+    def read_private_text(self, path: Path) -> str:
+        return path.read_text("utf-8")
+
+    def inspect_private_executable(
+        self, path: Path,
+    ) -> tuple[NativeCodexIdentity, str]:
+        metadata = path.stat()
+        return (
+            NativeCodexIdentity(
+                metadata.st_dev, metadata.st_ino, metadata.st_size,
+                metadata.st_mtime_ns,
+            ),
+            "OpenAI OpCo, LLC",
+        )
+
+    def fsync_directory(self, path: Path) -> None:
+        return None
+
+    def smoke(
+        self, executable: Path, *, environment: dict[str, str], timeout: float,
+    ) -> None:
+        return None
+
+
+def _verified_runtime(root: Path) -> object:
+    return codex_runner_module.CodexRuntimePreparer(
+        cache_root=(root / "private-runtime" / "codex-runtime").resolve(),
+        discover=_TinyLockedRuntime,
+        _cache_adapter=_TinyCacheAdapter(),  # type: ignore[arg-type]
+        chunk_size=4,
+    ).prepare_verified()
+
+
+def _attested_command(root: Path) -> codex_runner_module.CodexCommand:
+    return codex_runner_module.CodexCommand._from_runtime(
+        _verified_runtime(root)
+    )
+
+
+def test_codex_command_keeps_an_immutable_validated_prefix(tmp_path: Path) -> None:
+    command = _attested_command(tmp_path)
 
     assert command.argv("exec", "--version") == [
-        r"C:\private\codex.exe", "exec", "--version",
+        command.prefix[0], "exec", "--version",
     ]
     with pytest.raises(FrozenInstanceError):
         command.prefix = ("replacement",)  # type: ignore[misc]
 
 
-@pytest.mark.parametrize("prefix", [(), ("",), ("safe", "bad\x00component")])
-def test_codex_command_rejects_empty_or_nul_prefix(prefix: tuple[str, ...]) -> None:
-    with pytest.raises(ValueError):
+@pytest.mark.parametrize(
+    "prefix",
+    [(), ("",), ("safe", "bad\x00component"), (r"C:\private\codex.exe",)],
+)
+def test_codex_command_rejects_all_public_construction(
+    prefix: tuple[str, ...],
+) -> None:
+    with pytest.raises(TypeError):
         codex_runner_module.CodexCommand(prefix)
 
 
 @pytest.mark.parametrize("argument", ["", "bad\x00argument"])
-def test_codex_command_rejects_empty_or_nul_arguments(argument: str) -> None:
-    command = codex_runner_module.CodexCommand((r"C:\private\codex.exe",))
+def test_codex_command_rejects_empty_or_nul_arguments(
+    tmp_path: Path, argument: str,
+) -> None:
+    command = _attested_command(tmp_path)
     with pytest.raises(ValueError):
         command.argv(argument)
 
@@ -64,9 +155,7 @@ def test_codex_command_rejects_empty_or_nul_arguments(argument: str) -> None:
 def test_resolver_returns_only_prepared_private_native_executable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    executable = (tmp_path / "private" / "codex.exe").resolve()
-    executable.parent.mkdir()
-    executable.write_bytes(b"verified")
+    runtime = _verified_runtime(tmp_path)
 
     def forbidden(*args: object, **kwargs: object) -> object:
         raise AssertionError("Node, JS, cmd, ps1, and shell execution is forbidden")
@@ -75,10 +164,10 @@ def test_resolver_returns_only_prepared_private_native_executable(
     monkeypatch.setattr(codex_runner_module.subprocess, "run", forbidden)
     monkeypatch.setattr(codex_runner_module.os, "system", forbidden)
 
-    command = codex_runner_module.resolve_codex_command(_prepare=lambda: executable)
+    command = codex_runner_module.resolve_codex_command(_prepare=lambda: runtime)
 
-    assert command.prefix == (str(executable),)
-    assert command.argv("exec") == [str(executable), "exec"]
+    assert command.prefix[0].endswith("codex.exe")
+    assert command.argv("exec") == [command.prefix[0], "exec"]
 
 
 def test_resolver_sanitizes_preparation_failure_and_project_traceback_locals() -> None:
@@ -157,8 +246,44 @@ def test_resolver_preserves_internal_preparation_failures(
 def test_codex_command_rejects_non_native_or_multi_component_prefix(
     prefix: tuple[str, ...],
 ) -> None:
-    with pytest.raises(ValueError):
+    with pytest.raises(TypeError):
         codex_runner_module.CodexCommand(prefix)
+
+
+def test_codex_command_copy_preserves_attestation_and_pickle_is_rejected(
+    tmp_path: Path,
+) -> None:
+    command = _attested_command(tmp_path)
+    assert copy.copy(command) is command
+    assert copy.deepcopy(command) is command
+    with pytest.raises(TypeError):
+        pickle.dumps(command)
+
+
+def test_runner_rejects_forged_unattested_command_before_executor(
+    tmp_path: Path,
+) -> None:
+    forged = object.__new__(codex_runner_module.CodexCommand)
+    object.__setattr__(forged, "prefix", (str(tmp_path / "codex.exe"),))
+    object.__setattr__(forged, "_identity", object())
+    object.__setattr__(forged, "_sha256", "0" * 64)
+    object.__setattr__(forged, "_nonce", object())
+    executor = FakeExecutor()
+    runner = CodexRunner(
+        run_root=(tmp_path / "runs").resolve(),
+        repository=FakeRepository(),
+        command_executor=executor,
+        command_resolver=lambda: forged,
+    )
+    with pytest.raises(
+        codex_runner_module.CodexProcessStartError,
+        match="^Codex executable is unavailable$",
+    ):
+        runner.run(
+            _prepared(tmp_path), _mapping(tmp_path), run_id="run-1",
+            prompt="safe prompt",
+        )
+    assert not executor.calls
 
 
 def test_codex_auth_source_accepts_environment_auth_without_returning_secret() -> None:
@@ -277,9 +402,7 @@ def _runner(root: Path, executor: FakeExecutor, repository: FakeRepository | Non
     return CodexRunner(
         run_root=(root / "runs").resolve(), repository=repository or FakeRepository(),
         command_executor=executor,
-        command_resolver=lambda: codex_runner_module.CodexCommand(
-            (r"C:\private\codex.exe",)
-        ),
+        command_resolver=lambda: _attested_command(root),
     )
 
 
@@ -289,7 +412,7 @@ def test_default_runner_fails_closed_when_private_runtime_preparation_fails(
     executor = FakeExecutor()
     monkeypatch.setattr(
         codex_runner_module.CodexRuntimePreparer,
-        "prepare",
+        "prepare_verified",
         lambda self: (_ for _ in ()).throw(OSError("unavailable")),
     )
     runner = CodexRunner(
@@ -426,10 +549,12 @@ def test_run_uses_noninteractive_command_safe_environment_and_persisted_prompt(t
     command, cwd, env, timeout, _, stdin = executor.calls[0]
     schema = Path(command[command.index("--output-schema") + 1])
     assert command == [
-        r"C:\private\codex.exe", "exec", "--cd", str(prepared.path),
+        command[0], "exec", "--cd", str(prepared.path),
         "--sandbox", "workspace-write",
         "--output-schema", str(schema), "-",
     ]
+    assert Path(command[0]).name == "codex.exe"
+    assert Path(command[0]).is_relative_to(tmp_path)
     assert schema.is_file()
     assert cwd == prepared.path
     assert timeout == 30
@@ -1373,9 +1498,7 @@ def test_run_rejects_oversized_prompt_and_output(tmp_path: Path) -> None:
     runner = CodexRunner(
         run_root=(tmp_path / "runs").resolve(), repository=FakeRepository(),
         command_executor=FakeExecutor(), max_prompt_bytes=8,
-        command_resolver=lambda: codex_runner_module.CodexCommand(
-            (r"C:\private\codex.exe",)
-        ),
+        command_resolver=lambda: _attested_command(tmp_path),
     )
     with pytest.raises(UnsafeCodexRunError, match="prompt"):
         runner.run(_prepared(tmp_path), _mapping(tmp_path), run_id="run-1", prompt="too long prompt")
@@ -1384,9 +1507,7 @@ def test_run_rejects_oversized_prompt_and_output(tmp_path: Path) -> None:
     runner = CodexRunner(
         run_root=(tmp_path / "other-runs").resolve(), repository=FakeRepository(),
         command_executor=executor, max_output_bytes=100,
-        command_resolver=lambda: codex_runner_module.CodexCommand(
-            (r"C:\private\codex.exe",)
-        ),
+        command_resolver=lambda: _attested_command(tmp_path),
     )
     with pytest.raises(CodexOutputError, match="output limit"):
         runner.run(_prepared(tmp_path), _mapping(tmp_path), run_id="run-2", prompt="safe")

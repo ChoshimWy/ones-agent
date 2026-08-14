@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import os
 import shutil
 import subprocess
+import threading
 import traceback
 from pathlib import Path
 
@@ -156,11 +158,17 @@ class FakeCacheAdapter:
         self.smoke_error: BaseException | None = None
         self.fsync_error: BaseException | None = None
         self.directory_error: BaseException | None = None
+        self.ancestor_error: BaseException | None = None
 
     def prepare_private_directory(self, path: Path) -> Path:
         self.events.append(("prepare-directory", path))
         path.mkdir(exist_ok=True)
         return path.resolve(strict=True)
+
+    def validate_cache_ancestor_chain(self, root: Path) -> None:
+        self.events.append(("validate-ancestors", root))
+        if self.ancestor_error is not None:
+            raise self.ancestor_error
 
     def validate_private_directory(self, path: Path) -> None:
         self.events.append(("validate-directory", path))
@@ -235,6 +243,185 @@ def test_preparer_streams_source_and_publishes_manifest_last(tmp_path: Path) -> 
     assert source.closed
     assert source.read_calls > 1
     assert not tuple(root.glob(".staging-*"))
+
+
+def test_preparer_smokes_only_valid_manifest_staging_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+
+    class OrderingAdapter(FakeCacheAdapter):
+        def smoke(
+            self, executable: Path, *, environment: dict[str, str], timeout: float,
+        ) -> None:
+            assert executable.parent.name.startswith(".staging-")
+            manifest = executable.parent / "manifest.json"
+            assert manifest.is_file()
+            super().smoke(executable, environment=environment, timeout=timeout)
+
+    executable = _prepare_runtime(root, FakeLockedSource(), OrderingAdapter())
+    assert executable.parent.name == hashlib.sha256(b"signed-native").hexdigest()
+
+
+def test_preparer_revalidates_staging_manifest_before_smoke(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+
+    class CorruptingAdapter(FakeCacheAdapter):
+        smoked = False
+
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            manifest = path / "manifest.json"
+            if path.name.startswith(".staging-") and manifest.is_file():
+                value = json.loads(manifest.read_text("utf-8"))
+                value["target"] = "../outside.exe"
+                manifest.write_text(json.dumps(value), encoding="utf-8")
+
+        def smoke(
+            self, executable: Path, *, environment: dict[str, str], timeout: float,
+        ) -> None:
+            self.smoked = True
+
+    adapter = CorruptingAdapter()
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        _prepare_runtime(root, FakeLockedSource(), adapter)
+    assert not adapter.smoked
+    assert not tuple(root.glob(".staging-*"))
+
+
+@pytest.mark.parametrize("failure_point", ["manifest_fsync", "root_fsync"])
+def test_postpublish_fsync_failure_removes_attempted_final_and_allows_retry(
+    tmp_path: Path, failure_point: str,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+
+    class PostPublishFailureAdapter(FakeCacheAdapter):
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            manifest_exists = (path / "manifest.json").is_file()
+            final_exists = any(
+                child.is_dir() and len(child.name) == 64
+                for child in root.iterdir()
+            )
+            if failure_point == "manifest_fsync" and path.name.startswith(
+                ".staging-"
+            ) and manifest_exists:
+                raise OSError("post-manifest fsync")
+            if failure_point == "root_fsync" and path == root and final_exists:
+                raise OSError("post-rename root fsync")
+
+    adapter = PostPublishFailureAdapter()
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        _prepare_runtime(root, FakeLockedSource(), adapter)
+    assert not tuple(root.glob(".staging-*"))
+    assert not tuple(path for path in root.iterdir() if len(path.name) == 64)
+
+    executable = _prepare_runtime(root, FakeLockedSource(), FakeCacheAdapter())
+    assert executable.is_file()
+
+
+def test_postrename_cleanup_retries_transient_final_delete_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+
+    class RootFailure(FakeCacheAdapter):
+        def fsync_directory(self, path: Path) -> None:
+            super().fsync_directory(path)
+            if path == root and any(
+                child.is_dir() and len(child.name) == 64
+                for child in root.iterdir()
+            ):
+                raise OSError("root fsync failed")
+
+    original = codex_runtime_module._remove_owned_tree
+    final_attempts = 0
+
+    def transient(path: Path) -> None:
+        nonlocal final_attempts
+        if len(path.name) == 64:
+            final_attempts += 1
+            if final_attempts == 1:
+                raise OSError("transient delete")
+        original(path)
+
+    monkeypatch.setattr(codex_runtime_module, "_remove_owned_tree", transient)
+    with pytest.raises(OSError, match="private Codex runtime is unavailable"):
+        _prepare_runtime(root, FakeLockedSource(), RootFailure())
+    assert final_attempts >= 2
+    assert not tuple(path for path in root.iterdir() if len(path.name) == 64)
+
+
+@pytest.mark.parametrize("stale_kind", ["random", "deterministic"])
+def test_preparer_cleans_private_owned_incomplete_cache_and_retries(
+    tmp_path: Path, stale_kind: str,
+) -> None:
+    payload = b"retry-payload"
+    digest = hashlib.sha256(payload).hexdigest()
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    stale = root / (
+        ".staging-" + ("a" * 32) if stale_kind == "random" else digest
+    )
+    stale.mkdir()
+    (stale / "codex.exe").write_bytes(b"incomplete")
+
+    executable = _prepare_runtime(
+        root, FakeLockedSource(payload), FakeCacheAdapter()
+    )
+
+    assert executable == (root / digest / "codex.exe").resolve(strict=True)
+    if stale_kind == "random":
+        assert stale.is_dir()
+    else:
+        assert stale == executable.parent
+
+
+def test_preparer_ignores_potentially_active_random_staging_directory(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    active = root / (".staging-" + "b" * 32)
+    active.mkdir()
+    (active / "codex.exe").write_bytes(b"possibly-active")
+
+    executable = _prepare_runtime(
+        root, FakeLockedSource(b"other-version"), FakeCacheAdapter()
+    )
+
+    assert executable.is_file()
+    assert active.is_dir()
+    assert (active / "codex.exe").read_bytes() == b"possibly-active"
+
+
+def test_incomplete_hash_directory_is_validated_before_manifest_lookup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    root.mkdir(parents=True)
+    candidate = root / ("c" * 64)
+    candidate.mkdir()
+    adapter = FakeCacheAdapter()
+    adapter.directory_error = OSError("simulated reparse")
+    original_exists = Path.exists
+
+    def guarded_exists(path: Path) -> bool:
+        if path == candidate / "manifest.json":
+            raise AssertionError("manifest lookup traversed an unvalidated directory")
+        return original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", guarded_exists)
+    CodexRuntimePreparer(
+        cache_root=root,
+        discover=FakeLockedSource,
+        _cache_adapter=adapter,  # type: ignore[arg-type]
+    )._cleanup_stale_owned_entries(root, adapter)  # type: ignore[arg-type]
+    assert candidate.is_dir()
 
 
 def _prepare_runtime(
@@ -531,6 +718,132 @@ def test_preparer_rejects_nul_cache_root_before_filesystem_access() -> None:
         CodexRuntimePreparer(cache_root=Path("C:/unsafe\x00root"))
 
 
+@pytest.mark.parametrize(
+    "dangerous_mask",
+    [0x00000040, 0x00010000, 0x00040000, 0x00080000, 0x40000000, 0x10000000, 0x001301BF],
+)
+def test_windows_cache_ancestor_rejects_untrusted_replacement_rights(
+    dangerous_mask: int,
+) -> None:
+    with pytest.raises(OSError, match="ancestor"):
+        codex_runtime_module._validate_windows_cache_ancestor_acl(
+            owner="S-1-5-18",
+            entries=(("S-1-1-0", dangerous_mask, 0, 0),),
+            user_sid="S-1-5-21-current",
+        )
+
+
+def test_windows_cache_ancestor_allows_read_add_only_and_inherit_only_rights() -> None:
+    codex_runtime_module._validate_windows_cache_ancestor_acl(
+        owner="S-1-5-18",
+        entries=(
+            ("S-1-1-0", 0x001200A9, 0, 0),
+            ("S-1-5-11", 0x00000004, 0, 0),
+            ("S-1-5-11", 0xE0010000, 0x08, 0),
+        ),
+        user_sid="S-1-5-21-current",
+    )
+
+
+def test_windows_cache_ancestor_rejects_unknown_ace_shape() -> None:
+    with pytest.raises(OSError, match="ancestor"):
+        codex_runtime_module._validate_windows_cache_ancestor_acl(
+            owner="S-1-5-18",
+            entries=(("S-1-1-0", 0x1F01FF, 0, 5),),
+            user_sid="S-1-5-21-current",
+        )
+
+
+def test_unsafe_cache_ancestor_fails_before_creating_private_root(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    adapter = FakeCacheAdapter()
+    adapter.ancestor_error = OSError("unsafe ancestor")
+    with pytest.raises(OSError, match="unsafe ancestor"):
+        CodexRuntimePreparer(
+            cache_root=root,
+            discover=FakeLockedSource,
+            _cache_adapter=adapter,  # type: ignore[arg-type]
+        ).prepare()
+    assert not root.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="real LOCALAPPDATA ACL is Windows-only")
+def test_real_localappdata_ancestor_chain_is_safe_without_staging() -> None:
+    local_app_data = Path(os.environ["LOCALAPPDATA"])
+    root = local_app_data / "ones-dev" / "codex-runtime"
+    adapter = codex_runtime_module._WindowsCacheRuntimeAdapter()
+
+    adapter.validate_cache_ancestor_chain(root)
+
+    assert local_app_data.is_dir()
+
+
+def test_cache_ancestor_chain_rejects_reparse_point(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import private_paths
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    target = root.parent.parent
+    monkeypatch.setattr(private_paths, "_current_user_sid", lambda: "user")
+    monkeypatch.setattr(
+        private_paths,
+        "_windows_descriptor",
+        lambda path: ("user", (("user", 0x1F01FF, 0, 0),), True),
+    )
+    monkeypatch.setattr(
+        private_paths, "_is_link_or_reparse", lambda path: path == target,
+    )
+    adapter = codex_runtime_module._WindowsCacheRuntimeAdapter(
+        _runtime_adapter=FakeRuntimeAdapter(tmp_path),
+    )
+    with pytest.raises(OSError, match="ancestor"):
+        adapter.validate_cache_ancestor_chain(root)
+
+
+def test_cache_ancestor_chain_rejects_identity_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import private_paths
+
+    root = tmp_path / "ones-dev" / "codex-runtime"
+    target = root.parent.parent
+    original_stat = Path.stat
+    calls = 0
+
+    def racing_stat(path: Path, *args: object, **kwargs: object) -> object:
+        nonlocal calls
+        metadata = original_stat(path, *args, **kwargs)
+        if path == target:
+            calls += 1
+            if calls >= 3:
+                class Changed:
+                    st_mode = metadata.st_mode
+                    st_dev = metadata.st_dev
+                    st_ino = metadata.st_ino + 1
+
+                return Changed()
+        return metadata
+
+    monkeypatch.setattr(private_paths, "_current_user_sid", lambda: "user")
+    monkeypatch.setattr(
+        private_paths,
+        "_windows_descriptor",
+        lambda path: ("user", (("user", 0x1F01FF, 0, 0),), True),
+    )
+    monkeypatch.setattr(private_paths, "_is_link_or_reparse", lambda path: False)
+    monkeypatch.setattr(Path, "stat", racing_stat)
+    adapter = codex_runtime_module._WindowsCacheRuntimeAdapter(
+        _runtime_adapter=FakeRuntimeAdapter(tmp_path),
+    )
+    with pytest.raises(OSError, match="unstable"):
+        adapter.validate_cache_ancestor_chain(root)
+
+
 def test_zero_length_destination_write_fails_closed() -> None:
     class StalledWriter:
         def write(self, data: bytes | memoryview) -> int:
@@ -596,6 +909,188 @@ def test_smoke_kills_process_when_output_exceeds_limit(
             (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
         )
     assert killed
+
+
+@pytest.mark.parametrize(
+    "primary",
+    [
+        asyncio.CancelledError(), KeyboardInterrupt(), SystemExit(),
+        GeneratorExit(), MemoryError("memory"),
+        subprocess.TimeoutExpired(["codex.exe", "--version"], 2.0),
+        OSError("wait failed"),
+    ],
+)
+def test_smoke_failure_always_kills_reaps_closes_and_joins(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    primary: BaseException,
+) -> None:
+    events: list[str] = []
+
+    class Pipe(io.BytesIO):
+        def close(self) -> None:
+            events.append("close-pipe")
+            super().close()
+
+    class Process:
+        stdout = Pipe(b"")
+        wait_calls = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.wait_calls += 1
+            events.append(f"wait-{self.wait_calls}")
+            if self.wait_calls == 1:
+                raise primary
+            return 1
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    process = Process()
+    monkeypatch.setattr(
+        codex_runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    expected = (
+        OSError if isinstance(primary, subprocess.TimeoutExpired) else type(primary)
+    )
+    with pytest.raises(expected):
+        codex_runtime_module._run_bounded_smoke(
+            (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
+        )
+
+    assert events[:3] == ["wait-1", "kill", "wait-2"]
+    assert "close-pipe" in events
+    assert process.stdout.closed
+    assert not any(
+        thread.name == "ones-dev-codex-smoke-output" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_smoke_reader_failure_is_propagated_after_process_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader_error = RuntimeError("reader failed")
+    events: list[str] = []
+
+    class Pipe:
+        closed = False
+
+        def read(self, size: int) -> bytes:
+            raise reader_error
+
+        def close(self) -> None:
+            self.closed = True
+            events.append("close-pipe")
+
+    class Process:
+        stdout = Pipe()
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append("wait")
+            return 0
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    process = Process()
+    monkeypatch.setattr(
+        codex_runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        codex_runtime_module._run_bounded_smoke(
+            (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
+        )
+    assert caught.value is reader_error
+    assert "kill" in events and "close-pipe" in events
+    assert not any(
+        thread.name == "ones-dev-codex-smoke-output" and thread.is_alive()
+        for thread in threading.enumerate()
+    )
+
+
+def test_smoke_primary_control_flow_beats_cleanup_memory_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = asyncio.CancelledError()
+
+    class Process:
+        stdout = io.BytesIO(b"")
+        calls = 0
+
+        def wait(self, timeout: float | None = None) -> int:
+            self.calls += 1
+            if self.calls == 1:
+                raise primary
+            return 1
+
+        def kill(self) -> None:
+            raise MemoryError("cleanup memory")
+
+    monkeypatch.setattr(
+        codex_runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: Process(),
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        codex_runtime_module._run_bounded_smoke(
+            (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
+        )
+    assert caught.value is primary
+
+
+def test_smoke_thread_start_failure_still_kills_reaps_and_closes_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    primary = MemoryError("thread start failed")
+    events: list[str] = []
+
+    class Process:
+        stdout = io.BytesIO(b"")
+
+        def wait(self, timeout: float | None = None) -> int:
+            events.append("wait")
+            return 1
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    class Thread:
+        name = "ones-dev-codex-smoke-output"
+
+        def start(self) -> None:
+            raise primary
+
+        def join(self, timeout: float | None = None) -> None:
+            events.append("join")
+
+        def is_alive(self) -> bool:
+            return False
+
+    process = Process()
+    monkeypatch.setattr(
+        codex_runtime_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: process,
+    )
+    monkeypatch.setattr(
+        codex_runtime_module.threading,
+        "Thread",
+        lambda *args, **kwargs: Thread(),
+    )
+    with pytest.raises(MemoryError) as caught:
+        codex_runtime_module._run_bounded_smoke(
+            (tmp_path / "codex.exe").resolve(), environment={}, timeout=2.0,
+        )
+    assert caught.value is primary
+    assert events[:2] == ["kill", "wait"]
+    assert "join" in events
+    assert process.stdout.closed
 
 
 def _discover(

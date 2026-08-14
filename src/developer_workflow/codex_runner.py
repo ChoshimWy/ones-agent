@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlsplit
 
 from jsonschema import Draft202012Validator
 
-from .codex_runtime import CodexRuntimePreparer
+from .codex_runtime import CodexRuntimePreparer, _PreparedCodexRuntime
 from .contracts import (
     AcceptanceCoverage,
     CodexResult,
@@ -62,24 +62,39 @@ class CodexOutputError(CodexRunnerError):
     """Codex returned invalid or unsafe structured output."""
 
 
-@dataclass(frozen=True, slots=True)
+_COMMAND_ATTESTATION_NONCE = object()
+
+
+@dataclass(frozen=True, slots=True, init=False, repr=False)
 class CodexCommand:
     """An immutable argv prefix produced by the private runtime staging layer."""
 
     prefix: tuple[str, ...]
+    _identity: object = field(repr=False)
+    _sha256: str = field(repr=False)
+    _nonce: object = field(repr=False)
 
-    def __post_init__(self) -> None:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise TypeError("Codex commands cannot be constructed directly")
+
+    @classmethod
+    def _from_runtime(cls, runtime: object) -> CodexCommand:
         if (
-            type(self.prefix) is not tuple
-            or len(self.prefix) != 1
-            or any(
-                type(component) is not str or not component or "\x00" in component
-                for component in self.prefix
-            )
-            or not Path(self.prefix[0]).is_absolute()
-            or Path(self.prefix[0]).name.casefold() != "codex.exe"
+            type(runtime) is not _PreparedCodexRuntime
+            or not runtime._is_attested()
+            or runtime.path != runtime.path.resolve(strict=True)
+            or runtime.path.name.casefold() != "codex.exe"
         ):
-            raise ValueError("Codex command prefix is invalid")
+            raise TypeError("Codex runtime attestation is invalid")
+        instance = object.__new__(cls)
+        object.__setattr__(instance, "prefix", (str(runtime.path),))
+        object.__setattr__(instance, "_identity", runtime.identity)
+        object.__setattr__(instance, "_sha256", runtime.sha256)
+        object.__setattr__(instance, "_nonce", _COMMAND_ATTESTATION_NONCE)
+        return instance
+
+    def _is_attested(self) -> bool:
+        return self._nonce is _COMMAND_ATTESTATION_NONCE
 
     def argv(self, *arguments: str) -> list[str]:
         if any(
@@ -89,6 +104,15 @@ class CodexCommand:
             raise ValueError("Codex command argument is invalid")
         return [*self.prefix, *arguments]
 
+    def __copy__(self) -> CodexCommand:
+        return self
+
+    def __deepcopy__(self, memo: dict[int, object]) -> CodexCommand:
+        return self
+
+    def __reduce_ex__(self, protocol: int) -> object:
+        raise TypeError("Codex commands cannot be serialized")
+
 
 def _raise_codex_executable_unavailable() -> None:
     raise CodexProcessStartError("Codex executable is unavailable") from None
@@ -96,15 +120,17 @@ def _raise_codex_executable_unavailable() -> None:
 
 def resolve_codex_command(
     *,
-    _prepare: Callable[[], Path] | None = None,
+    _prepare: Callable[[], _PreparedCodexRuntime] | None = None,
 ) -> CodexCommand:
     """Return only the verified native executable staged in the private cache."""
 
-    executable: Path | None = None
+    runtime: _PreparedCodexRuntime | None = None
     failed = False
     try:
-        executable = (
-            CodexRuntimePreparer().prepare() if _prepare is None else _prepare()
+        runtime = (
+            CodexRuntimePreparer().prepare_verified()
+            if _prepare is None
+            else _prepare()
         )
     except BaseException as error:
         if (
@@ -115,10 +141,10 @@ def resolve_codex_command(
             raise
         failed = True
     if failed:
-        del _prepare, executable
+        del _prepare, runtime
         _raise_codex_executable_unavailable()
-    assert executable is not None
-    return CodexCommand((str(executable),))
+    assert runtime is not None
+    return CodexCommand._from_runtime(runtime)
 
 
 class RepositoryGuard(Protocol):
@@ -1328,7 +1354,13 @@ class CodexRunner:
         if any(secret in prompt for secret in removed_secrets):
             raise UnsafeCodexRunError("prompt contains credential material")
         self._write_prompt(run_directory / "codex-prompt.txt", prompt_bytes)
-        command = self.command_resolver().argv(
+        resolved_command = self.command_resolver()
+        if (
+            type(resolved_command) is not CodexCommand
+            or not resolved_command._is_attested()
+        ):
+            _raise_codex_executable_unavailable()
+        command = resolved_command.argv(
             "exec", "--cd", str(effective_cwd), "--sandbox", sandbox,
             "--output-schema", str(self.schema_path), "-",
         )
