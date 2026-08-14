@@ -14,7 +14,8 @@
 
 - Modify: `src/developer_workflow/config.py` — 定义并持久化 profile 来源，校验名称与来源组合。
 - Modify: `src/developer_workflow/setup_models.py` — 将来源字段带入可编辑 `WorkflowDraft`。
-- Modify: `src/developer_workflow/codex_runner.py` — 解析安全、不可变的 Codex argv 前缀。
+- Create: `src/developer_workflow/codex_runtime.py` — 锁定并验证 OpenAI 签名的原生来源，准备和复核私有 Codex 运行时。
+- Modify: `src/developer_workflow/codex_runner.py` — 提供安全、不可变的 Codex argv 前缀与进程错误边界。
 - Modify: `src/developer_workflow/requirement_flow.py` — 统一根据 profile 来源构造 sandbox 命令。
 - Modify: `src/developer_workflow/setup_validation.py` — doctor 使用统一 Codex 命令，并提供内置 profile 的真实能力验证边界。
 - Modify: `src/developer_workflow/setup_controller.py` — 以 operation lock、revision CAS 和取消收割管理确认事务。
@@ -157,118 +158,192 @@ git commit -m "feat(setup): persist sandbox profile sources"
 
 ---
 
-### Task 2: Resolve Codex as a safe argv prefix on Windows
+### Task 2A: Discover and lock the signed native Codex payload
 
 **Files:**
+- Create: `src/developer_workflow/codex_runtime.py`
 - Modify: `src/developer_workflow/codex_runner.py`
-- Test: `tests/test_developer_workflow_codex_runner.py`
+- Create: `tests/test_developer_workflow_codex_runtime.py`
+- Modify: `tests/test_developer_workflow_codex_runner.py`
 
-- [ ] **Step 1: Write failing resolver tests**
+- [ ] **Step 1: Write failing native-source tests**
 
-Use a temporary fake install layout and dependency-injected `which`, identity validator and platform value. Cover direct executable, npm layout and rejection paths:
+Add dependency-injected tests for the fixed npm native layout and Windows trust boundary:
 
 ```python
-def test_resolve_codex_command_uses_direct_executable(tmp_path: Path) -> None:
-    executable = _safe_file(tmp_path / "codex.exe")
-    command = resolve_codex_command(
-        which=lambda name: str(executable) if name == "codex.exe" else None,
-        platform="win32",
-        path_validator=_accept_exact(executable),
-    )
-    assert command.prefix == (str(executable.resolve()),)
-
-
-def test_resolve_codex_command_maps_standard_npm_shim_without_executing_it(
+def test_discover_native_source_uses_fixed_platform_payload_without_node(
     tmp_path: Path,
 ) -> None:
     root = tmp_path / "node"
-    shim = _safe_file(root / "codex.cmd", b"UNTRUSTED-CONTENT-NOT-EXECUTED")
-    node = _safe_file(root / "node.exe")
-    entry = _safe_file(root / "node_modules/@openai/codex/bin/codex.js")
-    command = resolve_codex_command(
-        which=lambda name: str(shim) if name == "codex.cmd" else None,
-        platform="win32",
-        path_validator=_accept_exact(node, entry, shim),
+    shim = _regular_file(root / "codex.cmd", b"NEVER-EXECUTED")
+    native = _regular_file(
+        root / "node_modules/@openai/codex/node_modules/@openai/"
+        "codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe",
+        b"SIGNED-NATIVE-PAYLOAD",
     )
-    assert command.prefix == (str(node.resolve()), str(entry.resolve()))
-
-
-@pytest.mark.parametrize("unsafe", ["reparse", "missing-node", "missing-entry", "identity-race"])
-def test_resolve_codex_command_rejects_unsafe_npm_layout(unsafe: str, tmp_path: Path) -> None:
-    with pytest.raises(CodexProcessStartError, match="Codex executable is unavailable") as caught:
-        _resolve_unsafe_layout(tmp_path, unsafe)
-    assert caught.value.__cause__ is None
-    assert caught.value.__context__ is None
+    source = discover_locked_native_codex(
+        which=lambda name: str(shim) if name == "codex.cmd" else None,
+        opener=_fake_locked_opener(native),
+        signature_verifier=_valid_openai_signature,
+        platform="win32",
+    )
+    try:
+        assert source.publisher == "OpenAI OpCo, LLC"
+        assert source.size == len(b"SIGNED-NATIVE-PAYLOAD")
+        assert source.read_chunk(4096) == b"SIGNED-NATIVE-PAYLOAD"
+    finally:
+        source.close()
 ```
 
-Also assert that `.ps1`, extensionless workspace shims and arbitrary `.cmd` locations are never returned as executable argv entries.
+Add negative tests for missing/fake layout, `.cmd` contents pointing elsewhere, nonregular/reparse source, repository alias, identity race, invalid signature, wrong publisher, trust API failure, and a second writer/delete handle while the source is locked. Assert no test executes Node, JavaScript, a shim, PowerShell or a shell.
 
 - [ ] **Step 2: Run and verify RED**
 
 ```powershell
-uv run pytest tests/test_developer_workflow_codex_runner.py -k "resolve_codex_command" -q
+uv run pytest tests/test_developer_workflow_codex_runtime.py -k "native_source or signature or publisher" -q
 ```
 
-Expected: import failure for `resolve_codex_command`/`CodexCommand`.
+Expected: collection fails because `codex_runtime` and its source API do not exist.
 
-- [ ] **Step 3: Implement immutable command resolution**
+- [ ] **Step 3: Implement the locked source and WinVerifyTrust adapter**
 
-Add:
+Create these production-facing types:
 
 ```python
+OPENAI_AUTHENTICODE_PUBLISHER = "OpenAI OpCo, LLC"
+NATIVE_CODEX_RELATIVE_PATH = Path(
+    "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/"
+    "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
+)
+
+
 @dataclass(frozen=True, slots=True)
-class CodexCommand:
-    prefix: tuple[str, ...]
+class NativeCodexIdentity:
+    volume_serial: int
+    file_index: int
+    size: int
+    mtime_ns: int
 
-    def argv(self, *arguments: str) -> list[str]:
-        if not self.prefix or any(not item or "\x00" in item for item in self.prefix):
+
+@dataclass(slots=True, repr=False)
+class LockedNativeCodex:
+    descriptor: int = field(repr=False)
+    identity: NativeCodexIdentity
+    size: int
+    publisher: str
+    _closed: bool = False
+
+    def read_chunk(self, size: int) -> bytes: ...
+    def rewind(self) -> None: ...
+    def close(self) -> None: ...
+```
+
+The real opener uses `CreateFileW` with `FILE_SHARE_READ` only, `OPEN_EXISTING`, `FILE_FLAG_OPEN_REPARSE_POINT`, and no write/delete sharing. Validate the fixed path lexically and by final handle path, require a regular non-reparse file, bind Windows volume serial/file index/size/mtime, and reject a source inside any repository/worktree by stable identity.
+
+Implement a `WinVerifyTrust` ctypes adapter using `WINTRUST_ACTION_GENERIC_VERIFY_V2`; close trust state on every exit. After trust succeeds, read the signing certificate and require the exact publisher organization `OpenAI OpCo, LLC`. Do not call PowerShell or trust a certificate thumbprint. Catch only ordinary OS/trust-format errors; propagate `MemoryError`, `asyncio.CancelledError`, `KeyboardInterrupt`, `SystemExit`, and `GeneratorExit` unchanged. Raise the fixed public `CodexProcessStartError("Codex executable is unavailable")` outside raw handlers with empty cause/context and scrubbed project-frame locals.
+
+- [ ] **Step 4: Remove the unsafe Node/JS resolver path**
+
+Keep `CodexCommand` in `codex_runner.py`, but delete production behavior that returns `(node.exe, codex.js)`. `CodexCommand.argv()` continues to reject empty/NUL prefix and arguments. No production API may return `.cmd`, `.ps1`, `.js`, `node.exe`, or an external npm-native path as an executable prefix.
+
+- [ ] **Step 5: Run focused tests and commit**
+
+```powershell
+uv run pytest tests/test_developer_workflow_codex_runtime.py tests/test_developer_workflow_codex_runner.py -q
+uv run python -m py_compile src/developer_workflow/codex_runtime.py src/developer_workflow/codex_runner.py
+git diff --check
+git add src/developer_workflow/codex_runtime.py src/developer_workflow/codex_runner.py tests/test_developer_workflow_codex_runtime.py tests/test_developer_workflow_codex_runner.py
+git commit -m "feat(codex): verify native runtime payloads"
+```
+
+Expected: all focused tests pass; the source handle is closed exactly once on every path.
+
+---
+
+### Task 2B: Stage and reuse a private Codex runtime
+
+**Files:**
+- Modify: `src/developer_workflow/codex_runtime.py`
+- Modify: `src/developer_workflow/codex_runner.py`
+- Modify: `tests/test_developer_workflow_codex_runtime.py`
+
+- [ ] **Step 1: Write failing private-staging tests**
+
+```python
+def test_preparer_copies_locked_payload_to_private_hash_directory(tmp_path: Path) -> None:
+    source = _locked_source(b"SIGNED-CODEX", publisher=OPENAI_AUTHENTICODE_PUBLISHER)
+    runner = RecordingRunner(returncode=0, stdout="codex-cli 0.147.0\n")
+    preparer = CodexRuntimePreparer(
+        cache_root=tmp_path / "private-runtime",
+        source_factory=lambda: source,
+        signature_verifier=_valid_openai_signature,
+        directory_preparer=_prepare_test_private_directory,
+        process_runner=runner,
+    )
+    command = preparer.prepare()
+    digest = hashlib.sha256(b"SIGNED-CODEX").hexdigest()
+    assert command.prefix == (str((tmp_path / "private-runtime" / digest / "codex.exe").resolve()),)
+    assert runner.argv == [*command.prefix, "--version"]
+    assert source.closed is True
+```
+
+Add RED tests for source replacement/truncation, partial read, SHA mismatch, destination reparse, unsafe ACL, destination signature/publisher mismatch, disk-full/write/fsync/atomic-replace failure, manifest corruption/path injection, cancellation, exact temp cleanup, and old trusted cache preservation. Add reuse tests proving unchanged source avoids copy, a changed source prepares a new hash directory, and a valid cached runtime works when the npm source is absent.
+
+- [ ] **Step 2: Run and verify RED**
+
+```powershell
+uv run pytest tests/test_developer_workflow_codex_runtime.py -k "preparer or private_runtime or cache" -q
+```
+
+Expected: failures because `CodexRuntimePreparer` is absent.
+
+- [ ] **Step 3: Implement private staging and immutable manifest**
+
+```python
+@dataclass(slots=True)
+class CodexRuntimePreparer:
+    cache_root: Path
+    source_factory: Callable[[], LockedNativeCodex]
+    signature_verifier: SignatureVerifier
+    directory_preparer: Callable[[Path], Path]
+    process_runner: CommandExecutor
+    copy_buffer_bytes: int = 1024 * 1024
+
+    @classmethod
+    def production(cls) -> CodexRuntimePreparer:
+        local = os.environ.get("LOCALAPPDATA")
+        if not local:
             raise CodexProcessStartError("Codex executable is unavailable")
-        return [*self.prefix, *arguments]
+        return cls(
+            cache_root=Path(local) / "ones-dev" / "codex-runtime",
+            source_factory=discover_locked_native_codex,
+            signature_verifier=WindowsAuthenticodeVerifier(),
+            directory_preparer=prepare_private_directory,
+            process_runner=_bounded_subprocess,
+        )
 
-
-def resolve_codex_command(
-    *,
-    which: Callable[[str], str | None] = shutil.which,
-    platform: str = sys.platform,
-    path_validator: Callable[[Path], Path] = _validate_codex_component,
-) -> CodexCommand:
-    failed = False
-    try:
-        direct_name = "codex.exe" if platform == "win32" else "codex"
-        direct = which(direct_name)
-        if direct is not None:
-            return CodexCommand((str(path_validator(Path(direct))),))
-        if platform == "win32" and (shim := which("codex.cmd")) is not None:
-            shim_path = path_validator(Path(shim))
-            node = path_validator(shim_path.parent / "node.exe")
-            entry = path_validator(
-                shim_path.parent / "node_modules" / "@openai" / "codex" / "bin" / "codex.js"
-            )
-            return CodexCommand((str(node), str(entry)))
-        failed = True
-    except (OSError, ValueError):
-        failed = True
-    if failed:
-        raise CodexProcessStartError("Codex executable is unavailable") from None
-    raise CodexProcessStartError("Codex executable is unavailable") from None
+    def prepare(self) -> CodexCommand: ...
 ```
 
-Implement `_validate_codex_component(path: Path) -> Path` with `lstat` before and after `resolve(strict=True)`, exact `(st_dev, st_ino, st_size, st_mtime_ns)` comparison, regular-file enforcement, Windows reparse rejection, and the repository's protected-owner ACL allowlist. Reject a candidate inside the current worktree. Validation failure is converted outside the raw exception handler to fixed `CodexProcessStartError("Codex executable is unavailable") from None`. Do not log candidate paths. The resolver reads no shim contents and returns neither `.cmd` nor `.ps1` in `CodexCommand.prefix`.
+`prepare()` first validates existing private manifests without using manifest paths as filesystem targets. A valid cache requires protected non-reparse ancestors, exact schema/keys/types, target basename `codex.exe`, recomputed SHA-256 equal to directory name and manifest, valid OpenAI signature, stable file identity, and a bounded `--version` smoke with `shell=False` and cleaned environment.
 
-- [ ] **Step 4: Run resolver and process-start regressions**
+When staging, create a random directory only beneath the validated private root, stream from the locked descriptor into a random file, update SHA-256, flush/fsync, recheck source identity, set the protected destination ACL, verify destination hash/signature/publisher, and atomically rename within the same private root. Write the manifest through a separate random file plus fsync/atomic replace. Publish the manifest last; a directory without a valid manifest is never executable. Attempt every owned-temp cleanup on failure, but never delete an existing trusted version.
+
+- [ ] **Step 4: Verify the real installed signature without copying 299 MB in the unit suite**
+
+Add a Windows-only test that locates the fixed installed native payload, opens it with the production locked opener, verifies `publisher == OPENAI_AUTHENTICODE_PUBLISHER`, and closes it. Skip only when that exact npm layout is absent. Do not run the external source directly. Keep the 299 MB copy/smoke as an explicitly marked acceptance test executed once in Task 7.
+
+- [ ] **Step 5: Run tests and commit**
 
 ```powershell
-uv run pytest tests/test_developer_workflow_codex_runner.py -q
+uv run pytest tests/test_developer_workflow_codex_runtime.py tests/test_developer_workflow_codex_runner.py -q
+uv run python -m py_compile src/developer_workflow/codex_runtime.py src/developer_workflow/codex_runner.py
+git diff --check
+git add src/developer_workflow/codex_runtime.py src/developer_workflow/codex_runner.py tests/test_developer_workflow_codex_runtime.py
+git commit -m "feat(codex): stage private signed runtimes"
 ```
 
-Expected: all pass, including existing distinction between start failure and isolation failure.
-
-- [ ] **Step 5: Commit**
-
-```powershell
-git add src/developer_workflow/codex_runner.py tests/test_developer_workflow_codex_runner.py
-git commit -m "feat(codex): resolve safe command prefixes"
-```
+Expected: all focused tests pass; production source verification runs on this Windows host without executing npm/Node/JS/shims.
 
 ---
 
@@ -289,15 +364,16 @@ Add tests using a fake backend that records argv:
 ```python
 def test_builtin_workspace_executor_injects_only_fixed_profile_override(tmp_path: Path) -> None:
     calls: list[list[str]] = []
+    private_codex = _safe_private_codex(tmp_path)
     executor = SandboxCommandExecutor(
         permission_profile=BUILTIN_WORKSPACE_PROFILE,
         permission_profile_source=SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
-        codex_command=CodexCommand(("node.exe", "codex.js")),
+        codex_command=CodexCommand((str(private_codex),)),
         backend_executor=_record_success(calls),
     )
     executor([sys.executable, "-I", "-c", "print('ok')"], cwd=tmp_path, env={}, timeout=2, max_output_bytes=4096)
-    assert calls[-1][:7] == [
-        "node.exe", "codex.js", "-c", BUILTIN_WORKSPACE_OVERRIDE,
+    assert calls[-1][:6] == [
+        str(private_codex), "-c", BUILTIN_WORKSPACE_OVERRIDE,
         "sandbox", "--permission-profile", BUILTIN_WORKSPACE_PROFILE,
     ]
     assert all("shell" not in call for call in calls)
@@ -335,7 +411,7 @@ permission_profile_source: SandboxPermissionProfileSource = SandboxPermissionPro
 codex_command: CodexCommand | None = None
 
 def _command(self) -> CodexCommand:
-    return self.codex_command or resolve_codex_command()
+    return self.codex_command or CodexRuntimePreparer.production().prepare()
 
 def _sandbox_prefix(self, canonical_cwd: Path) -> list[str]:
     prefix = list(self._command().prefix)
@@ -350,7 +426,7 @@ def _sandbox_prefix(self, canonical_cwd: Path) -> list[str]:
 
 Validate source/name pairs in `__post_init__`. Preserve the state-provider branch and all existing outside-write/network/environment probes.
 
-Update `SubprocessDoctorRunner` to accept a resolver and build `command.argv("doctor", "--json")`. `ManagedSandboxExecutorFactory` passes `MANAGED`; add a factory method that builds the fixed `BUILTIN_WORKSPACE` executor. CLI profile validation explicitly constructs the managed form.
+Update `SubprocessDoctorRunner` to accept a preparer callable and build `command.argv("doctor", "--json")`. Production injects one shared `CodexRuntimePreparer` instance so doctor, capability probe and later runtime reuse the same verified private command. `ManagedSandboxExecutorFactory` passes `MANAGED`; add a factory method that builds the fixed `BUILTIN_WORKSPACE` executor. CLI profile validation explicitly constructs the managed form.
 
 - [ ] **Step 4: Run focused regressions**
 
@@ -672,7 +748,7 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(tmp_path: Pa
     assert _codex_config_facts(tmp_path) == before
 ```
 
-The backend must record exact argv and assert no `.cmd`, `.ps1`, `shell=True`, secret-bearing environment, user config write or ACL change occurred.
+The backend must record exact argv and assert no Node, JavaScript, `.cmd`, `.ps1`, `shell=True`, secret-bearing environment, user config write or ACL change occurred. The accepted argv prefix must be the private hash-addressed native executable. Snapshot the npm source bytes/identity/ACL and prove they are unchanged after preparation.
 
 - [ ] **Step 2: Run and verify RED**
 
@@ -697,6 +773,10 @@ In `docs/ones_dev_cli.md`, document:
 
 该操作不会修改 `~/.codex/config.toml` 或其 ACL。内置配置固定为
 `ones-dev-workspace`，不能在 TUI 中扩大权限。
+
+Windows 首次确认会验证已安装原生 Codex 的 OpenAI 数字签名，并准备约 299 MB
+的私有副本。ones-dev 不会执行或修改 npm/NVM 中的 Node、JavaScript 或 shim；
+相同版本后续直接复用经过哈希、签名和 ACL 复核的私有副本。
 ```
 
 - [ ] **Step 5: Run focused security and integration tests**
@@ -726,7 +806,7 @@ From a process environment where `git` is absent and no `[permissions.*]` profil
 uv run ones-dev tui
 ```
 
-Expected: Profile page displays the creation button; Confirm runs the probe; success selects `ones-dev-workspace` and enables Test/Next. Capture only status/category metadata—never environment values, credentials or raw command output.
+Expected: Profile page displays the creation button and the private-copy size notice. Confirm verifies the real installed OpenAI signature, copies the native executable once into the private hash directory, runs private `codex.exe --version`, then runs the sandbox probe. Success selects `ones-dev-workspace` and enables Test/Next. Confirm from a second fresh process reuses the same private digest without rewriting the 299 MB file. Capture only status/category metadata—never paths, environment values, credentials or raw command output.
 
 - [ ] **Step 8: Commit**
 
@@ -745,7 +825,7 @@ git commit -m "test(tui): verify runtime workspace profile setup"
 - [ ] Successful probe: exact builtin name/source persist and reach runtime preflight plus test runner.
 - [ ] Existing managed profiles retain catalog-only behavior and receive no builtin override.
 - [ ] User `config.toml` bytes, identity, mtime and ACL remain unchanged.
-- [ ] Windows npm Codex uses `node.exe + codex.js`, never `.cmd`/PowerShell/shell execution.
+- [ ] Windows npm source is never executed directly; the final prefix is only the signed, hashed, ACL-protected private native `codex.exe`.
 - [ ] Git absence remains independently recoverable and does not block Profile creation.
 - [ ] Cancellation, unmount, close and revision races leave no late state mutation.
 - [ ] Public exceptions and UI surfaces contain no raw path, command, environment or secret data.
