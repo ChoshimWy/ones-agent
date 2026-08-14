@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import FrozenInstanceError
 import json
 from pathlib import Path
+from traceback import TracebackException
 
 import pytest
 from pydantic import ValidationError
@@ -284,7 +285,6 @@ def test_workflow_draft_preserves_profile_source_through_deep_copy_and_json_roun
         sandbox_permission_profile="ones-dev-workspace",
         sandbox_permission_profile_source="builtin_workspace",
     )
-
     copied = draft.model_copy(deep=True)
     payload = copied.model_dump(mode="json")
     restored = WorkflowDraft.model_validate(payload)
@@ -299,6 +299,20 @@ def test_workflow_draft_preserves_profile_source_through_deep_copy_and_json_roun
         is workflow_config.SandboxPermissionProfileSource.BUILTIN_WORKSPACE
     )
 
+
+def _assert_provenance_error_has_no_project_canary(
+    error: ValidationError, canary: str
+) -> None:
+    assert error.errors()[0]["loc"] == ("sandbox_permission_profile_source",)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = TracebackException.from_exception(error, capture_locals=True)
+    for frame in traceback.stack:
+        filename = frame.filename.replace("\\", "/")
+        if filename.endswith(
+            ("src/developer_workflow/config.py", "src/developer_workflow/setup_models.py")
+        ):
+            assert canary not in "\n".join((frame.locals or {}).values())
 
 @pytest.mark.parametrize(
     ("profile", "source"),
@@ -339,9 +353,36 @@ def test_workflow_draft_provenance_errors_detach_the_original_exception(
         )
 
     error = captured.value
-    assert canary not in repr(error.errors())
-    assert error.__cause__ is None
-    assert error.__context__ is None
+    _assert_provenance_error_has_no_project_canary(error, canary)
+
+
+def test_workflow_draft_provenance_assignment_scrubs_project_traceback_state() -> None:
+    canary = "source-canary"
+    draft = WorkflowDraft(sandbox_permission_profile="managed-dev")
+
+    with pytest.raises(ValidationError) as captured:
+        draft.sandbox_permission_profile_source = canary
+
+    _assert_provenance_error_has_no_project_canary(captured.value, canary)
+
+
+def test_workflow_draft_provenance_errors_scrub_all_validation_entrypoints() -> None:
+    canary = "source-canary"
+    payload = {
+        "sandbox_permission_profile": "managed-dev",
+        "sandbox_permission_profile_source": canary,
+    }
+    operations = (
+        lambda: WorkflowDraft(**payload),
+        lambda: WorkflowDraft.model_validate(payload),
+        lambda: WorkflowDraft.model_validate_json(json.dumps(payload)),
+        lambda: WorkflowDraft.model_validate_strings(payload),
+    )
+
+    for operation in operations:
+        with pytest.raises(ValidationError) as captured:
+            operation()
+        _assert_provenance_error_has_no_project_canary(captured.value, canary)
 
 
 @pytest.mark.parametrize(

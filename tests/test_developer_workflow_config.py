@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from traceback import TracebackException
 
 import pytest
 from pydantic import ValidationError
@@ -50,6 +51,19 @@ def _write_config(path: Path, **overrides: object) -> Path:
     payload.update(overrides)
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+def _assert_provenance_error_has_no_project_canary(
+    error: ValidationError, canary: str
+) -> None:
+    assert error.errors()[0]["loc"] == ("sandbox_permission_profile_source",)
+    assert error.__cause__ is None
+    assert error.__context__ is None
+    traceback = TracebackException.from_exception(error, capture_locals=True)
+    for frame in traceback.stack:
+        filename = frame.filename.replace("\\", "/")
+        if filename.endswith("src/developer_workflow/config.py"):
+            assert canary not in "\n".join((frame.locals or {}).values())
 
 
 def test_load_resolves_relative_paths_and_prefers_exact_mapping(tmp_path: Path) -> None:
@@ -379,6 +393,37 @@ def test_sandbox_permission_profile_source_rejections_redact_structured_errors(
     assert all(canary not in form for canary in canaries for form in public_forms)
     assert error.__cause__ is None
     assert error.__context__ is None
+
+
+def test_provenance_errors_scrub_project_traceback_state_across_config_entrypoints(
+    tmp_path: Path,
+) -> None:
+    canary = "source-canary"
+    path = _write_config(
+        tmp_path / "ones-dev.json", sandbox_permission_profile_source=canary
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    operations = (
+        lambda: DeveloperWorkflowConfig(**payload),
+        lambda: DeveloperWorkflowConfig.model_validate(payload),
+        lambda: DeveloperWorkflowConfig.model_validate_json(json.dumps(payload)),
+        lambda: DeveloperWorkflowConfig.model_validate_strings(payload),
+    )
+
+    for operation in operations:
+        with pytest.raises(ValidationError) as captured:
+            operation()
+        _assert_provenance_error_has_no_project_canary(captured.value, canary)
+
+
+def test_provenance_assignment_error_scrubs_project_traceback_state(tmp_path: Path) -> None:
+    canary = "source-canary"
+    config = DeveloperWorkflowConfig.load(_write_config(tmp_path / "ones-dev.json"))
+
+    with pytest.raises(ValidationError) as captured:
+        config.sandbox_permission_profile_source = canary
+
+    _assert_provenance_error_has_no_project_canary(captured.value, canary)
 
 
 @pytest.mark.parametrize(

@@ -75,11 +75,16 @@ def _sanitized_validation_error(
         {
             "type": "value_error",
             "loc": (
+                ("sandbox_permission_profile_source",)
+                if str(item.get("ctx", {}).get("error"))
+                == "sandbox permission profile source is invalid"
+                else (
                 (item["loc"][0],)
                 if item["loc"]
                 and isinstance(item["loc"][0], str)
                 and item["loc"][0] in known_fields
                 else ("<redacted>",)
+                )
             ),
             "input": "<redacted>",
             "ctx": {"error": ValueError("input is invalid")},
@@ -109,6 +114,7 @@ class SetupModel(WorkflowModel):
         except ValidationError as error:
             sanitized_error = _sanitized_validation_error(type(self), error)
         if sanitized_error is not None:
+            data.clear()
             raise sanitized_error
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -118,6 +124,7 @@ class SetupModel(WorkflowModel):
         except ValidationError as error:
             sanitized_error = _sanitized_validation_error(type(self), error)
         if sanitized_error is not None:
+            value = None
             raise sanitized_error
 
     @classmethod
@@ -128,6 +135,9 @@ class SetupModel(WorkflowModel):
         except ValidationError as error:
             sanitized_error = _sanitized_validation_error(cls, error)
         if sanitized_error is not None:
+            obj = None
+            args = ()
+            kwargs = {}
             raise sanitized_error
         return result
 
@@ -139,6 +149,9 @@ class SetupModel(WorkflowModel):
         except ValidationError as error:
             sanitized_error = _sanitized_validation_error(cls, error)
         if sanitized_error is not None:
+            json_data = None
+            args = ()
+            kwargs = {}
             raise sanitized_error
         return result
 
@@ -150,6 +163,9 @@ class SetupModel(WorkflowModel):
         except ValidationError as error:
             sanitized_error = _sanitized_validation_error(cls, error)
         if sanitized_error is not None:
+            obj = None
+            args = ()
+            kwargs = {}
             raise sanitized_error
         return result
 
@@ -402,14 +418,41 @@ class WorkflowDraft(SetupModel):
                 if name == "sandbox_permission_profile_source"
                 else self.sandbox_permission_profile_source
             )
+            invalid_provenance = False
             try:
                 DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
                     profile,
                     source,
                 )
             except ValueError:
-                raise _profile_source_validation_error(type(self)) from None
+                invalid_provenance = True
+            if invalid_provenance:
+                value = None
+                profile = None
+                source = SandboxPermissionProfileSource.MANAGED
+                raise _profile_source_validation_error(type(self))
         super().__setattr__(name, value)
+
+    @classmethod
+    def model_validate_strings(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        invalid_provenance = False
+        if isinstance(obj, Mapping):
+            try:
+                DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+                    obj.get("sandbox_permission_profile"),
+                    obj.get(
+                        "sandbox_permission_profile_source",
+                        SandboxPermissionProfileSource.MANAGED,
+                    ),
+                )
+            except ValueError:
+                invalid_provenance = True
+        if invalid_provenance:
+            obj = None
+            args = ()
+            kwargs = {}
+            raise _profile_source_validation_error(cls)
+        return super().model_validate_strings(obj, *args, **kwargs)
 
     @field_validator("run_root", "mirror_root", "worktree_root")
     @classmethod
@@ -423,18 +466,15 @@ class WorkflowDraft(SetupModel):
             return None
         return DeveloperWorkflowConfig.validate_sandbox_permission_profile(value)
 
-    @model_validator(mode="before")
+    @field_validator("sandbox_permission_profile_source")
     @classmethod
-    def validate_sandbox_permission_profile_binding_before(cls, data: Any) -> Any:
-        if isinstance(data, Mapping):
-            DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
-                data.get("sandbox_permission_profile"),
-                data.get(
-                    "sandbox_permission_profile_source",
-                    SandboxPermissionProfileSource.MANAGED,
-                ),
-            )
-        return data
+    def validate_sandbox_permission_profile_source(
+        cls, value: SandboxPermissionProfileSource, info: Any
+    ) -> SandboxPermissionProfileSource:
+        DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+            info.data.get("sandbox_permission_profile"), value
+        )
+        return value
 
     @model_validator(mode="after")
     def validate_sandbox_permission_profile_binding(self) -> WorkflowDraft:

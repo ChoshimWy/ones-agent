@@ -148,6 +148,7 @@ class DeveloperWorkflowConfig(WorkflowModel):
             else:
                 raise
         if sanitize_error:
+            data.clear()
             raise _profile_source_validation_error(type(self))
 
     def __setattr__(self, name: str, value: Any) -> None:
@@ -168,10 +169,16 @@ class DeveloperWorkflowConfig(WorkflowModel):
                 if name == "sandbox_permission_profile_source"
                 else self.sandbox_permission_profile_source
             )
+            invalid_provenance = False
             try:
                 self.validate_sandbox_permission_profile_binding(profile, source)
             except ValueError:
-                raise _profile_source_validation_error(type(self)) from None
+                invalid_provenance = True
+            if invalid_provenance:
+                value = None
+                profile = None
+                source = SandboxPermissionProfileSource.MANAGED
+                raise _profile_source_validation_error(type(self))
         try:
             super().__setattr__(name, value)
         except ValidationError as error:
@@ -182,6 +189,9 @@ class DeveloperWorkflowConfig(WorkflowModel):
         else:
             sanitize_error = False
         if sanitize_error:
+            value = None
+            profile = None
+            source = SandboxPermissionProfileSource.MANAGED
             raise _profile_source_validation_error(type(self))
 
     @classmethod
@@ -195,8 +205,32 @@ class DeveloperWorkflowConfig(WorkflowModel):
             else:
                 raise
         if sanitize_error:
+            obj = None
+            args = ()
+            kwargs = {}
             raise _profile_source_validation_error(cls)
         return result
+
+    @classmethod
+    def model_validate_strings(cls, obj: Any, *args: Any, **kwargs: Any) -> Any:
+        invalid_provenance = False
+        if isinstance(obj, Mapping):
+            try:
+                cls.validate_sandbox_permission_profile_binding(
+                    obj.get("sandbox_permission_profile"),
+                    obj.get(
+                        "sandbox_permission_profile_source",
+                        SandboxPermissionProfileSource.MANAGED,
+                    ),
+                )
+            except ValueError:
+                invalid_provenance = True
+        if invalid_provenance:
+            obj = None
+            args = ()
+            kwargs = {}
+            raise _profile_source_validation_error(cls)
+        return super().model_validate_strings(obj, *args, **kwargs)
 
     @field_validator("sandbox_permission_profile")
     @classmethod
@@ -205,6 +239,16 @@ class DeveloperWorkflowConfig(WorkflowModel):
             raise ValueError(
                 "sandbox_permission_profile must name an installed managed Codex permissions profile"
             )
+        return value
+
+    @field_validator("sandbox_permission_profile_source")
+    @classmethod
+    def validate_sandbox_permission_profile_source(
+        cls, value: SandboxPermissionProfileSource, info: Any
+    ) -> SandboxPermissionProfileSource:
+        cls.validate_sandbox_permission_profile_binding(
+            info.data.get("sandbox_permission_profile"), value
+        )
         return value
 
     @classmethod
@@ -221,21 +265,6 @@ class DeveloperWorkflowConfig(WorkflowModel):
             valid = source == SandboxPermissionProfileSource.MANAGED
         if not valid:
             raise ValueError("sandbox permission profile source is invalid")
-
-    @model_validator(mode="before")
-    @classmethod
-    def validate_sandbox_permission_profile_binding_before(
-        cls, data: Any
-    ) -> Any:
-        if isinstance(data, Mapping):
-            cls.validate_sandbox_permission_profile_binding(
-                data.get("sandbox_permission_profile"),
-                data.get(
-                    "sandbox_permission_profile_source",
-                    SandboxPermissionProfileSource.MANAGED,
-                ),
-            )
-        return data
 
     @model_validator(mode="after")
     def validate_unique_repositories(self) -> DeveloperWorkflowConfig:
