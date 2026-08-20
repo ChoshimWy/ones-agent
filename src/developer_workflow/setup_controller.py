@@ -355,7 +355,7 @@ class SetupController:
                 task.add_done_callback(self._finish_catalog_task)
                 raise
             except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                if _is_setup_priority_failure(error):
                     raise
                 raise SetupActionError("managed profiles are unavailable") from None
             finally:
@@ -1121,7 +1121,7 @@ class SetupController:
                     self._invalidate_after(step, include_step=False)
                 raise
             except BaseException as error:
-                if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                if _is_setup_priority_failure(error):
                     raise
                 result = _fixed_result(
                     step,
@@ -1358,8 +1358,27 @@ class SetupController:
         self, step: SetupStep, probe: object | None
     ) -> ConnectionTestResult:
         if step is SetupStep.PROFILE:
-            selected = self._draft.workflow.sandbox_permission_profile or self._profile_id
-            await asyncio.to_thread(self._profile_catalog.require_selected, selected)
+            workflow = self._draft.workflow
+            selected = workflow.sandbox_permission_profile
+            source = workflow.sandbox_permission_profile_source
+            if (
+                type(selected) is not str
+                or type(source) is not SandboxPermissionProfileSource
+                or (
+                    source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+                    and selected != BUILTIN_WORKSPACE_PROFILE
+                )
+                or (
+                    source is SandboxPermissionProfileSource.MANAGED
+                    and selected == BUILTIN_WORKSPACE_PROFILE
+                )
+            ):
+                raise ValueError
+            await asyncio.to_thread(
+                self._profile_catalog.require_selected,
+                selected,
+                source,
+            )
             return _fixed_result(
                 step, status=ValidationStatus.PASSED, category="ok"
             )
@@ -1463,8 +1482,9 @@ class SetupController:
                 raise
             raise SetupActionError("credential is unavailable") from None
 
-    @staticmethod
-    def _normalize_ui_probe(step: SetupStep, probe: object | None) -> object | None:
+    def _normalize_ui_probe(
+        self, step: SetupStep, probe: object | None
+    ) -> object | None:
         """Convert the TUI's immutable transient snapshot through strict models."""
 
         if not isinstance(probe, Mapping):
@@ -1490,8 +1510,19 @@ class SetupController:
                     remote_url=values["repository-url"],
                 )
             if step is SetupStep.CODEX:
+                profile = self._draft.workflow.sandbox_permission_profile
+                source = self._draft.workflow.sandbox_permission_profile_source
+                supplied = values["codex-profile"]
+                if (
+                    type(profile) is not str
+                    or type(source) is not SandboxPermissionProfileSource
+                    or type(supplied) is not str
+                    or supplied != profile
+                ):
+                    raise ValueError
                 return CodexProbeInput(
-                    profile=values["codex-profile"],
+                    profile=profile,
+                    profile_source=source,
                     worktree=Path(values["codex-worktree"]),
                 )
             if step is SetupStep.PRIVATE_PATHS:

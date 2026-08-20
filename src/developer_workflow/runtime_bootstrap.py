@@ -19,8 +19,17 @@ from config.settings import OnesSettings
 from src.services.ones_gateway import OnesGateway
 
 from .approval_rebuilder import WorkflowApprovalRebuilder
-from .codex_runner import CodexRunner, validate_codex_auth_source
-from .config import DeveloperWorkflowConfig
+from .codex_runner import (
+    CodexRunner,
+    resolve_codex_command,
+    validate_codex_auth_source,
+)
+from .codex_runtime import CodexRuntimePreparer
+from .config import (
+    BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
+    SandboxPermissionProfileSource,
+)
 from .defect_flow import DefectCandidateService, DefectFlow
 from .ones_comment import OnesCommenter
 from .orchestrator import DeveloperWorkflowOrchestrator
@@ -85,7 +94,20 @@ class PrivateRootPreparer(Protocol):
 
 
 class SandboxProfileValidator(Protocol):
-    def __call__(self, profile: str, environment: Mapping[str, str]) -> None: ...
+    def __call__(
+        self,
+        profile: str,
+        source: SandboxPermissionProfileSource,
+        environment: Mapping[str, str],
+    ) -> None: ...
+
+
+class SandboxFactory(Protocol):
+    def __call__(
+        self,
+        profile: str,
+        source: SandboxPermissionProfileSource,
+    ) -> object: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,7 +117,7 @@ class RuntimeAdapterBundle:
     gateway_factory: Callable[..., object] | None = None
     codex_factory: Callable[..., object] | None = None
     repository_factory: Callable[..., object] | None = None
-    sandbox_factory: Callable[..., object] | None = None
+    sandbox_factory: SandboxFactory | None = None
     pr_factory: Callable[..., object] | None = None
     commenter_factory: Callable[..., object] | None = None
 
@@ -153,11 +175,19 @@ def _preflight_environment(source: Mapping[str, str]) -> dict[str, str]:
 
 
 def _default_sandbox_validator(
-    profile: str, environment: Mapping[str, str]
+    profile: str,
+    source: SandboxPermissionProfileSource,
+    environment: Mapping[str, str],
+    *,
+    codex_preparer: CodexRuntimePreparer | None = None,
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="ones-dev-sandbox-preflight-") as raw:
         cwd = Path(raw).resolve(strict=True)
-        completed = SandboxCommandExecutor(permission_profile=profile)(
+        completed = SandboxCommandExecutor(
+            permission_profile=profile,
+            permission_profile_source=source,
+            codex_preparer=codex_preparer,
+        )(
             sandbox_preflight_command(),
             cwd=cwd,
             env=dict(environment),
@@ -257,6 +287,48 @@ class RuntimeBootstrapper:
     gateway_close: Callable[[OnesGateway], None] = _run_gateway_close
     ambient_environment: Callable[[], Mapping[str, str]] = lambda: os.environ
     adapters: RuntimeAdapterBundle = field(default_factory=RuntimeAdapterBundle)
+    codex_runtime_preparer: CodexRuntimePreparer = field(
+        default_factory=CodexRuntimePreparer,
+        repr=False,
+    )
+
+    @staticmethod
+    def _profile_provenance(
+        active: ActiveSetup,
+    ) -> tuple[str, SandboxPermissionProfileSource]:
+        workflow = active.workflow
+        profile = workflow.sandbox_permission_profile
+        source = workflow.sandbox_permission_profile_source
+        if (
+            type(profile) is not str
+            or type(source) is not SandboxPermissionProfileSource
+        ):
+            raise ValueError
+        if source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE:
+            if profile != BUILTIN_WORKSPACE_PROFILE:
+                raise ValueError
+        elif source is SandboxPermissionProfileSource.MANAGED:
+            if profile == BUILTIN_WORKSPACE_PROFILE:
+                raise ValueError
+        else:  # pragma: no cover - exact enum type makes this defensive only
+            raise ValueError
+        return profile, source
+
+    def _validate_sandbox_capability(
+        self,
+        profile: str,
+        source: SandboxPermissionProfileSource,
+        environment: Mapping[str, str],
+    ) -> None:
+        if self.sandbox_profile_validator is _default_sandbox_validator:
+            _default_sandbox_validator(
+                profile,
+                source,
+                environment,
+                codex_preparer=self.codex_runtime_preparer,
+            )
+            return
+        self.sandbox_profile_validator(profile, source, environment)
 
     def build_ones_probe_gateway(
         self, public: Mapping[str, str], secrets: RuntimeSecrets
@@ -342,6 +414,7 @@ class RuntimeBootstrapper:
         try:
             if type(active) is not ActiveSetup or type(secrets) is not RuntimeSecrets:
                 raise ValueError
+            persisted_profile, persisted_source = self._profile_provenance(active)
             if set(secrets.values) != set(active.credential_kinds):
                 raise ValueError
             public = active.runtime
@@ -352,6 +425,14 @@ class RuntimeBootstrapper:
             workflow = DeveloperWorkflowConfig.model_validate(
                 active.workflow.model_dump(mode="python", round_trip=True)
             )
+            if (
+                type(workflow.sandbox_permission_profile) is not str
+                or type(workflow.sandbox_permission_profile_source)
+                is not SandboxPermissionProfileSource
+                or workflow.sandbox_permission_profile != persisted_profile
+                or workflow.sandbox_permission_profile_source is not persisted_source
+            ):
+                raise ValueError
             codex_kinds = {
                 SecretKind.CODEX_API_KEY,
                 SecretKind.CODEX_AUTH_TOKEN,
@@ -406,8 +487,9 @@ class RuntimeBootstrapper:
                 *(repo for group in workflow.repository_groups for repo in group.repositories),
             ):
                 parse_repository_identity(mapping.repo_url, public.provider_host)
-            self.sandbox_profile_validator(
-                workflow.sandbox_permission_profile,
+            self._validate_sandbox_capability(
+                persisted_profile,
+                persisted_source,
                 _preflight_environment(codex_environment),
             )
             run_root, mirror_root, worktree_root = self.private_root_preparer(
@@ -441,6 +523,9 @@ class RuntimeBootstrapper:
                 CodexRunner(
                     run_root,
                     repository,
+                    command_resolver=lambda: resolve_codex_command(
+                        _prepare=self.codex_runtime_preparer.prepare_verified
+                    ),
                     environment_provider=environment_provider,
                 )
                 if self.adapters.codex_factory is None
@@ -450,11 +535,14 @@ class RuntimeBootstrapper:
             )
             test_runner = (
                 SandboxCommandExecutor(
-                    permission_profile=workflow.sandbox_permission_profile
+                    permission_profile=persisted_profile,
+                    permission_profile_source=persisted_source,
+                    codex_preparer=self.codex_runtime_preparer,
                 )
                 if self.adapters.sandbox_factory is None
                 else self.adapters.sandbox_factory(
-                    workflow.sandbox_permission_profile
+                    persisted_profile,
+                    persisted_source,
                 )
             )
             group_workspace = RepositoryGroupWorkspace(repository)

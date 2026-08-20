@@ -50,7 +50,12 @@ class TuiHostFactory(Protocol):
 
 
 class SandboxProfileValidator(Protocol):
-    def __call__(self, profile: str, environment: dict[str, str]) -> None: ...
+    def __call__(
+        self,
+        profile: str,
+        source: SandboxPermissionProfileSource,
+        environment: dict[str, str],
+    ) -> None: ...
 
 
 class _ParserExit(Exception):
@@ -502,7 +507,9 @@ def _valid_runtime_text(value: str) -> bool:
 
 
 def _validate_sandbox_permission_profile(
-    profile: str, environment: dict[str, str]
+    profile: str,
+    source: SandboxPermissionProfileSource,
+    environment: dict[str, str],
 ) -> None:
     """Prove the managed profile's sandbox capabilities before service startup."""
 
@@ -512,7 +519,7 @@ def _validate_sandbox_permission_profile(
         cwd = Path(raw).resolve(strict=True)
         executor = SandboxCommandExecutor(
             permission_profile=profile,
-            permission_profile_source=SandboxPermissionProfileSource.MANAGED,
+            permission_profile_source=source,
         )
         completed = executor(
             sandbox_preflight_command(),

@@ -8,7 +8,12 @@ from pathlib import Path
 
 import pytest
 
-from src.developer_workflow.config import DeveloperWorkflowConfig, PublishingConfig
+from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
+    PublishingConfig,
+    SandboxPermissionProfileSource,
+)
 from src.developer_workflow.contracts import RepositoryMapping
 from src.developer_workflow.setup_models import (
     ActiveSetup,
@@ -68,6 +73,21 @@ def _active(tmp_path: Path, *, codex_auth_mode: str = "credential") -> ActiveSet
     )
 
 
+def _active_with_profile(
+    tmp_path: Path,
+    profile: str,
+    source: SandboxPermissionProfileSource,
+) -> ActiveSetup:
+    workflow_data = _workflow(tmp_path).model_dump(mode="python", round_trip=True)
+    workflow_data.update(
+        sandbox_permission_profile=profile,
+        sandbox_permission_profile_source=source,
+    )
+    return _active(tmp_path).validated_update(
+        workflow=DeveloperWorkflowConfig.model_validate(workflow_data)
+    )
+
+
 def _secrets(**updates: str) -> RuntimeSecrets:
     values = {
         SecretKind.ONES_EMAIL: "stored@example.invalid",
@@ -100,7 +120,7 @@ def test_bootstrap_normalizes_committed_workflow_to_public_runtime_contracts(
     assert type(active.workflow) is not DeveloperWorkflowConfig
     handle = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     ).build(active, _secrets())
     try:
         assert type(handle.orchestrator.config) is DeveloperWorkflowConfig
@@ -166,7 +186,7 @@ def test_bootstrap_uses_explicit_inputs_without_mutating_parent_environment(
     before = dict(os.environ)
     bootstrapper = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     )
 
     handle = bootstrapper.build(_active(tmp_path), _secrets())
@@ -194,7 +214,7 @@ def test_bootstrap_ones_settings_ignore_all_unspecified_ambient_values(
     monkeypatch.setenv("ONES_COMMENT_TIMEOUT_SECONDS", "999")
     handle = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     ).build(_active(tmp_path), _secrets())
     try:
         settings = handle.gateway.settings
@@ -234,7 +254,7 @@ def test_bootstrap_requires_exact_active_credential_kind_set(
         private_root_preparer=lambda roots: (
             root_calls.append(tuple(roots)) or tuple(roots)
         ),
-        sandbox_profile_validator=lambda profile, environment: sandbox_calls.append(
+        sandbox_profile_validator=lambda profile, source, environment: sandbox_calls.append(
             environment
         ),
     )
@@ -258,7 +278,7 @@ def test_sandbox_preflight_never_receives_credentials_or_userinfo_urls(
     seen: list[dict[str, str]] = []
     handle = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: seen.append(
+        sandbox_profile_validator=lambda profile, source, environment: seen.append(
             dict(environment)
         ),
     ).build(_active(tmp_path), _secrets())
@@ -272,6 +292,227 @@ def test_sandbox_preflight_never_receives_credentials_or_userinfo_urls(
         )
         assert "proxy-secret" not in repr(seen)
         assert "api-secret" not in repr(seen)
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        ("managed-dev", SandboxPermissionProfileSource.MANAGED),
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+    ],
+)
+def test_bootstrap_forwards_exact_persisted_profile_source_to_both_sandbox_factories(
+    tmp_path: Path,
+    profile: str,
+    source: SandboxPermissionProfileSource,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeAdapterBundle,
+        RuntimeBootstrapper,
+    )
+
+    calls: list[tuple[str, str, SandboxPermissionProfileSource]] = []
+    bootstrapper = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda selected, persisted_source, environment: calls.append(
+            ("preflight", selected, persisted_source)
+        ),
+        adapters=RuntimeAdapterBundle(
+            sandbox_factory=lambda selected, persisted_source: calls.append(
+                ("runtime", selected, persisted_source)
+            )
+            or object()
+        ),
+    )
+
+    handle = bootstrapper.build(
+        _active_with_profile(tmp_path, profile, source),
+        _secrets(),
+    )
+    try:
+        assert calls == [
+            ("preflight", profile, source),
+            ("runtime", profile, source),
+        ]
+    finally:
+        handle.close()
+
+
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.MANAGED),
+        ("managed-dev", SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        ("managed-dev", "managed"),
+        ("managed-dev", type("SourceText", (str,), {})("managed")),
+        (
+            type("ProfileText", (str,), {})("managed-dev"),
+            SandboxPermissionProfileSource.MANAGED,
+        ),
+    ],
+)
+def test_bootstrap_rejects_confused_profile_provenance_before_secrets_roots_or_factories(
+    tmp_path: Path,
+    profile: object,
+    source: object,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeAdapterBundle,
+        RuntimeBootstrapError,
+        RuntimeBootstrapper,
+    )
+
+    class TrackingValues(dict[SecretKind, str]):
+        reads = 0
+
+        def __iter__(self):
+            self.reads += 1
+            return super().__iter__()
+
+        def items(self):
+            self.reads += 1
+            return super().items()
+
+        def get(self, key: object, default: object = None):
+            self.reads += 1
+            return super().get(key, default)
+
+        def __getitem__(self, key: object):
+            self.reads += 1
+            return super().__getitem__(key)
+
+    active = _active(tmp_path)
+    object.__setattr__(active.workflow, "sandbox_permission_profile", profile)
+    object.__setattr__(active.workflow, "sandbox_permission_profile_source", source)
+    secrets = _secrets()
+    tracking = TrackingValues(secrets.values)
+    tracking.reads = 0
+    object.__setattr__(secrets, "values", tracking)
+    effects: list[str] = []
+    bootstrapper = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: effects.append("roots") or tuple(roots),
+        sandbox_profile_validator=lambda *args: effects.append("preflight"),
+        adapters=RuntimeAdapterBundle(
+            gateway_factory=lambda *args: effects.append("gateway") or object(),
+            codex_factory=lambda *args: effects.append("codex") or object(),
+            repository_factory=lambda *args: effects.append("repository") or object(),
+            sandbox_factory=lambda *args: effects.append("sandbox") or object(),
+            pr_factory=lambda *args, **kwargs: effects.append("pr") or object(),
+            commenter_factory=lambda *args: effects.append("commenter") or object(),
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeBootstrapError,
+        match="production runtime configuration is incomplete",
+    ):
+        bootstrapper.build(active, secrets)
+
+    assert tracking.reads == 0
+    assert effects == []
+
+
+def test_bootstrap_never_invokes_untrusted_profile_equality(tmp_path: Path) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeBootstrapError,
+        RuntimeBootstrapper,
+    )
+
+    class EqualProfile:
+        compared = False
+
+        def __eq__(self, other: object) -> bool:
+            self.compared = True
+            return True
+
+    profile = EqualProfile()
+    active = _active(tmp_path)
+    object.__setattr__(active.workflow, "sandbox_permission_profile", profile)
+
+    with pytest.raises(RuntimeBootstrapError):
+        RuntimeBootstrapper(
+            private_root_preparer=lambda roots: pytest.fail("roots must not be prepared"),
+            sandbox_profile_validator=lambda *args: pytest.fail("sandbox must not run"),
+        ).build(active, _secrets())
+
+    assert profile.compared is False
+
+
+def test_bootstrap_shares_one_codex_preparer_across_fresh_runtime_leases(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.runtime_bootstrap as runtime_module
+
+    class Preparer:
+        def prepare_verified(self) -> object:
+            return object()
+
+    preparer = Preparer()
+    resolver_calls: list[object] = []
+    marker = object()
+
+    def resolve(*, _prepare: object) -> object:
+        resolver_calls.append(getattr(_prepare, "__self__", None))
+        return marker
+
+    monkeypatch.setattr(runtime_module, "resolve_codex_command", resolve)
+    handle = runtime_module.RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, source, environment: None,
+        codex_runtime_preparer=preparer,  # type: ignore[arg-type]
+    ).build(_active(tmp_path), _secrets())
+    try:
+        flow = handle.orchestrator.requirement_flow
+        assert flow.test_runner.codex_preparer is preparer
+        assert flow.codex.command_resolver() is marker
+        assert resolver_calls == [preparer]
+    finally:
+        handle.close()
+
+
+def test_setup_document_round_trip_preserves_source_for_both_runtime_sandbox_calls(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeAdapterBundle,
+        RuntimeBootstrapper,
+    )
+    from src.developer_workflow.setup_models import SetupDocument
+
+    active = _active_with_profile(
+        tmp_path,
+        BUILTIN_WORKSPACE_PROFILE,
+        SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+    )
+    loaded = SetupDocument.model_validate_json(
+        SetupDocument(profile_id="runtime", active=active).model_dump_json()
+    )
+    assert loaded.active is not None
+    calls: list[tuple[str, SandboxPermissionProfileSource]] = []
+    handle = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, source, environment: calls.append(
+            (profile, source)
+        ),
+        adapters=RuntimeAdapterBundle(
+            sandbox_factory=lambda profile, source: calls.append((profile, source))
+            or object()
+        ),
+    ).build(loaded.active, _secrets())
+    try:
+        assert calls == [
+            (
+                BUILTIN_WORKSPACE_PROFILE,
+                SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+            ),
+            (
+                BUILTIN_WORKSPACE_PROFILE,
+                SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+            ),
+        ]
     finally:
         handle.close()
 
@@ -298,7 +539,7 @@ def test_legacy_sandbox_adapter_forwards_only_sanitized_preflight_environment(
 
     orchestrator = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile, environment: seen.append(
+        sandbox_profile_validator=lambda profile, source, environment: seen.append(
             dict(environment)
         ),
     )
@@ -357,7 +598,7 @@ def test_codex_auth_mode_contract_rejects_conflicting_or_unused_inputs_before_ro
     with pytest.raises(RuntimeBootstrapError):
         RuntimeBootstrapper(
             private_root_preparer=lambda roots: root_calls.append(roots) or tuple(roots),
-            sandbox_profile_validator=lambda profile, environment: None,
+            sandbox_profile_validator=lambda profile, source, environment: None,
         ).build(active, RuntimeSecrets(values))
     assert root_calls == []
 
@@ -499,7 +740,7 @@ def test_runtime_handle_and_reachable_runtime_repr_never_expose_secrets(
     )
     handle = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     ).build(active, secrets)
     try:
         rendered = "\n".join(
@@ -528,7 +769,7 @@ def test_bootstrap_fails_closed_before_private_roots_when_secret_missing(
     roots: list[tuple[Path, ...]] = []
     bootstrapper = RuntimeBootstrapper(
         private_root_preparer=lambda values: roots.append(tuple(values)) or tuple(values),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     )
     incomplete = RuntimeSecrets(
         {
@@ -550,7 +791,7 @@ def test_runtime_handle_closes_gateway_exactly_once(tmp_path: Path) -> None:
     closed: list[object] = []
     bootstrapper = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
         gateway_close=lambda gateway: closed.append(gateway),
     )
     handle = bootstrapper.build(_active(tmp_path), _secrets())
@@ -573,7 +814,7 @@ def test_bootstrap_rejects_control_characters_in_explicit_transport_secrets(
 
     bootstrapper = RuntimeBootstrapper(
         private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     )
     unsafe = _secrets(provider_token="unsafe\nheader")
 

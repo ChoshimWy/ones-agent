@@ -10,6 +10,7 @@ from uuid import uuid4
 import pytest
 from textual.widgets import Button, Input, Select, Static
 
+from src.developer_workflow.config import SandboxPermissionProfileSource
 from src.developer_workflow.setup_models import SetupDraft
 from src.developer_workflow.setup_models import SecretKind, WorkflowDraft
 from src.developer_workflow.setup_import import ImportDetection
@@ -323,14 +324,14 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         return _EffectRepository(raw, effects)
 
     runtime_builder = RuntimeBootstrapper(
-        sandbox_profile_validator=lambda selected, env: None,
+        sandbox_profile_validator=lambda selected, source, env: None,
         gateway_close=lambda gateway: None,
         ambient_environment=lambda: {},
         adapters=RuntimeAdapterBundle(
             gateway_factory=lambda settings: original_flow.gateway,
             codex_factory=lambda run_root, repository, environment: original_flow.codex,
             repository_factory=repository_factory,
-            sandbox_factory=lambda selected: original_flow.test_runner,
+            sandbox_factory=lambda selected, source: original_flow.test_runner,
             pr_factory=lambda **kwargs: original_publisher.pr_client,
             commenter_factory=lambda gateway, runtime_store: commenter,
         ),
@@ -338,8 +339,9 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
     bootstrap = FakeBootstrap()
     bootstrap.catalog = SimpleNamespace(
         list_profiles=lambda: (profile,),
-        require_selected=lambda selected: selected
+        require_selected=lambda selected, source: selected
         if selected == profile
+        and source is SandboxPermissionProfileSource.MANAGED
         else (_ for _ in ()).throw(ValueError("profile unavailable"))
     )
     setup = SetupController(

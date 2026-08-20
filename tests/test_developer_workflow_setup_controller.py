@@ -103,11 +103,23 @@ def _result(step: SetupStep, passed: bool = True) -> ConnectionTestResult:
 
 
 class FakeCatalog:
+    def __init__(self) -> None:
+        self.selections: list[tuple[str, SandboxPermissionProfileSource]] = []
+
     def list_profiles(self) -> tuple[str, ...]:
         return ("managed-profile",)
 
-    def require_selected(self, profile: str) -> str:
-        if profile != "managed-profile":
+    def require_selected(
+        self,
+        profile: str,
+        source: SandboxPermissionProfileSource,
+    ) -> str:
+        self.selections.append((profile, source))
+        if (
+            type(source) is not SandboxPermissionProfileSource
+            or source is not SandboxPermissionProfileSource.MANAGED
+            or profile != "managed-profile"
+        ):
             raise ValueError("SECRET profile")
         return profile
 
@@ -154,6 +166,7 @@ async def test_managed_profile_snapshot_is_frozen_and_loaded_off_loop() -> None:
 
     class Catalog(FakeCatalog):
         def __init__(self) -> None:
+            super().__init__()
             self.thread_id: int | None = None
 
         def list_profiles(self) -> tuple[str, ...]:
@@ -212,6 +225,7 @@ async def test_managed_profile_cancel_is_propagated_and_worker_is_owned() -> Non
 
 class _BuiltinCatalog(FakeCatalog):
     def __init__(self) -> None:
+        super().__init__()
         self.calls = 0
         self.entered = Event()
         self.release = Event()
@@ -821,6 +835,223 @@ async def _pass_all(controller: SetupController) -> None:
     await controller.test_step(SetupStep.PROFILE)
     for step in SetupController.STEPS[1:-1]:
         await controller.test_step(step, object())
+
+
+@pytest.mark.asyncio
+async def test_profile_retest_passes_exact_managed_provenance_to_catalog(
+    tmp_path: Path,
+) -> None:
+    controller, _, _, bootstrap = _controller(tmp_path)
+
+    result = await controller.test_step(SetupStep.PROFILE)
+
+    assert result.status is ValidationStatus.PASSED
+    assert bootstrap.catalog.selections == [
+        ("managed-profile", SandboxPermissionProfileSource.MANAGED)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_profile_retest_passes_builtin_provenance_without_managed_fallback(
+    tmp_path: Path,
+) -> None:
+    class Catalog(FakeCatalog):
+        def __init__(self) -> None:
+            super().__init__()
+            self.managed_lists = 0
+            self.builtin_calls = 0
+
+        def list_profiles(self) -> tuple[str, ...]:
+            self.managed_lists += 1
+            return ()
+
+        def verify_builtin_workspace_profile(self) -> str:
+            self.builtin_calls += 1
+            return BUILTIN_WORKSPACE_PROFILE
+
+        def require_selected(
+            self,
+            profile: str,
+            source: SandboxPermissionProfileSource,
+        ) -> str:
+            self.selections.append((profile, source))
+            if (
+                type(profile) is not str
+                or type(source) is not SandboxPermissionProfileSource
+                or source is not SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+                or profile != BUILTIN_WORKSPACE_PROFILE
+            ):
+                raise ValueError
+            verified = self.verify_builtin_workspace_profile()
+            if type(verified) is not str or verified != BUILTIN_WORKSPACE_PROFILE:
+                raise ValueError
+            return verified
+
+    controller, _, _, _ = _controller(tmp_path)
+    data = controller.draft.workflow.model_dump(mode="python", round_trip=True)
+    data.update(
+        sandbox_permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        sandbox_permission_profile_source=(
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ),
+    )
+    controller.apply_workflow(WorkflowDraft.model_validate(data))
+    catalog = Catalog()
+    controller._profile_catalog = catalog
+
+    result = await controller.test_step(SetupStep.PROFILE)
+
+    assert result.status is ValidationStatus.PASSED
+    assert catalog.selections == [
+        (
+            BUILTIN_WORKSPACE_PROFILE,
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        )
+    ]
+    assert catalog.builtin_calls == 1
+    assert catalog.managed_lists == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.MANAGED),
+        ("managed-profile", SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        ("managed-profile", "managed"),
+        ("managed-profile", type("SourceText", (str,), {})("managed")),
+        (
+            type("ProfileText", (str,), {})("managed-profile"),
+            SandboxPermissionProfileSource.MANAGED,
+        ),
+    ],
+)
+async def test_profile_retest_rejects_confused_provenance_without_catalog_calls(
+    tmp_path: Path,
+    profile: object,
+    source: object,
+) -> None:
+    controller, _, _, bootstrap = _controller(tmp_path)
+    object.__setattr__(
+        controller._draft.workflow,
+        "sandbox_permission_profile",
+        profile,
+    )
+    object.__setattr__(
+        controller._draft.workflow,
+        "sandbox_permission_profile_source",
+        source,
+    )
+
+    result = await controller.test_step(SetupStep.PROFILE)
+
+    assert result == ConnectionTestResult(
+        step=SetupStep.PROFILE,
+        status=ValidationStatus.FAILED,
+        category="incompatible",
+    )
+    assert bootstrap.catalog.selections == []
+
+
+@pytest.mark.asyncio
+async def test_profile_retest_never_invokes_untrusted_profile_equality(
+    tmp_path: Path,
+) -> None:
+    class EqualProfile:
+        compared = False
+
+        def __eq__(self, other: object) -> bool:
+            self.compared = True
+            return True
+
+    profile = EqualProfile()
+    controller, _, _, bootstrap = _controller(tmp_path)
+    object.__setattr__(
+        controller._draft.workflow,
+        "sandbox_permission_profile",
+        profile,
+    )
+
+    result = await controller.test_step(SetupStep.PROFILE)
+
+    assert result.status is ValidationStatus.FAILED
+    assert profile.compared is False
+    assert bootstrap.catalog.selections == []
+
+
+@pytest.mark.asyncio
+async def test_profile_retest_catalog_failure_is_fixed_without_source_fallback(
+    tmp_path: Path,
+) -> None:
+    class Catalog(FakeCatalog):
+        def require_selected(self, profile, source):
+            self.selections.append((profile, source))
+            raise RuntimeError("CATALOG-SECRET")
+
+    controller, _, _, _ = _controller(tmp_path)
+    catalog = Catalog()
+    controller._profile_catalog = catalog
+
+    result = await controller.test_step(SetupStep.PROFILE)
+
+    assert result == ConnectionTestResult(
+        step=SetupStep.PROFILE,
+        status=ValidationStatus.FAILED,
+        category="incompatible",
+    )
+    assert catalog.selections == [
+        ("managed-profile", SandboxPermissionProfileSource.MANAGED)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_profile_retest_catalog_cancellation_propagates_without_fallback(
+    tmp_path: Path,
+) -> None:
+    failure = asyncio.CancelledError()
+
+    class Catalog(FakeCatalog):
+        def require_selected(self, profile, source):
+            self.selections.append((profile, source))
+            raise failure
+
+    controller, _, _, _ = _controller(tmp_path)
+    catalog = Catalog()
+    controller._profile_catalog = catalog
+
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await controller.test_step(SetupStep.PROFILE)
+
+    assert caught.value is failure
+    assert catalog.selections == [
+        ("managed-profile", SandboxPermissionProfileSource.MANAGED)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_type", [MemoryError, GeneratorExit])
+async def test_profile_retest_catalog_priority_failure_propagates(
+    tmp_path: Path,
+    failure_type: type[BaseException],
+) -> None:
+    failure = failure_type()
+
+    class Catalog(FakeCatalog):
+        def require_selected(self, profile, source):
+            self.selections.append((profile, source))
+            raise failure
+
+    controller, _, _, _ = _controller(tmp_path)
+    catalog = Catalog()
+    controller._profile_catalog = catalog
+
+    with pytest.raises(failure_type) as caught:
+        await controller.test_step(SetupStep.PROFILE)
+
+    assert caught.value is failure
+    assert catalog.selections == [
+        ("managed-profile", SandboxPermissionProfileSource.MANAGED)
+    ]
 
 
 @pytest.mark.asyncio

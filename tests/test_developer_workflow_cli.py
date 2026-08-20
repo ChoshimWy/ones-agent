@@ -1772,7 +1772,7 @@ def test_production_factory_builds_the_real_service_graph_without_network(
 
     orchestrator = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     )
 
     assert isinstance(orchestrator.requirement_flow, RequirementFlow)
@@ -1811,7 +1811,7 @@ def test_production_factory_delegates_legacy_environment_to_runtime_bootstrap(
 
     result = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile, environment: None,
+        sandbox_profile_validator=lambda profile, source, environment: None,
     )
 
     assert result is expected
@@ -1837,7 +1837,8 @@ def test_production_factory_rejects_invalid_git_email_before_creating_roots(
 
     with pytest.raises(RuntimeError, match="production runtime configuration is incomplete"):
         build_production_orchestrator(
-            config, sandbox_profile_validator=lambda profile, environment: None
+            config,
+            sandbox_profile_validator=lambda profile, source, environment: None,
         )
 
     assert not config.run_root.exists()
@@ -1874,7 +1875,8 @@ def test_production_factory_requires_a_verified_codex_auth_source_before_roots(
         RuntimeError, match="production runtime configuration is incomplete"
     ):
         build_production_orchestrator(
-            config, sandbox_profile_validator=lambda profile, environment: None
+            config,
+            sandbox_profile_validator=lambda profile, source, environment: None,
         )
 
     assert not config.run_root.exists()
@@ -1895,11 +1897,15 @@ def test_production_factory_validates_managed_sandbox_profile_before_roots(
         "/project/api/project/team/{team_id}/task/{item_id}/comments",
     )
     config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
-    seen: list[str] = []
+    seen: list[tuple[str, SandboxPermissionProfileSource]] = []
 
-    def reject_profile(profile: str, environment: dict[str, str]) -> None:
+    def reject_profile(
+        profile: str,
+        source: SandboxPermissionProfileSource,
+        environment: dict[str, str],
+    ) -> None:
         del environment
-        seen.append(profile)
+        seen.append((profile, source))
         raise RuntimeError("sandbox profile is unavailable")
 
     with pytest.raises(
@@ -1909,7 +1915,9 @@ def test_production_factory_validates_managed_sandbox_profile_before_roots(
             config, sandbox_profile_validator=reject_profile
         )
 
-    assert seen == ["managed-dev"]
+    assert seen == [
+        ("managed-dev", SandboxPermissionProfileSource.MANAGED)
+    ]
     assert not config.run_root.exists()
     assert not config.mirror_root.exists()
     assert not config.worktree_root.exists()

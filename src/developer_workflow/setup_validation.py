@@ -36,6 +36,7 @@ from .codex_runner import (
 from .codex_runtime import CodexRuntimePreparer
 from .config import (
     BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
     SandboxPermissionProfileSource,
 )
 from .contracts import WorkflowModel
@@ -241,6 +242,9 @@ class CodexProbeInput(SetupModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     profile: StrictStr
+    profile_source: SandboxPermissionProfileSource = (
+        SandboxPermissionProfileSource.MANAGED
+    )
     worktree: Path
 
     @field_validator("profile")
@@ -249,6 +253,16 @@ class CodexProbeInput(SetupModel):
         if PROFILE_RE.fullmatch(value) is None:
             raise ValueError("profile is invalid")
         return value
+
+    @model_validator(mode="after")
+    def validate_profile_binding(self) -> CodexProbeInput:
+        if type(self.profile_source) is not SandboxPermissionProfileSource:
+            raise ValueError("profile source is invalid")
+        DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+            self.profile,
+            self.profile_source,
+        )
+        return self
 
     @field_validator("worktree")
     @classmethod
@@ -837,9 +851,30 @@ class ManagedProfileCatalog:
         return BUILTIN_WORKSPACE_PROFILE
 
     def require_selected(
-        self, selected: str, *, timeout_seconds: float | None = None
+        self,
+        selected: str,
+        source: SandboxPermissionProfileSource,
+        *,
+        timeout_seconds: float | None = None,
     ) -> str:
-        if type(selected) is not str or PROFILE_RE.fullmatch(selected) is None:
+        if (
+            type(selected) is not str
+            or type(source) is not SandboxPermissionProfileSource
+            or PROFILE_RE.fullmatch(selected) is None
+        ):
+            raise SetupValidationError("managed profile selection is invalid")
+        if source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE:
+            if selected != BUILTIN_WORKSPACE_PROFILE:
+                raise SetupValidationError("managed profile selection is invalid")
+            verified = self.verify_builtin_workspace_profile(
+                timeout_seconds=timeout_seconds
+            )
+            if type(verified) is not str or verified != BUILTIN_WORKSPACE_PROFILE:
+                raise SetupValidationError("built-in workspace profile is unavailable")
+            return verified
+        if source is not SandboxPermissionProfileSource.MANAGED:
+            raise SetupValidationError("managed profile selection is invalid")
+        if selected == BUILTIN_WORKSPACE_PROFILE:
             raise SetupValidationError("managed profile selection is invalid")
         if selected not in self.list_profiles(timeout_seconds=timeout_seconds):
             raise SetupValidationError("managed profile is unavailable")
@@ -1403,10 +1438,15 @@ class SetupValidator:
                     await _to_thread_cleanup(
                         self.profile_catalog.require_selected,
                         probe.profile,
+                        probe.profile_source,
                         timeout_seconds=remaining,
                     )
                 else:
-                    await _invoke(self.profile_catalog.require_selected, probe.profile)
+                    await _invoke(
+                        self.profile_catalog.require_selected,
+                        probe.profile,
+                        probe.profile_source,
+                    )
             return _result(SetupStep.CODEX)
         except BaseException as error:
             if _is_probe_priority_failure(error):

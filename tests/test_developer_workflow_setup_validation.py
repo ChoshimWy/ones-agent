@@ -776,12 +776,132 @@ def test_profile_catalog_uses_exact_permissions_table_and_rechecks_selection(
     probe_roots = [executor.calls[0][1] for executor in executors]
     assert all(executor.calls[0][0] == tuple(sandbox_preflight_command()) for executor in executors)
     assert all(root != tmp_path and not root.exists() for root in probe_roots)
-    assert catalog.require_selected("managed-a") == "managed-a"
+    assert catalog.require_selected(
+        "managed-a", SandboxPermissionProfileSource.MANAGED
+    ) == "managed-a"
     config.write_text('[permissions."managed-b"]\nextends = ":workspace"\n', encoding="utf-8")
     with pytest.raises(SetupValidationError, match="unavailable"):
-        catalog.require_selected("managed-a")
+        catalog.require_selected("managed-a", SandboxPermissionProfileSource.MANAGED)
     with pytest.raises(SetupValidationError, match="invalid"):
-        catalog.require_selected("invented/profile")
+        catalog.require_selected(
+            "invented/profile", SandboxPermissionProfileSource.MANAGED
+        )
+
+
+def test_profile_catalog_dispatches_builtin_source_only_to_full_fixed_probe(
+) -> None:
+    class Catalog(ManagedProfileCatalog):
+        managed_calls = 0
+        builtin_calls = 0
+
+        def list_profiles(self, *, timeout_seconds=None):
+            self.managed_calls += 1
+            return ()
+
+        def verify_builtin_workspace_profile(self, *, timeout_seconds=None):
+            self.builtin_calls += 1
+            return BUILTIN_WORKSPACE_PROFILE
+
+    catalog = Catalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        executor_factory=lambda profile: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+
+    assert catalog.require_selected(
+        BUILTIN_WORKSPACE_PROFILE,
+        SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+    ) == BUILTIN_WORKSPACE_PROFILE
+    assert catalog.builtin_calls == 1
+    assert catalog.managed_calls == 0
+
+
+@pytest.mark.parametrize(
+    "verified",
+    [
+        None,
+        b"ones-dev-workspace",
+        type("ProfileText", (str,), {})(BUILTIN_WORKSPACE_PROFILE),
+    ],
+)
+def test_profile_catalog_rejects_non_exact_builtin_probe_result(
+    verified: object,
+) -> None:
+    class Catalog(ManagedProfileCatalog):
+        def list_profiles(self, *, timeout_seconds=None):
+            pytest.fail("managed catalog must not run")
+
+        def verify_builtin_workspace_profile(self, *, timeout_seconds=None):
+            return verified
+
+    catalog = Catalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        executor_factory=lambda profile: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+
+    with pytest.raises(SetupValidationError, match="unavailable"):
+        catalog.require_selected(
+            BUILTIN_WORKSPACE_PROFILE,
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        )
+
+
+@pytest.mark.parametrize(
+    ("profile", "source"),
+    [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.MANAGED),
+        ("managed", SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        ("managed", "managed"),
+        ("managed", type("SourceText", (str,), {})("managed")),
+        (
+            type("ProfileText", (str,), {})("managed"),
+            SandboxPermissionProfileSource.MANAGED,
+        ),
+    ],
+)
+def test_profile_catalog_rejects_source_name_confusion_without_any_probe(
+    profile: object,
+    source: object,
+) -> None:
+    class Catalog(ManagedProfileCatalog):
+        def list_profiles(self, *, timeout_seconds=None):
+            pytest.fail("managed catalog must not run")
+
+        def verify_builtin_workspace_profile(self, *, timeout_seconds=None):
+            pytest.fail("builtin probe must not run")
+
+    catalog = Catalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        executor_factory=lambda selected: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+
+    with pytest.raises(SetupValidationError, match="invalid"):
+        catalog.require_selected(profile, source)  # type: ignore[arg-type]
+
+
+def test_profile_catalog_never_invokes_untrusted_profile_equality() -> None:
+    class EqualProfile:
+        compared = False
+
+        def __eq__(self, other: object) -> bool:
+            self.compared = True
+            return True
+
+    profile = EqualProfile()
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        executor_factory=lambda selected: pytest.fail("executor must not run"),
+        file_security=lambda path, admin: True,
+    )
+
+    with pytest.raises(SetupValidationError, match="invalid"):
+        catalog.require_selected(
+            profile,  # type: ignore[arg-type]
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        )
+    assert profile.compared is False
 
 
 @pytest.mark.parametrize(
@@ -1115,7 +1235,9 @@ def test_production_runtime_wires_only_real_policy_boundaries(
     assert runtime.codex_runtime_preparer is preparer
     assert runtime.catalog.codex_doctor.codex_preparer is preparer
     assert runtime.catalog.executor_factory.codex_preparer is preparer
-    assert runtime.catalog.require_selected("managed") == "managed"
+    assert runtime.catalog.require_selected(
+        "managed", SandboxPermissionProfileSource.MANAGED
+    ) == "managed"
     assert any(call[0][1] == "sandbox" for call in calls)
     assert all(cwd != tmp_path for command, cwd in calls if command[1] == "sandbox")
     assert all(command[0] != "codex" for command, _ in calls)
@@ -1659,7 +1781,8 @@ async def test_sync_codex_probe_does_not_block_event_loop_and_times_out_cleanly(
     finished = threading.Event()
 
     class BlockingCatalog:
-        def require_selected(self, selected):
+        def require_selected(self, selected, source):
+            assert source is SandboxPermissionProfileSource.MANAGED
             started.set()
             time.sleep(0.12)
             finished.set()
@@ -1688,7 +1811,9 @@ async def test_sync_codex_probe_does_not_block_event_loop_and_times_out_cleanly(
 @pytest.mark.asyncio
 async def test_codex_probe_never_runs_capability_executor_in_source(tmp_path: Path) -> None:
     class Catalog:
-        def require_selected(self, selected): return selected
+        def require_selected(self, selected, source):
+            assert source is SandboxPermissionProfileSource.MANAGED
+            return selected
 
     def reject_source_execution(*args, **kwargs):
         raise AssertionError("catalog already performed the capability probe in a temp root")
@@ -1718,10 +1843,11 @@ async def test_codex_probe_propagates_memory_from_real_catalog_call_chain(
     def require_selected(
         self: ManagedProfileCatalog,
         selected: str,
+        source: SandboxPermissionProfileSource,
         *,
         timeout_seconds: float | None = None,
     ) -> str:
-        del self, selected, timeout_seconds
+        del self, selected, source, timeout_seconds
         raise failure
 
     monkeypatch.setattr(ManagedProfileCatalog, "require_selected", require_selected)
@@ -1755,8 +1881,12 @@ async def test_codex_probe_propagates_every_priority_failure(
     failure = failure_type()
 
     class Catalog:
-        async def require_selected(self, selected: str) -> str:
-            del self, selected
+        async def require_selected(
+            self,
+            selected: str,
+            source: SandboxPermissionProfileSource,
+        ) -> str:
+            del self, selected, source
             raise failure
 
     validator = SetupValidator._testing(
