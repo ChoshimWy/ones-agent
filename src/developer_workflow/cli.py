@@ -12,10 +12,11 @@ import tempfile
 import unicodedata
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Protocol, TextIO
+from typing import Callable, Mapping, Protocol, TextIO
 from urllib.parse import urlsplit
 
 from .config import DeveloperWorkflowConfig, SandboxPermissionProfileSource
+from .codex_runtime import CodexRuntimePreparer
 from .contracts import DefectCandidate, WorkflowRun, WorkflowState
 from .orchestrator import DeveloperWorkflowOrchestrator
 
@@ -50,12 +51,7 @@ class TuiHostFactory(Protocol):
 
 
 class SandboxProfileValidator(Protocol):
-    def __call__(
-        self,
-        profile: str,
-        source: SandboxPermissionProfileSource,
-        environment: dict[str, str],
-    ) -> None: ...
+    def __call__(self, profile: str, environment: dict[str, str]) -> None: ...
 
 
 class _ParserExit(Exception):
@@ -506,21 +502,35 @@ def _valid_runtime_text(value: str) -> bool:
     )
 
 
-def _validate_sandbox_permission_profile(
+def _validate_runtime_sandbox_permission_profile(
     profile: str,
     source: SandboxPermissionProfileSource,
-    environment: dict[str, str],
+    environment: Mapping[str, str],
+    *,
+    codex_preparer: CodexRuntimePreparer | None = None,
 ) -> None:
-    """Prove the managed profile's sandbox capabilities before service startup."""
+    """Prove one explicitly sourced runtime profile without inferring provenance."""
 
     from .requirement_flow import SandboxCommandExecutor, sandbox_preflight_command
 
+    if type(profile) is not str or type(source) is not SandboxPermissionProfileSource:
+        raise RuntimeError("sandbox profile is unavailable")
+    try:
+        DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+            profile,
+            source,
+        )
+    except ValueError:
+        raise RuntimeError("sandbox profile is unavailable") from None
     with tempfile.TemporaryDirectory(prefix="ones-dev-sandbox-preflight-") as raw:
         cwd = Path(raw).resolve(strict=True)
-        executor = SandboxCommandExecutor(
-            permission_profile=profile,
-            permission_profile_source=source,
-        )
+        executor_arguments: dict[str, object] = {
+            "permission_profile": profile,
+            "permission_profile_source": source,
+        }
+        if codex_preparer is not None:
+            executor_arguments["codex_preparer"] = codex_preparer
+        executor = SandboxCommandExecutor(**executor_arguments)
         completed = executor(
             sandbox_preflight_command(),
             cwd=cwd,
@@ -530,6 +540,45 @@ def _validate_sandbox_permission_profile(
         )
         if completed.returncode != 0:
             raise RuntimeError("sandbox profile is unavailable")
+
+
+def _validate_sandbox_permission_profile(
+    profile: str,
+    environment: dict[str, str],
+) -> None:
+    """Legacy JSON/CLI entrypoint: managed profiles only, with explicit source."""
+
+    _validate_runtime_sandbox_permission_profile(
+        profile,
+        SandboxPermissionProfileSource.MANAGED,
+        environment,
+    )
+
+
+def _legacy_runtime_validator(
+    validator: SandboxProfileValidator,
+) -> Callable[[str, SandboxPermissionProfileSource, Mapping[str, str]], None]:
+    def validate(
+        profile: str,
+        source: SandboxPermissionProfileSource,
+        environment: Mapping[str, str],
+    ) -> None:
+        if (
+            type(profile) is not str
+            or type(source) is not SandboxPermissionProfileSource
+            or source is not SandboxPermissionProfileSource.MANAGED
+        ):
+            raise RuntimeError("sandbox profile is unavailable")
+        try:
+            DeveloperWorkflowConfig.validate_sandbox_permission_profile_binding(
+                profile,
+                source,
+            )
+        except ValueError:
+            raise RuntimeError("sandbox profile is unavailable") from None
+        validator(profile, dict(environment))
+
+    return validate
 
 
 def build_production_orchestrator(
@@ -550,7 +599,9 @@ def build_production_orchestrator(
     )
     bootstrapper = RuntimeBootstrapper(
         ambient_environment=lambda: environment,
-        sandbox_profile_validator=sandbox_profile_validator,
+        sandbox_profile_validator=_legacy_runtime_validator(
+            sandbox_profile_validator
+        ),
     )
     return bootstrapper.build(active, secrets).orchestrator
 
@@ -665,8 +716,19 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
             )
         ),
     )
-    runtime_builder = WorkflowRuntimeBootstrapper()
     validation = ValidationBootstrapper.production()
+    preparer = validation.codex_runtime_preparer
+    runtime_builder = WorkflowRuntimeBootstrapper(
+        codex_runtime_preparer=preparer,
+        sandbox_profile_validator=lambda profile, source, sandbox_environment: (
+            _validate_runtime_sandbox_permission_profile(
+                profile,
+                source,
+                sandbox_environment,
+                codex_preparer=preparer,
+            )
+        ),
+    )
     store = SetupStore(WindowsCredentialStore())
 
     def new_setup_controller() -> SetupController:

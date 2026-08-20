@@ -15,6 +15,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_PROFILE,
     DeveloperWorkflowConfig,
     SandboxPermissionProfileSource,
 )
@@ -390,6 +391,73 @@ def test_tui_missing_optional_template_still_builds_setup_host(
     assert context.detection.template_available is False
     assert context.template_workflow is None
     assert runtime is not None
+
+
+def test_production_tui_host_shares_validation_codex_preparer_with_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow import runtime_bootstrap, setup_validation
+    import src.developer_workflow.cli as cli_module
+
+    shared_preparer = object()
+    events: list[tuple[str, object | None]] = []
+    validator_calls: list[tuple[object, object, object]] = []
+    validation = SimpleNamespace(
+        codex_runtime_preparer=shared_preparer,
+        validator=object(),
+        catalog=object(),
+    )
+
+    class ValidationBootstrapper:
+        @classmethod
+        def production(cls):
+            events.append(("validation", shared_preparer))
+            return validation
+
+    class WorkflowBootstrapper:
+        def __init__(
+            self,
+            *,
+            codex_runtime_preparer: object,
+            sandbox_profile_validator: object,
+        ) -> None:
+            events.append(("workflow", codex_runtime_preparer))
+            self.codex_runtime_preparer = codex_runtime_preparer
+            self.sandbox_profile_validator = sandbox_profile_validator
+
+    def validate_runtime(profile, source, environment, *, codex_preparer):
+        validator_calls.append((profile, source, codex_preparer))
+
+    monkeypatch.setattr(setup_validation, "RuntimeBootstrapper", ValidationBootstrapper)
+    monkeypatch.setattr(runtime_bootstrap, "RuntimeBootstrapper", WorkflowBootstrapper)
+    monkeypatch.setattr(
+        cli_module,
+        "_validate_runtime_sandbox_permission_profile",
+        validate_runtime,
+    )
+    monkeypatch.chdir(tmp_path)
+
+    factory, runtime = cli_module.build_production_tui_host(tmp_path / "missing.json")
+    runtime.sandbox_profile_validator(
+        "managed",
+        SandboxPermissionProfileSource.MANAGED,
+        {},
+    )
+
+    assert factory is not None
+    assert runtime.codex_runtime_preparer is shared_preparer
+    assert events == [
+        ("validation", shared_preparer),
+        ("workflow", shared_preparer),
+    ]
+    assert validator_calls == [
+        (
+            "managed",
+            SandboxPermissionProfileSource.MANAGED,
+            shared_preparer,
+        )
+    ]
 
 
 def _make_unsafe_optional_dotenv(path: Path, payload: str) -> None:
@@ -1772,7 +1840,7 @@ def test_production_factory_builds_the_real_service_graph_without_network(
 
     orchestrator = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile, source, environment: None,
+        sandbox_profile_validator=lambda profile, environment: None,
     )
 
     assert isinstance(orchestrator.requirement_flow, RequirementFlow)
@@ -1811,7 +1879,7 @@ def test_production_factory_delegates_legacy_environment_to_runtime_bootstrap(
 
     result = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile, source, environment: None,
+        sandbox_profile_validator=lambda profile, environment: None,
     )
 
     assert result is expected
@@ -1838,7 +1906,7 @@ def test_production_factory_rejects_invalid_git_email_before_creating_roots(
     with pytest.raises(RuntimeError, match="production runtime configuration is incomplete"):
         build_production_orchestrator(
             config,
-            sandbox_profile_validator=lambda profile, source, environment: None,
+            sandbox_profile_validator=lambda profile, environment: None,
         )
 
     assert not config.run_root.exists()
@@ -1876,7 +1944,7 @@ def test_production_factory_requires_a_verified_codex_auth_source_before_roots(
     ):
         build_production_orchestrator(
             config,
-            sandbox_profile_validator=lambda profile, source, environment: None,
+            sandbox_profile_validator=lambda profile, environment: None,
         )
 
     assert not config.run_root.exists()
@@ -1897,15 +1965,14 @@ def test_production_factory_validates_managed_sandbox_profile_before_roots(
         "/project/api/project/team/{team_id}/task/{item_id}/comments",
     )
     config = DeveloperWorkflowConfig.load(_config_file(tmp_path))
-    seen: list[tuple[str, SandboxPermissionProfileSource]] = []
+    seen: list[str] = []
 
     def reject_profile(
         profile: str,
-        source: SandboxPermissionProfileSource,
         environment: dict[str, str],
     ) -> None:
         del environment
-        seen.append((profile, source))
+        seen.append(profile)
         raise RuntimeError("sandbox profile is unavailable")
 
     with pytest.raises(
@@ -1915,9 +1982,47 @@ def test_production_factory_validates_managed_sandbox_profile_before_roots(
             config, sandbox_profile_validator=reject_profile
         )
 
-    assert seen == [
-        ("managed-dev", SandboxPermissionProfileSource.MANAGED)
-    ]
+    assert seen == ["managed-dev"]
+    assert not config.run_root.exists()
+    assert not config.mirror_root.exists()
+    assert not config.worktree_root.exists()
+
+
+def test_legacy_production_factory_rejects_builtin_profile_without_callback_or_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.cli import build_production_orchestrator
+
+    _set_complete_non_ones_runtime(monkeypatch)
+    monkeypatch.setenv("ONES_EMAIL", "developer@example.invalid")
+    monkeypatch.setenv("ONES_PASSWORD", "runtime-password")
+    monkeypatch.setenv(
+        "ONES_COMMENT_LIST_PATH_TEMPLATE",
+        "/project/api/project/team/{team_id}/task/{item_id}/comments",
+    )
+    data = DeveloperWorkflowConfig.load(_config_file(tmp_path)).model_dump(
+        mode="python", round_trip=True
+    )
+    data.update(
+        sandbox_permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        sandbox_permission_profile_source=(
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ),
+    )
+    config = DeveloperWorkflowConfig.model_validate(data)
+
+    with pytest.raises(
+        RuntimeError,
+        match="production runtime configuration is incomplete",
+    ):
+        build_production_orchestrator(
+            config,
+            sandbox_profile_validator=lambda profile, environment: pytest.fail(
+                "legacy validator must not accept a built-in profile"
+            ),
+        )
+
     assert not config.run_root.exists()
     assert not config.mirror_root.exists()
     assert not config.worktree_root.exists()

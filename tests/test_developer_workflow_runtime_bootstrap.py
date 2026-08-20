@@ -539,7 +539,7 @@ def test_legacy_sandbox_adapter_forwards_only_sanitized_preflight_environment(
 
     orchestrator = build_production_orchestrator(
         DeveloperWorkflowConfig.load(_config_file(tmp_path)),
-        sandbox_profile_validator=lambda profile, source, environment: seen.append(
+        sandbox_profile_validator=lambda profile, environment: seen.append(
             dict(environment)
         ),
     )
