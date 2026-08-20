@@ -1758,6 +1758,56 @@ def test_real_standard_profile_ancestor_chain_is_safe_without_staging() -> None:
     assert profile.is_dir()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="real Windows private staging ACL")
+def test_real_windows_adapter_stages_small_payload_without_inherited_acl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.developer_workflow.codex_runtime import CodexRuntimePreparer
+    from src.developer_workflow.private_paths import prepare_private_directory
+
+    root = prepare_private_directory(tmp_path / "private-runtime")
+    source = FakeLockedSource(b"small-native-payload")
+    digest = hashlib.sha256(source.payload).hexdigest()
+    runtime = codex_runtime_module._WindowsRuntimeAdapter()
+    monkeypatch.setattr(
+        runtime,
+        "verify_publisher",
+        lambda descriptor, path: OPENAI_AUTHENTICODE_PUBLISHER,
+    )
+    adapter = codex_runtime_module._WindowsCacheRuntimeAdapter(
+        _runtime_adapter=runtime,
+    )
+    smoke_calls: list[Path] = []
+    monkeypatch.setattr(
+        adapter,
+        "smoke",
+        lambda executable, *, environment, timeout: smoke_calls.append(executable),
+    )
+    preparer = CodexRuntimePreparer(
+        cache_root=root,
+        discover=lambda: source,  # type: ignore[arg-type]
+        _cache_adapter=adapter,
+        chunk_size=4,
+    )
+
+    executable = preparer._stage_locked_source(  # type: ignore[attr-defined]
+        root,
+        source,  # type: ignore[arg-type]
+        digest,
+        adapter,
+    )
+
+    assert executable == root / digest / "codex.exe"
+    assert executable.read_bytes() == source.payload
+    assert len(smoke_calls) == 1
+    assert smoke_calls[0].name == "codex.exe"
+    assert smoke_calls[0].parent.name.startswith(".staging-")
+    adapter.validate_private_directory(executable.parent)
+    assert not tuple(root.glob(".staging-*"))
+    assert not tuple(root.glob(".lease-*"))
+
+
 def test_unsafe_cache_ancestor_fails_before_creating_private_root(
     tmp_path: Path,
 ) -> None:

@@ -839,7 +839,6 @@ class CodexRuntimePreparer:
                 root, staging_token, adapter, created_ns=self._lease_now_ns(),
             )
             adapter.fsync_directory(root)
-            staging.mkdir(exist_ok=False)
             adapter.prepare_private_directory(staging)
             temporary = staging / f"codex-{uuid.uuid4().hex}.tmp"
             digest = hashlib.sha256()
