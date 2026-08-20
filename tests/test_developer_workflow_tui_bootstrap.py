@@ -112,7 +112,7 @@ async def _open_workspace_profile_modal(pilot: object) -> None:
         pilot,
         lambda: pilot.app.screen.id == "setup-wizard"
         and all(
-            item.id != "setup-workspace-profile-confirmation"
+            not (item.id or "").startswith("setup-workspace-profile-confirmation-")
             for item in pilot.app.screen_stack
         ),
     )
@@ -121,7 +121,9 @@ async def _open_workspace_profile_modal(pilot: object) -> None:
     pilot.app.screen._request_builtin_workspace_profile()
 
     def modal_ready() -> bool:
-        if pilot.app.screen.id != "setup-workspace-profile-confirmation":
+        if not (pilot.app.screen.id or "").startswith(
+            "setup-workspace-profile-confirmation-"
+        ):
             return False
         buttons = list(pilot.app.screen.query("#confirm-workspace-profile"))
         return len(buttons) == 1 and buttons[0].region.height > 0
@@ -710,12 +712,14 @@ async def test_runtime_profile_duplicate_confirmation_is_single_flight() -> None
     async with _wizard_app(controller).run_test() as pilot:
         screen = pilot.app.screen
         await _open_workspace_profile_modal(pilot)
+        token = screen._profile_modal_token
+        assert token is not None
         await pilot.click("#confirm-workspace-profile")
         await _wait_until(pilot, lambda: controller.profile_confirm_calls == 1)
         assert screen.query_one("#create-workspace-profile", Button).disabled
 
-        screen._builtin_workspace_profile_finished(True)
-        screen._builtin_workspace_profile_finished(True)
+        screen._builtin_workspace_profile_finished(True, token)
+        screen._builtin_workspace_profile_finished(True, token)
         await pilot.pause()
         assert controller.profile_confirm_calls == 1
         release.set()
@@ -744,8 +748,9 @@ async def test_runtime_profile_retry_is_enabled_only_after_owner_is_cleared() ->
             screen._request_builtin_workspace_profile()
             await _wait_until(
                 pilot,
-                lambda: pilot.app.screen.id
-                == "setup-workspace-profile-confirmation"
+                lambda: (pilot.app.screen.id or "").startswith(
+                    "setup-workspace-profile-confirmation-"
+                )
                 and len(pilot.app.screen.query("#confirm-workspace-profile")) == 1,
             )
             await pilot.click("#confirm-workspace-profile")
@@ -764,7 +769,9 @@ async def test_runtime_profile_retry_is_enabled_only_after_owner_is_cleared() ->
         screen._request_builtin_workspace_profile()
         await _wait_until(
             pilot,
-            lambda: pilot.app.screen.id == "setup-workspace-profile-confirmation"
+            lambda: (pilot.app.screen.id or "").startswith(
+                "setup-workspace-profile-confirmation-"
+            )
             and len(pilot.app.screen.query("#confirm-workspace-profile")) == 1,
         )
         await pilot.click("#confirm-workspace-profile")
@@ -852,12 +859,17 @@ async def test_runtime_profile_modal_is_single_flight_and_clears_every_exit() ->
         wizard._request_builtin_workspace_profile()
         await _wait_until(
             pilot,
-            lambda: pilot.app.screen.id == "setup-workspace-profile-confirmation"
+            lambda: (pilot.app.screen.id or "").startswith(
+                "setup-workspace-profile-confirmation-"
+            )
             and len(pilot.app.screen.query("#cancel-workspace-profile")) == 1,
         )
         assert wizard._profile_modal_open
+        assert wizard.query_one("#create-workspace-profile").disabled
+        assert wizard.query_one("#test-connection").disabled
+        assert wizard.query_one("#next-step").disabled
         assert sum(
-            item.id == "setup-workspace-profile-confirmation"
+            (item.id or "").startswith("setup-workspace-profile-confirmation-")
             for item in pilot.app.screen_stack
         ) == 1
 
@@ -885,18 +897,179 @@ async def test_runtime_profile_modal_push_failure_and_late_callback_are_safe(
             raise RuntimeError("PRIVATE-PUSH-CANARY")
 
         monkeypatch.setattr(pilot.app, "push_screen", fail_push)
+        epoch = wizard._mount_epoch
         wizard._request_builtin_workspace_profile()
         assert not wizard._profile_modal_open
+        assert wizard._mount_epoch == epoch + 1
         assert controller.profile_confirm_calls == 0
         notice = str(wizard.query_one("#setup-notice").render())
         assert "Safe workspace profile could not be verified" in notice
         assert "PRIVATE-PUSH-CANARY" not in notice
 
-        wizard._profile_modal_open = True
-        await wizard.remove()
-        wizard._builtin_workspace_profile_finished(True)
-        assert not wizard._profile_modal_open
+
+@pytest.mark.asyncio
+async def test_runtime_profile_modal_callback_token_is_one_shot() -> None:
+    callbacks: list[object] = []
+    controller = _RuntimeProfileController([True])
+    async with _wizard_app(controller).run_test() as pilot:
+        wizard = pilot.app.screen
+        pilot.app.push_screen = (  # type: ignore[method-assign]
+            lambda modal, callback: callbacks.append(callback)
+        )
+
+        wizard._request_builtin_workspace_profile()
+        first = callbacks[-1]
+        first(False)
+        first(True)
+        await pilot.pause()
         assert controller.profile_confirm_calls == 0
+
+        wizard._request_builtin_workspace_profile()
+        second = callbacks[-1]
+        second(True)
+        await _wait_until(pilot, lambda: wizard._profile_task is None)
+        assert controller.profile_confirm_calls == 1
+        second(True)
+        await pilot.pause()
+        assert controller.profile_confirm_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_profile_probe_busy_blocks_all_underlying_mutations() -> None:
+    import asyncio
+
+    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+    from textual.widgets import Button, Input, Select
+
+    release = asyncio.Event()
+
+    class BlockingFailureController(_RuntimeProfileController):
+        async def list_managed_profiles(self) -> tuple[str, ...]:
+            return ("managed-profile",)
+
+        async def confirm_builtin_workspace_profile(self) -> str:
+            self.profile_confirm_calls += 1
+            await release.wait()
+            raise RuntimeError("fixed failure")
+
+    controller = BlockingFailureController()
+    for step in SetupStep:
+        controller._results[step] = controller._results[step].model_copy(
+            update={"status": ValidationStatus.PASSED, "category": "ok"}
+        )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        profile = screen.query_one("#sandbox-profile", Select)
+        profile.value = "managed-profile"
+        await pilot.pause()
+        assert not screen.query_one("#next-step", Button).disabled
+
+        screen._start_builtin_workspace_profile()
+        await _wait_until(pilot, lambda: controller.profile_confirm_calls == 1)
+        assert all(widget.disabled for widget in screen.query(Input))
+        assert all(widget.disabled for widget in screen.query(Select))
+        for widget_id in (
+            "create-workspace-profile",
+            "test-connection",
+            "next-step",
+            "back-step",
+            "review-setup",
+            "nav-ones",
+        ):
+            assert screen.query_one(f"#{widget_id}", Button).disabled
+
+        original_step = screen.current_step
+        original_calls = list(controller.calls)
+        original_workflows = list(controller.workflow_calls)
+        screen._pressed_next()
+        screen._pressed_back()
+        screen._pressed_review()
+        screen._pressed_test()
+        screen._pressed_navigation(
+            SimpleNamespace(button=screen.query_one("#nav-ones", Button))
+        )
+        await screen.action_test_connection()
+        screen._profile_changed(SimpleNamespace(value="managed-profile"))
+        assert screen.current_step is original_step
+        assert controller.calls == original_calls
+        assert controller.workflow_calls == original_workflows
+
+        release.set()
+        await _wait_until(pilot, lambda: screen._profile_task is None)
+        assert not screen.query_one("#next-step", Button).disabled
+        assert not screen.query_one("#test-connection", Button).disabled
+
+
+@pytest.mark.asyncio
+async def test_remount_uses_fresh_supervisor_and_rejects_old_modal_callback() -> None:
+    from textual.app import App
+
+    from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+
+    class ObservableSupervisor:
+        def __init__(self) -> None:
+            self.closed = False
+            self.calls = 0
+
+        @property
+        def busy(self) -> bool:
+            return False
+
+        async def run_readonly(self, call):
+            assert not self.closed
+            self.calls += 1
+            return await call()
+
+        def close(self) -> None:
+            self.closed = True
+
+    supervisors: list[ObservableSupervisor] = []
+
+    def supervisor_factory() -> ObservableSupervisor:
+        supervisor = ObservableSupervisor()
+        supervisors.append(supervisor)
+        return supervisor
+
+    controller = _RuntimeProfileController([True])
+    screen = SetupWizardScreen(
+        controller,
+        supervisor_factory=supervisor_factory,
+    )
+
+    class RemountApp(App[None]):
+        def on_mount(self) -> None:
+            self.push_screen(screen)
+
+    async with RemountApp().run_test() as pilot:
+        callbacks: list[object] = []
+        real_push = pilot.app.push_screen
+        pilot.app.push_screen = (  # type: ignore[method-assign]
+            lambda modal, callback=None: callbacks.append(callback)
+        )
+        screen._request_builtin_workspace_profile()
+        old_callback = callbacks[-1]
+        pilot.app.push_screen = real_push  # type: ignore[method-assign]
+
+        await screen.remove()
+        assert supervisors[0].closed
+        await pilot.app.push_screen(screen)
+        await pilot.pause()
+        assert len(supervisors) == 2
+        assert not supervisors[1].closed
+
+        old_callback(True)
+        await pilot.pause()
+        assert controller.profile_confirm_calls == 0
+
+        callbacks.clear()
+        pilot.app.push_screen = (  # type: ignore[method-assign]
+            lambda modal, callback=None: callbacks.append(callback)
+        )
+        screen._request_builtin_workspace_profile()
+        callbacks[-1](True)
+        await _wait_until(pilot, lambda: screen._profile_task is None)
+        assert controller.profile_confirm_calls == 1
+        assert supervisors[1].calls == 1
 
 
 @pytest.mark.asyncio

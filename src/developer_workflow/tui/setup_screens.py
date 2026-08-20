@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import inspect
 from pathlib import Path
 from types import MappingProxyType
+from uuid import uuid4
 
 from textual import on
 from textual.app import ComposeResult
@@ -325,6 +326,7 @@ class SetupWizardScreen(SetupRootScreen):
         cancel_callback: Callable[[], Awaitable[None]] | None = None,
         import_context: SetupImportContext | None = None,
         import_discard_callback: Callable[[], None] | None = None,
+        supervisor_factory: Callable[[], object] | None = None,
     ) -> None:
         super().__init__(controller, screen_id="setup-wizard")
         self.current_step = self._controller_step()
@@ -332,13 +334,18 @@ class SetupWizardScreen(SetupRootScreen):
         self._cancel_callback = cancel_callback
         self._import_context = import_context
         self._import_discard_callback = import_discard_callback
-        self._supervisor = _SetupReadOnlySupervisor()
+        self._supervisor_factory = supervisor_factory or _SetupReadOnlySupervisor
+        self._supervisor = self._supervisor_factory()
+        self._mounted_once = False
+        self._mount_active = False
+        self._mount_epoch = 0
         self._generation = 0
         self._transients_cleared = False
         self._test_task: asyncio.Task[None] | None = None
         self._profile_task: asyncio.Task[str] | None = None
         self._profile_cancel_requested: asyncio.Task[str] | None = None
         self._profile_modal_open = False
+        self._profile_modal_token: tuple[str, int] | None = None
         self._managed_profiles: tuple[str, ...] = ()
         self._profile_catalog_ready = False
         self._profile_generation = 0
@@ -446,6 +453,17 @@ class SetupWizardScreen(SetupRootScreen):
             yield Input(placeholder="Worktree root", id="worktree-root")
 
     async def on_mount(self) -> None:
+        if self._mounted_once:
+            self._supervisor = self._supervisor_factory()
+            self._test_task = None
+            self._profile_task = None
+            self._profile_cancel_requested = None
+            self._profile_modal_open = False
+            self._profile_modal_token = None
+            self._transients_cleared = False
+        self._mounted_once = True
+        self._mount_active = True
+        self._mount_epoch += 1
         self._apply_layout(self.size.width)
         await self._refresh_managed_profiles()
         if not self.is_attached:
@@ -492,6 +510,7 @@ class SetupWizardScreen(SetupRootScreen):
     def _profile_changed(self, event: Select.Changed) -> None:
         if (
             not self.is_attached
+            or self._profile_setup_busy()
             or self._syncing_profile
             or type(event.value) is not str
         ):
@@ -509,18 +528,28 @@ class SetupWizardScreen(SetupRootScreen):
     @on(Button.Pressed, "#create-workspace-profile")
     def _request_builtin_workspace_profile(self) -> None:
         if (
-            self._profile_modal_open
+            self.current_step is not SetupStep.PROFILE
+            or not self._mount_active
+            or self._profile_modal_open
             or self._profile_task is not None
         ):
             return
+        token = (uuid4().hex, self._mount_epoch)
+        self._profile_modal_token = token
         self._profile_modal_open = True
+        self._render_state()
         try:
             self.app.push_screen(
-                SetupWorkspaceProfileConfirmation(),
-                self._builtin_workspace_profile_finished,
+                SetupWorkspaceProfileConfirmation(token[0]),
+                lambda confirmed, token=token: (
+                    self._builtin_workspace_profile_finished(confirmed, token)
+                ),
             )
         except BaseException as error:
             self._profile_modal_open = False
+            if self._profile_modal_token is token:
+                self._profile_modal_token = None
+            self._mount_epoch += 1
             if isinstance(
                 error,
                 (KeyboardInterrupt, SystemExit, MemoryError, GeneratorExit),
@@ -530,16 +559,32 @@ class SetupWizardScreen(SetupRootScreen):
                 self.query_one("#setup-notice", Static).update(
                     "Safe workspace profile could not be verified"
                 )
+                self._render_state()
 
-    def _builtin_workspace_profile_finished(self, confirmed: bool | None) -> None:
+    def _builtin_workspace_profile_finished(
+        self,
+        confirmed: bool | None,
+        token: tuple[str, int],
+    ) -> None:
+        if (
+            self._profile_modal_token is not token
+            or token[1] != self._mount_epoch
+            or not self._mount_active
+            or not self.is_attached
+        ):
+            return
+        self._profile_modal_token = None
         self._profile_modal_open = False
-        if confirmed is not True or not self.is_attached:
+        if confirmed is not True or self.current_step is not SetupStep.PROFILE:
+            self._render_state()
             return
         self._start_builtin_workspace_profile()
 
     def _start_builtin_workspace_profile(self) -> None:
         if (
             not self.is_attached
+            or not self._mount_active
+            or self.current_step is not SetupStep.PROFILE
             or self._supervisor.busy
             or self._profile_task is not None
         ):
@@ -553,11 +598,13 @@ class SetupWizardScreen(SetupRootScreen):
         self._transients_cleared = False
         self._generation += 1
         generation = self._generation
+        mount_epoch = self._mount_epoch
         task = asyncio.create_task(
             self._confirm_builtin_workspace_profile(),
             name="tui-setup-workspace-profile",
         )
         self._profile_task = task
+        self._render_state()
 
         def completed(done: asyncio.Task[str]) -> None:
             outcome = "cancelled"
@@ -576,10 +623,14 @@ class SetupWizardScreen(SetupRootScreen):
             if (
                 failure is None
                 and self.is_attached
+                and self._mount_active
+                and mount_epoch == self._mount_epoch
                 and (generation == self._generation or cancelled_here)
             ):
                 if cancelled_here:
                     outcome = "cancelled"
+                elif self.current_step is not SetupStep.PROFILE:
+                    outcome = "failure"
                 if outcome == "verified":
                     try:
                         if not self._has_builtin_profile_binding():
@@ -743,6 +794,8 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#review-imports")
     def _review_imports(self) -> None:
+        if self._profile_setup_busy():
+            return
         if self._import_context is None:
             self.query_one("#setup-notice", Static).update("No import sources available")
             return
@@ -751,6 +804,8 @@ class SetupWizardScreen(SetupRootScreen):
         )
 
     def _import_finished(self, source: str | None) -> None:
+        if self._profile_setup_busy():
+            return
         context = self._import_context
         if context is None:
             return
@@ -787,6 +842,31 @@ class SetupWizardScreen(SetupRootScreen):
     def _state(self) -> object:
         return getattr(self.controller, "state", object())
 
+    def _profile_setup_busy(self) -> bool:
+        return self._profile_modal_token is not None or self._profile_task is not None
+
+    def _apply_profile_busy_state(self) -> None:
+        if self._profile_setup_busy():
+            for widget in self.query("Input, Select, Button"):
+                widget.disabled = True
+            return
+        for widget in self.query(Input):
+            widget.disabled = False
+        for widget in self.query(".setup-nav-button"):
+            widget.disabled = False
+        for widget_id in (
+            "create-workspace-profile",
+            "review-imports",
+            "confirm-review",
+            "activate-runtime",
+            "cancel-setup",
+        ):
+            self.query_one(f"#{widget_id}", Button).disabled = False
+        for widget_id in ("sandbox-profile", "codex-profile"):
+            self.query_one(f"#{widget_id}", Select).disabled = not bool(
+                self._managed_profiles
+            )
+
     def _render_state(self) -> None:
         view = build_setup_step_view(self._state(), self.current_step)
         for step, container_id in _STEP_IDS.items():
@@ -805,6 +885,7 @@ class SetupWizardScreen(SetupRootScreen):
         if self.current_step in {SetupStep.PROFILE, SetupStep.CODEX} and not self._selected_profile():
             self.query_one("#test-connection", Button).disabled = True
             self.query_one("#next-step", Button).disabled = True
+        self._apply_profile_busy_state()
 
     def _selected_profile(self) -> str:
         if not self._profile_catalog_ready:
@@ -1229,7 +1310,11 @@ class SetupWizardScreen(SetupRootScreen):
         self._clear_inputs()
 
     def _start_test_connection(self) -> None:
-        if self._test_task is not None and not self._test_task.done():
+        if (
+            self._profile_setup_busy()
+            or self._test_task is not None
+            and not self._test_task.done()
+        ):
             return
         task = asyncio.create_task(
             self.action_test_connection(), name="tui-setup-test-action"
@@ -1254,13 +1339,19 @@ class SetupWizardScreen(SetupRootScreen):
         self._start_test_connection()
 
     def action_confirm_primary_action(self) -> None:
+        if self._profile_setup_busy():
+            return
         if self.current_step is SetupStep.REVIEW:
             self._request_activation_confirmation()
         else:
             self._start_test_connection()
 
     async def action_test_connection(self) -> None:
-        if self._supervisor.busy or self.current_step is SetupStep.REVIEW:
+        if (
+            self._profile_setup_busy()
+            or self._supervisor.busy
+            or self.current_step is SetupStep.REVIEW
+        ):
             return
         button = self.query_one("#test-connection", Button)
         profile_ready = (
@@ -1334,6 +1425,8 @@ class SetupWizardScreen(SetupRootScreen):
             self._render_state()
 
     def action_cancel_edit(self) -> None:
+        if self._profile_modal_token is not None:
+            return
         profile_task = self._profile_task
         if profile_task is not None:
             if self._profile_cancel_requested is not profile_task:
@@ -1350,17 +1443,21 @@ class SetupWizardScreen(SetupRootScreen):
         self._supervisor.close()
         self._leave_step()
         self._clear_controller_transients_once()
-        self._supervisor = _SetupReadOnlySupervisor()
+        self._supervisor = self._supervisor_factory()
         if self.is_attached:
             self.query_one("#setup-notice", Static).update("Setup edit cancelled")
             self._render_state()
 
     @on(Button.Pressed, "#test-connection")
     def _pressed_test(self) -> None:
+        if self._profile_setup_busy():
+            return
         self._start_test_connection()
 
     @on(Button.Pressed, ".setup-nav-button")
     def _pressed_navigation(self, event: Button.Pressed) -> None:
+        if self._profile_setup_busy():
+            return
         button_id = event.button.id or ""
         requested = next(
             (
@@ -1389,6 +1486,8 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#next-step")
     def _pressed_next(self) -> None:
+        if self._profile_setup_busy():
+            return
         view = build_setup_step_view(self._state(), self.current_step)
         if not view.can_continue:
             return
@@ -1402,6 +1501,8 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#back-step")
     def _pressed_back(self) -> None:
+        if self._profile_setup_busy():
+            return
         order = tuple(SetupStep)
         index = order.index(self.current_step)
         if index > 0:
@@ -1412,6 +1513,8 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#review-setup")
     def _pressed_review(self) -> None:
+        if self._profile_setup_busy():
+            return
         if not self.query_one("#review-setup", Button).disabled:
             self._leave_step()
             self.current_step = SetupStep.REVIEW
@@ -1420,6 +1523,8 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#confirm-review")
     def _pressed_confirm(self) -> None:
+        if self._profile_setup_busy():
+            return
         confirm = getattr(self.controller, "confirm_review", None)
         if callable(confirm):
             try:
@@ -1433,9 +1538,13 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#activate-runtime")
     def _pressed_activate(self) -> None:
+        if self._profile_setup_busy():
+            return
         self._request_activation_confirmation()
 
     def _request_activation_confirmation(self) -> None:
+        if self._profile_setup_busy():
+            return
         callback = self._activation_callback
         if callback is None:
             self.query_one("#setup-notice", Static).update(
@@ -1448,6 +1557,8 @@ class SetupWizardScreen(SetupRootScreen):
         )
 
     def _activation_finished(self, handle: object | None) -> None:
+        if self._profile_setup_busy():
+            return
         if handle is not None and self.is_attached:
             self.complete(handle)
         elif self.is_attached:
@@ -1457,6 +1568,9 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#cancel-setup")
     async def _pressed_cancel(self) -> None:
+        if self._profile_setup_busy():
+            self.action_cancel_edit()
+            return
         self.action_cancel_edit()
         callback = self._cancel_callback
         if callback is not None:
@@ -1465,7 +1579,10 @@ class SetupWizardScreen(SetupRootScreen):
     def on_unmount(self) -> None:
         self._generation += 1
         self._profile_generation += 1
+        self._mount_active = False
+        self._mount_epoch += 1
         self._profile_modal_open = False
+        self._profile_modal_token = None
         self._supervisor.close()
         task = self._test_task
         if task is not None and not task.done():
@@ -1501,8 +1618,8 @@ class SetupWorkspaceProfileConfirmation(_ExplicitConfirmation):
         Binding("escape", "cancel_workspace_profile", "Back", priority=True),
     ]
 
-    def __init__(self) -> None:
-        super().__init__(id="setup-workspace-profile-confirmation")
+    def __init__(self, nonce: str) -> None:
+        super().__init__(id=f"setup-workspace-profile-confirmation-{nonce}")
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-confirmation"):
