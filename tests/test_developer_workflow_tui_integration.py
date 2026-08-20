@@ -48,6 +48,7 @@ from src.developer_workflow.publisher import Publisher
 from src.developer_workflow.repository import WorktreeRepository
 from src.developer_workflow.repository_group import RepositoryGroupWorkspace
 from src.developer_workflow.requirement_flow import (
+    _socket_network_denial_probe_command,
     RequirementFlow,
     SandboxCommandExecutor,
     SandboxStatePolicy,
@@ -258,6 +259,19 @@ def _cold_start_codex_preparer(
     return preparer, backend, digest
 
 
+def _sandbox_probe_call_count(platform_name: str) -> int:
+    return 3 if platform_name == "nt" else 4
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "expected"), (("nt", 3), ("posix", 4)),
+)
+def test_sandbox_probe_call_count_is_platform_exact(
+    platform_name: str, expected: int,
+) -> None:
+    assert _sandbox_probe_call_count(platform_name) == expected
+
+
 def _assert_recorded_sandbox_prefixes(
     backend: _RecordingSandboxBackend,
     *,
@@ -266,7 +280,8 @@ def _assert_recorded_sandbox_prefixes(
     profile: str,
     final_command: list[str],
 ) -> None:
-    assert len(backend.calls) == 3
+    expected_calls = _sandbox_probe_call_count(os.name)
+    assert len(backend.calls) == expected_calls
     cwd = backend.calls[0][1]
     expected = [str(private_executable)]
     if builtin:
@@ -314,12 +329,21 @@ def _assert_recorded_sandbox_prefixes(
         str(cwd.parent / f".ones-sandbox-probes-{probe_id}" / "outside-write.txt"),
         f"ones-sandbox-probe-{probe_id}",
     ]
-    assert list(backend.calls[2][0][len(expected) :]) == final_command
-    assert not any(
-        "socket.socket" in item
-        for argv, *_ in backend.calls
-        for item in argv
-    )
+    final_index = 2 if os.name == "nt" else 3
+    assert list(backend.calls[final_index][0][len(expected) :]) == final_command
+    if os.name == "nt":
+        assert not any(
+            "socket.socket" in item
+            for argv, *_ in backend.calls
+            for item in argv
+        )
+    else:
+        third_child = list(backend.calls[2][0][len(expected) :])
+        assert len(third_child) == 5
+        assert third_child[4].isdigit()
+        assert third_child == _socket_network_denial_probe_command(
+            int(third_child[4])
+        )
     for argv, *_ in backend.calls:
         assert argv.count("--sandbox-state-disable-network") == 1
         flag = argv.index("--sandbox-state-disable-network")

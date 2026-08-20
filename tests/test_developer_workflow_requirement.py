@@ -2366,6 +2366,7 @@ def test_real_sandbox_rejects_writes_outside_worktree(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows permits local loopback")
 def test_real_sandbox_disables_even_loopback_network(tmp_path: Path) -> None:
     worktree = tmp_path / "worktree"
     worktree.mkdir()

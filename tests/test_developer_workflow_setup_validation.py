@@ -20,7 +20,10 @@ from src.developer_workflow.config import (
     SandboxPermissionProfileSource,
 )
 from src.developer_workflow.setup_models import SetupValidationError
-from src.developer_workflow.requirement_flow import sandbox_preflight_command
+from src.developer_workflow.requirement_flow import (
+    _socket_network_denial_probe_command,
+    sandbox_preflight_command,
+)
 from src.developer_workflow.setup_validation import (
     CodexProbeInput,
     ConnectionTestResult,
@@ -520,16 +523,19 @@ def test_builtin_workspace_catalog_runs_real_full_sandbox_executor(
     )
 
     assert catalog.verify_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
-    assert len(calls) == 3
+    expected_calls = 3 if os.name == "nt" else 4
+    assert len(calls) == expected_calls
     children = [argv[argv.index("--") + 1 :] for argv, *_ in calls]
     assert any("inside-write.txt" in item for item in children[0])
     assert any("outside-write.txt" in item for item in children[1])
-    assert children[2] == sandbox_preflight_command()
-    assert not any(
-        "socket.socket" in item
-        for child in children
-        for item in child
-    )
+    final_index = 2 if os.name == "nt" else 3
+    assert children[final_index] == sandbox_preflight_command()
+    if os.name == "nt":
+        assert not any("socket.socket" in item for child in children for item in child)
+    else:
+        assert len(children[2]) == 5
+        assert children[2][4].isdigit()
+        assert children[2] == _socket_network_denial_probe_command(int(children[2][4]))
     roots = {cwd for _, cwd, _, _ in calls}
     assert len(roots) == 1
     assert all(not root.exists() for root in roots)
