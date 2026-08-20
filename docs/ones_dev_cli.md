@@ -16,8 +16,12 @@ uv run ones-dev tui --config docs/examples/ones-dev.config.json
 
 首次启动不要求预先安装 Codex permission profile。Profile 页面没有可用配置时，
 选择 **Create safe workspace profile**，阅读固定权限摘要并显式点击 **Confirm**。
-ones-dev 会在运行中验证工作区内写入、工作区外拒绝、网络拒绝和环境隔离；全部
-通过后才选择固定的 `ones-dev-workspace` 并允许继续。取消或验证失败不会保存配置。
+ones-dev 会在运行中验证工作区内写入、工作区外拒绝和环境隔离；Windows 还会确认
+已验证私有原生 Codex 的完整 argv 中恰好一次启用固定
+`--sandbox-state-disable-network` 控制。Windows 本机 loopback 可能仍可访问，这不代表
+允许外部 direct network；验收不会访问 LAN 或公网。非 Windows 继续执行本地 socket
+拒绝探测。全部检查通过后才选择固定的 `ones-dev-workspace` 并允许继续；取消或验证
+失败不会保存配置。
 
 该操作不会修改 `~/.codex/config.toml`、其文件 identity、mtime 或 ACL，也不会修改
 npm/NVM 中的原生 Codex、Node、JavaScript、`.cmd` 或 `.ps1`。Windows 首次确认会
@@ -147,7 +151,7 @@ ONES 写一条汇总评论，绝不自动修改 ONES 状态。若中途失败，
 }
 ```
 
-`run_root`、`worktree_root` 和 `mirror_root` 必须是专用 private roots，不应指向当前源码目录、共享目录或符号链接。非交互 CLI 的 `sandbox_permission_profile` 必须是管理员已安装的 managed sandbox profile；TUI 还可在显式确认后使用固定的运行时内置 profile。工作流会在每次测试命令前验证 worktree 可写、外部目录不可写、网络不可达且敏感环境变量未进入沙箱。
+`run_root`、`worktree_root` 和 `mirror_root` 必须是专用 private roots，不应指向当前源码目录、共享目录或符号链接。非交互 CLI 的 `sandbox_permission_profile` 必须是管理员已安装的 managed sandbox profile；TUI 还可在显式确认后使用固定的运行时内置 profile。工作流会在每次测试命令前验证 worktree 可写、外部目录不可写且敏感环境变量未进入沙箱。Windows 的外部 direct network 限制依赖已签名、哈希/ACL/locked 并经 fixed verifier 验证的私有 Codex 及其精确 `--sandbox-state-disable-network` 控制；允许本机 loopback，且验收不访问 LAN 或公网。非 Windows 保留本地 socket 拒绝探测。
 
 凭据不得写入 JSON。生产 CLI 只从受控进程环境读取下列变量，示例值均是占位符：
 

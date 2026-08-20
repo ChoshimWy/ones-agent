@@ -402,150 +402,6 @@ def sandbox_preflight_command() -> list[str]:
     return [sys.executable, "-I", "-c", "print('sandbox-preflight')"]
 
 
-_WINDOWS_NETWORK_TOKEN_PROBE_SCRIPT = r'''# Fixed ASCII-only Windows token probe.
-import sys
-sys.excepthook = lambda *args: None
-try:
-    import ctypes
-    from ctypes import wintypes
-except BaseException:
-    raise SystemExit(24)
-
-SAFE = 23
-UNSAFE = 24
-TOKEN_QUERY = 0x0008
-ERROR_INSUFFICIENT_BUFFER = 122
-# Winnt.h TOKEN_INFORMATION_CLASS values.
-TokenIsAppContainer = 29
-TokenCapabilities = 30
-# Winnt.h WELL_KNOWN_SID_TYPE values. Microsoft documents these as the
-# internetClient, internetClientServer, and privateNetworkClientServer SIDs.
-WinCapabilityInternetClientSid = 85
-WinCapabilityInternetClientServerSid = 86
-WinCapabilityPrivateNetworkClientServerSid = 87
-SECURITY_MAX_SID_SIZE = 68
-
-
-class SID_AND_ATTRIBUTES(ctypes.Structure):
-    _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
-
-
-class TOKEN_GROUPS(ctypes.Structure):
-    _fields_ = [("GroupCount", wintypes.DWORD),
-                ("Groups", SID_AND_ATTRIBUTES * 1)]
-
-
-def require(value):
-    if not value:
-        raise RuntimeError
-
-
-def inspect_capabilities(advapi32, token):
-    needed = wintypes.DWORD()
-    ctypes.set_last_error(0)
-    require(not advapi32.GetTokenInformation(
-        token, TokenCapabilities, None, 0, ctypes.byref(needed)))
-    require(ctypes.get_last_error() == ERROR_INSUFFICIENT_BUFFER)
-    offset = TOKEN_GROUPS.Groups.offset
-    require(offset <= needed.value <= 1024 * 1024)
-    raw = ctypes.create_string_buffer(needed.value)
-    returned = wintypes.DWORD()
-    require(advapi32.GetTokenInformation(
-        token, TokenCapabilities, raw, needed.value, ctypes.byref(returned)))
-    require(offset <= returned.value <= needed.value)
-    count = TOKEN_GROUPS.from_buffer(raw).GroupCount
-    entry_size = ctypes.sizeof(SID_AND_ATTRIBUTES)
-    require(count <= (returned.value - offset) // entry_size)
-    base = ctypes.addressof(raw)
-    end = base + returned.value
-    forbidden = []
-    for sid_type in (
-        WinCapabilityInternetClientSid,
-        WinCapabilityInternetClientServerSid,
-        WinCapabilityPrivateNetworkClientServerSid,
-    ):
-        sid_size = wintypes.DWORD(SECURITY_MAX_SID_SIZE)
-        sid = ctypes.create_string_buffer(SECURITY_MAX_SID_SIZE)
-        require(advapi32.CreateWellKnownSid(
-            sid_type, None, sid, ctypes.byref(sid_size)))
-        require(8 <= sid_size.value <= SECURITY_MAX_SID_SIZE)
-        forbidden.append(sid)
-    for index in range(count):
-        entry = SID_AND_ATTRIBUTES.from_buffer(raw, offset + index * entry_size)
-        sid_pointer = int(entry.Sid or 0)
-        require(base <= sid_pointer < end)
-        sid = ctypes.c_void_p(sid_pointer)
-        require(advapi32.IsValidSid(sid))
-        sid_length = advapi32.GetLengthSid(sid)
-        require(8 <= sid_length and sid_pointer + sid_length <= end)
-        require(not any(advapi32.EqualSid(sid, item) for item in forbidden))
-
-
-def probe():
-    token = wintypes.HANDLE()
-    opened = False
-    result = UNSAFE
-    try:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-        kernel32.GetCurrentProcess.argtypes = []
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        advapi32.OpenProcessToken.argtypes = [
-            wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
-        advapi32.OpenProcessToken.restype = wintypes.BOOL
-        advapi32.GetTokenInformation.argtypes = [
-            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD)]
-        advapi32.GetTokenInformation.restype = wintypes.BOOL
-        advapi32.CreateWellKnownSid.argtypes = [
-            ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
-            ctypes.POINTER(wintypes.DWORD)]
-        advapi32.CreateWellKnownSid.restype = wintypes.BOOL
-        advapi32.IsValidSid.argtypes = [ctypes.c_void_p]
-        advapi32.IsValidSid.restype = wintypes.BOOL
-        advapi32.GetLengthSid.argtypes = [ctypes.c_void_p]
-        advapi32.GetLengthSid.restype = wintypes.DWORD
-        advapi32.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
-        advapi32.EqualSid.restype = wintypes.BOOL
-        require(advapi32.OpenProcessToken(
-            kernel32.GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(token)))
-        opened = True
-        is_app_container = wintypes.DWORD()
-        returned = wintypes.DWORD()
-        require(advapi32.GetTokenInformation(
-            token, TokenIsAppContainer, ctypes.byref(is_app_container),
-            ctypes.sizeof(is_app_container), ctypes.byref(returned)))
-        require(returned.value == ctypes.sizeof(is_app_container))
-        require(is_app_container.value == 1)
-        inspect_capabilities(advapi32, token)
-        result = SAFE
-    except BaseException:
-        result = UNSAFE
-    if opened:
-        try:
-            if not kernel32.CloseHandle(token):
-                result = UNSAFE
-        except BaseException:
-            result = UNSAFE
-    return result
-
-
-try:
-    status = probe()
-except BaseException:
-    status = UNSAFE
-raise SystemExit(status if type(status) is int else UNSAFE)
-'''
-
-
-def _windows_network_token_probe_command() -> list[str]:
-    """Return the fixed child that proves an AppContainer has no network SIDs."""
-
-    return [sys.executable, "-I", "-c", _WINDOWS_NETWORK_TOKEN_PROBE_SCRIPT]
-
-
 def _socket_network_denial_probe_command(port: int) -> list[str]:
     """Return the non-Windows compatibility probe for denied loopback access."""
 
@@ -1227,6 +1083,13 @@ class SandboxCommandExecutor:
                 "--",
                 *child_command,
             ]
+            network_flag = "--sandbox-state-disable-network"
+            if (
+                wrapped.count(network_flag) != 1
+                or wrapped[len(wrapped_prefix) : len(wrapped_prefix) + 2]
+                != [network_flag, "--"]
+            ):
+                raise RequirementFlowError("sandbox network control is invalid")
             result: subprocess.CompletedProcess[str] | None = None
             backend_failure: BaseException | None = None
             try:
@@ -1353,11 +1216,7 @@ class SandboxCommandExecutor:
             )
             if outside_result.returncode == 0 or outside_marker.exists():
                 raise RequirementFlowError("sandbox capability probe allowed outside writes")
-            if os.name == "nt":
-                network_probe = invoke(
-                    _windows_network_token_probe_command(), probe=True,
-                )
-            else:
+            if os.name != "nt":
                 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 try:
                     listener.bind(("127.0.0.1", 0))
@@ -1370,12 +1229,14 @@ class SandboxCommandExecutor:
                     )
                 finally:
                     listener.close()
-            if (
-                network_probe.returncode != 23
-                or network_probe.stdout != ""
-                or network_probe.stderr != ""
-            ):
-                raise RequirementFlowError("sandbox capability probe did not prove network denial")
+                if (
+                    network_probe.returncode != 23
+                    or network_probe.stdout != ""
+                    or network_probe.stderr != ""
+                ):
+                    raise RequirementFlowError(
+                        "sandbox capability probe did not prove network denial"
+                    )
             completed = invoke(command, probe=False, input_bytes=stdin)
         except BaseException as error:
             primary = error

@@ -719,7 +719,7 @@ def _simulated_restrictive_sandbox_backend(
         if any("outside-write.txt" in argument for argument in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
         if any(
-            "s.connect" in argument or "TokenIsAppContainer" in argument
+            "s.connect" in argument
             for argument in child
         ):
             return subprocess.CompletedProcess(command, 23, "", "")
@@ -738,77 +738,36 @@ def _simulated_restrictive_sandbox_backend(
     return backend
 
 
-@pytest.mark.parametrize(
-    "token_status",
-    ("safe", "not-appcontainer", "internet-client", "api-error", "raw-output"),
-)
-def test_windows_network_probe_requires_clean_appcontainer_without_network_caps(
+@pytest.mark.skipif(os.name != "nt", reason="Windows Codex control-plane policy")
+def test_windows_network_control_uses_attested_flag_without_network_child(
     tmp_path: Path,
-    token_status: str,
 ) -> None:
-    network_children: list[list[str]] = []
-
-    def backend(
-        command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
-        max_output_bytes: int, stdin: bytes | None = None,
-    ) -> subprocess.CompletedProcess[str]:
-        del max_output_bytes, stdin
-        child = command[command.index("--") + 1 :]
-        if any("inside-write.txt" in item for item in child):
-            completed = subprocess.run(
-                child, cwd=cwd, env=env, capture_output=True, timeout=timeout,
-                check=False,
-            )
-            return subprocess.CompletedProcess(
-                command,
-                completed.returncode,
-                completed.stdout.decode("utf-8", errors="strict"),
-                completed.stderr.decode("utf-8", errors="strict"),
-            )
-        if any("outside-write.txt" in item for item in child):
-            return subprocess.CompletedProcess(command, 13, "", "")
-        if any("socket.socket" in item or "TokenIsAppContainer" in item for item in child):
-            network_children.append(child)
-            if token_status == "safe":
-                return subprocess.CompletedProcess(command, 23, "", "")
-            if token_status == "raw-output":
-                return subprocess.CompletedProcess(command, 23, "token-data", "")
-            return subprocess.CompletedProcess(command, 24, "", "")
-        return subprocess.CompletedProcess(command, 0, "", "")
-
+    calls: list[tuple[list[str], Path, dict[str, str], float, int, bytes | None]] = []
+    command = _attested_sandbox_command(tmp_path)
+    private_prefix = list(command.prefix)
     executor = SandboxCommandExecutor(
         permission_profile="managed",
-        codex_command=_attested_sandbox_command(tmp_path),
-        backend_executor=backend,
+        codex_command=command,
+        backend_executor=_simulated_restrictive_sandbox_backend(calls),
     )
-    if token_status == "safe":
-        completed = executor(
-            ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
-            max_output_bytes=1024,
+
+    completed = executor(
+        ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
+        max_output_bytes=1024,
+    )
+
+    assert completed.returncode == 0
+    assert len(calls) == 3
+    for wrapped, *_ in calls:
+        assert wrapped[: len(private_prefix)] == private_prefix
+        assert wrapped.count("--sandbox-state-disable-network") == 1
+        flag = wrapped.index("--sandbox-state-disable-network")
+        assert wrapped[flag + 1] == "--"
+        assert not any(
+            "socket.socket" in item
+            for item in wrapped
         )
-        assert completed.returncode == 0
-    else:
-        with pytest.raises(
-            RequirementFlowError,
-            match="sandbox capability probe did not prove network denial",
-        ):
-            executor(
-                ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
-                max_output_bytes=1024,
-            )
-    assert len(network_children) == 1
-    child = network_children[0]
-    assert child[:3] == [sys.executable, "-I", "-c"]
-    assert len(child) == 4
-    script = child[3]
-    assert "TokenIsAppContainer = 29" in script
-    assert "TokenCapabilities = 30" in script
-    assert "WinCapabilityInternetClientSid = 85" in script
-    assert "WinCapabilityInternetClientServerSid = 86" in script
-    assert "WinCapabilityPrivateNetworkClientServerSid = 87" in script
-    assert "socket" not in script
-    assert script.encode("ascii", errors="strict").decode("ascii") == script
-    compile(script, "<windows-network-token-probe>", "exec")
+    assert calls[-1][0][calls[-1][0].index("--") + 1 :] == ["tool", "final"]
 
 
 @pytest.mark.parametrize(
@@ -888,7 +847,7 @@ def test_structured_pytest_selector_classifies_only_associated_exit_one_as_test_
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
         if any(
-            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+            "s.connect" in item for item in child
         ):
             return subprocess.CompletedProcess(command, 23, "", "")
         if any("inside-write.txt" in item for item in child):
@@ -936,7 +895,7 @@ def test_sandbox_executor_wraps_command_with_explicit_policy_and_empty_home(
         if any("outside-write.txt" in argument for argument in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
         if any(
-            "s.connect" in argument or "TokenIsAppContainer" in argument
+            "s.connect" in argument
             for argument in child
         ):
             return subprocess.CompletedProcess(command, 23, "", "")
@@ -1057,7 +1016,7 @@ def test_sandbox_executor_uses_one_decreasing_absolute_deadline(
         elif any("outside-write.txt" in item for item in child):
             returncode = 13
         elif any(
-            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+            "s.connect" in item for item in child
         ):
             returncode = 23
         else:
@@ -1081,8 +1040,9 @@ def test_sandbox_executor_uses_one_decreasing_absolute_deadline(
     )
 
     assert completed.returncode == 0
-    assert len(children) == 4
-    assert observed_timeouts == pytest.approx([1.0, 0.8, 0.6, 0.4])
+    expected_timeouts = [1.0, 0.8, 0.6] if os.name == "nt" else [1.0, 0.8, 0.6, 0.4]
+    assert len(children) == len(expected_timeouts)
+    assert observed_timeouts == pytest.approx(expected_timeouts)
     assert all(
         later < earlier
         for earlier, later in zip(observed_timeouts, observed_timeouts[1:])
@@ -1134,7 +1094,7 @@ def test_sandbox_executor_stops_before_backend_when_total_budget_is_exhausted(
     assert caught.value.__context__ is None
     assert len(children) == 2
     assert not any(
-        "s.connect" in item or "TokenIsAppContainer" in item
+        "s.connect" in item
         for child in children
         for item in child
     )

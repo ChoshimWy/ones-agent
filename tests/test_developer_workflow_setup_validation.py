@@ -503,7 +503,7 @@ def test_builtin_workspace_catalog_runs_real_full_sandbox_executor(
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(argv, 13, "", "denied")
         if any(
-            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+            "s.connect" in item for item in child
         ):
             return subprocess.CompletedProcess(argv, 23, "", "")
         return subprocess.CompletedProcess(argv, 0, "sandbox-preflight\n", "")
@@ -520,12 +520,16 @@ def test_builtin_workspace_catalog_runs_real_full_sandbox_executor(
     )
 
     assert catalog.verify_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
-    assert len(calls) == 4
+    assert len(calls) == 3
     children = [argv[argv.index("--") + 1 :] for argv, *_ in calls]
     assert any("inside-write.txt" in item for item in children[0])
     assert any("outside-write.txt" in item for item in children[1])
-    assert any("TokenIsAppContainer" in item for item in children[2])
-    assert children[3] == sandbox_preflight_command()
+    assert children[2] == sandbox_preflight_command()
+    assert not any(
+        "socket.socket" in item
+        for child in children
+        for item in child
+    )
     roots = {cwd for _, cwd, _, _ in calls}
     assert len(roots) == 1
     assert all(not root.exists() for root in roots)
@@ -1361,7 +1365,7 @@ def test_production_runtime_wires_only_real_policy_boundaries(
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
         if any(
-            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+            "s.connect" in item for item in child
         ):
             return subprocess.CompletedProcess(command, 23, "", "")
         if any("inside-write.txt" in item for item in child):

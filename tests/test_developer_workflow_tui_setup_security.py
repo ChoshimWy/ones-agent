@@ -456,7 +456,7 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
             wizard.query_one("#sandbox-profile", Select).value
             == BUILTIN_WORKSPACE_PROFILE
         )
-        assert len(backend.calls) == 4
+        assert len(backend.calls) == 3
         await pilot.click("#test-connection")
         await _wait_until(pilot, lambda: wizard._test_task is not None)
         test_task = wizard._test_task
@@ -468,7 +468,7 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
             and result.status is ValidationStatus.PASSED
             for result in controller.state.results
         )
-        assert len(backend.calls) == 8
+        assert len(backend.calls) == 6
         await _wait_until(
             pilot,
             lambda: wizard.query_one("#next-step", Button).disabled is False,
@@ -530,9 +530,9 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
         SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
     ]
     private_executable = private_executable.resolve(strict=True)
-    for offset in (0, 4):
+    for offset in (0, 3):
         observed = type(backend)()
-        observed.calls = backend.calls[offset : offset + 4]
+        observed.calls = backend.calls[offset : offset + 3]
         _assert_recorded_sandbox_prefixes(
             observed,
             private_executable=private_executable,

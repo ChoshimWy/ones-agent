@@ -224,7 +224,7 @@ class _RecordingSandboxBackend:
         )
         child = list(argv[argv.index("--") + 1 :])
         code = child[3] if len(child) > 3 and child[1:3] == ["-I", "-c"] else ""
-        if "socket.socket" in code or "TokenIsAppContainer" in code:
+        if "socket.socket" in code:
             return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
         if "Path(sys.argv[1]).write_text" in code and any(
             part.startswith(".ones-sandbox-probes-") for part in Path(child[-2]).parts
@@ -266,7 +266,7 @@ def _assert_recorded_sandbox_prefixes(
     profile: str,
     final_command: list[str],
 ) -> None:
-    assert len(backend.calls) == 4
+    assert len(backend.calls) == 3
     cwd = backend.calls[0][1]
     expected = [str(private_executable)]
     if builtin:
@@ -314,16 +314,16 @@ def _assert_recorded_sandbox_prefixes(
         str(cwd.parent / f".ones-sandbox-probes-{probe_id}" / "outside-write.txt"),
         f"ones-sandbox-probe-{probe_id}",
     ]
-    third_child = list(backend.calls[2][0][len(expected) :])
-    assert third_child[:3] == [sys.executable, "-I", "-c"]
-    assert len(third_child) == 4
-    assert "TokenIsAppContainer = 29" in third_child[3]
-    assert "TokenCapabilities = 30" in third_child[3]
-    assert "WinCapabilityInternetClientSid = 85" in third_child[3]
-    assert "WinCapabilityInternetClientServerSid = 86" in third_child[3]
-    assert "WinCapabilityPrivateNetworkClientServerSid = 87" in third_child[3]
-    assert "socket" not in third_child[3]
-    assert list(backend.calls[3][0][len(expected) :]) == final_command
+    assert list(backend.calls[2][0][len(expected) :]) == final_command
+    assert not any(
+        "socket.socket" in item
+        for argv, *_ in backend.calls
+        for item in argv
+    )
+    for argv, *_ in backend.calls:
+        assert argv.count("--sandbox-state-disable-network") == 1
+        flag = argv.index("--sandbox-state-disable-network")
+        assert argv[flag + 1] == "--"
 
 
 def test_recording_backend_proves_builtin_and_managed_native_argv(
@@ -892,7 +892,7 @@ def _group_ui_runtime(tmp_path: Path):
         del timeout, max_output_bytes, stdin
         child = command[command.index("--") + 1 :]
         code = child[3] if len(child) > 3 and child[1:3] == ["-I", "-c"] else ""
-        if "socket.socket" in code or "TokenIsAppContainer" in code:
+        if "socket.socket" in code:
             return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
         if "Path(sys.argv[1]).write_text" in code:
             target = Path(child[-2])
