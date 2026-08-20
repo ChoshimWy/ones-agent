@@ -382,29 +382,53 @@ class SetupController:
         priority_failure: BaseException | None = None
         ordinary_failure = False
         revision = -1
+        probe_task: asyncio.Task[Any] | None = None
+        worker_awaitable: Any = None
+
+        def verify_in_worker() -> object:
+            verifier = getattr(
+                self._profile_catalog,
+                "verify_builtin_workspace_profile",
+            )
+            if not callable(verifier):
+                raise TypeError
+            return verifier()
+
         async with self._operation_lock:
             self._ensure_mutable()
             owner = asyncio.current_task()
-            self._operation_task = owner
-            self._catalog_owner_task = owner
-            revision = self._revision
-            probe_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self._profile_catalog.verify_builtin_workspace_profile
-                )
-            )
             try:
+                self._operation_task = owner
+                self._catalog_owner_task = owner
+                revision = self._revision
+                worker_awaitable = asyncio.to_thread(verify_in_worker)
+                probe_task = asyncio.create_task(worker_awaitable)
+                worker_awaitable = None
                 verified_profile = await asyncio.shield(probe_task)
-            except asyncio.CancelledError:
-                self._catalog_tasks.add(probe_task)
-                probe_task.add_done_callback(self._finish_catalog_task)
-                raise
             except BaseException as error:
+                if isinstance(error, asyncio.CancelledError) and probe_task is not None:
+                    if probe_task.done():
+                        self._finish_catalog_task(probe_task)
+                    else:
+                        self._catalog_tasks.add(probe_task)
+                        probe_task.add_done_callback(self._finish_catalog_task)
                 if _is_setup_priority_failure(error):
                     priority_failure = error
                 else:
                     ordinary_failure = True
             finally:
+                if worker_awaitable is not None:
+                    try:
+                        close = getattr(worker_awaitable, "close", None)
+                        if callable(close):
+                            close()
+                    except BaseException as error:
+                        if _is_setup_priority_failure(error):
+                            if priority_failure is None:
+                                priority_failure = error
+                        elif priority_failure is None:
+                            ordinary_failure = True
+                    worker_awaitable = None
                 if self._operation_task is owner:
                     self._operation_task = None
                 if self._catalog_owner_task is owner:
@@ -412,14 +436,14 @@ class SetupController:
 
             if priority_failure is not None:
                 failure = priority_failure
-                del probe_task, priority_failure, verified_profile
+                del probe_task, priority_failure, verified_profile, verify_in_worker
                 _raise_sanitized_action_exception(failure)
             if (
                 ordinary_failure
                 or type(verified_profile) is not str
                 or verified_profile != BUILTIN_WORKSPACE_PROFILE
             ):
-                del probe_task, priority_failure, verified_profile
+                del probe_task, priority_failure, verified_profile, verify_in_worker
                 _raise_sanitized_action_failure(
                     "built-in workspace profile is unavailable"
                 )

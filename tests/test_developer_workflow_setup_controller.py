@@ -510,6 +510,168 @@ async def test_builtin_profile_confirmation_never_invokes_untrusted_equality(
     assert controller.draft == original
 
 
+@pytest.mark.asyncio
+async def test_builtin_profile_getter_failure_is_sanitized_and_controller_recovers(
+    tmp_path: Path,
+) -> None:
+    secret = "builtin-getter-secret-canary"
+
+    class GetterCatalog:
+        @property
+        def verify_builtin_workspace_profile(self) -> object:
+            getter_secret = secret
+            raise RuntimeError(getter_secret)
+
+    controller = _builtin_controller(tmp_path, _BuiltinCatalog())
+    controller._profile_catalog = GetterCatalog()
+    original = controller.draft
+    revision = controller.revision
+
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ) as caught:
+        await controller.confirm_builtin_workspace_profile()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    trace = caught.value.__traceback__
+    while trace is not None:
+        if Path(trace.tb_frame.f_code.co_filename).name == "setup_controller.py":
+            assert secret not in repr(trace.tb_frame.f_locals)
+        trace = trace.tb_next
+    assert controller._operation_task is None
+    assert controller._catalog_owner_task is None
+    assert controller._catalog_tasks == set()
+    assert controller.draft == original
+    assert controller.revision == revision
+
+    controller._profile_catalog = _BuiltinCatalog()
+    assert await controller.confirm_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "catalog",
+    [
+        object(),
+        type("Catalog", (), {"verify_builtin_workspace_profile": object()})(),
+    ],
+)
+async def test_builtin_profile_invalid_catalog_releases_all_operation_ownership(
+    tmp_path: Path, catalog: object,
+) -> None:
+    controller = _builtin_controller(tmp_path, _BuiltinCatalog())
+    controller._profile_catalog = catalog
+    original = controller.draft
+
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ):
+        await controller.confirm_builtin_workspace_profile()
+
+    assert controller._operation_task is None
+    assert controller._catalog_owner_task is None
+    assert controller._catalog_tasks == set()
+    assert controller.draft == original
+    controller.close()
+    assert controller.closed
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_create_task_failure_closes_unstarted_coroutine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "create-task-secret-canary"
+    controller = _builtin_controller(tmp_path, _BuiltinCatalog())
+    original = controller.draft
+    revision = controller.revision
+    received: list[object] = []
+    real_create_task = asyncio.create_task
+
+    def fail_create_task(awaitable: object) -> object:
+        received.append(awaitable)
+        raise RuntimeError(secret)
+
+    monkeypatch.setattr(asyncio, "create_task", fail_create_task)
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ) as caught:
+        await controller.confirm_builtin_workspace_profile()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert len(received) == 1
+    assert getattr(received[0], "cr_frame", object()) is None
+    assert controller._operation_task is None
+    assert controller._catalog_owner_task is None
+    assert controller._catalog_tasks == set()
+    assert controller.draft == original
+    assert controller.revision == revision
+
+    monkeypatch.setattr(asyncio, "create_task", real_create_task)
+    assert await controller.confirm_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_to_thread_construction_failure_releases_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "to-thread-secret-canary"
+    controller = _builtin_controller(tmp_path, _BuiltinCatalog())
+    original = controller.draft
+
+    def fail_to_thread(*args: object, **kwargs: object) -> object:
+        construction_secret = secret
+        raise RuntimeError(construction_secret)
+
+    monkeypatch.setattr(asyncio, "to_thread", fail_to_thread)
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ) as caught:
+        await controller.confirm_builtin_workspace_profile()
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert controller._operation_task is None
+    assert controller._catalog_owner_task is None
+    assert controller._catalog_tasks == set()
+    assert controller.draft == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_type",
+    [
+        MemoryError,
+        asyncio.CancelledError,
+        KeyboardInterrupt,
+        SystemExit,
+        GeneratorExit,
+    ],
+)
+async def test_builtin_profile_startup_priority_failure_is_propagated_and_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_type: type[BaseException],
+) -> None:
+    failure = failure_type()
+    controller = _builtin_controller(tmp_path, _BuiltinCatalog())
+    original = controller.draft
+
+    def fail_to_thread(*args: object, **kwargs: object) -> object:
+        raise failure
+
+    monkeypatch.setattr(asyncio, "to_thread", fail_to_thread)
+    with pytest.raises(failure_type) as caught:
+        await controller.confirm_builtin_workspace_profile()
+
+    assert caught.value is failure
+    assert controller._operation_task is None
+    assert controller._catalog_owner_task is None
+    assert controller._catalog_tasks == set()
+    assert controller.draft == original
+
+
 class Handle:
     def __init__(self) -> None:
         self.closed = 0
