@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import subprocess
 from dataclasses import FrozenInstanceError
@@ -439,6 +440,8 @@ def test_builtin_workspace_verification_uses_fixed_executor_and_private_root(
         validation_module, "BuiltinWorkspaceSandboxExecutorFactory", Factory
     )
     monkeypatch.setattr(validation_module, "prepare_private_directory", prepare)
+    ticks = iter((100.0, 100.2))
+    monkeypatch.setattr(validation_module.time, "monotonic", lambda: next(ticks))
     catalog = ManagedProfileCatalog._testing(
         codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
         trusted_admin_catalog=None,
@@ -457,7 +460,7 @@ def test_builtin_workspace_verification_uses_fixed_executor_and_private_root(
     assert len(calls) == 1
     command, root, environment, timeout, max_output_bytes = calls[0]
     assert command == tuple(sandbox_preflight_command())
-    assert 0 < timeout <= 0.25
+    assert timeout == pytest.approx(0.05)
     assert max_output_bytes == 64 * 1024
     assert all(
         marker not in key.casefold()
@@ -467,6 +470,90 @@ def test_builtin_workspace_verification_uses_fixed_executor_and_private_root(
     assert root == prepared[0]
     assert root != tmp_path
     assert not root.exists()
+
+
+def test_builtin_workspace_catalog_runs_real_full_sandbox_executor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    calls: list[tuple[list[str], Path, dict[str, str], float]] = []
+
+    def backend(
+        argv: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append((list(argv), cwd, dict(env), timeout))
+        child = argv[argv.index("--") + 1 :]
+        if any("inside-write.txt" in item for item in child):
+            completed = subprocess.run(
+                child,
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            return subprocess.CompletedProcess(
+                argv,
+                completed.returncode,
+                completed.stdout.decode(),
+                completed.stderr.decode(),
+            )
+        if any("outside-write.txt" in item for item in child):
+            return subprocess.CompletedProcess(argv, 13, "", "denied")
+        if any("s.connect" in item for item in child):
+            return subprocess.CompletedProcess(argv, 23, "", "network denied")
+        return subprocess.CompletedProcess(argv, 0, "sandbox-preflight\n", "")
+
+    monkeypatch.setattr(validation_module, "_bounded_subprocess", backend)
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=lambda *args, **kwargs: pytest.fail("doctor must not run"),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=lambda profile: pytest.fail("managed factory must not run"),
+        file_security=lambda path, admin: True,
+        codex_runtime_preparer=_TinyPreparer(tmp_path),  # type: ignore[arg-type]
+        timeout_seconds=2.0,
+    )
+
+    assert catalog.verify_builtin_workspace_profile() == BUILTIN_WORKSPACE_PROFILE
+    assert len(calls) == 4
+    children = [argv[argv.index("--") + 1 :] for argv, *_ in calls]
+    assert any("inside-write.txt" in item for item in children[0])
+    assert any("outside-write.txt" in item for item in children[1])
+    assert any("s.connect" in item for item in children[2])
+    assert children[3] == sandbox_preflight_command()
+    roots = {cwd for _, cwd, _, _ in calls}
+    assert len(roots) == 1
+    assert all(not root.exists() for root in roots)
+    assert all(
+        argv[1:10]
+        == [
+            "-c",
+            'permissions.ones-dev-workspace.extends=":workspace"',
+            "sandbox",
+            "--permission-profile",
+            BUILTIN_WORKSPACE_PROFILE,
+            "--include-managed-config",
+            "-C",
+            str(cwd),
+            "--sandbox-state-disable-network",
+        ]
+        for argv, cwd, _, _ in calls
+    )
+    environments = [environment for _, _, environment, _ in calls]
+    assert all(environment["HOME"] == environment["USERPROFILE"] for environment in environments)
+    assert all(environment["TEMP"] == environment["HOME"] for environment in environments)
+    assert all(environment["GIT_CONFIG_GLOBAL"] == os.devnull for environment in environments)
+    assert all(
+        not any(
+            marker in key.casefold()
+            for key in environment
+            for marker in ("token", "secret", "credential", "password", "askpass")
+        )
+        for environment in environments
+    )
 
 
 def test_builtin_workspace_verification_sanitizes_ordinary_failure(

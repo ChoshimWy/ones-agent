@@ -414,7 +414,11 @@ class SetupController:
                 failure = priority_failure
                 del probe_task, priority_failure, verified_profile
                 _raise_sanitized_action_exception(failure)
-            if ordinary_failure or verified_profile != BUILTIN_WORKSPACE_PROFILE:
+            if (
+                ordinary_failure
+                or type(verified_profile) is not str
+                or verified_profile != BUILTIN_WORKSPACE_PROFILE
+            ):
                 del probe_task, priority_failure, verified_profile
                 _raise_sanitized_action_failure(
                     "built-in workspace profile is unavailable"

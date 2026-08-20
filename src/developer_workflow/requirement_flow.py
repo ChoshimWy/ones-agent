@@ -20,12 +20,13 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 from ctypes import wintypes
 
 from src.contracts import RequirementRecord, WikiPageSnapshot
@@ -887,6 +888,9 @@ class SandboxCommandExecutor:
     backend_executor: CommandExecutor = _bounded_subprocess
     codex_command: CodexCommand | None = field(default=None, repr=False)
     codex_preparer: CodexRuntimePreparer | None = field(default=None, repr=False)
+    clock: Callable[[], float] = field(
+        default=time.monotonic, repr=False, compare=False
+    )
     sandbox_policy_verified: bool = field(default=True, init=False)
     _command_consumption: _SandboxCommandConsumption = field(
         default_factory=_SandboxCommandConsumption, init=False, repr=False, compare=False
@@ -909,6 +913,7 @@ class SandboxCommandExecutor:
             self.backend_executor,
             self.codex_command,
             self.codex_preparer,
+            self.clock,
             self.sandbox_policy_verified,
         )
 
@@ -951,6 +956,8 @@ class SandboxCommandExecutor:
             raise ValueError("sandbox Codex command source is ambiguous")
         if not callable(self.backend_executor):
             raise ValueError("sandbox backend executor is invalid")
+        if not callable(self.clock):
+            raise ValueError("sandbox clock is invalid")
         if self.sandbox_state_provider is not None and not callable(
             self.sandbox_state_provider
         ):
@@ -977,6 +984,22 @@ class SandboxCommandExecutor:
         stdin: bytes | None = None,
     ) -> subprocess.CompletedProcess[str]:
         self._validate_configuration()
+        try:
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(timeout)
+                or timeout <= 0
+            ):
+                raise ValueError
+            started = self.clock()
+            deadline = started + float(timeout)
+            if not math.isfinite(started) or not math.isfinite(deadline):
+                raise ValueError
+        except BaseException as error:
+            if _is_sandbox_priority_failure(error):
+                raise
+            raise RequirementFlowError("sandbox timeout is invalid") from None
         probe_id = uuid.uuid4().hex
         try:
             directory_guard = _SandboxDirectoryGuard(cwd, probe_id)
@@ -1037,19 +1060,32 @@ class SandboxCommandExecutor:
             result: subprocess.CompletedProcess[str] | None = None
             backend_failure: BaseException | None = None
             try:
+                remaining = deadline - self.clock()
+                if not math.isfinite(remaining) or remaining <= 0:
+                    raise TimeoutError
                 result = self.backend_executor(
                     wrapped,
                     cwd=canonical_cwd,
                     env=sandbox_env,
-                    timeout=min(timeout, 20.0) if probe else timeout,
+                    timeout=min(remaining, 20.0) if probe else remaining,
                     max_output_bytes=min(max_output_bytes, 64 * 1024)
                     if probe
                     else max_output_bytes,
                     stdin=input_bytes,
                 )
+                if deadline - self.clock() < 0:
+                    result = None
+                    raise TimeoutError
             except BaseException as error:
                 if _is_sandbox_priority_failure(error):
                     backend_failure = error
+                elif isinstance(
+                    error,
+                    (TimeoutError, subprocess.TimeoutExpired),
+                ):
+                    backend_failure = RequirementFlowError(
+                        "sandbox execution timed out"
+                    )
                 else:
                     message = (
                         "sandbox capability probe failed"

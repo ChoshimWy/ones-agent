@@ -457,6 +457,59 @@ async def test_builtin_profile_confirmation_propagates_control_flow_failures(
     assert controller.draft == original
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid_profile",
+    [
+        None,
+        b"ones-dev-workspace",
+        type("ProfileSubclass", (str,), {})(BUILTIN_WORKSPACE_PROFILE),
+    ],
+)
+async def test_builtin_profile_confirmation_rejects_non_exact_string_results(
+    tmp_path: Path, invalid_profile: object,
+) -> None:
+    catalog = _BuiltinCatalog()
+    catalog.verify_builtin_workspace_profile = lambda: invalid_profile  # type: ignore[method-assign]
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+    revision = controller.revision
+
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ):
+        await controller.confirm_builtin_workspace_profile()
+
+    assert controller.draft == original
+    assert controller.revision == revision
+
+
+@pytest.mark.asyncio
+async def test_builtin_profile_confirmation_never_invokes_untrusted_equality(
+    tmp_path: Path,
+) -> None:
+    class EqualProfile:
+        compared = False
+
+        def __eq__(self, other: object) -> bool:
+            self.compared = True
+            return True
+
+    invalid_profile = EqualProfile()
+    catalog = _BuiltinCatalog()
+    catalog.verify_builtin_workspace_profile = lambda: invalid_profile  # type: ignore[method-assign]
+    controller = _builtin_controller(tmp_path, catalog)
+    original = controller.draft
+
+    with pytest.raises(
+        SetupActionError, match="built-in workspace profile is unavailable"
+    ):
+        await controller.confirm_builtin_workspace_profile()
+
+    assert invalid_profile.compared is False
+    assert controller.draft == original
+
+
 class Handle:
     def __init__(self) -> None:
         self.closed = 0

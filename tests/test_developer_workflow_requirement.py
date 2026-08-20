@@ -756,7 +756,7 @@ def test_subprocess_test_runner_uses_structured_argv_safe_env_and_real_result(
     assert argv == [sys.executable, "-c", "print(1)"]
     assert cwd == tmp_path.resolve()
     assert "ONES_TOKEN" not in env
-    assert timeout == 12
+    assert 0 < timeout < 12
     assert output_limit > 0
     assert stdin is None
     assert result.command == command
@@ -909,6 +909,116 @@ def test_builtin_workspace_profile_injects_only_the_fixed_override(
         "pytest",
         "-q",
     ]
+
+
+def test_sandbox_executor_uses_one_decreasing_absolute_deadline(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.value = 100.0
+
+        def __call__(self) -> float:
+            return self.value
+
+        def advance(self, seconds: float) -> None:
+            self.value += seconds
+
+    clock = Clock()
+    observed_timeouts: list[float] = []
+    children: list[list[str]] = []
+
+    def backend(
+        argv: list[str], *, timeout: float, **kwargs: object,
+    ) -> subprocess.CompletedProcess[str]:
+        child = argv[argv.index("--") + 1 :]
+        children.append(child)
+        observed_timeouts.append(timeout)
+        if any("inside-write.txt" in item for item in child):
+            Path(child[-2]).write_text(child[-1], encoding="utf-8")
+            returncode = 0
+        elif any("outside-write.txt" in item for item in child):
+            returncode = 13
+        elif any("s.connect" in item for item in child):
+            returncode = 23
+        else:
+            returncode = 0
+        clock.advance(0.2)
+        return subprocess.CompletedProcess(argv, returncode, "", "")
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=backend,
+        clock=clock,
+    )
+
+    completed = executor(
+        ["tool", "final"],
+        cwd=tmp_path.resolve(),
+        env={},
+        timeout=1.0,
+        max_output_bytes=1024,
+    )
+
+    assert completed.returncode == 0
+    assert len(children) == 4
+    assert observed_timeouts == pytest.approx([1.0, 0.8, 0.6, 0.4])
+    assert all(
+        later < earlier
+        for earlier, later in zip(observed_timeouts, observed_timeouts[1:])
+    )
+
+
+def test_sandbox_executor_stops_before_backend_when_total_budget_is_exhausted(
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        def __init__(self) -> None:
+            self.value = 20.0
+
+        def __call__(self) -> float:
+            return self.value
+
+    clock = Clock()
+    command = _attested_sandbox_command(tmp_path)
+    children: list[list[str]] = []
+
+    def backend(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        child = argv[argv.index("--") + 1 :]
+        children.append(child)
+        if any("inside-write.txt" in item for item in child):
+            Path(child[-2]).write_text(child[-1], encoding="utf-8")
+            returncode = 0
+        else:
+            returncode = 13
+        clock.value += 0.6
+        return subprocess.CompletedProcess(argv, returncode, "", "")
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=command,
+        backend_executor=backend,
+        clock=clock,
+    )
+
+    with pytest.raises(Exception, match="sandbox execution timed out") as caught:
+        executor(
+            ["tool", "must-not-run"],
+            cwd=tmp_path.resolve(),
+            env={},
+            timeout=1.0,
+            max_output_bytes=1024,
+        )
+
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert len(children) == 2
+    assert not any("s.connect" in item for child in children for item in child)
+    assert not any("must-not-run" in item for child in children for item in child)
+    assert not command._is_attested()
+    assert not list(tmp_path.glob(".ones-sandbox-*"))
+    assert not list(tmp_path.parent.glob(".ones-sandbox-probes-*"))
 
 
 @pytest.mark.parametrize(
