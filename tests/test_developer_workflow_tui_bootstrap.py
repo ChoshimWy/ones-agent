@@ -95,6 +95,67 @@ def _wizard_app(controller: object):
     return WizardApp()
 
 
+async def _wait_until(pilot: object, predicate, *, attempts: int = 80) -> None:
+    """Yield to Textual deterministically until an observable condition holds."""
+
+    for _ in range(attempts):
+        if predicate():
+            return
+        await pilot.pause()
+    assert predicate()
+
+
+async def _open_workspace_profile_modal(pilot: object) -> None:
+    from textual.widgets import Button
+
+    await pilot.click("#create-workspace-profile")
+    await _wait_until(
+        pilot,
+        lambda: pilot.app.screen.id == "setup-workspace-profile-confirmation"
+        and pilot.app.screen.query_one(
+            "#confirm-workspace-profile", Button
+        ).region.height > 0,
+    )
+
+
+class _RuntimeProfileController(_WizardSetupController):
+    def __init__(self, outcomes: list[object] | None = None) -> None:
+        from src.developer_workflow.setup_models import SetupDraft, WorkflowDraft
+
+        super().__init__()
+        self.draft = SetupDraft(workflow=WorkflowDraft())
+        self.profile_confirm_calls = 0
+        self.profile_confirm_outcomes = list(outcomes or [True])
+
+    async def list_managed_profiles(self) -> tuple[str, ...]:
+        return ()
+
+    async def confirm_builtin_workspace_profile(self) -> str:
+        from src.developer_workflow.config import (
+            BUILTIN_WORKSPACE_PROFILE,
+            SandboxPermissionProfileSource,
+        )
+        from src.developer_workflow.setup_models import WorkflowDraft
+
+        self.profile_confirm_calls += 1
+        outcome = self.profile_confirm_outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if hasattr(outcome, "wait"):
+            await outcome.wait()
+        workflow_data = self.draft.workflow.model_dump(mode="python", round_trip=True)
+        workflow_data.update(
+            sandbox_permission_profile=BUILTIN_WORKSPACE_PROFILE,
+            sandbox_permission_profile_source=(
+                SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+            ),
+        )
+        self.draft = self.draft.model_copy(
+            update={"workflow": WorkflowDraft.model_validate(workflow_data)}
+        )
+        return BUILTIN_WORKSPACE_PROFILE
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "width,layout", [(60, "one"), (99, "two"), (100, "two"), (120, "three")]
@@ -473,6 +534,268 @@ async def test_setup_rejects_stale_draft_profile_and_blocks_empty_catalog() -> N
         screen = pilot.app.screen
         assert screen.query_one("#sandbox-profile", Select).disabled
         assert screen.query_one("#test-connection", Button).disabled
+
+
+@pytest.mark.asyncio
+async def test_empty_profile_catalog_offers_explicit_runtime_creation() -> None:
+    from textual.widgets import Button, Select
+
+    controller = _RuntimeProfileController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await pilot.pause()
+        screen = pilot.app.screen
+        assert screen.query_one("#sandbox-profile", Select).disabled
+        assert screen.query_one("#codex-profile", Select).disabled
+        create = screen.query_one("#create-workspace-profile", Button)
+        assert create.disabled is False
+        assert create.label.plain == "Create safe workspace profile"
+
+        await _open_workspace_profile_modal(pilot)
+        modal = pilot.app.screen
+        rendered = "\n".join(str(widget.render()) for widget in modal.query("Static"))
+        assert "ones-dev workspace profile" in rendered
+        for requirement in (
+            "inside-write",
+            "outside-deny",
+            "network-deny",
+            "environment isolation",
+            "299 MB",
+            "private cache",
+        ):
+            assert requirement in rendered
+        assert modal.query_one("#confirm-workspace-profile", Button).variant == "warning"
+        assert modal.query_one("#cancel-workspace-profile", Button)
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_modal_requires_explicit_confirmation() -> None:
+    controller = _RuntimeProfileController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await _open_workspace_profile_modal(pilot)
+        modal = pilot.app.screen
+        await pilot.press("enter")
+        await pilot.pause()
+        assert pilot.app.screen is modal
+        assert controller.profile_confirm_calls == 0
+
+        await pilot.click("#cancel-workspace-profile")
+        await pilot.pause()
+        assert pilot.app.screen.id == "setup-wizard"
+        assert controller.profile_confirm_calls == 0
+
+        await _open_workspace_profile_modal(pilot)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert pilot.app.screen.id == "setup-wizard"
+        assert controller.profile_confirm_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_success_reads_authoritative_draft_and_enables_test() -> None:
+    from src.developer_workflow.config import BUILTIN_WORKSPACE_PROFILE
+    from textual.widgets import Button, Select
+
+    controller = _RuntimeProfileController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(pilot, lambda: controller.profile_confirm_calls == 1)
+        await _wait_until(
+            pilot,
+            lambda: pilot.app.screen.query_one(
+                "#sandbox-profile", Select
+            ).value == BUILTIN_WORKSPACE_PROFILE,
+        )
+        screen = pilot.app.screen
+        assert screen.query_one("#codex-profile", Select).value == BUILTIN_WORKSPACE_PROFILE
+        assert screen.query_one("#sandbox-profile", Select).disabled is False
+        assert screen.query_one("#codex-profile", Select).disabled is False
+        assert screen.query_one("#test-connection", Button).disabled is False
+        assert screen.query_one("#next-step", Button).disabled is True
+        assert screen.query_one("#create-workspace-profile", Button).disabled is False
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_failure_is_redacted_and_retry_can_succeed() -> None:
+    from src.developer_workflow.config import BUILTIN_WORKSPACE_PROFILE
+    from textual.widgets import Button, Select, Static
+
+    canary = "PROFILE-RAW-FAILURE-CANARY C:/private/hash-secret"
+    controller = _RuntimeProfileController([RuntimeError(canary), True])
+    async with _wizard_app(controller).run_test() as pilot:
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(
+            pilot,
+            lambda: controller.profile_confirm_calls == 1
+            and pilot.app.screen.query_one(
+                "#create-workspace-profile", Button
+            ).label.plain == "Retry safe workspace profile",
+        )
+        screen = pilot.app.screen
+        assert screen.query_one("#setup-notice", Static).renderable == (
+            "Safe workspace profile could not be verified"
+        )
+        rendered = "\n".join(
+            str(widget.render()) for widget in screen.query("Static, Button")
+        )
+        assert canary not in rendered
+        assert "C:/private" not in rendered
+        assert canary not in repr(screen)
+        assert canary not in repr(screen._state())
+        retry = screen.query_one("#create-workspace-profile", Button)
+        assert retry.disabled is False
+
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(pilot, lambda: controller.profile_confirm_calls == 2)
+        await _wait_until(
+            pilot,
+            lambda: screen.query_one("#sandbox-profile", Select).value
+            == BUILTIN_WORKSPACE_PROFILE,
+        )
+        assert screen.query_one("#codex-profile", Select).value == BUILTIN_WORKSPACE_PROFILE
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_does_not_trust_success_return_without_draft_binding() -> None:
+    from textual.widgets import Button, Select, Static
+
+    class ForgedSuccessController(_RuntimeProfileController):
+        async def confirm_builtin_workspace_profile(self) -> str:
+            self.profile_confirm_calls += 1
+            return "ones-dev-workspace"
+
+    controller = ForgedSuccessController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(
+            pilot,
+            lambda: pilot.app.screen.query_one(
+                "#create-workspace-profile", Button
+            ).label.plain == "Retry safe workspace profile",
+        )
+        screen = pilot.app.screen
+        assert screen.query_one("#sandbox-profile", Select).disabled
+        assert screen.query_one("#codex-profile", Select).disabled
+        assert screen.query_one("#setup-notice", Static).renderable == (
+            "Safe workspace profile could not be verified"
+        )
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_duplicate_confirmation_is_single_flight() -> None:
+    import asyncio
+
+    from textual.widgets import Button
+
+    release = asyncio.Event()
+    controller = _RuntimeProfileController([release])
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(pilot, lambda: controller.profile_confirm_calls == 1)
+        assert screen.query_one("#create-workspace-profile", Button).disabled
+
+        screen._builtin_workspace_profile_finished(True)
+        screen._builtin_workspace_profile_finished(True)
+        await pilot.pause()
+        assert controller.profile_confirm_calls == 1
+        release.set()
+        await _wait_until(
+            pilot,
+            lambda: not screen.query_one(
+                "#create-workspace-profile", Button
+            ).disabled,
+        )
+        assert controller.profile_confirm_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_escape_during_profile_probe_cancels_and_leaves_retry_available() -> None:
+    import asyncio
+
+    from textual.widgets import Button
+
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class BlockingController(_RuntimeProfileController):
+        async def confirm_builtin_workspace_profile(self) -> str:
+            self.profile_confirm_calls += 1
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    controller = BlockingController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await entered.wait()
+        await pilot.press("escape")
+        await cancelled.wait()
+        await pilot.pause()
+        screen = pilot.app.screen
+        create = screen.query_one("#create-workspace-profile", Button)
+        assert create.disabled is False
+        assert create.label.plain == "Retry safe workspace profile"
+        assert controller.profile_confirm_calls == 1
+        assert controller.cancel_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_unmount_discards_late_profile_probe_without_render_mutation() -> None:
+    import asyncio
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class LateController(_RuntimeProfileController):
+        async def confirm_builtin_workspace_profile(self) -> str:
+            self.profile_confirm_calls += 1
+            entered.set()
+            try:
+                await asyncio.shield(release.wait())
+            except asyncio.CancelledError:
+                await release.wait()
+            return "ones-dev-workspace"
+
+    controller = LateController()
+    async with _wizard_app(controller).run_test() as pilot:
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await entered.wait()
+        screen = pilot.app.screen
+        await screen.remove()
+        release.set()
+        await pilot.pause()
+        assert controller.profile_confirm_calls == 1
+        assert controller.cancel_calls == 1
+        assert screen._managed_profiles == ()
+
+
+@pytest.mark.asyncio
+async def test_failed_runtime_profile_keeps_existing_managed_selection() -> None:
+    from textual.widgets import Select
+
+    class ManagedController(_RuntimeProfileController):
+        async def list_managed_profiles(self) -> tuple[str, ...]:
+            return ("managed-profile", "restricted-profile")
+
+    controller = ManagedController([RuntimeError("hidden")])
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        screen.query_one("#sandbox-profile", Select).value = "restricted-profile"
+        await pilot.pause()
+        await _open_workspace_profile_modal(pilot)
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(pilot, lambda: controller.profile_confirm_calls == 1)
+        assert screen.query_one("#sandbox-profile", Select).value == "restricted-profile"
+        assert screen.query_one("#codex-profile", Select).value == "restricted-profile"
 
 
 @pytest.mark.asyncio
