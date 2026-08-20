@@ -2006,7 +2006,15 @@ def test_sandbox_state_provider_must_prove_policy_and_never_leaks_on_error(
             max_output_bytes=1024,
         )
 
+    assert str(caught.value) == "sandbox capability probe failed"
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
     assert marker not in str(caught.value)
+    trace = caught.value.__traceback__
+    while trace is not None:
+        if Path(trace.tb_frame.f_code.co_filename).name == "requirement_flow.py":
+            assert marker not in repr(trace.tb_frame.f_locals)
+        trace = trace.tb_next
 
 
 def test_sandbox_state_provider_rejects_secret_bearing_payload_keys(

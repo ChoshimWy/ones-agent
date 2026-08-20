@@ -88,6 +88,10 @@ class RequirementSourceError(RequirementFlowError):
     """A requirement or Wiki source cannot be safely verified."""
 
 
+class _SandboxBudgetExhausted(TimeoutError):
+    """The executor's own absolute sandbox budget has been exhausted."""
+
+
 def _is_sandbox_priority_failure(error: BaseException) -> bool:
     return isinstance(
         error,
@@ -1062,7 +1066,7 @@ class SandboxCommandExecutor:
             try:
                 remaining = deadline - self.clock()
                 if not math.isfinite(remaining) or remaining <= 0:
-                    raise TimeoutError
+                    raise _SandboxBudgetExhausted
                 result = self.backend_executor(
                     wrapped,
                     cwd=canonical_cwd,
@@ -1075,14 +1079,11 @@ class SandboxCommandExecutor:
                 )
                 if deadline - self.clock() < 0:
                     result = None
-                    raise TimeoutError
+                    raise _SandboxBudgetExhausted
             except BaseException as error:
                 if _is_sandbox_priority_failure(error):
                     backend_failure = error
-                elif isinstance(
-                    error,
-                    (TimeoutError, subprocess.TimeoutExpired),
-                ):
+                elif isinstance(error, _SandboxBudgetExhausted):
                     backend_failure = RequirementFlowError(
                         "sandbox execution timed out"
                     )
