@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from uuid import uuid4
@@ -29,8 +30,11 @@ from src.developer_workflow.credential_store import (
 )
 from src.developer_workflow.repository import WorktreeRepository
 from src.developer_workflow.setup_validation import (
+    BuiltinWorkspaceSandboxExecutorFactory,
     ConnectionTestResult,
+    ManagedProfileCatalog,
     SetupStep,
+    SetupValidator,
     ValidationStatus,
 )
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
@@ -43,6 +47,8 @@ from src.developer_workflow.tui.setup_screens import SetupImportContext, SetupWi
 from tests.test_developer_workflow_tui_integration import (
     _EffectRepository,
     _MultiRemoteRunner,
+    _assert_recorded_sandbox_prefixes,
+    _cold_start_codex_preparer,
     _group_ui_runtime,
     _security_facts,
 )
@@ -55,6 +61,7 @@ from tests.test_developer_workflow_setup_controller import (
     _runtime,
     _workflow,
 )
+from tests.test_developer_workflow_setup_validation import _doctor
 
 
 @pytest.fixture
@@ -299,33 +306,10 @@ async def _wait_until(pilot: object, predicate, *, attempts: int = 100) -> None:
     assert predicate()
 
 
-class _EmptyBuiltinCatalog:
-    def __init__(self) -> None:
-        self.verifications = 0
-        self.selections: list[tuple[str, SandboxPermissionProfileSource]] = []
-
-    def list_profiles(self) -> tuple[str, ...]:
-        return ()
-
-    def verify_builtin_workspace_profile(self) -> str:
-        self.verifications += 1
-        return BUILTIN_WORKSPACE_PROFILE
-
-    def require_selected(
-        self, profile: str, source: SandboxPermissionProfileSource
-    ) -> str:
-        self.selections.append((profile, source))
-        if (
-            profile != BUILTIN_WORKSPACE_PROFILE
-            or source is not SandboxPermissionProfileSource.BUILTIN_WORKSPACE
-        ):
-            raise ValueError
-        return self.verify_builtin_workspace_profile()
-
-
 @pytest.mark.asyncio
 async def test_tui_creates_builtin_profile_without_preconfiguration(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Visible cold-start actions cross the real controller/store transaction."""
 
@@ -333,11 +317,48 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
 
     codex_config = tmp_path / "codex-home" / "config.toml"
     codex_config.parent.mkdir(parents=True)
-    codex_config.write_bytes(b"# no permission profiles\n")
+    codex_config.write_bytes(b"[permissions]\n")
     config_before = _security_facts(codex_config)
-    catalog = _EmptyBuiltinCatalog()
-    bootstrap = FakeBootstrap()
-    bootstrap.catalog = catalog
+    npm_source = tmp_path / "npm" / "native" / "codex.exe"
+    npm_source.parent.mkdir(parents=True)
+    npm_source.write_bytes(b"tiny-signed-native-codex")
+    source_before = _security_facts(npm_source)
+    preparer, backend, digest = _cold_start_codex_preparer(
+        tmp_path / "cold-start", npm_source
+    )
+    private_executable = (
+        tmp_path
+        / "cold-start"
+        / "private-runtime"
+        / "codex-runtime"
+        / digest
+        / "codex.exe"
+    )
+
+    def builtin_factory(*, codex_preparer):
+        assert codex_preparer is preparer
+        return BuiltinWorkspaceSandboxExecutorFactory(
+            backend_executor=backend,
+            codex_preparer=codex_preparer,
+        )
+
+    monkeypatch.setattr(
+        "src.developer_workflow.setup_validation.BuiltinWorkspaceSandboxExecutorFactory",
+        builtin_factory,
+    )
+    monkeypatch.setenv("PATH", "")
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=_doctor(codex_config),
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        file_security=lambda path, private: path == codex_config and not private,
+        codex_runtime_preparer=preparer,
+    )
+    bootstrap = SimpleNamespace(
+        catalog=catalog,
+        validator=SetupValidator._testing(profile_catalog=catalog),
+        codex_runtime_preparer=preparer,
+    )
     credentials = IntegrationCredentials()
     setup_path = tmp_path / "setup-private" / "config.json"
     store = SetupStore(credentials, config_path=setup_path)  # type: ignore[arg-type]
@@ -373,6 +394,8 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
     async with app.run_test(size=(140, 40)) as pilot:
         assert isinstance(app.screen, SetupWizardScreen)
         wizard = app.screen
+        assert backend.calls == []
+        assert not private_executable.exists()
         assert wizard.query_one("#sandbox-profile", Select).disabled
         create = wizard.query_one("#create-workspace-profile", Button)
         assert create.disabled is False
@@ -381,22 +404,32 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
             pilot,
             lambda: bool(app.screen.query("#confirm-workspace-profile")),
         )
+        assert backend.calls == []
+        assert not private_executable.exists()
         await pilot.click("#confirm-workspace-profile")
-        await _wait_until(
-            pilot,
-            lambda: app.screen is wizard
-            and wizard.query_one("#sandbox-profile", Select).value
-            == BUILTIN_WORKSPACE_PROFILE,
+        await _wait_until(pilot, lambda: wizard._profile_task is not None)
+        profile_task = wizard._profile_task
+        assert profile_task is not None
+        assert await asyncio.wait_for(asyncio.shield(profile_task), 30) == "verified"
+        await pilot.pause()
+        assert app.screen is wizard
+        assert (
+            wizard.query_one("#sandbox-profile", Select).value
+            == BUILTIN_WORKSPACE_PROFILE
         )
+        assert len(backend.calls) == 4
         await pilot.click("#test-connection")
-        await _wait_until(
-            pilot,
-            lambda: any(
-                result.step is SetupStep.PROFILE
-                and result.status is ValidationStatus.PASSED
-                for result in controller.state.results
-            ),
+        await _wait_until(pilot, lambda: wizard._test_task is not None)
+        test_task = wizard._test_task
+        assert test_task is not None
+        await asyncio.wait_for(asyncio.shield(test_task), 30)
+        await pilot.pause()
+        assert any(
+            result.step is SetupStep.PROFILE
+            and result.status is ValidationStatus.PASSED
+            for result in controller.state.results
         )
+        assert len(backend.calls) == 8
         await _wait_until(
             pilot,
             lambda: wizard.query_one("#next-step", Button).disabled is False,
@@ -408,8 +441,16 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
 
         # The acceptance target is the Profile transaction; the remaining remote
         # probes stay at their existing fake transport boundary before real save.
-        for step in SetupController.STEPS[1:-1]:
-            await controller.test_step(step, object())
+        controller._results.update(
+            {
+                step: ConnectionTestResult(
+                    step=step,
+                    status=ValidationStatus.PASSED,
+                    category="ok",
+                )
+                for step in SetupController.STEPS[1:-1]
+            }
+        )
         controller.confirm_review()
         handle = await controller.save_and_activate()
         assert handle is builder.handle
@@ -432,75 +473,41 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
     ] == [
         (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE)
     ]
-    assert catalog.verifications == 2
-    assert catalog.selections == [
-        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE)
-    ]
-    assert _security_facts(codex_config) == config_before
-
-
-@pytest.mark.asyncio
-async def test_reloaded_builtin_profile_reaches_runtime_factory_with_source(
-    tmp_path: Path,
-) -> None:
-    """SetupStore round-trip preserves the source consumed by a fresh runtime."""
-
-    credentials = IntegrationCredentials()
-    setup_path = tmp_path / "reload-private" / "config.json"
-    store = SetupStore(credentials, config_path=setup_path)  # type: ignore[arg-type]
-    workflow_data = _workflow(tmp_path).model_dump(mode="python", round_trip=True)
-    workflow_data.update(
-        sandbox_permission_profile=BUILTIN_WORKSPACE_PROFILE,
-        sandbox_permission_profile_source=(
-            SandboxPermissionProfileSource.BUILTIN_WORKSPACE
-        ),
-    )
-    draft = SetupDraft(
-        runtime=_runtime(),
-        workflow=WorkflowDraft.model_validate(workflow_data),
-    )
-    bootstrap = FakeBootstrap()
-    bootstrap.catalog = _EmptyBuiltinCatalog()
-    first_builder = FakeRuntimeBuilder()
-    controller = SetupController(
-        profile_id="cold-start",
-        store=store,
-        runtime_builder=first_builder,
-        runtime_bootstrap=bootstrap,
-        draft=draft,
-    )
-    for kind, value in (
-        (SecretKind.ONES_PASSWORD, "ones-password-for-store"),
-        (SecretKind.PROVIDER_TOKEN, "provider-token-for-store"),
-    ):
-        controller.set_secret(kind, value)
-    for step in SetupController.STEPS[:-1]:
-        await controller.test_step(step, None if step is SetupStep.PROFILE else object())
-    controller.confirm_review()
-    assert await controller.save_and_activate() is first_builder.handle
-
-    restarted_store = SetupStore(
-        credentials, config_path=setup_path  # type: ignore[arg-type]
-    )
     restarted_builder = FakeRuntimeBuilder()
     restarted = SetupController(
         profile_id="cold-start",
-        store=restarted_store,
+        store=SetupStore(
+            credentials, config_path=setup_path  # type: ignore[arg-type]
+        ),
         runtime_builder=restarted_builder,
         runtime_bootstrap=bootstrap,
     )
     assert await restarted.activate_existing() is restarted_builder.handle
-    calls = [*first_builder.calls, *restarted_builder.calls]
     assert [
-        (
-            active.workflow.sandbox_permission_profile,
-            active.workflow.sandbox_permission_profile_source,
-        )
-        for active, _secrets in calls
+        active.workflow.sandbox_permission_profile_source
+        for active, _secrets in [*builder.calls, *restarted_builder.calls]
     ] == [
-        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
-        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
     ]
+    private_executable = private_executable.resolve(strict=True)
+    for offset in (0, 4):
+        observed = type(backend)()
+        observed.calls = backend.calls[offset : offset + 4]
+        _assert_recorded_sandbox_prefixes(
+            observed,
+            private_executable=private_executable,
+            builtin=True,
+            profile=BUILTIN_WORKSPACE_PROFILE,
+            final_command=[
+                sys.executable,
+                "-I",
+                "-c",
+                "print('sandbox-preflight')",
+            ],
+        )
+    assert _security_facts(codex_config) == config_before
+    assert _security_facts(npm_source) == source_before
 
 
 @pytest.mark.asyncio

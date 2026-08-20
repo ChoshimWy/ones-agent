@@ -33,8 +33,9 @@ provider、Codex、私有目录和 Review。每一步只执行对应的只读连
 mirror、worktree、commit、push、PR 或写入 ONES。
 
 ONES、provider、Codex 和 Git 传输凭据保存在 Windows Credential Manager；版本化配置
-文件只保存非敏感策略。sandbox 与 Codex 只能选择管理员预先安装并被探测通过的托管
-profile。全部检查通过后无需重启即可进入 Dashboard。Dashboard 的 `Configure runtime`
+文件只保存非敏感策略。TUI 可选择运行时固定的 `ones-dev-workspace` 内置 profile，
+也可选择管理员预先安装并被探测通过的 managed profile；两者来源会分别保存，不能
+按名称互相推断。全部检查通过后无需重启即可进入 Dashboard。Dashboard 的 `Configure runtime`
 可先关闭现有 runtime，再进入重新配置；取消会恢复之前的稳定 generation。若进程在
 激活中断，下一次启动会显示恢复页面；恢复旧 generation、丢弃未完成 generation 和
 清理孤立凭据均要求二次确认。任何错误、通知、Rich renderable 或 TaskEvent 都只显示
@@ -146,7 +147,7 @@ ONES 写一条汇总评论，绝不自动修改 ONES 状态。若中途失败，
 }
 ```
 
-`run_root`、`worktree_root` 和 `mirror_root` 必须是专用 private roots，不应指向当前源码目录、共享目录或符号链接。`sandbox_permission_profile` 必须是管理员已安装的 managed sandbox profile；工作流会在每次测试命令前验证 worktree 可写、外部目录不可写、网络不可达且敏感环境变量未进入沙箱。
+`run_root`、`worktree_root` 和 `mirror_root` 必须是专用 private roots，不应指向当前源码目录、共享目录或符号链接。非交互 CLI 的 `sandbox_permission_profile` 必须是管理员已安装的 managed sandbox profile；TUI 还可在显式确认后使用固定的运行时内置 profile。工作流会在每次测试命令前验证 worktree 可写、外部目录不可写、网络不可达且敏感环境变量未进入沙箱。
 
 凭据不得写入 JSON。生产 CLI 只从受控进程环境读取下列变量，示例值均是占位符：
 

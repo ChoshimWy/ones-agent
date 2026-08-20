@@ -52,6 +52,7 @@ from src.developer_workflow.requirement_flow import (
     SandboxCommandExecutor,
     SandboxStatePolicy,
     SubprocessConfiguredTestRunner,
+    sandbox_preflight_command,
 )
 from src.developer_workflow.state_store import FileRunStore
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp, TuiTaskMessage
@@ -205,10 +206,12 @@ class _RecordingSandboxBackend:
         **kwargs,
     ):
         del timeout, max_output_bytes
-        assert "shell" not in kwargs
+        shell = kwargs.pop("shell", False)
+        assert shell is False
+        assert kwargs == {}
         argv = tuple(command)
         copied_env = dict(env)
-        self.calls.append((argv, Path(cwd), copied_env, stdin is not None))
+        self.calls.append((argv, Path(cwd), copied_env, shell))
         assert not any(
             token in key.casefold()
             for key in copied_env
@@ -260,14 +263,69 @@ def _assert_recorded_sandbox_prefixes(
     *,
     private_executable: Path,
     builtin: bool,
+    profile: str,
+    final_command: list[str],
 ) -> None:
     assert len(backend.calls) == 4
+    cwd = backend.calls[0][1]
     expected = [str(private_executable)]
     if builtin:
         expected.extend(["-c", BUILTIN_WORKSPACE_OVERRIDE])
-    for argv, _cwd, _env, _has_stdin in backend.calls:
+    expected.extend(
+        [
+            "sandbox",
+            "--permission-profile",
+            profile,
+            "--include-managed-config",
+            "-C",
+            str(cwd),
+            "--sandbox-state-disable-network",
+            "--",
+        ]
+    )
+    for argv, observed_cwd, environment, shell in backend.calls:
+        assert observed_cwd == cwd
         assert list(argv[: len(expected)]) == expected
-        assert "--sandbox-state-disable-network" in argv
+        assert environment["PATH"] == ""
+        assert shell is False
+        assert not any(
+            token in key.casefold()
+            for key in environment
+            for token in ("token", "secret", "credential", "password", "askpass")
+        )
+
+    first_child = list(backend.calls[0][0][len(expected) :])
+    assert first_child[:4] == [
+        sys.executable,
+        "-I",
+        "-c",
+        "from pathlib import Path; import sys; "
+        "Path(sys.argv[1]).write_text(sys.argv[2], encoding='utf-8')",
+    ]
+    inside = Path(first_child[4])
+    assert inside.name == "inside-write.txt"
+    assert inside.parent.parent == cwd
+    probe_id = inside.parent.name.removeprefix(".ones-sandbox-")
+    assert inside.parent.name == f".ones-sandbox-{probe_id}"
+    assert first_child[5] == f"ones-sandbox-probe-{probe_id}"
+    second_child = list(backend.calls[1][0][len(expected) :])
+    assert second_child == [
+        *first_child[:4],
+        str(cwd.parent / f".ones-sandbox-probes-{probe_id}" / "outside-write.txt"),
+        f"ones-sandbox-probe-{probe_id}",
+    ]
+    third_child = list(backend.calls[2][0][len(expected) :])
+    assert third_child[:4] == [
+        sys.executable,
+        "-I",
+        "-c",
+        "import socket,sys; s=socket.socket(); s.settimeout(2); "
+        "\ntry: s.connect(('127.0.0.1', int(sys.argv[1])))"
+        "\nexcept OSError: raise SystemExit(23)"
+        "\nraise SystemExit(0)",
+    ]
+    assert third_child[4].isdigit()
+    assert list(backend.calls[3][0][len(expected) :]) == final_command
 
 
 def test_recording_backend_proves_builtin_and_managed_native_argv(
@@ -293,7 +351,7 @@ def test_recording_backend_proves_builtin_and_managed_native_argv(
     completed = builtin(
         [sys.executable, "-I", "-c", "print('ok')"],
         cwd=worktree.resolve(),
-        env={"PATH": os.environ.get("PATH", ""), "ONES_TOKEN": "must-not-cross"},
+        env={"PATH": "", "ONES_TOKEN": "must-not-cross"},
         timeout=20,
         max_output_bytes=64 * 1024,
     )
@@ -302,7 +360,11 @@ def test_recording_backend_proves_builtin_and_managed_native_argv(
         tmp_path / "builtin" / "private-runtime" / "codex-runtime" / digest / "codex.exe"
     ).resolve(strict=True)
     _assert_recorded_sandbox_prefixes(
-        builtin_backend, private_executable=private_executable, builtin=True
+        builtin_backend,
+        private_executable=private_executable,
+        builtin=True,
+        profile=BUILTIN_WORKSPACE_PROFILE,
+        final_command=[sys.executable, "-I", "-c", "print('ok')"],
     )
 
     managed_preparer, managed_backend, managed_digest = _cold_start_codex_preparer(
@@ -319,7 +381,7 @@ def test_recording_backend_proves_builtin_and_managed_native_argv(
     assert managed(
         [sys.executable, "-I", "-c", "print('ok')"],
         cwd=managed_worktree.resolve(),
-        env={"PATH": os.environ.get("PATH", "")},
+        env={"PATH": ""},
         timeout=20,
         max_output_bytes=64 * 1024,
     ).returncode == 0
@@ -332,7 +394,11 @@ def test_recording_backend_proves_builtin_and_managed_native_argv(
         / "codex.exe"
     ).resolve(strict=True)
     _assert_recorded_sandbox_prefixes(
-        managed_backend, private_executable=managed_executable, builtin=False
+        managed_backend,
+        private_executable=managed_executable,
+        builtin=False,
+        profile="managed-existing",
+        final_command=[sys.executable, "-I", "-c", "print('ok')"],
     )
     assert all("-c" not in argv[: argv.index("sandbox")] for argv, *_ in managed_backend.calls)
     assert _security_facts(source) == source_before

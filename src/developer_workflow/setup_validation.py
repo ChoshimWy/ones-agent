@@ -681,6 +681,7 @@ class ManagedProfileCatalog:
     file_security: Callable[[Path, bool], bool] = _default_file_security
     timeout_seconds: float = 20.0
     max_output_bytes: int = 1024 * 1024
+    cold_config_path: Path | None = field(default=None, repr=False)
     codex_runtime_preparer: CodexRuntimePreparer | None = field(
         default=None, repr=False
     )
@@ -689,11 +690,13 @@ class ManagedProfileCatalog:
     @classmethod
     def production(cls, *, probe_parent: Path | None = None) -> ManagedProfileCatalog:
         preparer = CodexRuntimePreparer()
+        user_home = Path.home()
         return cls(
             codex_doctor=SubprocessDoctorRunner(codex_preparer=preparer),
             probe_worktree=probe_parent,
             executor_factory=ManagedSandboxExecutorFactory(codex_preparer=preparer),
             file_security=_default_file_security,
+            cold_config_path=(user_home / ".codex" / "config.toml").absolute(),
             codex_runtime_preparer=preparer,
             _construction_token=_PRODUCTION_CONSTRUCTION,
         )
@@ -713,6 +716,14 @@ class ManagedProfileCatalog:
             or not math.isfinite(self.timeout_seconds)
             or self.timeout_seconds <= 0
             or not 1 <= self.max_output_bytes <= _MAX_DOCUMENT_BYTES
+            or (
+                self.cold_config_path is not None
+                and (
+                    not isinstance(self.cold_config_path, Path)
+                    or not self.cold_config_path.is_absolute()
+                    or "\x00" in os.fspath(self.cold_config_path)
+                )
+            )
         ):
             raise SetupValidationError("managed profile catalog is invalid")
 
@@ -721,9 +732,20 @@ class ManagedProfileCatalog:
         if not isinstance(total, (int, float)) or not math.isfinite(total) or total <= 0:
             raise SetupValidationError("managed profile timeout is invalid")
         deadline = time.monotonic() + total
+        admin_profiles = self._read_admin_profiles()
+        cold_config = self.cold_config_path
+        cold_config_absent = False
+        if cold_config is not None:
+            try:
+                cold_config.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                cold_config_absent = True
+            except OSError:
+                pass
+        if cold_config_absent and not admin_profiles:
+            return ()
         config_path = self._config_path_from_doctor(timeout_seconds=total)
         user_profiles = self._read_user_profiles(config_path)
-        admin_profiles = self._read_admin_profiles()
         if len(user_profiles) != len(set(user_profiles)) or len(admin_profiles) != len(set(admin_profiles)):
             raise SetupValidationError("managed profile catalog is invalid")
         if set(user_profiles) & set(admin_profiles):

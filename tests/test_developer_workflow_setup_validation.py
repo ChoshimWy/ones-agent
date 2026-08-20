@@ -927,6 +927,41 @@ def test_profile_catalog_fails_closed_on_wrong_schema(tmp_path: Path, document: 
         catalog.list_profiles()
 
 
+def test_empty_cold_catalog_does_not_prepare_codex_before_confirmation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    config = tmp_path / ".codex" / "config.toml"
+
+    class NeverPrepare:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def prepare_verified(self) -> object:
+            self.calls += 1
+            raise AssertionError("Codex preparation requires explicit confirmation")
+
+    preparer = NeverPrepare()
+    monkeypatch.setattr(
+        validation_module,
+        "CodexRuntimePreparer",
+        lambda: preparer,
+    )
+    monkeypatch.setattr(
+        validation_module.Path,
+        "home",
+        classmethod(lambda cls: tmp_path),
+    )
+    monkeypatch.delenv("PROGRAMDATA", raising=False)
+    runtime = RuntimeBootstrapper.production(probe_parent=tmp_path)
+
+    assert runtime.catalog.cold_config_path == config
+    assert runtime.catalog.list_profiles() == ()
+    assert preparer.calls == 0
+
+
 def test_profile_catalog_rejects_doctor_path_outside_reported_home(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
@@ -1201,7 +1236,8 @@ def test_production_runtime_wires_only_real_policy_boundaries(
 ) -> None:
     import src.developer_workflow.setup_validation as validation_module
 
-    config = tmp_path / "config.toml"
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir()
     config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
     calls: list[tuple[list[str], Path]] = []
     preparer = _TinyPreparer(tmp_path)
@@ -1226,6 +1262,11 @@ def test_production_runtime_wires_only_real_policy_boundaries(
     monkeypatch.setattr(validation_module, "_bounded_subprocess", os_command)
     monkeypatch.setattr(validation_module, "_default_file_security", lambda path, admin: True)
     monkeypatch.setattr(validation_module, "CodexRuntimePreparer", lambda: preparer)
+    monkeypatch.setattr(
+        validation_module.Path,
+        "home",
+        classmethod(lambda cls: tmp_path),
+    )
     runtime = RuntimeBootstrapper.production(probe_parent=tmp_path)
     assert isinstance(runtime.catalog.codex_doctor, SubprocessDoctorRunner)
     assert isinstance(runtime.catalog.executor_factory, ManagedSandboxExecutorFactory)
