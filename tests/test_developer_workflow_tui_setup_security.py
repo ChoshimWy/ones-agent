@@ -32,9 +32,11 @@ from src.developer_workflow.repository import WorktreeRepository
 from src.developer_workflow.setup_validation import (
     BuiltinWorkspaceSandboxExecutorFactory,
     ConnectionTestResult,
+    ManagedSandboxExecutorFactory,
     ManagedProfileCatalog,
     SetupStep,
     SetupValidator,
+    SubprocessDoctorRunner,
     ValidationStatus,
 )
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
@@ -43,7 +45,11 @@ from src.developer_workflow.tui.app import TuiTaskMessage
 from src.developer_workflow.tui.models import RunActivity
 from src.developer_workflow.tui.supervisor import TaskEvent
 from src.developer_workflow.tui.screens import DashboardScreen
-from src.developer_workflow.tui.setup_screens import SetupImportContext, SetupWizardScreen
+from src.developer_workflow.tui.setup_screens import (
+    SetupImportContext,
+    SetupWizardScreen,
+    SetupWorkspaceProfileConfirmation,
+)
 from tests.test_developer_workflow_tui_integration import (
     _EffectRepository,
     _MultiRemoteRunner,
@@ -347,13 +353,34 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
         builtin_factory,
     )
     monkeypatch.setenv("PATH", "")
-    catalog = ManagedProfileCatalog._testing(
-        codex_doctor=_doctor(codex_config),
-        trusted_admin_catalog=None,
-        probe_worktree=tmp_path,
-        file_security=lambda path, private: path == codex_config and not private,
-        codex_runtime_preparer=preparer,
+    monkeypatch.delenv("PROGRAMDATA", raising=False)
+    doctor_backend_calls: list[tuple[str, ...]] = []
+    doctor_result = _doctor(codex_config)
+
+    def doctor_backend(command, *, cwd, env, timeout, max_output_bytes):
+        doctor_backend_calls.append(tuple(command))
+        return doctor_result(
+            command[-2:],
+            cwd=cwd,
+            env=env,
+            timeout=timeout,
+            max_output_bytes=max_output_bytes,
+            shell=False,
+        )
+
+    catalog = ManagedProfileCatalog.production(probe_parent=tmp_path)
+    catalog.codex_doctor = SubprocessDoctorRunner(
+        codex_preparer=preparer,
+        backend_runner=doctor_backend,
     )
+    catalog.executor_factory = ManagedSandboxExecutorFactory(
+        codex_preparer=preparer
+    )
+    catalog.file_security = (
+        lambda path, private: path == codex_config and not private
+    )
+    catalog.cold_config_path = codex_config
+    catalog.codex_runtime_preparer = preparer
     bootstrap = SimpleNamespace(
         catalog=catalog,
         validator=SetupValidator._testing(profile_catalog=catalog),
@@ -395,6 +422,7 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
         assert isinstance(app.screen, SetupWizardScreen)
         wizard = app.screen
         assert backend.calls == []
+        assert doctor_backend_calls == []
         assert not private_executable.exists()
         assert wizard.query_one("#sandbox-profile", Select).disabled
         create = wizard.query_one("#create-workspace-profile", Button)
@@ -405,8 +433,11 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
             lambda: bool(app.screen.query("#confirm-workspace-profile")),
         )
         assert backend.calls == []
+        assert doctor_backend_calls == []
         assert not private_executable.exists()
-        await pilot.click("#confirm-workspace-profile")
+        confirmation = app.screen
+        assert isinstance(confirmation, SetupWorkspaceProfileConfirmation)
+        confirmation._confirm()
         await _wait_until(pilot, lambda: wizard._profile_task is not None)
         profile_task = wizard._profile_task
         assert profile_task is not None
@@ -508,6 +539,7 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
         )
     assert _security_facts(codex_config) == config_before
     assert _security_facts(npm_source) == source_before
+    assert doctor_backend_calls == []
 
 
 @pytest.mark.asyncio

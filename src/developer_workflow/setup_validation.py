@@ -735,6 +735,7 @@ class ManagedProfileCatalog:
         admin_profiles = self._read_admin_profiles()
         cold_config = self.cold_config_path
         cold_config_absent = False
+        cold_config_empty = False
         if cold_config is not None:
             try:
                 cold_config.stat(follow_symlinks=False)
@@ -742,7 +743,9 @@ class ManagedProfileCatalog:
                 cold_config_absent = True
             except OSError:
                 pass
-        if cold_config_absent and not admin_profiles:
+            else:
+                cold_config_empty = self._cold_config_has_no_profiles(cold_config)
+        if (cold_config_absent or cold_config_empty) and not admin_profiles:
             return ()
         config_path = self._config_path_from_doctor(timeout_seconds=total)
         user_profiles = self._read_user_profiles(config_path)
@@ -956,6 +959,31 @@ class ManagedProfileCatalog:
             if _is_probe_priority_failure(error):
                 raise
             raise SetupValidationError("Codex profile discovery is unavailable") from None
+
+    def _cold_config_has_no_profiles(self, path: Path) -> bool:
+        """Return true only when the secured candidate proves an empty catalog."""
+
+        try:
+            raw = _read_secure_bytes(
+                path,
+                admin=False,
+                security=self.file_security,
+            )
+            document = tomllib.loads(raw.decode("utf-8", errors="strict"))
+            if type(document) is not dict or "profiles" in document:
+                return False
+            permissions = document.get("permissions")
+            return permissions is None or (
+                type(permissions) is dict and not permissions
+            )
+        except (
+            SetupValidationError,
+            UnicodeError,
+            tomllib.TOMLDecodeError,
+            TypeError,
+            ValueError,
+        ):
+            return False
 
     def _read_user_profiles(self, path: Path) -> tuple[str, ...]:
         raw = _read_secure_bytes(path, admin=False, security=self.file_security)

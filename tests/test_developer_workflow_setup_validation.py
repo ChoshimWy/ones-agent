@@ -962,6 +962,114 @@ def test_empty_cold_catalog_does_not_prepare_codex_before_confirmation(
     assert preparer.calls == 0
 
 
+@pytest.mark.parametrize(
+    "document",
+    ("", "# ordinary Codex settings only\nmodel = 'gpt-test'\n", "[permissions]\n"),
+    ids=("empty", "ordinary", "empty-permissions"),
+)
+def test_existing_safe_cold_config_without_profiles_skips_doctor_and_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    document: str,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    config = tmp_path / ".codex" / "config.toml"
+    config.parent.mkdir()
+    config.write_text(document, encoding="utf-8")
+    prepare_calls: list[bool] = []
+
+    class NeverPrepare:
+        def prepare_verified(self) -> object:
+            prepare_calls.append(True)
+            raise AssertionError("Codex preparation requires explicit confirmation")
+
+    monkeypatch.setattr(validation_module, "CodexRuntimePreparer", NeverPrepare)
+    monkeypatch.setattr(
+        validation_module.Path,
+        "home",
+        classmethod(lambda cls: tmp_path),
+    )
+    monkeypatch.setattr(
+        validation_module,
+        "_default_file_security",
+        lambda path, admin: path == config and not admin,
+    )
+    monkeypatch.delenv("PROGRAMDATA", raising=False)
+    runtime = RuntimeBootstrapper.production(probe_parent=tmp_path)
+
+    assert runtime.catalog.list_profiles() == ()
+    assert prepare_calls == []
+
+
+@pytest.mark.parametrize("mode", ("malformed", "unsafe", "race"))
+def test_uncertain_cold_config_never_becomes_an_empty_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+) -> None:
+    import src.developer_workflow.setup_validation as validation_module
+
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[permissions]\n" if mode != "malformed" else "[permissions\n",
+        encoding="utf-8",
+    )
+    doctor_calls: list[bool] = []
+
+    def doctor(*args, **kwargs):
+        doctor_calls.append(True)
+        raise OSError("doctor required")
+
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=doctor,
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor,
+        file_security=lambda path, admin: mode != "unsafe",
+        cold_config_path=config,
+    )
+    if mode == "race":
+        monkeypatch.setattr(
+            validation_module,
+            "_read_secure_bytes",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                SetupValidationError("managed profile source is unsafe")
+            ),
+        )
+
+    with pytest.raises(SetupValidationError, match="discovery is unavailable"):
+        catalog.list_profiles()
+    assert doctor_calls == [True]
+
+
+def test_existing_managed_cold_config_keeps_doctor_and_capability_probe(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[permissions.managed]\nextends=":workspace"\n', encoding="utf-8"
+    )
+    doctor_calls: list[bool] = []
+    doctor = _doctor(config)
+
+    def observed_doctor(*args, **kwargs):
+        doctor_calls.append(True)
+        return doctor(*args, **kwargs)
+
+    catalog = ManagedProfileCatalog._testing(
+        codex_doctor=observed_doctor,
+        trusted_admin_catalog=None,
+        probe_worktree=tmp_path,
+        executor_factory=_CapabilityExecutor,
+        file_security=lambda path, admin: True,
+        cold_config_path=config,
+    )
+
+    assert catalog.list_profiles() == ("managed",)
+    assert doctor_calls == [True]
+
+
 def test_profile_catalog_rejects_doctor_path_outside_reported_home(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
     config.write_text('[permissions.managed]\nextends=":workspace"\n', encoding="utf-8")
