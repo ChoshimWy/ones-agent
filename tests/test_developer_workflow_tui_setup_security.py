@@ -45,11 +45,7 @@ from src.developer_workflow.tui.app import TuiTaskMessage
 from src.developer_workflow.tui.models import RunActivity
 from src.developer_workflow.tui.supervisor import TaskEvent
 from src.developer_workflow.tui.screens import DashboardScreen
-from src.developer_workflow.tui.setup_screens import (
-    SetupImportContext,
-    SetupWizardScreen,
-    SetupWorkspaceProfileConfirmation,
-)
+from src.developer_workflow.tui.setup_screens import SetupImportContext, SetupWizardScreen
 from tests.test_developer_workflow_tui_integration import (
     _EffectRepository,
     _MultiRemoteRunner,
@@ -428,16 +424,28 @@ async def test_tui_creates_builtin_profile_without_preconfiguration(
         create = wizard.query_one("#create-workspace-profile", Button)
         assert create.disabled is False
         await pilot.click("#create-workspace-profile")
+
+        def confirmation_is_clickable() -> bool:
+            matches = app.screen.query("#confirm-workspace-profile")
+            if not matches:
+                return False
+            button = matches.first(Button)
+            return (
+                button.display
+                and button.visible
+                and not button.disabled
+                and button.region.width > 0
+                and button.region.height > 0
+            )
+
         await _wait_until(
             pilot,
-            lambda: bool(app.screen.query("#confirm-workspace-profile")),
+            confirmation_is_clickable,
         )
         assert backend.calls == []
         assert doctor_backend_calls == []
         assert not private_executable.exists()
-        confirmation = app.screen
-        assert isinstance(confirmation, SetupWorkspaceProfileConfirmation)
-        confirmation._confirm()
+        await pilot.click("#confirm-workspace-profile")
         await _wait_until(pilot, lambda: wizard._profile_task is not None)
         profile_task = wizard._profile_task
         assert profile_task is not None
