@@ -336,7 +336,9 @@ class SetupWizardScreen(SetupRootScreen):
         self._generation = 0
         self._transients_cleared = False
         self._test_task: asyncio.Task[None] | None = None
-        self._profile_task: asyncio.Task[None] | None = None
+        self._profile_task: asyncio.Task[str] | None = None
+        self._profile_cancel_requested: asyncio.Task[str] | None = None
+        self._profile_modal_open = False
         self._managed_profiles: tuple[str, ...] = ()
         self._profile_catalog_ready = False
         self._profile_generation = 0
@@ -506,14 +508,31 @@ class SetupWizardScreen(SetupRootScreen):
 
     @on(Button.Pressed, "#create-workspace-profile")
     def _request_builtin_workspace_profile(self) -> None:
-        if self._profile_task is not None and not self._profile_task.done():
+        if (
+            self._profile_modal_open
+            or self._profile_task is not None
+        ):
             return
-        self.app.push_screen(
-            SetupWorkspaceProfileConfirmation(),
-            self._builtin_workspace_profile_finished,
-        )
+        self._profile_modal_open = True
+        try:
+            self.app.push_screen(
+                SetupWorkspaceProfileConfirmation(),
+                self._builtin_workspace_profile_finished,
+            )
+        except BaseException as error:
+            self._profile_modal_open = False
+            if isinstance(
+                error,
+                (KeyboardInterrupt, SystemExit, MemoryError, GeneratorExit),
+            ):
+                raise
+            if self.is_attached:
+                self.query_one("#setup-notice", Static).update(
+                    "Safe workspace profile could not be verified"
+                )
 
     def _builtin_workspace_profile_finished(self, confirmed: bool | None) -> None:
+        self._profile_modal_open = False
         if confirmed is not True or not self.is_attached:
             return
         self._start_builtin_workspace_profile()
@@ -523,30 +542,83 @@ class SetupWizardScreen(SetupRootScreen):
             not self.is_attached
             or self._supervisor.busy
             or self._profile_task is not None
-            and not self._profile_task.done()
         ):
             return
         button = self.query_one("#create-workspace-profile", Button)
         button.disabled = True
+        self.query_one("#setup-notice", Static).update(
+            "Verifying safe workspace profile; first setup may safely copy about "
+            "299 MB of signed native Codex into a private cache; later runs reuse it"
+        )
         self._transients_cleared = False
         self._generation += 1
         generation = self._generation
         task = asyncio.create_task(
-            self._confirm_builtin_workspace_profile(generation),
+            self._confirm_builtin_workspace_profile(),
             name="tui-setup-workspace-profile",
         )
         self._profile_task = task
 
-        def completed(done: asyncio.Task[None]) -> None:
+        def completed(done: asyncio.Task[str]) -> None:
+            outcome = "cancelled"
+            failure: BaseException | None = None
+            try:
+                outcome = done.result()
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+            except BaseException as error:
+                failure = error
+            cancelled_here = self._profile_cancel_requested is done
+            if cancelled_here:
+                self._profile_cancel_requested = None
             if self._profile_task is done:
                 self._profile_task = None
-            if done.cancelled():
-                return
-            try:
-                failure = done.exception()
-            except asyncio.CancelledError:
-                return
-            if failure is not None and self.is_attached:
+            if (
+                failure is None
+                and self.is_attached
+                and (generation == self._generation or cancelled_here)
+            ):
+                if cancelled_here:
+                    outcome = "cancelled"
+                if outcome == "verified":
+                    try:
+                        if not self._has_builtin_profile_binding():
+                            outcome = "failure"
+                        else:
+                            self._apply_builtin_profile_selection()
+                    except BaseException as error:
+                        if isinstance(
+                            error,
+                            (
+                                KeyboardInterrupt,
+                                SystemExit,
+                                MemoryError,
+                                GeneratorExit,
+                            ),
+                        ):
+                            failure = error
+                        else:
+                            outcome = "failure"
+                if failure is not None:
+                    self.app.call_later(self._raise_profile_failure, failure)
+                    return
+                button = self.query_one("#create-workspace-profile", Button)
+                button.label = (
+                    "Create safe workspace profile"
+                    if outcome == "verified"
+                    else "Retry safe workspace profile"
+                )
+                button.disabled = False
+                notice = self.query_one("#setup-notice", Static)
+                notice.update(
+                    "Safe workspace profile verified"
+                    if outcome == "verified"
+                    else "Safe workspace profile verification cancelled"
+                    if outcome == "cancelled"
+                    else "Safe workspace profile could not be verified"
+                )
+                self._render_state()
+            if failure is not None:
                 self.app.call_later(self._raise_profile_failure, failure)
 
         task.add_done_callback(completed)
@@ -555,70 +627,51 @@ class SetupWizardScreen(SetupRootScreen):
     def _raise_profile_failure(failure: BaseException) -> None:
         raise failure
 
-    async def _confirm_builtin_workspace_profile(self, generation: int) -> None:
-        notice = self.query_one("#setup-notice", Static)
-        notice.update(
-            "Verifying safe workspace profile; first setup may safely copy about "
-            "299 MB of signed native Codex into a private cache; later runs reuse it"
+    def _has_builtin_profile_binding(self) -> bool:
+        draft = getattr(self.controller, "draft", None)
+        workflow = getattr(draft, "workflow", None)
+        profile = getattr(workflow, "sandbox_permission_profile", None)
+        source = getattr(workflow, "sandbox_permission_profile_source", None)
+        return (
+            type(profile) is str
+            and profile == BUILTIN_WORKSPACE_PROFILE
+            and source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
         )
+
+    def _apply_builtin_profile_selection(self) -> None:
+        profiles = tuple(
+            dict.fromkeys((*self._managed_profiles, BUILTIN_WORKSPACE_PROFILE))
+        )
+        self._managed_profiles = profiles
+        options = tuple((item, item) for item in profiles)
+        self._syncing_profile = True
+        try:
+            for widget_id in ("sandbox-profile", "codex-profile"):
+                widget = self.query_one(f"#{widget_id}", Select)
+                widget.set_options(options)
+                widget.disabled = False
+                widget.value = BUILTIN_WORKSPACE_PROFILE
+        finally:
+            self._syncing_profile = False
+
+    async def _confirm_builtin_workspace_profile(self) -> str:
         confirm = getattr(
             self.controller, "confirm_builtin_workspace_profile", None
         )
-        succeeded = False
         try:
             if not callable(confirm):
                 raise RuntimeError("workspace profile confirmation is unavailable")
             await self._supervisor.run_readonly(confirm)
-            if generation != self._generation or not self.is_attached:
-                return
-            draft = getattr(self.controller, "draft", None)
-            workflow = getattr(draft, "workflow", None)
-            profile = getattr(workflow, "sandbox_permission_profile", None)
-            source = getattr(
-                workflow, "sandbox_permission_profile_source", None
-            )
-            if not (
-                type(profile) is str
-                and profile == BUILTIN_WORKSPACE_PROFILE
-                and source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
-            ):
-                raise RuntimeError("workspace profile binding is unavailable")
-            profiles = tuple(
-                dict.fromkeys((*self._managed_profiles, BUILTIN_WORKSPACE_PROFILE))
-            )
-            self._managed_profiles = profiles
-            options = tuple((item, item) for item in profiles)
-            self._syncing_profile = True
-            try:
-                for widget_id in ("sandbox-profile", "codex-profile"):
-                    widget = self.query_one(f"#{widget_id}", Select)
-                    widget.set_options(options)
-                    widget.disabled = False
-                    widget.value = BUILTIN_WORKSPACE_PROFILE
-            finally:
-                self._syncing_profile = False
-            succeeded = True
-            notice.update("Safe workspace profile verified")
+            return "verified"
         except asyncio.CancelledError:
-            return
+            return "cancelled"
         except BaseException as error:
             if isinstance(
                 error,
                 (KeyboardInterrupt, SystemExit, MemoryError, GeneratorExit),
             ):
                 raise
-            if generation == self._generation and self.is_attached:
-                notice.update("Safe workspace profile could not be verified")
-        finally:
-            if generation == self._generation and self.is_attached:
-                button = self.query_one("#create-workspace-profile", Button)
-                button.label = (
-                    "Create safe workspace profile"
-                    if succeeded
-                    else "Retry safe workspace profile"
-                )
-                button.disabled = False
-                self._render_state()
+            return "failure"
 
     def _populate_public_draft(self) -> None:
         """Render the detached public draft; credential inputs always stay blank."""
@@ -1281,21 +1334,24 @@ class SetupWizardScreen(SetupRootScreen):
             self._render_state()
 
     def action_cancel_edit(self) -> None:
+        profile_task = self._profile_task
+        if profile_task is not None:
+            if self._profile_cancel_requested is not profile_task:
+                self._generation += 1
+                self._profile_cancel_requested = profile_task
+                if not profile_task.done():
+                    profile_task.cancel()
+            if self.is_attached:
+                self.query_one("#setup-notice", Static).update(
+                    "Cancelling safe workspace profile verification"
+                )
+            return
         self._generation += 1
         self._supervisor.close()
-        profile_task = self._profile_task
-        profile_pending = profile_task is not None and not profile_task.done()
-        if profile_pending:
-            profile_task.cancel()
         self._leave_step()
         self._clear_controller_transients_once()
         self._supervisor = _SetupReadOnlySupervisor()
         if self.is_attached:
-            if profile_pending:
-                self.query_one("#create-workspace-profile", Button).label = (
-                    "Retry safe workspace profile"
-                )
-                self.query_one("#create-workspace-profile", Button).disabled = False
             self.query_one("#setup-notice", Static).update("Setup edit cancelled")
             self._render_state()
 
@@ -1409,6 +1465,7 @@ class SetupWizardScreen(SetupRootScreen):
     def on_unmount(self) -> None:
         self._generation += 1
         self._profile_generation += 1
+        self._profile_modal_open = False
         self._supervisor.close()
         task = self._test_task
         if task is not None and not task.done():
@@ -1456,7 +1513,7 @@ class SetupWorkspaceProfileConfirmation(_ExplicitConfirmation):
                 "of signed native Codex into a private cache; later runs reuse it."
             )
             yield Button(
-                "Enable safe workspace profile",
+                "Confirm",
                 id="confirm-workspace-profile",
                 variant="warning",
             )

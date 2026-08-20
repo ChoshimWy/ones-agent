@@ -108,13 +108,27 @@ async def _wait_until(pilot: object, predicate, *, attempts: int = 80) -> None:
 async def _open_workspace_profile_modal(pilot: object) -> None:
     from textual.widgets import Button
 
-    await pilot.click("#create-workspace-profile")
     await _wait_until(
         pilot,
-        lambda: pilot.app.screen.id == "setup-workspace-profile-confirmation"
-        and pilot.app.screen.query_one(
-            "#confirm-workspace-profile", Button
-        ).region.height > 0,
+        lambda: pilot.app.screen.id == "setup-wizard"
+        and all(
+            item.id != "setup-workspace-profile-confirmation"
+            for item in pilot.app.screen_stack
+        ),
+    )
+    button = pilot.app.screen.query_one("#create-workspace-profile", Button)
+    assert not button.disabled
+    pilot.app.screen._request_builtin_workspace_profile()
+
+    def modal_ready() -> bool:
+        if pilot.app.screen.id != "setup-workspace-profile-confirmation":
+            return False
+        buttons = list(pilot.app.screen.query("#confirm-workspace-profile"))
+        return len(buttons) == 1 and buttons[0].region.height > 0
+
+    await _wait_until(
+        pilot,
+        modal_ready,
     )
 
 
@@ -564,6 +578,7 @@ async def test_empty_profile_catalog_offers_explicit_runtime_creation() -> None:
         ):
             assert requirement in rendered
         assert modal.query_one("#confirm-workspace-profile", Button).variant == "warning"
+        assert modal.query_one("#confirm-workspace-profile", Button).label.plain == "Confirm"
         assert modal.query_one("#cancel-workspace-profile", Button)
 
 
@@ -714,6 +729,56 @@ async def test_runtime_profile_duplicate_confirmation_is_single_flight() -> None
 
 
 @pytest.mark.asyncio
+async def test_runtime_profile_retry_is_enabled_only_after_owner_is_cleared() -> None:
+    from src.developer_workflow.config import BUILTIN_WORKSPACE_PROFILE
+    from textual.widgets import Button, Select
+
+    controller = _RuntimeProfileController(
+        [RuntimeError("first"), RuntimeError("second"), True]
+    )
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        for expected_calls in (1, 2):
+            assert screen._profile_task is None
+            assert not screen._profile_modal_open
+            screen._request_builtin_workspace_profile()
+            await _wait_until(
+                pilot,
+                lambda: pilot.app.screen.id
+                == "setup-workspace-profile-confirmation"
+                and len(pilot.app.screen.query("#confirm-workspace-profile")) == 1,
+            )
+            await pilot.click("#confirm-workspace-profile")
+            await _wait_until(
+                pilot,
+                lambda: controller.profile_confirm_calls == expected_calls
+                and not screen.query_one(
+                    "#create-workspace-profile", Button
+                ).disabled,
+            )
+            assert screen._profile_task is None
+            assert screen.query_one(
+                "#create-workspace-profile", Button
+            ).label.plain == "Retry safe workspace profile"
+
+        screen._request_builtin_workspace_profile()
+        await _wait_until(
+            pilot,
+            lambda: pilot.app.screen.id == "setup-workspace-profile-confirmation"
+            and len(pilot.app.screen.query("#confirm-workspace-profile")) == 1,
+        )
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(
+            pilot,
+            lambda: screen.query_one("#sandbox-profile", Select).value
+            == BUILTIN_WORKSPACE_PROFILE,
+        )
+        assert controller.profile_confirm_calls == 3
+        assert screen._profile_task is None
+        assert not screen.query_one("#create-workspace-profile", Button).disabled
+
+
+@pytest.mark.asyncio
 async def test_escape_during_profile_probe_cancels_and_leaves_retry_available() -> None:
     import asyncio
 
@@ -723,6 +788,23 @@ async def test_escape_during_profile_probe_cancels_and_leaves_retry_available() 
     cancelled = asyncio.Event()
 
     class BlockingController(_RuntimeProfileController):
+        accepted_secret_count = 3
+        accepted_secret_presence = {
+            "ones": True,
+            "provider": True,
+            "codex": True,
+        }
+
+        @property
+        def state(self) -> object:
+            state = super().state
+            return SimpleNamespace(
+                **{
+                    **vars(state),
+                    "secret_count": self.accepted_secret_count,
+                }
+            )
+
         async def confirm_builtin_workspace_profile(self) -> str:
             self.profile_confirm_calls += 1
             entered.set()
@@ -733,18 +815,88 @@ async def test_escape_during_profile_probe_cancels_and_leaves_retry_available() 
 
     controller = BlockingController()
     async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        supervisor_closes: list[bool] = []
+        original_close = screen._supervisor.close
+
+        def record_close() -> None:
+            supervisor_closes.append(True)
+            original_close()
+
+        screen._supervisor.close = record_close
+        assert controller.state.secret_count == 3
+        secret_presence = dict(controller.accepted_secret_presence)
         await _open_workspace_profile_modal(pilot)
         await pilot.click("#confirm-workspace-profile")
         await entered.wait()
         await pilot.press("escape")
         await cancelled.wait()
         await pilot.pause()
-        screen = pilot.app.screen
         create = screen.query_one("#create-workspace-profile", Button)
         assert create.disabled is False
         assert create.label.plain == "Retry safe workspace profile"
         assert controller.profile_confirm_calls == 1
-        assert controller.cancel_calls == 1
+        assert controller.cancel_calls == 0
+        assert controller.state.secret_count == 3
+        assert controller.accepted_secret_presence == secret_presence
+        assert screen._profile_task is None
+        assert supervisor_closes == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_modal_is_single_flight_and_clears_every_exit() -> None:
+    controller = _RuntimeProfileController()
+    async with _wizard_app(controller).run_test() as pilot:
+        wizard = pilot.app.screen
+        wizard._request_builtin_workspace_profile()
+        wizard._request_builtin_workspace_profile()
+        await _wait_until(
+            pilot,
+            lambda: pilot.app.screen.id == "setup-workspace-profile-confirmation"
+            and len(pilot.app.screen.query("#cancel-workspace-profile")) == 1,
+        )
+        assert wizard._profile_modal_open
+        assert sum(
+            item.id == "setup-workspace-profile-confirmation"
+            for item in pilot.app.screen_stack
+        ) == 1
+
+        await pilot.click("#cancel-workspace-profile")
+        await _wait_until(pilot, lambda: pilot.app.screen is wizard)
+        assert not wizard._profile_modal_open
+        assert controller.profile_confirm_calls == 0
+
+        await _open_workspace_profile_modal(pilot)
+        await pilot.press("escape")
+        await _wait_until(pilot, lambda: pilot.app.screen is wizard)
+        assert not wizard._profile_modal_open
+        assert controller.profile_confirm_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_profile_modal_push_failure_and_late_callback_are_safe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = _RuntimeProfileController()
+    async with _wizard_app(controller).run_test() as pilot:
+        wizard = pilot.app.screen
+
+        def fail_push(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("PRIVATE-PUSH-CANARY")
+
+        monkeypatch.setattr(pilot.app, "push_screen", fail_push)
+        wizard._request_builtin_workspace_profile()
+        assert not wizard._profile_modal_open
+        assert controller.profile_confirm_calls == 0
+        notice = str(wizard.query_one("#setup-notice").render())
+        assert "Safe workspace profile could not be verified" in notice
+        assert "PRIVATE-PUSH-CANARY" not in notice
+
+        wizard._profile_modal_open = True
+        await wizard.remove()
+        wizard._builtin_workspace_profile_finished(True)
+        assert not wizard._profile_modal_open
+        assert controller.profile_confirm_calls == 0
 
 
 @pytest.mark.asyncio
