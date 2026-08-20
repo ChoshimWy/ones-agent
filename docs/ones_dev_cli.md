@@ -14,6 +14,17 @@
 uv run ones-dev tui --config docs/examples/ones-dev.config.json
 ```
 
+首次启动不要求预先安装 Codex permission profile。Profile 页面没有可用配置时，
+选择 **Create safe workspace profile**，阅读固定权限摘要并显式点击 **Confirm**。
+ones-dev 会在运行中验证工作区内写入、工作区外拒绝、网络拒绝和环境隔离；全部
+通过后才选择固定的 `ones-dev-workspace` 并允许继续。取消或验证失败不会保存配置。
+
+该操作不会修改 `~/.codex/config.toml`、其文件 identity、mtime 或 ACL，也不会修改
+npm/NVM 中的原生 Codex、Node、JavaScript、`.cmd` 或 `.ps1`。Windows 首次确认会
+验证已安装原生 Codex 的 OpenAI 数字签名，并准备约 299 MB 的当前用户私有副本；
+后续启动会按内容哈希、签名和 ACL 复核后复用相同副本。内置配置权限固定，不能
+通过 TUI 扩权；已有管理员托管 profile 继续使用原兼容路径，无需这次创建确认。
+
 `--config` 指向的示例文件只用于导入，不会被改写；其中的标识符和地址仍是占位符。
 首次配置或已保存配置不完整时，TUI 会进入受限配置模式，而不是要求用户先在终端中
 准备完整配置。配置过程依次包含七个步骤：托管 profile、ONES、仓库与仓库组、Git

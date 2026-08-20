@@ -10,7 +10,10 @@ from uuid import uuid4
 import pytest
 from textual.widgets import Button, Input, Select, Static
 
-from src.developer_workflow.config import SandboxPermissionProfileSource
+from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_PROFILE,
+    SandboxPermissionProfileSource,
+)
 from src.developer_workflow.setup_models import SetupDraft
 from src.developer_workflow.setup_models import SecretKind, WorkflowDraft
 from src.developer_workflow.setup_import import ImportDetection
@@ -41,10 +44,17 @@ from tests.test_developer_workflow_tui_integration import (
     _EffectRepository,
     _MultiRemoteRunner,
     _group_ui_runtime,
+    _security_facts,
 )
 from tests.test_developer_workflow_tui_integration import _source_facts
 from tests.test_developer_workflow_tui_security import SECRETS, _audit
-from tests.test_developer_workflow_setup_controller import FakeBootstrap
+from tests.test_developer_workflow_setup_controller import (
+    FakeBootstrap,
+    FakeRuntimeBuilder,
+    IntegrationCredentials,
+    _runtime,
+    _workflow,
+)
 
 
 @pytest.fixture
@@ -279,6 +289,292 @@ async def _test_current_step(
 async def _next_step(pilot, app: DeveloperWorkflowTuiApp) -> None:
     app.screen._pressed_next()
     await pilot.pause()
+
+
+async def _wait_until(pilot: object, predicate, *, attempts: int = 100) -> None:
+    for _ in range(attempts):
+        if predicate():
+            return
+        await pilot.pause(0.01)
+    assert predicate()
+
+
+class _EmptyBuiltinCatalog:
+    def __init__(self) -> None:
+        self.verifications = 0
+        self.selections: list[tuple[str, SandboxPermissionProfileSource]] = []
+
+    def list_profiles(self) -> tuple[str, ...]:
+        return ()
+
+    def verify_builtin_workspace_profile(self) -> str:
+        self.verifications += 1
+        return BUILTIN_WORKSPACE_PROFILE
+
+    def require_selected(
+        self, profile: str, source: SandboxPermissionProfileSource
+    ) -> str:
+        self.selections.append((profile, source))
+        if (
+            profile != BUILTIN_WORKSPACE_PROFILE
+            or source is not SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ):
+            raise ValueError
+        return self.verify_builtin_workspace_profile()
+
+
+@pytest.mark.asyncio
+async def test_tui_creates_builtin_profile_without_preconfiguration(
+    tmp_path: Path,
+) -> None:
+    """Visible cold-start actions cross the real controller/store transaction."""
+
+    from textual.widgets import Button, Select
+
+    codex_config = tmp_path / "codex-home" / "config.toml"
+    codex_config.parent.mkdir(parents=True)
+    codex_config.write_bytes(b"# no permission profiles\n")
+    config_before = _security_facts(codex_config)
+    catalog = _EmptyBuiltinCatalog()
+    bootstrap = FakeBootstrap()
+    bootstrap.catalog = catalog
+    credentials = IntegrationCredentials()
+    setup_path = tmp_path / "setup-private" / "config.json"
+    store = SetupStore(credentials, config_path=setup_path)  # type: ignore[arg-type]
+    workflow_data = _workflow(tmp_path).model_dump(mode="python", round_trip=True)
+    workflow_data.update(
+        sandbox_permission_profile=None,
+        sandbox_permission_profile_source=SandboxPermissionProfileSource.MANAGED,
+    )
+    draft = SetupDraft(
+        runtime=_runtime(),
+        workflow=WorkflowDraft.model_validate(workflow_data),
+    )
+    builder = FakeRuntimeBuilder()
+    controller = SetupController(
+        profile_id="cold-start",
+        store=store,
+        runtime_builder=builder,
+        runtime_bootstrap=bootstrap,
+        draft=draft,
+    )
+    for kind, value in (
+        (SecretKind.ONES_PASSWORD, "ones-password-for-store"),
+        (SecretKind.PROVIDER_TOKEN, "provider-token-for-store"),
+    ):
+        controller.set_secret(kind, value)
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=controller,
+        setup_controller_factory=lambda: controller,
+        runtime_bootstrapper=builder,
+        poll_interval=10,
+    )
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        assert isinstance(app.screen, SetupWizardScreen)
+        wizard = app.screen
+        assert wizard.query_one("#sandbox-profile", Select).disabled
+        create = wizard.query_one("#create-workspace-profile", Button)
+        assert create.disabled is False
+        await pilot.click("#create-workspace-profile")
+        await _wait_until(
+            pilot,
+            lambda: bool(app.screen.query("#confirm-workspace-profile")),
+        )
+        await pilot.click("#confirm-workspace-profile")
+        await _wait_until(
+            pilot,
+            lambda: app.screen is wizard
+            and wizard.query_one("#sandbox-profile", Select).value
+            == BUILTIN_WORKSPACE_PROFILE,
+        )
+        await pilot.click("#test-connection")
+        await _wait_until(
+            pilot,
+            lambda: any(
+                result.step is SetupStep.PROFILE
+                and result.status is ValidationStatus.PASSED
+                for result in controller.state.results
+            ),
+        )
+        await _wait_until(
+            pilot,
+            lambda: wizard.query_one("#next-step", Button).disabled is False,
+        )
+        await pilot.click("#next-step")
+        await _wait_until(
+            pilot, lambda: wizard.current_step is SetupStep.ONES
+        )
+
+        # The acceptance target is the Profile transaction; the remaining remote
+        # probes stay at their existing fake transport boundary before real save.
+        for step in SetupController.STEPS[1:-1]:
+            await controller.test_step(step, object())
+        controller.confirm_review()
+        handle = await controller.save_and_activate()
+        assert handle is builder.handle
+
+    loaded = SetupStore(
+        credentials, config_path=setup_path  # type: ignore[arg-type]
+    ).load()
+    assert loaded.active is not None
+    assert loaded.active.workflow.sandbox_permission_profile == BUILTIN_WORKSPACE_PROFILE
+    assert (
+        loaded.active.workflow.sandbox_permission_profile_source
+        is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+    )
+    assert [
+        (
+            active.workflow.sandbox_permission_profile,
+            active.workflow.sandbox_permission_profile_source,
+        )
+        for active, _secrets in builder.calls
+    ] == [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE)
+    ]
+    assert catalog.verifications == 2
+    assert catalog.selections == [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE)
+    ]
+    assert _security_facts(codex_config) == config_before
+
+
+@pytest.mark.asyncio
+async def test_reloaded_builtin_profile_reaches_runtime_factory_with_source(
+    tmp_path: Path,
+) -> None:
+    """SetupStore round-trip preserves the source consumed by a fresh runtime."""
+
+    credentials = IntegrationCredentials()
+    setup_path = tmp_path / "reload-private" / "config.json"
+    store = SetupStore(credentials, config_path=setup_path)  # type: ignore[arg-type]
+    workflow_data = _workflow(tmp_path).model_dump(mode="python", round_trip=True)
+    workflow_data.update(
+        sandbox_permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        sandbox_permission_profile_source=(
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ),
+    )
+    draft = SetupDraft(
+        runtime=_runtime(),
+        workflow=WorkflowDraft.model_validate(workflow_data),
+    )
+    bootstrap = FakeBootstrap()
+    bootstrap.catalog = _EmptyBuiltinCatalog()
+    first_builder = FakeRuntimeBuilder()
+    controller = SetupController(
+        profile_id="cold-start",
+        store=store,
+        runtime_builder=first_builder,
+        runtime_bootstrap=bootstrap,
+        draft=draft,
+    )
+    for kind, value in (
+        (SecretKind.ONES_PASSWORD, "ones-password-for-store"),
+        (SecretKind.PROVIDER_TOKEN, "provider-token-for-store"),
+    ):
+        controller.set_secret(kind, value)
+    for step in SetupController.STEPS[:-1]:
+        await controller.test_step(step, None if step is SetupStep.PROFILE else object())
+    controller.confirm_review()
+    assert await controller.save_and_activate() is first_builder.handle
+
+    restarted_store = SetupStore(
+        credentials, config_path=setup_path  # type: ignore[arg-type]
+    )
+    restarted_builder = FakeRuntimeBuilder()
+    restarted = SetupController(
+        profile_id="cold-start",
+        store=restarted_store,
+        runtime_builder=restarted_builder,
+        runtime_bootstrap=bootstrap,
+    )
+    assert await restarted.activate_existing() is restarted_builder.handle
+    calls = [*first_builder.calls, *restarted_builder.calls]
+    assert [
+        (
+            active.workflow.sandbox_permission_profile,
+            active.workflow.sandbox_permission_profile_source,
+        )
+        for active, _secrets in calls
+    ] == [
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+        (BUILTIN_WORKSPACE_PROFILE, SandboxPermissionProfileSource.BUILTIN_WORKSPACE),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_existing_managed_profile_advances_without_forced_confirmation(
+    tmp_path: Path,
+) -> None:
+    """Catalog-managed profiles retain the legacy selection-only UI path."""
+
+    from textual.widgets import Button, Select
+
+    class ManagedCatalog:
+        def __init__(self) -> None:
+            self.selections: list[tuple[str, SandboxPermissionProfileSource]] = []
+
+        def list_profiles(self) -> tuple[str, ...]:
+            return ("managed-profile",)
+
+        def require_selected(
+            self, profile: str, source: SandboxPermissionProfileSource
+        ) -> str:
+            self.selections.append((profile, source))
+            if (
+                profile != "managed-profile"
+                or source is not SandboxPermissionProfileSource.MANAGED
+            ):
+                raise ValueError
+            return profile
+
+    catalog = ManagedCatalog()
+    bootstrap = FakeBootstrap()
+    bootstrap.catalog = catalog
+    builder = FakeRuntimeBuilder()
+    controller = SetupController(
+        profile_id="managed-compatibility",
+        store=SetupStore(
+            IntegrationCredentials(),  # type: ignore[arg-type]
+            config_path=tmp_path / "managed-private" / "config.json",
+        ),
+        runtime_builder=builder,
+        runtime_bootstrap=bootstrap,
+        draft=SetupDraft(runtime=_runtime(), workflow=_workflow(tmp_path)),
+    )
+    app = DeveloperWorkflowTuiApp(
+        setup_controller=controller,
+        setup_controller_factory=lambda: controller,
+        runtime_bootstrapper=builder,
+        poll_interval=10,
+    )
+    async with app.run_test(size=(140, 40)) as pilot:
+        wizard = app.screen
+        assert isinstance(wizard, SetupWizardScreen)
+        await _wait_until(
+            pilot,
+            lambda: wizard.query_one("#sandbox-profile", Select).value
+            == "managed-profile",
+        )
+        assert not app.screen.query("#confirm-workspace-profile")
+        await pilot.click("#test-connection")
+        await _wait_until(
+            pilot,
+            lambda: any(
+                result.step is SetupStep.PROFILE
+                and result.status is ValidationStatus.PASSED
+                for result in controller.state.results
+            ),
+        )
+        await _wait_until(
+            pilot,
+            lambda: wizard.query_one("#next-step", Button).disabled is False,
+        )
+        assert not app.screen.query("#confirm-workspace-profile")
+    assert catalog.selections == [
+        ("managed-profile", SandboxPermissionProfileSource.MANAGED)
+    ]
 
 
 @pytest.mark.asyncio

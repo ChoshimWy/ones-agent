@@ -26,7 +26,12 @@ from src.contracts import (
 from src.developer_workflow import cli
 from src.developer_workflow.approval_rebuilder import WorkflowApprovalRebuilder
 from src.developer_workflow.codex_runtime import CodexRuntimePreparer, NativeCodexIdentity
-from src.developer_workflow.config import DeveloperWorkflowConfig
+from src.developer_workflow.config import (
+    BUILTIN_WORKSPACE_OVERRIDE,
+    BUILTIN_WORKSPACE_PROFILE,
+    DeveloperWorkflowConfig,
+    SandboxPermissionProfileSource,
+)
 from src.developer_workflow.contracts import (
     AcceptanceCoverage,
     CodexResult,
@@ -129,6 +134,208 @@ def _tiny_codex_preparer(root: Path) -> CodexRuntimePreparer:
         _cache_adapter=_TinyPrivateCache(),  # type: ignore[arg-type]
         chunk_size=4,
     )
+
+
+def _security_facts(path: Path) -> tuple[bytes, tuple[int, int, int, int], object]:
+    """Snapshot content, identity/mtime and ACL without invoking a shell."""
+
+    from src.developer_workflow.private_paths import _windows_descriptor
+
+    metadata = path.stat(follow_symlinks=False)
+    acl: object = metadata.st_mode
+    if os.name == "nt":
+        owner, entries, protected = _windows_descriptor(path)
+        acl = (owner, tuple(entries), protected)
+    return (
+        path.read_bytes(),
+        (metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns),
+        acl,
+    )
+
+
+class _FileLockedCodex:
+    """Tiny physical stand-in for the signed npm native payload."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._stream = path.open("rb")
+        metadata = os.fstat(self._stream.fileno())
+        self.identity = NativeCodexIdentity(
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+        self.size = metadata.st_size
+
+    def rewind(self) -> None:
+        self._stream.seek(0)
+
+    def read_chunk(self, size: int) -> bytes:
+        return self._stream.read(size)
+
+    def current_identity(self) -> NativeCodexIdentity:
+        metadata = os.fstat(self._stream.fileno())
+        return NativeCodexIdentity(
+            metadata.st_dev,
+            metadata.st_ino,
+            metadata.st_size,
+            metadata.st_mtime_ns,
+        )
+
+    def close(self) -> None:
+        self._stream.close()
+
+
+class _RecordingSandboxBackend:
+    """Fake only process launch while exercising the real sandbox executor probes."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[tuple[str, ...], Path, dict[str, str], bool]] = []
+
+    def __call__(
+        self,
+        command,
+        *,
+        cwd,
+        env,
+        timeout,
+        max_output_bytes,
+        stdin=None,
+        **kwargs,
+    ):
+        del timeout, max_output_bytes
+        assert "shell" not in kwargs
+        argv = tuple(command)
+        copied_env = dict(env)
+        self.calls.append((argv, Path(cwd), copied_env, stdin is not None))
+        assert not any(
+            token in key.casefold()
+            for key in copied_env
+            for token in ("token", "secret", "credential", "password", "askpass")
+        )
+        assert not any(
+            item.casefold().endswith((".js", ".cmd", ".ps1"))
+            or Path(item).name.casefold() in {"node", "node.exe"}
+            for item in argv
+        )
+        child = list(argv[argv.index("--") + 1 :])
+        code = child[3] if len(child) > 3 and child[1:3] == ["-I", "-c"] else ""
+        if "socket.socket" in code:
+            return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
+        if "Path(sys.argv[1]).write_text" in code and any(
+            part.startswith(".ones-sandbox-probes-") for part in Path(child[-2]).parts
+        ):
+            return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
+        return subprocess.run(
+            child,
+            cwd=cwd,
+            env=env,
+            input=stdin,
+            capture_output=True,
+            text=stdin is None,
+            check=False,
+            shell=False,
+        )
+
+
+def _cold_start_codex_preparer(
+    root: Path, source: Path,
+) -> tuple[CodexRuntimePreparer, _RecordingSandboxBackend, str]:
+    root.mkdir(parents=True, exist_ok=True)
+    payload = source.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    backend = _RecordingSandboxBackend()
+    preparer = CodexRuntimePreparer(
+        cache_root=(root / "private-runtime" / "codex-runtime").resolve(),
+        discover=lambda: _FileLockedCodex(source),  # type: ignore[arg-type]
+        _cache_adapter=_TinyPrivateCache(),  # type: ignore[arg-type]
+        chunk_size=4,
+    )
+    return preparer, backend, digest
+
+
+def _assert_recorded_sandbox_prefixes(
+    backend: _RecordingSandboxBackend,
+    *,
+    private_executable: Path,
+    builtin: bool,
+) -> None:
+    assert len(backend.calls) == 4
+    expected = [str(private_executable)]
+    if builtin:
+        expected.extend(["-c", BUILTIN_WORKSPACE_OVERRIDE])
+    for argv, _cwd, _env, _has_stdin in backend.calls:
+        assert list(argv[: len(expected)]) == expected
+        assert "--sandbox-state-disable-network" in argv
+
+
+def test_recording_backend_proves_builtin_and_managed_native_argv(
+    tmp_path: Path,
+) -> None:
+    """Both profile sources use the private native payload; only builtin adds -c."""
+
+    source = tmp_path / "npm" / "native" / "codex.exe"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"tiny-signed-native-codex")
+    source_before = _security_facts(source)
+    preparer, builtin_backend, digest = _cold_start_codex_preparer(
+        tmp_path / "builtin", source
+    )
+    worktree = tmp_path / "builtin-worktree"
+    worktree.mkdir()
+    builtin = SandboxCommandExecutor(
+        permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        permission_profile_source=SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        backend_executor=builtin_backend,
+        codex_preparer=preparer,
+    )
+    completed = builtin(
+        [sys.executable, "-I", "-c", "print('ok')"],
+        cwd=worktree.resolve(),
+        env={"PATH": os.environ.get("PATH", ""), "ONES_TOKEN": "must-not-cross"},
+        timeout=20,
+        max_output_bytes=64 * 1024,
+    )
+    assert completed.returncode == 0
+    private_executable = (
+        tmp_path / "builtin" / "private-runtime" / "codex-runtime" / digest / "codex.exe"
+    ).resolve(strict=True)
+    _assert_recorded_sandbox_prefixes(
+        builtin_backend, private_executable=private_executable, builtin=True
+    )
+
+    managed_preparer, managed_backend, managed_digest = _cold_start_codex_preparer(
+        tmp_path / "managed", source
+    )
+    managed_worktree = tmp_path / "managed-worktree"
+    managed_worktree.mkdir()
+    managed = SandboxCommandExecutor(
+        permission_profile="managed-existing",
+        permission_profile_source=SandboxPermissionProfileSource.MANAGED,
+        backend_executor=managed_backend,
+        codex_preparer=managed_preparer,
+    )
+    assert managed(
+        [sys.executable, "-I", "-c", "print('ok')"],
+        cwd=managed_worktree.resolve(),
+        env={"PATH": os.environ.get("PATH", "")},
+        timeout=20,
+        max_output_bytes=64 * 1024,
+    ).returncode == 0
+    managed_executable = (
+        tmp_path
+        / "managed"
+        / "private-runtime"
+        / "codex-runtime"
+        / managed_digest
+        / "codex.exe"
+    ).resolve(strict=True)
+    _assert_recorded_sandbox_prefixes(
+        managed_backend, private_executable=managed_executable, builtin=False
+    )
+    assert all("-c" not in argv[: argv.index("sandbox")] for argv, *_ in managed_backend.calls)
+    assert _security_facts(source) == source_before
 
 
 def _config_file(tmp_path: Path) -> Path:
