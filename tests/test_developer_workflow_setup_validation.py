@@ -502,8 +502,10 @@ def test_builtin_workspace_catalog_runs_real_full_sandbox_executor(
             )
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(argv, 13, "", "denied")
-        if any("s.connect" in item for item in child):
-            return subprocess.CompletedProcess(argv, 23, "", "network denied")
+        if any(
+            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+        ):
+            return subprocess.CompletedProcess(argv, 23, "", "")
         return subprocess.CompletedProcess(argv, 0, "sandbox-preflight\n", "")
 
     monkeypatch.setattr(validation_module, "_bounded_subprocess", backend)
@@ -522,7 +524,7 @@ def test_builtin_workspace_catalog_runs_real_full_sandbox_executor(
     children = [argv[argv.index("--") + 1 :] for argv, *_ in calls]
     assert any("inside-write.txt" in item for item in children[0])
     assert any("outside-write.txt" in item for item in children[1])
-    assert any("s.connect" in item for item in children[2])
+    assert any("TokenIsAppContainer" in item for item in children[2])
     assert children[3] == sandbox_preflight_command()
     roots = {cwd for _, cwd, _, _ in calls}
     assert len(roots) == 1
@@ -1358,8 +1360,10 @@ def test_production_runtime_wires_only_real_policy_boundaries(
         child = command[command.index("--") + 1 :]
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
-        if any("s.connect" in item for item in child):
-            return subprocess.CompletedProcess(command, 23, "", "denied")
+        if any(
+            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+        ):
+            return subprocess.CompletedProcess(command, 23, "", "")
         if any("inside-write.txt" in item for item in child):
             completed = subprocess.run(child, cwd=cwd, env=env, capture_output=True, check=False)
             return subprocess.CompletedProcess(

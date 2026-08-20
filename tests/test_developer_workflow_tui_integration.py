@@ -224,7 +224,7 @@ class _RecordingSandboxBackend:
         )
         child = list(argv[argv.index("--") + 1 :])
         code = child[3] if len(child) > 3 and child[1:3] == ["-I", "-c"] else ""
-        if "socket.socket" in code:
+        if "socket.socket" in code or "TokenIsAppContainer" in code:
             return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
         if "Path(sys.argv[1]).write_text" in code and any(
             part.startswith(".ones-sandbox-probes-") for part in Path(child[-2]).parts
@@ -315,23 +315,14 @@ def _assert_recorded_sandbox_prefixes(
         f"ones-sandbox-probe-{probe_id}",
     ]
     third_child = list(backend.calls[2][0][len(expected) :])
-    assert third_child[:4] == [
-        sys.executable,
-        "-I",
-        "-c",
-        "import socket,sys; s=None"
-        "\ntry:"
-        "\n s=socket.socket()"
-        "\n s.settimeout(2)"
-        "\n s.connect(('127.0.0.1', int(sys.argv[1])))"
-        "\nexcept OSError: raise SystemExit(23)"
-        "\nfinally:"
-        "\n if s is not None:"
-        "\n  try: s.close()"
-        "\n  except OSError: pass"
-        "\nraise SystemExit(0)",
-    ]
-    assert third_child[4].isdigit()
+    assert third_child[:3] == [sys.executable, "-I", "-c"]
+    assert len(third_child) == 4
+    assert "TokenIsAppContainer = 29" in third_child[3]
+    assert "TokenCapabilities = 30" in third_child[3]
+    assert "WinCapabilityInternetClientSid = 85" in third_child[3]
+    assert "WinCapabilityInternetClientServerSid = 86" in third_child[3]
+    assert "WinCapabilityPrivateNetworkClientServerSid = 87" in third_child[3]
+    assert "socket" not in third_child[3]
     assert list(backend.calls[3][0][len(expected) :]) == final_command
 
 
@@ -901,7 +892,7 @@ def _group_ui_runtime(tmp_path: Path):
         del timeout, max_output_bytes, stdin
         child = command[command.index("--") + 1 :]
         code = child[3] if len(child) > 3 and child[1:3] == ["-I", "-c"] else ""
-        if "socket.socket" in code:
+        if "socket.socket" in code or "TokenIsAppContainer" in code:
             return subprocess.CompletedProcess(command, 23, stdout="", stderr="")
         if "Path(sys.argv[1]).write_text" in code:
             target = Path(child[-2])

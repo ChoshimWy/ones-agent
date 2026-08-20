@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import src.developer_workflow.requirement_flow as requirement_flow_module
 from src.contracts import ProjectRef, RequirementRecord, StatusRef, WikiPageRef, WikiPageSnapshot
 from src.developer_workflow.config import (
     BUILTIN_WORKSPACE_OVERRIDE,
@@ -717,8 +718,11 @@ def _simulated_restrictive_sandbox_backend(
         child = command[command.index("--") + 1 :]
         if any("outside-write.txt" in argument for argument in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
-        if any("s.connect" in argument for argument in child):
-            return subprocess.CompletedProcess(command, 23, "", "network denied")
+        if any(
+            "s.connect" in argument or "TokenIsAppContainer" in argument
+            for argument in child
+        ):
+            return subprocess.CompletedProcess(command, 23, "", "")
         if any("inside-write.txt" in argument for argument in child):
             completed = subprocess.run(
                 child, cwd=cwd, env=env, capture_output=True, timeout=timeout, check=False
@@ -735,27 +739,14 @@ def _simulated_restrictive_sandbox_backend(
 
 
 @pytest.mark.parametrize(
-    ("socket_mode", "expected_returncode"),
-    (("constructor-denied", 23), ("connect-denied", 23), ("success", 0)),
+    "token_status",
+    ("safe", "not-appcontainer", "internet-client", "api-error", "raw-output"),
 )
-def test_network_probe_child_has_clean_exact_denial_exit(
+def test_windows_network_probe_requires_clean_appcontainer_without_network_caps(
     tmp_path: Path,
-    socket_mode: str,
-    expected_returncode: int,
+    token_status: str,
 ) -> None:
-    network_results: list[subprocess.CompletedProcess[str]] = []
-    wrapper = (
-        "import socket,sys; code,port,mode=sys.argv[1:4]\n"
-        "class ProbeSocket:\n"
-        " def settimeout(self,value): pass\n"
-        " def connect(self,address):\n"
-        "  if mode=='connect-denied': raise PermissionError('denied')\n"
-        " def close(self): pass\n"
-        "def denied(*args,**kwargs): raise PermissionError('denied')\n"
-        "socket.socket=denied if mode=='constructor-denied' else ProbeSocket\n"
-        "sys.argv=['network-probe',port]\n"
-        "exec(code,{'__name__':'__main__'})"
-    )
+    network_children: list[list[str]] = []
 
     def backend(
         command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
@@ -776,23 +767,13 @@ def test_network_probe_child_has_clean_exact_denial_exit(
             )
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(command, 13, "", "")
-        if any("socket.socket" in item for item in child):
-            completed = subprocess.run(
-                [sys.executable, "-I", "-c", wrapper, child[3], child[4], socket_mode],
-                cwd=cwd,
-                env=env,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-            )
-            result = subprocess.CompletedProcess(
-                command,
-                completed.returncode,
-                completed.stdout.decode("utf-8", errors="strict"),
-                completed.stderr.decode("utf-8", errors="strict"),
-            )
-            network_results.append(result)
-            return result
+        if any("socket.socket" in item or "TokenIsAppContainer" in item for item in child):
+            network_children.append(child)
+            if token_status == "safe":
+                return subprocess.CompletedProcess(command, 23, "", "")
+            if token_status == "raw-output":
+                return subprocess.CompletedProcess(command, 23, "token-data", "")
+            return subprocess.CompletedProcess(command, 24, "", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
     executor = SandboxCommandExecutor(
@@ -800,7 +781,13 @@ def test_network_probe_child_has_clean_exact_denial_exit(
         codex_command=_attested_sandbox_command(tmp_path),
         backend_executor=backend,
     )
-    if socket_mode == "success":
+    if token_status == "safe":
+        completed = executor(
+            ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
+            max_output_bytes=1024,
+        )
+        assert completed.returncode == 0
+    else:
         with pytest.raises(
             RequirementFlowError,
             match="sandbox capability probe did not prove network denial",
@@ -809,16 +796,53 @@ def test_network_probe_child_has_clean_exact_denial_exit(
                 ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
                 max_output_bytes=1024,
             )
-    else:
-        completed = executor(
-            ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
-            max_output_bytes=1024,
-        )
-        assert completed.returncode == 0
-    assert len(network_results) == 1
-    assert network_results[0].returncode == expected_returncode
-    assert network_results[0].stdout == ""
-    assert network_results[0].stderr == ""
+    assert len(network_children) == 1
+    child = network_children[0]
+    assert child[:3] == [sys.executable, "-I", "-c"]
+    assert len(child) == 4
+    script = child[3]
+    assert "TokenIsAppContainer = 29" in script
+    assert "TokenCapabilities = 30" in script
+    assert "WinCapabilityInternetClientSid = 85" in script
+    assert "WinCapabilityInternetClientServerSid = 86" in script
+    assert "WinCapabilityPrivateNetworkClientServerSid = 87" in script
+    assert "socket" not in script
+    assert script.encode("ascii", errors="strict").decode("ascii") == script
+    compile(script, "<windows-network-token-probe>", "exec")
+
+
+@pytest.mark.parametrize(
+    ("socket_mode", "expected_returncode"),
+    (("constructor-denied", 23), ("connect-denied", 23), ("success", 0)),
+)
+def test_nonwindows_socket_probe_preserves_exact_clean_denial_exit(
+    socket_mode: str,
+    expected_returncode: int,
+) -> None:
+    child = requirement_flow_module._socket_network_denial_probe_command(321)
+    wrapper = (
+        "import socket,sys; code,port,mode=sys.argv[1:4]\n"
+        "class ProbeSocket:\n"
+        " def settimeout(self,value): pass\n"
+        " def connect(self,address):\n"
+        "  if mode=='connect-denied': raise PermissionError('denied')\n"
+        " def close(self): pass\n"
+        "def denied(*args,**kwargs): raise PermissionError('denied')\n"
+        "socket.socket=denied if mode=='constructor-denied' else ProbeSocket\n"
+        "sys.argv=['network-probe',port]\n"
+        "exec(code,{'__name__':'__main__'})"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", wrapper, child[3], child[4], socket_mode],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+
+    assert result.returncode == expected_returncode
+    assert result.stdout == b""
+    assert result.stderr == b""
 
 
 def test_subprocess_test_runner_uses_structured_argv_safe_env_and_real_result(
@@ -863,8 +887,10 @@ def test_structured_pytest_selector_classifies_only_associated_exit_one_as_test_
         child = command[command.index("--") + 1 :]
         if any("outside-write.txt" in item for item in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
-        if any("s.connect" in item for item in child):
-            return subprocess.CompletedProcess(command, 23, "", "network denied")
+        if any(
+            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+        ):
+            return subprocess.CompletedProcess(command, 23, "", "")
         if any("inside-write.txt" in item for item in child):
             return _simulated_restrictive_sandbox_backend(calls)(command, **kwargs)  # type: ignore[arg-type]
         return subprocess.CompletedProcess(
@@ -909,8 +935,11 @@ def test_sandbox_executor_wraps_command_with_explicit_policy_and_empty_home(
         child = command[command.index("--") + 1 :]
         if any("outside-write.txt" in argument for argument in child):
             return subprocess.CompletedProcess(command, 13, "", "denied")
-        if any("s.connect" in argument for argument in child):
-            return subprocess.CompletedProcess(command, 23, "", "network denied")
+        if any(
+            "s.connect" in argument or "TokenIsAppContainer" in argument
+            for argument in child
+        ):
+            return subprocess.CompletedProcess(command, 23, "", "")
         if any("inside-write.txt" in argument for argument in child):
             completed = subprocess.run(
                 child,
@@ -1027,7 +1056,9 @@ def test_sandbox_executor_uses_one_decreasing_absolute_deadline(
             returncode = 0
         elif any("outside-write.txt" in item for item in child):
             returncode = 13
-        elif any("s.connect" in item for item in child):
+        elif any(
+            "s.connect" in item or "TokenIsAppContainer" in item for item in child
+        ):
             returncode = 23
         else:
             returncode = 0
@@ -1102,7 +1133,11 @@ def test_sandbox_executor_stops_before_backend_when_total_budget_is_exhausted(
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
     assert len(children) == 2
-    assert not any("s.connect" in item for child in children for item in child)
+    assert not any(
+        "s.connect" in item or "TokenIsAppContainer" in item
+        for child in children
+        for item in child
+    )
     assert not any("must-not-run" in item for child in children for item in child)
     assert not command._is_attested()
     assert not list(tmp_path.glob(".ones-sandbox-*"))
