@@ -319,9 +319,16 @@ def _assert_recorded_sandbox_prefixes(
         sys.executable,
         "-I",
         "-c",
-        "import socket,sys; s=socket.socket(); s.settimeout(2); "
-        "\ntry: s.connect(('127.0.0.1', int(sys.argv[1])))"
+        "import socket,sys; s=None"
+        "\ntry:"
+        "\n s=socket.socket()"
+        "\n s.settimeout(2)"
+        "\n s.connect(('127.0.0.1', int(sys.argv[1])))"
         "\nexcept OSError: raise SystemExit(23)"
+        "\nfinally:"
+        "\n if s is not None:"
+        "\n  try: s.close()"
+        "\n  except OSError: pass"
         "\nraise SystemExit(0)",
     ]
     assert third_child[4].isdigit()

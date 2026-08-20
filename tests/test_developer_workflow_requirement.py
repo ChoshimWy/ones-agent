@@ -46,6 +46,7 @@ from src.developer_workflow.repository_group import PreparedRepository
 from src.developer_workflow.requirement_flow import (
     CodexRequirementAdapter,
     RequirementFlow,
+    RequirementFlowError,
     SandboxCommandExecutor,
     SandboxStatePolicy,
     SubprocessConfiguredTestRunner,
@@ -731,6 +732,93 @@ def _simulated_restrictive_sandbox_backend(
         return subprocess.CompletedProcess(command, 0, "ok", "")
 
     return backend
+
+
+@pytest.mark.parametrize(
+    ("socket_mode", "expected_returncode"),
+    (("constructor-denied", 23), ("connect-denied", 23), ("success", 0)),
+)
+def test_network_probe_child_has_clean_exact_denial_exit(
+    tmp_path: Path,
+    socket_mode: str,
+    expected_returncode: int,
+) -> None:
+    network_results: list[subprocess.CompletedProcess[str]] = []
+    wrapper = (
+        "import socket,sys; code,port,mode=sys.argv[1:4]\n"
+        "class ProbeSocket:\n"
+        " def settimeout(self,value): pass\n"
+        " def connect(self,address):\n"
+        "  if mode=='connect-denied': raise PermissionError('denied')\n"
+        " def close(self): pass\n"
+        "def denied(*args,**kwargs): raise PermissionError('denied')\n"
+        "socket.socket=denied if mode=='constructor-denied' else ProbeSocket\n"
+        "sys.argv=['network-probe',port]\n"
+        "exec(code,{'__name__':'__main__'})"
+    )
+
+    def backend(
+        command: list[str], *, cwd: Path, env: dict[str, str], timeout: float,
+        max_output_bytes: int, stdin: bytes | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        del max_output_bytes, stdin
+        child = command[command.index("--") + 1 :]
+        if any("inside-write.txt" in item for item in child):
+            completed = subprocess.run(
+                child, cwd=cwd, env=env, capture_output=True, timeout=timeout,
+                check=False,
+            )
+            return subprocess.CompletedProcess(
+                command,
+                completed.returncode,
+                completed.stdout.decode("utf-8", errors="strict"),
+                completed.stderr.decode("utf-8", errors="strict"),
+            )
+        if any("outside-write.txt" in item for item in child):
+            return subprocess.CompletedProcess(command, 13, "", "")
+        if any("socket.socket" in item for item in child):
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", wrapper, child[3], child[4], socket_mode],
+                cwd=cwd,
+                env=env,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            result = subprocess.CompletedProcess(
+                command,
+                completed.returncode,
+                completed.stdout.decode("utf-8", errors="strict"),
+                completed.stderr.decode("utf-8", errors="strict"),
+            )
+            network_results.append(result)
+            return result
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    executor = SandboxCommandExecutor(
+        permission_profile="managed",
+        codex_command=_attested_sandbox_command(tmp_path),
+        backend_executor=backend,
+    )
+    if socket_mode == "success":
+        with pytest.raises(
+            RequirementFlowError,
+            match="sandbox capability probe did not prove network denial",
+        ):
+            executor(
+                ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
+                max_output_bytes=1024,
+            )
+    else:
+        completed = executor(
+            ["tool", "final"], cwd=tmp_path.resolve(), env={}, timeout=10,
+            max_output_bytes=1024,
+        )
+        assert completed.returncode == 0
+    assert len(network_results) == 1
+    assert network_results[0].returncode == expected_returncode
+    assert network_results[0].stdout == ""
+    assert network_results[0].stderr == ""
 
 
 def test_subprocess_test_runner_uses_structured_argv_safe_env_and_real_result(
