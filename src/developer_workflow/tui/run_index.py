@@ -55,3 +55,8 @@ class RunIndex:
         valid.sort(key=lambda item: item.updated_at, reverse=True)
         corrupted.sort(key=lambda item: item.run_id)
         return (*valid, *corrupted)
+
+    def delete(self, run_id: str) -> None:
+        """Delete one authoritative task record from the backing store."""
+
+        self._store.delete(run_id)

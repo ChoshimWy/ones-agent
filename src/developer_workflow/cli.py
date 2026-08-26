@@ -670,7 +670,18 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     """Build only the private setup host; no workflow runtime is opened here."""
 
     from .credential_store import WindowsCredentialStore
-    from .runtime_bootstrap import RuntimeBootstrapper as WorkflowRuntimeBootstrapper
+    from .codex_runner import CodexRunner, resolve_codex_command
+    from .config import (
+        BUILTIN_WORKSPACE_PROFILE,
+        PublishingConfig,
+        PublishingProvider,
+    )
+    from .contracts import RepositoryMapping
+    from .runtime_bootstrap import (
+        RuntimeAdapterBundle,
+        RuntimeBootstrapper as WorkflowRuntimeBootstrapper,
+    )
+    from .requirement_flow import DirectConfiguredTestRunner
     from .setup_controller import SetupController
     from .setup_import import (
         ImportDetection,
@@ -678,10 +689,13 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
         detect_import_sources,
         load_template_workflow,
     )
-    from .setup_models import WorkflowDraft
+    from .setup_models import RuntimePublicConfig, SetupDraft, WorkflowDraft
     from .setup_store import SetupStore
     from .tui.setup_screens import SetupImportContext
-    from .setup_validation import RuntimeBootstrapper as ValidationBootstrapper
+    from .setup_validation import (
+        RuntimeBootstrapper as ValidationBootstrapper,
+        SetupStep,
+    )
 
     template_path = Path(template_path)
     environment = dict(os.environ)
@@ -718,18 +732,137 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     )
     validation = ValidationBootstrapper.production()
     preparer = validation.codex_runtime_preparer
+    class _MvpPullRequestClient:
+        """Keep MVP analysis/repair local; publishing remains explicitly unavailable."""
+
+        def close(self) -> None:
+            return None
+
+        def find(self, **_kwargs: object) -> None:
+            raise RuntimeError("publishing is unavailable in MVP mode")
+
+        def create(self, **_kwargs: object) -> str:
+            raise RuntimeError("publishing is unavailable in MVP mode")
+
+    def validate_mvp_sandbox_profile(
+        profile: str,
+        source: SandboxPermissionProfileSource,
+        sandbox_environment: Mapping[str, str],
+    ) -> None:
+        # The MVP does not accept configured shell commands, so its test runner is
+        # dormant.  A SandboxCommandExecutor still probes fail-closed before any
+        # future command; repeating that probe while merely opening Dashboard
+        # incorrectly blocks Windows hosts whose local restricted-token sandbox is
+        # unavailable.  Managed profiles retain the full startup validation path.
+        if (
+            type(profile) is str
+            and profile == BUILTIN_WORKSPACE_PROFILE
+            and type(source) is SandboxPermissionProfileSource
+            and source is SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ):
+            return
+        _validate_runtime_sandbox_permission_profile(
+            profile,
+            source,
+            sandbox_environment,
+            codex_preparer=preparer,
+        )
+
+    def build_unsandboxed_mvp_codex(
+        run_root: Path,
+        repository: object,
+        environment_provider: Callable[[], Mapping[str, str]],
+    ) -> CodexRunner:
+        return CodexRunner(
+            run_root,
+            repository,  # type: ignore[arg-type]
+            command_resolver=lambda: resolve_codex_command(
+                _prepare=preparer.prepare_verified
+            ),
+            environment_provider=environment_provider,
+            sandbox_mode_override="danger-full-access",
+        )
+
+    def build_direct_mvp_test_runner(
+        _profile: str,
+        _source: SandboxPermissionProfileSource,
+    ) -> DirectConfiguredTestRunner:
+        return DirectConfiguredTestRunner()
+
     runtime_builder = WorkflowRuntimeBootstrapper(
         codex_runtime_preparer=preparer,
-        sandbox_profile_validator=lambda profile, source, sandbox_environment: (
-            _validate_runtime_sandbox_permission_profile(
-                profile,
-                source,
-                sandbox_environment,
-                codex_preparer=preparer,
-            )
-        ),
+        sandbox_profile_validator=validate_mvp_sandbox_profile,
     )
     store = SetupStore(WindowsCredentialStore())
+    runtime_builder.workflow_saver = lambda active, workflow: (
+        store.replace_active_workflow("default", active.generation, workflow)
+    )
+
+    cwd = Path.cwd().resolve(strict=True)
+    workspace = next(
+        (candidate for candidate in (cwd, *cwd.parents) if (candidate / ".git").exists()),
+        cwd,
+    )
+    # Repository mirrors and isolated worktrees can be large. Keep the direct
+    # MVP runtime beside the checked-out workspace so it uses the same drive,
+    # instead of silently exhausting the usually smaller system drive.
+    runtime_root = workspace.parent / ".ones-dev-runtime"
+    repository_name = re.sub(r"[^A-Za-z0-9._-]+", "-", workspace.name).strip("-.")
+    if not repository_name:
+        repository_name = "workspace"
+    head_path = workspace / ".git" / "HEAD"
+    branch = "main"
+    try:
+        head = head_path.read_text(encoding="ascii").strip()
+        if head.startswith("ref: refs/heads/"):
+            branch = head.removeprefix("ref: refs/heads/")
+    except (OSError, UnicodeError):
+        pass
+    workflow = WorkflowDraft(
+        run_root=runtime_root / "runs",
+        mirror_root=runtime_root / "mirrors",
+        worktree_root=runtime_root / "worktrees",
+        sandbox_permission_profile=BUILTIN_WORKSPACE_PROFILE,
+        sandbox_permission_profile_source=(
+            SandboxPermissionProfileSource.BUILTIN_WORKSPACE
+        ),
+        repositories=(
+            RepositoryMapping(
+                key="workspace",
+                project_id="pending-project",
+                iteration_id="*",
+                repo_url=str(workspace),
+                repo_name=repository_name,
+                base_branch=branch,
+            ),
+        ),
+        publishing=PublishingConfig(
+            provider=PublishingProvider.GITHUB,
+            default_target_branch=branch,
+        ),
+    )
+    runtime_builder.adapters = RuntimeAdapterBundle(
+        codex_factory=build_unsandboxed_mvp_codex,
+        sandbox_factory=build_direct_mvp_test_runner,
+        pr_factory=lambda **_kwargs: _MvpPullRequestClient(),
+    )
+    draft = SetupDraft(
+        runtime=RuntimePublicConfig(
+            ones_base_url="http://localhost",
+            ones_team_id="pending-team",
+            ones_issue_type_id="pending-type",
+            ones_comment_list_path_template=(
+                "/project/api/project/team/{team_id}/task/{item_id}/comments"
+            ),
+            provider_host="github.com",
+            provider_api_url="https://github.com/api/v3",
+            git_author_name="ONES Dev Agent",
+            git_author_email="ones-dev@localhost",
+            codex_auth_mode="file",
+            codex_home=None,
+        ),
+        workflow=workflow,
+    )
 
     def new_setup_controller() -> SetupController:
         return SetupController(
@@ -737,6 +870,9 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
             store=store,
             runtime_builder=runtime_builder,
             runtime_bootstrap=validation,
+            draft=draft,
+            steps=(SetupStep.ONES, SetupStep.REVIEW),
+            activation_timeout=180.0,
         )
 
     new_setup_controller.import_context = import_context  # type: ignore[attr-defined]

@@ -373,6 +373,37 @@ def build_branch_name(workflow_type: WorkflowType | str, work_item_id: str, titl
     return branch
 
 
+def build_run_branch_name(
+    workflow_type: WorkflowType | str,
+    work_item_id: str,
+    title: str,
+    run_id: str,
+    *,
+    repository_key: str | None = None,
+) -> str:
+    """Build a work branch unique to one persisted workflow run."""
+
+    if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", run_id or ""):
+        raise ValueError("run_id is not a safe branch segment")
+    if repository_key is not None and not re.fullmatch(
+        r"[A-Za-z0-9._-]{1,128}", repository_key
+    ):
+        raise ValueError("repository_key is not a safe branch segment")
+    suffix = f"-{run_id}"
+    if repository_key is not None:
+        suffix += f"-{repository_key}"
+    base = build_branch_name(workflow_type, work_item_id, title)
+    available = 120 - len(suffix)
+    if available < 4:
+        raise ValueError("run-scoped branch suffix is too long")
+    base = base[:available].rstrip("-.")
+    if not base or base.endswith("/"):
+        raise ValueError("run-scoped branch could not be constructed safely")
+    branch = f"{base}{suffix}"
+    validate_git_ref_name(branch)
+    return branch
+
+
 @dataclass(slots=True)
 class WorktreeRepository:
     mirror_root: Path
@@ -590,19 +621,27 @@ class WorktreeRepository:
             raise RepositoryBoundaryError("local source repository does not exist") from error
         if _is_link_or_reparse(source) or not source.is_dir():
             raise RepositoryBoundaryError("local source repository is not a real directory")
+        trusted_source = f"safe.directory={source}"
         origin = self._output(
-            ["git", "-C", str(source), "remote", "get-url", "origin"],
+            [
+                "git", "-c", trusted_source, "-C", str(source),
+                "remote", "get-url", "origin",
+            ],
             operation="local source origin validation",
         ).decode("utf-8", "surrogateescape")
         if self._normalized_url(origin) != self._normalized_url(mapping.repo_url):
             raise MirrorOriginMismatch("local source origin does not match mapping")
         head = self._output(
-            ["git", "-C", str(source), "rev-parse", "--verify", "HEAD^{commit}"],
+            [
+                "git", "-c", trusted_source, "-C", str(source),
+                "rev-parse", "--verify", "HEAD^{commit}",
+            ],
             operation="local source HEAD validation",
         ).decode("ascii")
         status = self._execute(
             [
-                "git", "-C", str(source), "status", "--porcelain=v1", "-z",
+                "git", "-c", trusted_source, "-C", str(source),
+                "status", "--porcelain=v1", "-z",
                 "--untracked-files=all",
             ],
             operation="local source status validation",
@@ -635,8 +674,19 @@ class WorktreeRepository:
                 raise MirrorOriginMismatch("existing mirror origin does not match mapping")
         else:
             clone_source = mapping.repo_url if source_facts is None else str(source_facts[0])
+            clone_command = ["git"]
+            if source_facts is not None:
+                clone_command.extend(
+                    [
+                        "-c", f"safe.directory={source_facts[0]}",
+                        "-c", f"safe.directory={source_facts[0] / '.git'}",
+                    ]
+                )
+            clone_command.extend(
+                ["clone", "--bare", clone_source, str(mirror)]
+            )
             self._execute(
-                ["git", "clone", "--bare", clone_source, str(mirror)],
+                clone_command,
                 operation="mirror clone",
             )
             if source_facts is not None:
@@ -658,10 +708,28 @@ class WorktreeRepository:
             ],
             operation="mirror fetch configuration",
         )
-        self._execute(
-            ["git", "--git-dir", str(mirror), "fetch", "--prune", "origin"],
-            operation="mirror fetch",
+        fetch_command = ["git"]
+        fetch_source = "origin"
+        fetch_refspec: list[str] = []
+        if source_facts is not None:
+            source = source_facts[0]
+            fetch_command.extend(
+                [
+                    "-c", f"safe.directory={source}",
+                    "-c", f"safe.directory={source / '.git'}",
+                ]
+            )
+            fetch_source = str(source)
+            fetch_refspec.append(
+                "+refs/heads/*:refs/remotes/origin/*"
+            )
+        fetch_command.extend(
+            [
+                "--git-dir", str(mirror), "fetch", "--prune",
+                fetch_source, *fetch_refspec,
+            ]
         )
+        self._execute(fetch_command, operation="mirror fetch")
         if source_facts is not None and self._local_source_facts(mapping) != source_facts:
             raise RepositoryIdentityError("local source repository changed during mirror setup")
         return mirror
@@ -1677,5 +1745,5 @@ __all__ = [
     "SnapshotTooLargeError",
     "TargetExists",
     "WorktreeRepository",
-    "build_branch_name",
+    "build_branch_name", "build_run_branch_name",
 ]

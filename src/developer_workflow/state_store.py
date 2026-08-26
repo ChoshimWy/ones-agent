@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import stat
 import tempfile
 import time
@@ -15,7 +16,14 @@ from typing import Iterator
 
 from pydantic import ValidationError
 
-from .contracts import StateEvent, WorkflowRun, WorkflowState
+from .contracts import (
+    DefectAction,
+    DefectCheckpoint,
+    StateEvent,
+    WorkflowRun,
+    WorkflowState,
+    WorkflowType,
+)
 
 if os.name == "nt":
     import ctypes
@@ -106,6 +114,43 @@ _TERMINAL = {
     WorkflowState.COMPLETED,
     WorkflowState.FAILED,
 }
+
+
+def _is_completed_analysis(run: WorkflowRun) -> bool:
+    return (
+        run.type is WorkflowType.DEFECT
+        and run.defect_action is DefectAction.ANALYZE
+        and run.defect_checkpoint is DefectCheckpoint.ROOT_VERIFIED
+        and len(run.codex_results) == 1
+        and bool(run.root_cause_evidence)
+        and run.codex_results[0].root_cause_evidence == run.root_cause_evidence
+        and not run.codex_results[0].unresolved_items
+        and not run.codex_results[0].changed_files
+        and not run.codex_results[0].repository_changes
+        and not run.codex_results[0].commands
+        and not run.changed_files
+        and not run.test_results
+        and run.approval is None
+        and run.group_publication is None
+        and run.publication.approved_fingerprint == ""
+        and run.publication.commit_hash == ""
+        and run.publication.comment_id == ""
+    )
+
+
+def _has_recorded_readonly_analysis(run: WorkflowRun) -> bool:
+    results = (
+        *run.previous_analysis_results,
+        *run.codex_results[:1],
+    )
+    return any(
+        bool(result.root_cause_evidence)
+        and not result.unresolved_items
+        and not result.changed_files
+        and not result.repository_changes
+        and not result.commands
+        for result in results
+    )
 
 
 class FileRunStore:
@@ -201,6 +246,39 @@ class FileRunStore:
         self._validate_root_identity()
         return tuple(sorted(run_ids))
 
+    def delete(self, run_id: str) -> None:
+        """Atomically remove one run from the active index, then delete its data."""
+
+        self._validate_run_id(run_id)
+        self._validate_root_identity()
+        run_dir = self._run_dir(run_id)
+        with self._locked(run_id) as locked_identity:
+            self._validate_run_identity(run_id, locked_identity)
+        self._validate_root_identity()
+        if _path_identity(run_dir) != locked_identity:
+            raise UnsafeRunPathError("workflow run directory identity changed")
+        tombstone = self._run_root / (
+            f".deleted-{run_id}-{os.getpid()}-{time.monotonic_ns()}"
+        )
+        self._assert_contained(tombstone)
+        try:
+            os.replace(run_dir, tombstone)
+        except FileNotFoundError as error:
+            raise RunNotFoundError("workflow run does not exist") from error
+        except OSError as error:
+            raise UnsafeRunPathError("workflow run could not be deleted safely") from error
+        self._run_identities.pop(run_id, None)
+        self._validate_root_identity()
+        try:
+            _reject_reparse_point(tombstone, "deleted run directory")
+            if _path_identity(tombstone) != locked_identity:
+                raise UnsafeRunPathError("deleted workflow run identity changed")
+            shutil.rmtree(tombstone)
+        except (FileNotFoundError, OSError):
+            # The run was already atomically removed from the active namespace.
+            # A private, non-indexed tombstone may be reclaimed by maintenance.
+            return
+
     def save(self, run: WorkflowRun, expected_version: int) -> WorkflowRun:
         with self._locked(run.run_id) as run_identity:
             return self._save_locked(run, expected_version, run_identity=run_identity)
@@ -261,6 +339,74 @@ class FileRunStore:
                 run_identity=run_identity,
             )
 
+    def decide_completed_analysis(
+        self,
+        run_id: str,
+        expected_version: int,
+        *,
+        accept: bool,
+    ) -> WorkflowRun:
+        """Atomically accept or regenerate one completed read-only analysis."""
+
+        if type(accept) is not bool:
+            raise ValueError("analysis decision is invalid")
+        with self._locked(run_id) as run_identity:
+            current = self._load_unlocked(run_id, run_identity)
+            self._check_version(current, expected_version)
+            if not _is_completed_analysis(current):
+                raise InvalidRunTransitionError(
+                    "analysis decision requires a completed read-only analysis"
+                )
+            now = _utc_now()
+            updates: dict[str, object] = {
+                "state": WorkflowState.IMPLEMENTING,
+                "history": (
+                    *current.history,
+                    StateEvent(
+                        source=WorkflowState.COMPLETED,
+                        target=WorkflowState.IMPLEMENTING,
+                        reason=(
+                            "accept analyzed solution and continue repair"
+                            if accept
+                            else "regenerate analyzed solution"
+                        ),
+                        occurred_at=now,
+                    ),
+                ),
+                "updated_at": now,
+                "blocked_reason": "",
+                "resume_state": None,
+            }
+            if accept:
+                updates.update(
+                    defect_action=DefectAction.ANALYZE_AND_REPAIR,
+                    analysis_solution_accepted=True,
+                )
+            else:
+                updates.update(
+                    analysis_generation=current.analysis_generation + 1,
+                    previous_analysis_results=(
+                        *current.previous_analysis_results[-4:],
+                        current.codex_results[0],
+                    ),
+                    codex_results=(),
+                    root_cause_evidence=(),
+                    investigation_suggestions=(),
+                    behavior_before="",
+                    behavior_after="",
+                    impact_scope=(),
+                    risk_level="",
+                    defect_checkpoint=DefectCheckpoint.NONE,
+                )
+            candidate = current.validated_update(**updates)
+            return self._save_locked(
+                candidate,
+                expected_version,
+                current=current,
+                internal_transition=True,
+                run_identity=run_identity,
+            )
+
     def _save_locked(
         self,
         run: WorkflowRun,
@@ -281,6 +427,26 @@ class FileRunStore:
                 ("history", run.history, persisted.history),
                 ("resume_state", run.resume_state, persisted.resume_state),
                 ("blocked_reason", run.blocked_reason, persisted.blocked_reason),
+                (
+                    "defect_action",
+                    run.defect_action,
+                    persisted.defect_action,
+                ),
+                (
+                    "analysis_generation",
+                    run.analysis_generation,
+                    persisted.analysis_generation,
+                ),
+                (
+                    "analysis_solution_accepted",
+                    run.analysis_solution_accepted,
+                    persisted.analysis_solution_accepted,
+                ),
+                (
+                    "previous_analysis_results",
+                    run.previous_analysis_results,
+                    persisted.previous_analysis_results,
+                ),
             )
             for field_name, incoming, existing in immutable_fields:
                 if incoming != existing:
@@ -385,6 +551,12 @@ class FileRunStore:
         source = current.state
         if source in _TERMINAL:
             raise InvalidRunTransitionError("terminal workflow state cannot transition")
+        if (
+            source is WorkflowState.IMPLEMENTING
+            and target is WorkflowState.COMPLETED
+            and _is_completed_analysis(current)
+        ):
+            return None
         if target is WorkflowState.CANCELLED:
             return None
         if source is WorkflowState.BLOCKED:
@@ -814,7 +986,7 @@ def _validate_persisted_run_invariants(run: WorkflowRun) -> None:
         if run.state is WorkflowState.PARTIAL_SUCCESS and not partial:
             raise InvalidRunMutationError("partial group publication facts are invalid")
     else:
-        if run.state is WorkflowState.COMPLETED and not (
+        if run.state is WorkflowState.COMPLETED and not _is_completed_analysis(run) and not (
             publication.approved_fingerprint and publication.commit_hash
             and publication.push_completed_at is not None and publication.pr_url
             and publication.comment_id and not publication.error
@@ -841,7 +1013,7 @@ def _validate_persisted_run_invariants(run: WorkflowRun) -> None:
             raise InvalidRunMutationError("history event reason must not be empty")
         if index and history[index - 1].target is not event.source:
             raise InvalidRunMutationError("history events must be continuous")
-        _validate_persisted_edge(history, index)
+        _validate_persisted_edge(run, history, index)
     if history[-1].target is not run.state:
         raise InvalidRunMutationError("history final state must match run state")
     _validate_block_metadata(run)
@@ -978,14 +1150,33 @@ def _validate_group_publication_binding(
             )
 
 
-def _validate_persisted_edge(history: tuple[StateEvent, ...], index: int) -> None:
+def _validate_persisted_edge(
+    run: WorkflowRun, history: tuple[StateEvent, ...], index: int
+) -> None:
     event = history[index]
     source = event.source
     target = event.target
+    if (
+        source is WorkflowState.COMPLETED
+        and target is WorkflowState.IMPLEMENTING
+        and run.type is WorkflowType.DEFECT
+        and (
+            run.analysis_solution_accepted
+            or run.analysis_generation > 0
+        )
+    ):
+        return
     if source in _TERMINAL:
         raise InvalidRunMutationError("terminal state cannot have outgoing history")
 
     if source in _MAIN_INDEX:
+        if (
+            source is WorkflowState.IMPLEMENTING
+            and target is WorkflowState.COMPLETED
+            and run.type is WorkflowType.DEFECT
+            and _has_recorded_readonly_analysis(run)
+        ):
+            return
         if target in {
             WorkflowState.BLOCKED,
             WorkflowState.FAILED,

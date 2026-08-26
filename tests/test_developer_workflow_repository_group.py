@@ -234,12 +234,20 @@ def test_local_source_origin_must_match_authoritative_remote(
 
 
 def test_repository_branch_is_unique_per_repository_and_bounded() -> None:
-    first = repository_branch(WorkflowType.DEFECT, "DEF-1", "x" * 300, "shared-sdk")
-    second = repository_branch(WorkflowType.DEFECT, "DEF-1", "x" * 300, "desktop-app")
+    first = repository_branch(
+        WorkflowType.DEFECT, "DEF-1", "x" * 300, "shared-sdk", "a" * 32
+    )
+    second = repository_branch(
+        WorkflowType.DEFECT, "DEF-1", "x" * 300, "desktop-app", "a" * 32
+    )
+    next_run = repository_branch(
+        WorkflowType.DEFECT, "DEF-1", "x" * 300, "shared-sdk", "b" * 32
+    )
 
     assert first.startswith("bugfix/DEF-1-")
     assert second.startswith("bugfix/DEF-1-")
     assert first != second
+    assert first != next_run
     assert first.endswith("-shared-sdk")
     assert second.endswith("-desktop-app")
     assert len(first) <= 120

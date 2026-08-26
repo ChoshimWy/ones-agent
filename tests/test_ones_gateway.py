@@ -8,7 +8,7 @@ import requests
 from structlog.testing import capture_logs
 
 from config.settings import OnesSettings
-from src.contracts import WorkflowStatusRef
+from src.contracts import IdentityRef, WorkflowStatusRef
 from src.integrations.ones import OnesPaginationError as SyncOnesPaginationError
 from src.integrations.ones_api import OnesPaginationError as AsyncOnesPaginationError
 from src.services.ones_gateway import (
@@ -582,11 +582,17 @@ class TestOnesGatewayAsync(unittest.IsolatedAsyncioTestCase):
                 "status": {"uuid": "status-1", "name": "Doing", "category": "in_progress"},
                 "issueType": {"uuid": "defect-type", "name": "Defect"},
                 "priority": {"uuid": "priority-1", "value": "High", "position": 1},
+                "parent": {"uuid": "parent-1", "name": None, "avatar": {}},
+                "deadline": None,
+                "createTime": 1787213579958320,
                 "serverUpdateStamp": 1786351001326130,
             }
         )
 
+        self.assertEqual(defect.created_at, "2026-08-20T08:12:59.958320Z")
         self.assertEqual(defect.updated_at, "2026-08-10T08:36:41.326130Z")
+        self.assertEqual(defect.deadline, "")
+        self.assertEqual(defect.parent, IdentityRef(id="parent-1", name="", avatar=""))
 
 
 class TestOnesGatewaySync(unittest.TestCase):

@@ -7,19 +7,31 @@ from threading import Event
 from types import SimpleNamespace
 
 import pytest
-from textual.widgets import Button, Input, Label, Static, TabbedContent
+from textual.containers import VerticalScroll
+from textual.widgets import (
+    Button,
+    Input,
+    Label,
+    Select,
+    SelectionList,
+    Static,
+    TabbedContent,
+)
 
 from src.developer_workflow import tui
 from src.developer_workflow.contracts import WorkflowRun, WorkflowState, WorkflowType
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp
 from src.developer_workflow.tui.controller import (
     CandidateSessionView,
+    StaleCandidateError,
     StaleTuiActionError,
     TuiControllerError,
 )
 from src.developer_workflow.tui.models import (
     DangerousActionRequest,
     DefectChoice,
+    DefectFilterOptions,
+    FilterChoice,
     HistoryView,
     MappingCandidateView,
     PublicationView,
@@ -38,7 +50,10 @@ from src.developer_workflow.tui.screens import (
     DashboardScreen,
     DefectWizardScreen,
     HelpScreen,
+    RequirementWizardScreen,
     PublicationResumeModal,
+    RunDetailPane,
+    RunDetailScreen,
     RunFilterScreen,
     RevisionModal,
     SettingsView,
@@ -155,6 +170,10 @@ class FakeController:
         self.shown.append(run_id)
         return _detail(next(item for item in self.runs if item.run_id == run_id))
 
+    def delete_task(self, run_id: str) -> None:
+        self.runs = tuple(item for item in self.runs if item.run_id != run_id)
+        self.raw_work_items.pop(run_id, None)
+
 
 def app_factory() -> DeveloperWorkflowTuiApp:
     return DeveloperWorkflowTuiApp(
@@ -163,6 +182,146 @@ def app_factory() -> DeveloperWorkflowTuiApp:
         provider_type="github",
         sandbox_configured=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_workspace_mode_exposes_persisted_tasks_and_reopens_detail() -> None:
+    class WorkspaceController(FakeController):
+        def list_workspaces(self):
+            return ()
+
+    controller = WorkspaceController()
+    app = DeveloperWorkflowTuiApp(
+        controller,  # type: ignore[arg-type]
+        3,
+        provider_type="github",
+        sandbox_configured=True,
+    )
+
+    async with app.run_test(size=(120, 32)) as pilot:
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        assert screen.query_one("#workspace-home").display
+        assert not screen.query_one("#workspace").display
+        assert screen.query_one("#nav-workspaces", Button).label.plain == "Workspaces"
+        assert screen.query_one("#nav-runs", Button).label.plain == "Tasks"
+        assert len(screen.query("#navigation Button")) == 3
+        assert not screen.query("#navigation #nav-runtime-setup")
+
+        await pilot.click("#nav-runs")
+        await pilot.pause()
+        assert not screen.query_one("#workspace-home").display
+        assert screen.query_one("#workspace").display
+        assert screen.query_one("#nav-runs", Button).variant == "primary"
+        assert screen.query_one("#nav-workspaces", Button).variant == "default"
+        assert len(screen.query("#run-list ListItem")) == 2
+        assert not screen.query_one("#action-bar").display
+        assert not screen.query("#action-resume")
+        assert not screen.query("#action-revise")
+        assert not screen.query("#action-approve")
+        assert not screen.query("#action-cancel")
+        assert not screen.query("#configure-runtime")
+        await pilot.click("#run-item-0")
+        await pilot.pause()
+        assert controller.shown[-1] == "run-1"
+        assert "BUG-1" in _plain(screen.query_one("#overview-content"))
+
+        await pilot.click("#nav-workspaces")
+        await pilot.pause()
+        assert screen.query_one("#workspace-home").display
+        assert screen.query_one("#nav-workspaces", Button).variant == "primary"
+        assert screen.query_one("#nav-runs", Button).variant == "default"
+        await pilot.click("#nav-runs")
+        await pilot.click("#run-item-1")
+        await pilot.pause()
+        assert controller.shown[-1] == "run-2"
+        assert "BUG-2" in _plain(screen.query_one("#overview-content"))
+
+        await pilot.click("#nav-settings")
+        await pilot.pause()
+        assert screen.query_one("#nav-settings", Button).variant == "primary"
+        assert screen.query_one("#nav-runs", Button).variant == "default"
+        assert screen.query_one("#settings-page").display
+        assert screen.query_one("#nav-runtime-setup", Button).label.plain == (
+            "Edit global configuration"
+        )
+
+
+@pytest.mark.asyncio
+async def test_task_delete_requires_confirmation_and_refreshes_list() -> None:
+    class WorkspaceController(FakeController):
+        def list_workspaces(self):
+            return ()
+
+    controller = WorkspaceController()
+    app = DeveloperWorkflowTuiApp(
+        controller,  # type: ignore[arg-type]
+        3,
+        provider_type="github",
+        sandbox_configured=True,
+    )
+
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.click("#nav-runs")
+        await pilot.pause()
+        await pilot.click("#run-item-0")
+        await pilot.click("#delete-task")
+        await pilot.pause()
+        assert app.screen.id == "task-delete-confirmation"
+        assert len(controller.runs) == 2
+
+        await pilot.click("#cancel-task-delete")
+        await pilot.pause()
+        assert len(controller.runs) == 2
+
+        await pilot.click("#delete-task")
+        await pilot.click("#confirm-task-delete")
+        async with asyncio.timeout(2):
+            while len(controller.runs) != 1:
+                await asyncio.sleep(0)
+        await pilot.pause()
+
+        assert tuple(item.run_id for item in controller.runs) == ("run-2",)
+        assert len(app.screen.query("#run-list ListItem")) == 1
+        assert "Task deleted" in _plain(app.screen.query_one("#notice"))
+
+
+@pytest.mark.asyncio
+async def test_task_detail_only_shows_available_analysis_decisions() -> None:
+    class AnalysisController(FakeController):
+        def __init__(self) -> None:
+            super().__init__()
+            self.runs = (
+                replace(_summary(1), state=WorkflowState.COMPLETED),
+            )
+
+        def show(self, run_id: str) -> RunDetail:
+            detail = super().show(run_id)
+            return replace(
+                detail,
+                can_accept_analysis=True,
+                can_regenerate_analysis=True,
+            )
+
+    app = DeveloperWorkflowTuiApp(
+        AnalysisController(),  # type: ignore[arg-type]
+        3,
+        provider_type="github",
+        sandbox_configured=True,
+    )
+
+    async with app.run_test(size=(120, 32)):
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        actions = screen.query_one("#action-bar")
+        assert actions.display
+        assert actions.parent is screen.query_one("#task-detail-column")
+        assert screen.query_one("#action-accept-analysis", Button).display
+        assert screen.query_one("#action-regenerate-analysis", Button).display
+        assert not screen.query_one("#action-retry-analysis", Button).display
+        assert sum(
+            button.display for button in screen.query("#action-bar Button")
+        ) == 2
 
 
 @pytest.mark.asyncio
@@ -268,7 +427,7 @@ async def test_run_list_shows_safe_updated_time_without_markup(width: int) -> No
 
 
 @pytest.mark.asyncio
-async def test_keyboard_opens_run_and_switches_all_six_tabs() -> None:
+async def test_keyboard_opens_run_and_switches_all_seven_tabs() -> None:
     app = app_factory()
     async with app.run_test(size=(120, 32)) as pilot:
         await pilot.press("j", "enter")
@@ -277,6 +436,7 @@ async def test_keyboard_opens_run_and_switches_all_six_tabs() -> None:
         tabs = app.screen.query_one("#detail-tabs", TabbedContent)
         assert tabs.active == "overview"
         for expected in (
+            "ai-activity",
             "repositories",
             "tests",
             "review",
@@ -285,6 +445,124 @@ async def test_keyboard_opens_run_and_switches_all_six_tabs() -> None:
         ):
             await pilot.press("tab")
             assert tabs.active == expected
+
+
+@pytest.mark.asyncio
+async def test_ai_activity_supports_keyboard_and_mouse_scrolling() -> None:
+    app = app_factory()
+    async with app.run_test(size=(80, 15)) as pilot:
+        for _ in range(100):
+            await pilot.pause()
+            if app.screen.query("#run-detail"):
+                break
+        pane = app.screen.query_one("#run-detail", RunDetailPane)
+        app.screen.query_one("#detail-tabs", TabbedContent).active = "ai-activity"
+        pane.set_detail(replace(
+            _detail(_summary(1)),
+            ai_activity=tuple(f"activity line {index}" for index in range(100)),
+        ))
+        await pilot.pause()
+
+        scroll = app.screen.query_one("#ai-activity-scroll", VerticalScroll)
+        assert scroll.max_scroll_y > 0
+        scroll.scroll_home(animate=False, immediate=True)
+        scroll.focus()
+        await pilot.press("pagedown")
+        await pilot.pause()
+        assert scroll.scroll_y > 0
+
+
+@pytest.mark.asyncio
+async def test_ai_activity_styles_events_and_compacts_shell_launcher() -> None:
+    app = app_factory()
+    async with app.run_test(size=(100, 24)):
+        pane = app.screen.query_one("#run-detail", RunDetailPane)
+        pane.set_detail(replace(
+            _detail(_summary(1)),
+            ai_activity=(
+                "Codex session started",
+                'Running: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "git status --short"',
+                'Command completed: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "git status --short" (exit 0)',
+                "Analysis result: repository evidence collected",
+                "Structured analysis result validated",
+            ),
+        ))
+
+        activity = app.screen.query_one("#ai-activity-content", Static).renderable
+        plain = _plain(app.screen.query_one("#ai-activity-content", Static))
+        assert "AI ANALYSIS" in plain
+        assert "Running: git status --short" in plain
+        assert "Command completed: git status --short  [exit 0]" in plain
+        assert "powershell.exe" not in plain.casefold()
+        assert getattr(activity, "spans", ())
+
+
+@pytest.mark.asyncio
+async def test_completed_analysis_report_offers_accept_and_regenerate_actions() -> None:
+    completed_summary = replace(_summary(1), state=WorkflowState.COMPLETED)
+    completed = replace(
+        _detail(completed_summary),
+        review=("AI ANALYSIS REPORT", "ROOT CAUSE", "BEST SOLUTION"),
+        can_accept_analysis=True,
+        can_regenerate_analysis=True,
+    )
+    calls: list[tuple[str, str, int]] = []
+
+    class DecisionController:
+        def accept_analysis_solution(
+            self, run_id: str, expected_version: int
+        ) -> RunDetail:
+            calls.append(("accept", run_id, expected_version))
+            return replace(
+                completed,
+                summary=replace(completed.summary, state=WorkflowState.IMPLEMENTING),
+                can_accept_analysis=False,
+                can_regenerate_analysis=False,
+            )
+
+        def regenerate_analysis_solution(
+            self, run_id: str, expected_version: int
+        ) -> RunDetail:
+            calls.append(("regenerate", run_id, expected_version))
+            return completed
+
+    class DecisionSupervisor:
+        async def run_mutation(self, run_id, action, call, *args):
+            del run_id, action
+            return call(*args)
+
+    app = app_factory()
+    async with app.run_test(size=(100, 24)) as pilot:
+        await app.push_screen(RunDetailScreen(
+            completed,
+            controller=DecisionController(),  # type: ignore[arg-type]
+            supervisor=DecisionSupervisor(),  # type: ignore[arg-type]
+        ))
+        await pilot.pause()
+        assert app.screen.query_one("#detail-accept-analysis", Button).display
+        assert app.screen.query_one("#detail-regenerate-analysis", Button).display
+        await pilot.click("#detail-accept-analysis")
+        await pilot.pause()
+
+    assert calls == [("accept", completed.summary.run_id, completed.summary.version)]
+
+
+@pytest.mark.asyncio
+async def test_runtime_setup_navigation_is_visible_and_opens_setup() -> None:
+    app = app_factory()
+    calls: list[bool] = []
+
+    async def begin_reconfigure() -> None:
+        calls.append(True)
+
+    app._begin_reconfigure = begin_reconfigure  # type: ignore[method-assign]
+    async with app.run_test(size=(120, 32)) as pilot:
+        button = app.screen.query_one("#nav-runtime-setup", Button)
+        assert button.label.plain == "Runtime setup"
+        await pilot.click("#nav-runtime-setup")
+        await pilot.pause()
+
+    assert calls == [True]
 
 
 @pytest.mark.asyncio
@@ -428,6 +706,19 @@ async def test_navigation_defects_opens_defect_wizard_without_starting_work() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_navigation_requirements_opens_requirement_list_wizard() -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.click("#nav-requirements")
+        assert isinstance(app.screen, RequirementWizardScreen)
+        assert app.screen.query_one("#query-requirements", Button).label.plain == (
+            "Query requirements"
+        )
+        assert app.supervisor.task_count == 0
+
+
+@pytest.mark.asyncio
 async def test_single_column_opens_independent_detail_and_returns() -> None:
     app = app_factory()
     async with app.run_test(size=(60, 32)) as pilot:
@@ -561,6 +852,29 @@ async def test_refresh_replaces_list_atomically_and_preserves_selected_run() -> 
         assert len(screen.query("#run-list ListItem")) == 0
         overview = screen.query_one("#overview-content")
         assert str(overview.renderable) == "No run selected"
+
+
+@pytest.mark.asyncio
+async def test_refresh_updates_stable_task_rows_without_recreating_them() -> None:
+    app = app_factory()
+    async with app.run_test(size=(120, 32)):
+        screen = app.screen
+        assert isinstance(screen, DashboardScreen)
+        first_row = screen.query_one("#run-item-0")
+        second_row = screen.query_one("#run-item-1")
+        screen.query_one("#run-list").index = 1
+
+        app.controller.runs = (  # type: ignore[attr-defined]
+            replace(_summary(1), state=WorkflowState.IMPLEMENTING, version=8),
+            replace(_summary(2), state=WorkflowState.TESTING, version=9),
+        )
+        await screen.refresh_runs()
+
+        assert screen.query_one("#run-item-0") is first_row
+        assert screen.query_one("#run-item-1") is second_row
+        assert screen.query_one("#run-list").index == 1
+        assert "IMPLEMENTING" in _plain(first_row.query_one(Label))
+        assert "TESTING" in _plain(second_row.query_one(Label))
 
 
 @pytest.mark.asyncio
@@ -837,8 +1151,24 @@ class WizardController(FakeController):
         self.confirmed_mapping = ""
         self.fail_query = False
         self.fail_start = False
+        self.fail_start_generically = False
         self.fail_confirm = False
         self.mapping_candidates: tuple[MappingCandidateView, ...] = (_candidate(),)
+
+    @property
+    def default_defect_project(self) -> str:
+        return "project-id"
+
+    def load_defect_filter_options(self, project: str) -> DefectFilterOptions:
+        assert project == "project-id"
+        return DefectFilterOptions(
+            iterations=(FilterChoice("iteration-id", "Iteration One"),),
+            assignees=(FilterChoice("assignee-id", "Alice"),),
+            statuses=(
+                FilterChoice("todo-id", "Todo"),
+                FilterChoice("fixing-id", "Fixing"),
+            ),
+        )
 
     def query_defects(
         self,
@@ -858,10 +1188,24 @@ class WizardController(FakeController):
     def start_defect(self, session_id: str, candidate_id: str) -> RunDetail:
         self.mutation_calls.append(("start_defect", session_id, candidate_id))
         if self.fail_start:
-            raise TuiControllerError("LEAK-STALE-CANDIDATE-CONTEXT")
+            raise StaleCandidateError("LEAK-STALE-CANDIDATE-CONTEXT")
+        if self.fail_start_generically:
+            raise TuiControllerError("LEAK-START-CONTEXT")
         return _validating_detail(
             "defect-1",
             run_id="run-defect-1",
+            candidates=self.mapping_candidates,
+        )
+
+    def analyze_defect(self, session_id: str, candidate_id: str) -> RunDetail:
+        self.mutation_calls.append(("analyze_defect", session_id, candidate_id))
+        if self.fail_start:
+            raise StaleCandidateError("LEAK-STALE-CANDIDATE-CONTEXT")
+        if self.fail_start_generically:
+            raise TuiControllerError("LEAK-START-CONTEXT")
+        return _validating_detail(
+            "defect-1",
+            run_id="run-defect-analysis-1",
             candidates=self.mapping_candidates,
         )
 
@@ -901,10 +1245,9 @@ async def _open_defect_wizard(pilot) -> None:
 
 
 async def _query_defects(pilot) -> None:
-    pilot.app.screen.query_one("#project", Input).value = "project-id"
-    pilot.app.screen.query_one("#iteration", Input).value = "iteration-id"
-    pilot.app.screen.query_one("#assignee", Input).value = "assignee-id"
-    pilot.app.screen.query_one("#status-ids", Input).value = "todo-id,fixing-id"
+    pilot.app.screen.query_one("#iteration", Select).value = "iteration-id"
+    pilot.app.screen.query_one("#assignee", Select).value = "assignee-id"
+    pilot.app.screen.query_one("#status-ids", SelectionList).select_all()
     await pilot.click("#query-defects")
     await pilot.pause()
 
@@ -914,6 +1257,10 @@ async def test_defect_wizard_uses_only_status_ids_and_confirms_mapping() -> None
     controller = WizardController()
     async with wizard_app_factory(controller).run_test(size=(120, 32)) as pilot:
         await _open_defect_wizard(pilot)
+        assert pilot.app.screen.query_one("#assignee", Select).value == "assignee-id"
+        assert tuple(
+            pilot.app.screen.query_one("#status-ids", SelectionList).selected
+        ) == ("todo-id",)
         await _query_defects(pilot)
         assert controller.last_query == (
             "project-id",
@@ -945,12 +1292,127 @@ async def test_defect_wizard_uses_only_status_ids_and_confirms_mapping() -> None
 
 
 @pytest.mark.asyncio
+async def test_defect_wizard_keeps_partial_ones_filter_options_usable() -> None:
+    class PartialOptionsController(WizardController):
+        def load_defect_filter_options(self, project: str) -> DefectFilterOptions:
+            assert project == "project-id"
+            return DefectFilterOptions(
+                iterations=(FilterChoice("iteration-id", "Iteration One"),),
+                assignees=(FilterChoice("assignee-id", "Current user", True),),
+                statuses=(),
+                unavailable=("statuses",),
+            )
+
+    async with wizard_app_factory(PartialOptionsController()).run_test(
+        size=(120, 32)
+    ) as pilot:
+        await _open_defect_wizard(pilot)
+        await pilot.pause()
+
+        assert pilot.app.screen.query_one("#iteration", Select).value == "iteration-id"
+        assert pilot.app.screen.query_one("#assignee", Select).value == "assignee-id"
+        assert not pilot.app.screen.query_one("#query-defects", Button).disabled
+        assert "statuses" in _plain(
+            pilot.app.screen.query_one("#wizard-notice", Static)
+        )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_defect_displays_live_analysis_progress() -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingWizardController(WizardController):
+        def confirm_repository(
+            self, run_id: str, mapping_key: str, expected_version: int
+        ) -> RunDetail:
+            entered.set()
+            assert release.wait(5)
+            return super().confirm_repository(run_id, mapping_key, expected_version)
+
+        def show(self, run_id: str) -> RunDetail:
+            return _validating_detail("defect-1", run_id=run_id)
+
+        def ai_activity(self, run_id: str) -> tuple[str, ...]:
+            return (
+                "Codex session started",
+                "Running: rg -n defect src",
+                "Command completed: rg -n defect src (exit 0)",
+            )
+
+    controller = BlockingWizardController()
+    async with wizard_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        await pilot.click("#analyze-candidate-0")
+        for _ in range(100):
+            await pilot.pause()
+            if pilot.app.screen.query("#mapping-0"):
+                break
+        assert pilot.app.screen.query("#mapping-0")
+        await pilot.click("#mapping-0")
+        for _ in range(100):
+            await pilot.pause()
+            if pilot.app.screen.query("#confirm-start"):
+                break
+        assert pilot.app.screen.query("#confirm-start")
+
+        click = asyncio.create_task(pilot.click("#confirm-start"))
+        try:
+            for _ in range(100):
+                await pilot.pause()
+                if entered.is_set():
+                    break
+            assert entered.is_set()
+            progress = ""
+            initial_progress = _plain(
+                pilot.app.screen.query_one("#ai-activity-content")
+            )
+            assert "Workflow started" in initial_progress
+            assert "No AI activity" not in initial_progress
+            for _ in range(100):
+                await pilot.pause()
+                progress = _plain(
+                    pilot.app.screen.query_one("#ai-activity-content")
+                )
+                if "Running: rg -n defect src" in progress:
+                    break
+            assert "Task detail" in _plain(pilot.app.screen.query_one(Label))
+            assert "Running: rg -n defect src" in progress
+        finally:
+            release.set()
+        await asyncio.wait_for(click, timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_candidate_query_has_zero_mutation_side_effects() -> None:
     controller = WizardController()
     async with wizard_app_factory(controller).run_test() as pilot:
         await _open_defect_wizard(pilot)
         await _query_defects(pilot)
         assert controller.mutation_calls == []
+
+
+@pytest.mark.asyncio
+async def test_defect_candidate_offers_read_only_analysis_and_repair_actions() -> None:
+    controller = WizardController()
+    async with wizard_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+
+        assert pilot.app.screen.query_one("#analyze-candidate-0", Button).label.plain == (
+            "AI analysis"
+        )
+        assert pilot.app.screen.query_one("#candidate-0", Button).label.plain == (
+            "Analyze and repair"
+        )
+        await pilot.click("#analyze-candidate-0")
+        await pilot.pause()
+
+        assert controller.mutation_calls == [
+            ("analyze_defect", "PRIVATE-CANDIDATE-CAPABILITY", "defect-1")
+        ]
+        assert pilot.app.screen.query_one("#mapping-0")
 
 
 @pytest.mark.asyncio
@@ -984,6 +1446,22 @@ async def test_stale_candidate_fails_closed_without_mapping_confirmation() -> No
         assert "LEAK-STALE" not in notice
         assert not pilot.app.screen.query("#mapping-key")
         assert not any(call[0] == "confirm_repository" for call in controller.mutation_calls)
+
+
+@pytest.mark.asyncio
+async def test_analysis_start_failure_is_not_misreported_as_stale_candidate() -> None:
+    controller = WizardController()
+    controller.fail_start_generically = True
+    async with wizard_app_factory(controller).run_test() as pilot:
+        await _open_defect_wizard(pilot)
+        await _query_defects(pilot)
+        await pilot.click("#analyze-candidate-0")
+        await pilot.pause()
+
+        notice = _plain(pilot.app.screen.query_one("#wizard-notice"))
+        assert notice == "AI analysis could not be started"
+        assert "LEAK-START" not in notice
+        assert not pilot.app.screen.query("#mapping-key")
 
 
 @pytest.mark.asyncio
@@ -1223,6 +1701,72 @@ def action_app_factory(controller: ActionController) -> DeveloperWorkflowTuiApp:
 
 
 @pytest.mark.asyncio
+async def test_invalid_analysis_task_offers_visible_retry_action() -> None:
+    class RetryController(ActionController):
+        def _detail(self) -> RunDetail:
+            return replace(
+                super()._detail(),
+                status_message="Codex analysis returned invalid structured output",
+            )
+
+    controller = RetryController(
+        WorkflowState.BLOCKED,
+        resume_state=WorkflowState.IMPLEMENTING,
+    )
+    async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        retry = pilot.app.screen.query_one("#action-retry-analysis", Button)
+        assert retry.display
+        assert retry.parent is pilot.app.screen.query_one("#action-bar")
+        assert retry.region.width < pilot.app.screen.query_one("#action-bar").region.width
+        await pilot.click("#action-retry-analysis")
+        await pilot.pause()
+
+    assert controller.action_calls == [("resume", "run-action", 7)]
+
+
+@pytest.mark.asyncio
+async def test_retry_analysis_does_not_block_the_textual_event_loop() -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingRetryController(ActionController):
+        def _detail(self) -> RunDetail:
+            return replace(
+                super()._detail(),
+                status_message="Codex analysis returned invalid structured output",
+            )
+
+        def resume(self, run_id: str, expected_version: int) -> RunDetail:
+            entered.set()
+            assert release.wait(5)
+            return super().resume(run_id, expected_version)
+
+    controller = BlockingRetryController(
+        WorkflowState.BLOCKED,
+        resume_state=WorkflowState.IMPLEMENTING,
+    )
+    async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        click = asyncio.create_task(pilot.click("#action-retry-analysis"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            await asyncio.wait_for(click, timeout=1)
+            assert _plain(pilot.app.screen.query_one("#notice")) == (
+                "Retrying AI analysis"
+            )
+            assert not pilot.app.screen.query_one(
+                "#action-retry-analysis", Button
+            ).display
+        finally:
+            release.set()
+        for _ in range(50):
+            await pilot.pause()
+            if controller.action_calls:
+                break
+
+    assert controller.action_calls == [("resume", "run-action", 7)]
+
+
+@pytest.mark.asyncio
 async def test_approval_modal_renders_complete_signed_multi_repository_facts() -> None:
     controller = ActionController()
     async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
@@ -1404,7 +1948,7 @@ async def test_publication_resume_uses_dedicated_modal_with_per_repository_facts
 ) -> None:
     controller = ActionController(state, resume_state=resume_state)
     async with action_app_factory(controller).run_test(size=(60, 26)) as pilot:
-        await pilot.click("#action-resume")
+        await pilot.app.screen.action_resume()
         await pilot.pause(0.1)
         assert isinstance(pilot.app.screen, PublicationResumeModal)
         rendered = "\n".join(_plain(item) for item in pilot.app.screen.query(Static))

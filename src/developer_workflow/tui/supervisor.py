@@ -131,6 +131,13 @@ class RunTaskSupervisor:
     def run_lock_count(self) -> int:
         return len(self._run_gates)
 
+    def is_run_active(self, run_id: str) -> bool:
+        """Return whether the owning event loop has queued or running work for a run."""
+
+        safe_run_id = safe_tui_text(run_id, maximum=64)
+        gate = self._run_gates.get(safe_run_id)
+        return gate is not None and gate.references > 0
+
     def submit(
         self, run_id: str, action: str, call: Callable[[], T]
     ) -> asyncio.Task[T]:

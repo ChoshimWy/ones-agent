@@ -420,6 +420,11 @@ class DeveloperWorkflowTuiApp(App[None]):
         await self.push_screen(dashboard)
         if self._ui_closed:
             raise _TransitionClosed
+        refresh_workspaces = getattr(dashboard, "refresh_workspaces", None)
+        if callable(refresh_workspaces):
+            await refresh_workspaces()
+        if self._ui_closed:
+            raise _TransitionClosed
         await dashboard.refresh_runs()
         if self._ui_closed:
             raise _TransitionClosed
@@ -607,6 +612,10 @@ class DeveloperWorkflowTuiApp(App[None]):
     async def _pressed_configure_runtime(self) -> None:
         await self._begin_reconfigure()
 
+    @on(Button.Pressed, "#nav-runtime-setup")
+    async def _pressed_runtime_setup_navigation(self) -> None:
+        await self._begin_reconfigure()
+
     async def _begin_reconfigure(self) -> None:
         """Close the stable runtime completely before constructing setup UI."""
 
@@ -628,8 +637,15 @@ class DeveloperWorkflowTuiApp(App[None]):
                     raise
                 safe_exit = True
                 close_failed = True
-            if not getattr(self.runtime_session, "close_complete", not close_failed):
+            close_complete = getattr(self.runtime_session, "close_complete", True)
+            if not close_complete:
+                # The runtime may still own resources, so retain the session for
+                # the final close drain.  The dashboard itself is no longer a
+                # safe surface after a close failure and must be removed before
+                # the host exits; never leave a half-closed runtime visible.
                 self._notify_runtime_close_pending()
+                await self._remove_dashboard()
+                self.activities.clear()
                 return
             else:
                 self.runtime_session = None
@@ -746,9 +762,13 @@ class DeveloperWorkflowTuiApp(App[None]):
         mount_generation = dashboard.mount_generation
         if (
             self._ui_closed
-            or self.screen is not dashboard
             or not dashboard.owns_refresh(mount_generation)
         ):
+            return
+        try:
+            if self.screen is not dashboard:
+                return
+        except Exception:
             return
         await dashboard.refresh_runs(
             dict(self.activities),
@@ -757,9 +777,13 @@ class DeveloperWorkflowTuiApp(App[None]):
         if (
             self._ui_closed
             or self._dashboard is not dashboard
-            or self.screen is not dashboard
             or not dashboard.owns_refresh(mount_generation)
         ):
+            return
+        try:
+            if self.screen is not dashboard:
+                return
+        except Exception:
             return
 
     async def on_tui_task_message(self, message: TuiTaskMessage) -> None:

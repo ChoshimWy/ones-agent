@@ -1,4 +1,4 @@
-﻿"""Restricted bootstrap screens used before a workflow runtime exists."""
+"""Restricted bootstrap screens used before a workflow runtime exists."""
 
 from __future__ import annotations
 
@@ -24,13 +24,8 @@ from ..config import (
     PublishingProvider,
     SandboxPermissionProfileSource,
 )
-from ..contracts import RepositoryRole
-from ..setup_models import (
-    DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
-    RuntimePublicConfig,
-    SecretKind,
-    WorkflowDraft,
-)
+from ..contracts import RepositoryGroupMapping, RepositoryMapping, RepositoryRole
+from ..setup_models import SecretKind, WorkflowDraft
 from ..setup_controller import SetupStepTransaction
 from ..setup_import import (
     ImportDetection,
@@ -39,7 +34,7 @@ from ..setup_import import (
 )
 from ..setup_repository import RepositoryGroupDraftBuilder, build_repository
 from ..setup_validation import SetupStep, ValidationStatus
-from .setup_models import build_setup_step_view, setup_step_label
+from .setup_models import TUI_SETUP_STEPS, build_setup_step_view, setup_step_label
 
 
 _RESULT_TEXT = {
@@ -53,6 +48,7 @@ _RESULT_TEXT = {
     "unsafe_path": "Private path validation failed",
     "sandbox": "Sandbox validation failed",
     "invalid_field": "Configuration fields are incomplete",
+    "not_configured": "Configuration fields are incomplete",
 }
 
 
@@ -183,7 +179,6 @@ _STEP_IDS = {
     SetupStep.ONES: "ones-step",
     SetupStep.REPOSITORIES: "repositories-step",
     SetupStep.PROVIDER: "provider-step",
-    SetupStep.CODEX: "codex-step",
     SetupStep.PRIVATE_PATHS: "private-paths-step",
     SetupStep.REVIEW: "review-step",
 }
@@ -194,23 +189,15 @@ _SECRET_FIELDS = {
         ("ones-password", SecretKind.ONES_PASSWORD),
     ),
     SetupStep.PROVIDER: (("provider-token", SecretKind.PROVIDER_TOKEN),),
-    SetupStep.CODEX: (
-        ("codex-api-key", SecretKind.CODEX_API_KEY),
-        ("codex-auth-token", SecretKind.CODEX_AUTH_TOKEN),
-    ),
 }
 _PROBE_FIELDS = {
     SetupStep.PROFILE: (),
     SetupStep.ONES: (
         "ones-team-id",
-        "ones-project-id",
-        "ones-status-id",
-        "ones-item-id",
         "ones-issue-type-id",
     ),
     SetupStep.REPOSITORIES: ("repository-path", "repository-url"),
     SetupStep.PROVIDER: ("provider-host", "provider-api-url"),
-    SetupStep.CODEX: ("codex-profile", "codex-worktree"),
     SetupStep.PRIVATE_PATHS: ("run-root", "mirror-root", "worktree-root"),
     SetupStep.REVIEW: (),
 }
@@ -220,9 +207,6 @@ _CONFIG_FIELDS = {
         "ones-base-url",
         "ones-team-id",
         "ones-issue-type-id",
-        "ones-project-id",
-        "ones-status-id",
-        "ones-item-id",
     ),
     SetupStep.REPOSITORIES: (
         "repository-key",
@@ -249,12 +233,6 @@ _CONFIG_FIELDS = {
         "git-author-email",
         "provider-type",
         "repository-branch",
-    ),
-    SetupStep.CODEX: (
-        "codex-auth-mode",
-        "codex-profile",
-        "codex-worktree",
-        "codex-home",
     ),
     SetupStep.PRIVATE_PATHS: ("run-root", "mirror-root", "worktree-root"),
     SetupStep.REVIEW: (),
@@ -355,7 +333,7 @@ class SetupWizardScreen(SetupRootScreen):
         with Horizontal(id="setup-shell"):
             with VerticalScroll(id="setup-navigation"):
                 yield Static("Runtime setup", classes="setup-title")
-                for step in SetupStep:
+                for step in self._setup_steps():
                     yield Button(
                         setup_step_label(step),
                         id=f"nav-{step.value.replace('_', '-')}",
@@ -366,7 +344,6 @@ class SetupWizardScreen(SetupRootScreen):
                 yield from self._ones_fields()
                 yield from self._repository_fields()
                 yield from self._provider_fields()
-                yield from self._codex_fields()
                 yield from self._private_path_fields()
                 with Vertical(id=_STEP_IDS[SetupStep.REVIEW], classes="setup-step"):
                     yield Label("Review validated configuration")
@@ -381,6 +358,11 @@ class SetupWizardScreen(SetupRootScreen):
             yield Button("Test connection", id="test-connection")
             yield Button("Next", id="next-step")
             yield Button("Review", id="review-setup")
+            yield Button(
+                "Save and open Dashboard",
+                id="save-mvp-runtime",
+                variant="primary",
+            )
             yield Button("Cancel", id="cancel-setup", variant="error")
 
     def _profile_fields(self) -> ComposeResult:
@@ -396,18 +378,22 @@ class SetupWizardScreen(SetupRootScreen):
     def _ones_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.ONES], classes="setup-step"):
             yield Label("ONES connection")
-            yield Input(placeholder="Base URL", id="ones-base-url")
+            yield Static(
+                "Use the ONES site root (for example https://ones.example.com), "
+                "not an API path. The test only logs in and reads metadata. "
+                "The current Git workspace and private runtime paths are configured "
+                "automatically for MVP mode.",
+                markup=False,
+            )
+            yield Input(placeholder="Base URL (site root)", id="ones-base-url")
             yield Input(placeholder="Team ID", id="ones-team-id")
             yield Input(placeholder="Defect issue type ID", id="ones-issue-type-id")
-            yield Input(placeholder="Project ID for test", id="ones-project-id")
-            yield Input(placeholder="Status ID for test", id="ones-status-id")
-            yield Input(placeholder="Work item ID for test", id="ones-item-id")
-            yield Input(placeholder="Email", id="ones-email", password=True)
-            yield Input(placeholder="Password", id="ones-password", password=True)
+            yield Input(placeholder="ONES account / email", id="ones-email", password=True)
+            yield Input(placeholder="ONES password", id="ones-password", password=True)
 
     def _repository_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.REPOSITORIES], classes="setup-step"):
-            yield Label("Repository and group mapping")
+            yield Label("Workspace folders (add one or more)")
             yield Input(placeholder="Repository key", id="repository-key")
             yield Input(placeholder="ONES project ID", id="repository-project-id")
             yield Input(placeholder="ONES iteration ID", id="repository-iteration-id")
@@ -424,6 +410,11 @@ class SetupWizardScreen(SetupRootScreen):
             yield Input(placeholder="Group key", id="repository-group-key")
             yield Input(placeholder="Primary repository key", id="repository-primary")
             yield Input(placeholder="Integration commands (separate with ;;)", id="repository-integration-commands")
+            yield Button("Add folder to workspace", id="add-repository-folder", variant="primary")
+            yield Select([], prompt="Select folder to edit/remove", id="repository-folder-select", disabled=True)
+            yield Button("Load selected folder", id="load-repository-folder")
+            yield Button("Remove selected folder", id="remove-repository-folder", variant="error")
+            yield Static("No folders added", id="repository-list", markup=False)
 
     def _provider_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.PROVIDER], classes="setup-step"):
@@ -434,16 +425,6 @@ class SetupWizardScreen(SetupRootScreen):
             yield Input(placeholder="Git author email", id="git-author-email")
             yield Input(placeholder="Provider type: github or gitlab", id="provider-type")
             yield Input(placeholder="Provider token", id="provider-token", password=True)
-
-    def _codex_fields(self) -> ComposeResult:
-        with Vertical(id=_STEP_IDS[SetupStep.CODEX], classes="setup-step"):
-            yield Label("Codex runtime")
-            yield Input(placeholder="Auth mode: credential or file", id="codex-auth-mode")
-            yield Select([], prompt="Select managed profile", id="codex-profile", disabled=True)
-            yield Input(placeholder="Probe worktree", id="codex-worktree")
-            yield Input(placeholder="Codex home", id="codex-home")
-            yield Input(placeholder="Codex API key", id="codex-api-key", password=True)
-            yield Input(placeholder="Codex auth token", id="codex-auth-token", password=True)
 
     def _private_path_fields(self) -> ComposeResult:
         with Vertical(id=_STEP_IDS[SetupStep.PRIVATE_PATHS], classes="setup-step"):
@@ -465,7 +446,10 @@ class SetupWizardScreen(SetupRootScreen):
         self._mount_active = True
         self._mount_epoch += 1
         self._apply_layout(self.size.width)
-        await self._refresh_managed_profiles()
+        if SetupStep.PROFILE in self._setup_steps():
+            await self._refresh_managed_profiles()
+        else:
+            self._profile_catalog_ready = True
         if not self.is_attached:
             return
         self._populate_public_draft()
@@ -497,7 +481,7 @@ class SetupWizardScreen(SetupRootScreen):
         self._managed_profiles = profiles
         self._profile_catalog_ready = True
         options = tuple((profile, profile) for profile in profiles)
-        for widget_id in ("sandbox-profile", "codex-profile"):
+        for widget_id in ("sandbox-profile",):
             widget = self.query_one(f"#{widget_id}", Select)
             widget.set_options(options)
             widget.disabled = not profiles
@@ -506,7 +490,7 @@ class SetupWizardScreen(SetupRootScreen):
                 notice or "No managed profiles are available"
             )
 
-    @on(Select.Changed, "#sandbox-profile, #codex-profile")
+    @on(Select.Changed, "#sandbox-profile")
     def _profile_changed(self, event: Select.Changed) -> None:
         if (
             not self.is_attached
@@ -517,7 +501,7 @@ class SetupWizardScreen(SetupRootScreen):
             return
         self._syncing_profile = True
         try:
-            for widget_id in ("sandbox-profile", "codex-profile"):
+            for widget_id in ("sandbox-profile",):
                 widget = self.query_one(f"#{widget_id}", Select)
                 if widget.value != event.value:
                     widget.value = event.value
@@ -697,7 +681,7 @@ class SetupWizardScreen(SetupRootScreen):
         options = tuple((item, item) for item in profiles)
         self._syncing_profile = True
         try:
-            for widget_id in ("sandbox-profile", "codex-profile"):
+            for widget_id in ("sandbox-profile",):
                 widget = self.query_one(f"#{widget_id}", Select)
                 widget.set_options(options)
                 widget.disabled = False
@@ -724,6 +708,40 @@ class SetupWizardScreen(SetupRootScreen):
                 raise
             return "failure"
 
+    def _set_repository_form(
+        self,
+        repository: RepositoryMapping,
+        group: RepositoryGroupMapping | None = None,
+    ) -> None:
+        """Load one repository mapping into the public folder editor."""
+
+        values = {
+            "repository-key": getattr(repository, "key", ""),
+            "repository-project-id": getattr(repository, "project_id", ""),
+            "repository-iteration-id": getattr(repository, "iteration_id", ""),
+            "repository-name": getattr(repository, "repo_name", ""),
+            "repository-path": str(getattr(repository, "source_path", None) or ""),
+            "repository-url": getattr(repository, "repo_url", ""),
+            "repository-branch": getattr(repository, "base_branch", ""),
+            "repository-role": getattr(getattr(repository, "role", None), "value", ""),
+            "repository-depends-on": ",".join(getattr(repository, "depends_on", ())),
+            "repository-allowed-paths": ",".join(getattr(repository, "allowed_paths", ())),
+            "repository-lint-commands": "\n".join(getattr(repository, "lint_commands", ())),
+            "repository-build-commands": "\n".join(getattr(repository, "build_commands", ())),
+            "repository-test-commands": "\n".join(getattr(repository, "test_commands", ())),
+            "repository-group-key": getattr(group, "key", "") if group is not None else "",
+            "repository-primary": (
+                getattr(group, "primary_repository", "") if group is not None else ""
+            ),
+            "repository-integration-commands": (
+                "\n".join(getattr(group, "integration_test_commands", ()))
+                if group is not None
+                else ""
+            ),
+        }
+        for widget_id, value in values.items():
+            self.query_one(f"#{widget_id}", Input).value = str(value)
+
     def _populate_public_draft(self) -> None:
         """Render the detached public draft; credential inputs always stay blank."""
 
@@ -731,20 +749,27 @@ class SetupWizardScreen(SetupRootScreen):
         runtime = getattr(draft, "runtime", None)
         workflow = getattr(draft, "workflow", None)
         values: dict[str, str] = {}
+        selected_repository: object | None = None
+        selected_group: object | None = None
         if runtime is not None:
-            values.update(
-                {
-                    "ones-base-url": runtime.ones_base_url,
-                    "ones-team-id": runtime.ones_team_id,
-                    "ones-issue-type-id": runtime.ones_issue_type_id,
-                    "provider-host": runtime.provider_host,
-                    "provider-api-url": runtime.provider_api_url,
-                    "git-author-name": runtime.git_author_name,
-                    "git-author-email": runtime.git_author_email,
-                    "codex-auth-mode": runtime.codex_auth_mode,
-                    "codex-home": str(runtime.codex_home or ""),
-                }
-            )
+            runtime_values = {
+                "ones-base-url": runtime.ones_base_url,
+                "ones-team-id": runtime.ones_team_id,
+                "ones-issue-type-id": runtime.ones_issue_type_id,
+                "provider-host": runtime.provider_host,
+                "provider-api-url": runtime.provider_api_url,
+                "git-author-name": runtime.git_author_name,
+                "git-author-email": runtime.git_author_email,
+            }
+            if self._setup_steps() == (SetupStep.ONES, SetupStep.REVIEW):
+                for widget_id, placeholder in (
+                    ("ones-base-url", "http://localhost"),
+                    ("ones-team-id", "pending-team"),
+                    ("ones-issue-type-id", "pending-type"),
+                ):
+                    if runtime_values[widget_id] == placeholder:
+                        runtime_values[widget_id] = ""
+            values.update(runtime_values)
         if workflow is not None:
             values.update(
                 {
@@ -759,38 +784,210 @@ class SetupWizardScreen(SetupRootScreen):
                 values["provider-type"] = publishing.provider.value
                 values["repository-branch"] = publishing.default_target_branch
             repositories = tuple(workflow.repositories)
-            if repositories:
-                repository = repositories[0]
-                values.update(
-                    {
-                        "repository-key": repository.key,
-                        "repository-project-id": repository.project_id,
-                        "repository-iteration-id": repository.iteration_id,
-                        "repository-name": repository.repo_name,
-                        "repository-path": str(repository.source_path or ""),
-                        "repository-url": repository.repo_url,
-                        "repository-branch": repository.base_branch,
-                        "repository-role": repository.role.value,
-                        "repository-depends-on": ",".join(repository.depends_on),
-                        "repository-allowed-paths": ",".join(repository.allowed_paths),
-                        "repository-lint-commands": "\n".join(repository.lint_commands),
-                        "repository-build-commands": "\n".join(repository.build_commands),
-                        "repository-test-commands": "\n".join(repository.test_commands),
-                    }
-                )
             groups = tuple(workflow.repository_groups)
-            if groups:
-                values["repository-group-key"] = groups[0].key
-                values["repository-primary"] = groups[0].primary_repository
+            selected_repository = repositories[0] if repositories else None
+            selected_group = None
+            if selected_repository is None and groups and groups[0].repositories:
+                selected_group = groups[0]
+                selected_repository = groups[0].repositories[0]
         selected_profile = values.pop("sandbox-profile", "")
         if selected_profile in self._managed_profiles:
-            for widget_id in ("sandbox-profile", "codex-profile"):
+            for widget_id in ("sandbox-profile",):
                 self.query_one(f"#{widget_id}", Select).value = selected_profile
         for widget_id, value in values.items():
             self.query_one(f"#{widget_id}", Input).value = value
+        if selected_repository is not None:
+            self._set_repository_form(selected_repository, selected_group)
+        self._update_repository_list()
+
+    def _repository_entries(
+        self,
+    ) -> tuple[
+        tuple[str, str, RepositoryMapping, RepositoryGroupMapping | None], ...
+    ]:
+        draft = getattr(self.controller, "draft", None)
+        workflow = getattr(draft, "workflow", None)
+        if workflow is None:
+            return ()
+        entries: list[
+            tuple[str, str, RepositoryMapping, RepositoryGroupMapping | None]
+        ] = []
+        for repository in workflow.repositories:
+            token = f"repo:{repository.key}"
+            label = f"{repository.key} · {repository.repo_name} · {repository.role.value}"
+            entries.append((token, label, repository, None))
+        for group in workflow.repository_groups:
+            for repository in group.repositories:
+                token = f"group:{group.key}/{repository.key}"
+                label = (
+                    f"{group.key}/{repository.key} · {repository.repo_name} · "
+                    f"{repository.role.value}"
+                )
+                entries.append((token, label, repository, group))
+        return tuple(entries)
+
+    def _update_repository_list(self) -> None:
+        """Show all configured workspace folders and make them editable."""
+
+        entries = self._repository_entries()
+        labels = tuple(label for _, label, _, _ in entries)
+        text = (
+            f"Workspace folders ({len(entries)}):\n" + "\n".join(
+                f"{index}. {label}" for index, label in enumerate(labels, 1)
+            )
+            if entries
+            else "No folders added"
+        )
+        self.query_one("#repository-list", Static).update(text)
+        selector = self.query_one("#repository-folder-select", Select)
+        selector.set_options(tuple((label, token) for token, label, _, _ in entries))
+        selector.disabled = not entries
+        if not entries:
+            selector.value = Select.BLANK
 
     def on_resize(self, event: Resize) -> None:
         self._apply_layout(event.size.width)
+
+    def _selected_repository_entry(
+        self,
+    ) -> tuple[str, str, RepositoryMapping, RepositoryGroupMapping | None] | None:
+        token = self.query_one("#repository-folder-select", Select).value
+        if type(token) is not str:
+            return None
+        return next(
+            (entry for entry in self._repository_entries() if entry[0] == token),
+            None,
+        )
+
+    @on(Button.Pressed, "#load-repository-folder")
+    def _load_repository_folder(self) -> None:
+        if self.current_step is not SetupStep.REPOSITORIES or self._profile_setup_busy():
+            return
+        entry = self._selected_repository_entry()
+        if entry is None:
+            self.query_one("#setup-notice", Static).update(
+                "Select a workspace folder first"
+            )
+            return
+        self._set_repository_form(entry[2], entry[3])
+        self.query_one("#setup-notice", Static).update(
+            "Folder loaded; test connection to save edits"
+        )
+
+    @on(Button.Pressed, "#remove-repository-folder")
+    def _remove_repository_folder(self) -> None:
+        if self.current_step is not SetupStep.REPOSITORIES or self._profile_setup_busy():
+            return
+        entry = self._selected_repository_entry()
+        if entry is None:
+            self.query_one("#setup-notice", Static).update(
+                "Select a workspace folder first"
+            )
+            return
+        _, _, repository, group = entry
+        if group is not None and repository.key == group.primary_repository:
+            self.query_one("#setup-notice", Static).update(
+                "The primary folder cannot be removed"
+            )
+            return
+        draft = getattr(self.controller, "draft", None)
+        workflow = getattr(draft, "workflow", None)
+        apply_workflow = getattr(self.controller, "apply_workflow", None)
+        if workflow is None or not callable(apply_workflow):
+            self.query_one("#setup-notice", Static).update(
+                "Workspace folder input is unavailable"
+            )
+            return
+        try:
+            updated = workflow.model_copy(deep=True)
+            if group is None:
+                updated.repositories = tuple(
+                    item for item in updated.repositories if item.key != repository.key
+                )
+            else:
+                remaining = tuple(
+                    item for item in group.repositories if item.key != repository.key
+                )
+                changed_groups = tuple(
+                    item.validated_update(repositories=remaining)
+                    if item.key == group.key
+                    else item
+                    for item in updated.repository_groups
+                )
+                updated.repository_groups = tuple(
+                    item for item in changed_groups if item.repositories
+                )
+            apply_workflow(updated, changed_step=SetupStep.REPOSITORIES)
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            self.query_one("#setup-notice", Static).update(
+                "Workspace folder could not be removed"
+            )
+            return
+        self._update_repository_list()
+        self.query_one("#setup-notice", Static).update("Folder removed")
+        self._render_state()
+
+    @on(Button.Pressed, "#add-repository-folder")
+    async def _add_repository_folder(self) -> None:
+        """Commit one validated folder while keeping the setup step open."""
+
+        if self.current_step is not SetupStep.REPOSITORIES or self._supervisor.busy:
+            return
+        apply_transaction = getattr(self.controller, "apply_step_transaction", None)
+        if not callable(apply_transaction):
+            self.query_one("#setup-notice", Static).update(
+                "Workspace folder input is unavailable"
+            )
+            return
+        try:
+            fields = self._snapshot_config_fields()
+            expected_revision = getattr(self.controller, "revision", -1)
+            draft = getattr(self.controller, "draft", None)
+            saved_runtime_fields = getattr(
+                self.controller, "runtime_public_fields", MappingProxyType({})
+            )
+            transaction = await asyncio.to_thread(
+                self._build_step_transaction,
+                fields,
+                draft,
+                saved_runtime_fields,
+            )
+            apply_transaction(
+                SetupStep.REPOSITORIES,
+                transaction,
+                expected_revision=expected_revision,
+            )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            self.query_one("#setup-notice", Static).update(
+                "Workspace folder is invalid"
+            )
+            return
+        for widget_id in (
+            "repository-key",
+            "repository-name",
+            "repository-path",
+            "repository-url",
+            "repository-branch",
+            "repository-role",
+            "repository-depends-on",
+            "repository-allowed-paths",
+            "repository-lint-commands",
+            "repository-build-commands",
+            "repository-test-commands",
+            "repository-integration-commands",
+        ):
+            self.query_one(f"#{widget_id}", Input).value = ""
+        self.query_one("#setup-notice", Static).update(
+            "Folder added; add another folder or continue"
+        )
+        self._update_repository_list()
+        self._render_state()
 
     @on(Button.Pressed, "#review-imports")
     def _review_imports(self) -> None:
@@ -836,14 +1033,33 @@ class SetupWizardScreen(SetupRootScreen):
         self.add_class("one" if width < 80 else "two" if width < 110 else "three")
 
     def _controller_step(self) -> SetupStep:
-        step = getattr(self.controller, "current_step", SetupStep.PROFILE)
-        return step if type(step) is SetupStep else SetupStep.PROFILE
+        steps = self._setup_steps()
+        step = getattr(self.controller, "current_step", steps[0])
+        return step if type(step) is SetupStep and step in steps else steps[0]
+
+    def _setup_steps(self) -> tuple[SetupStep, ...]:
+        steps = getattr(self.controller, "STEPS", TUI_SETUP_STEPS)
+        if (
+            type(steps) is tuple
+            and steps
+            and steps[-1] is SetupStep.REVIEW
+            and all(type(step) is SetupStep for step in steps)
+        ):
+            return steps
+        return TUI_SETUP_STEPS
 
     def _state(self) -> object:
         return getattr(self.controller, "state", object())
 
     def _profile_setup_busy(self) -> bool:
         return self._profile_modal_token is not None or self._profile_task is not None
+
+    def _mvp_mode(self) -> bool:
+        return self._setup_steps() == (SetupStep.ONES, SetupStep.REVIEW)
+
+    def _setup_action_busy(self) -> bool:
+        task = self._test_task
+        return self._profile_setup_busy() or task is not None and not task.done()
 
     def _apply_profile_busy_state(self) -> None:
         if self._profile_setup_busy():
@@ -857,18 +1073,27 @@ class SetupWizardScreen(SetupRootScreen):
         for widget_id in (
             "create-workspace-profile",
             "review-imports",
+            "add-repository-folder",
+            "load-repository-folder",
+            "remove-repository-folder",
             "confirm-review",
             "activate-runtime",
+            "save-mvp-runtime",
             "cancel-setup",
         ):
             self.query_one(f"#{widget_id}", Button).disabled = False
-        for widget_id in ("sandbox-profile", "codex-profile"):
+        for widget_id in ("sandbox-profile",):
             self.query_one(f"#{widget_id}", Select).disabled = not bool(
                 self._managed_profiles
             )
+        self.query_one("#repository-folder-select", Select).disabled = not bool(
+            self._repository_entries()
+        )
 
     def _render_state(self) -> None:
-        view = build_setup_step_view(self._state(), self.current_step)
+        steps = self._setup_steps()
+        view = build_setup_step_view(self._state(), self.current_step, steps=steps)
+        mvp_mode = self._mvp_mode()
         for step, container_id in _STEP_IDS.items():
             self.query_one(f"#{container_id}").display = step is self.current_step
         self.query_one("#setup-status", Static).update(
@@ -877,22 +1102,34 @@ class SetupWizardScreen(SetupRootScreen):
         self.query_one("#setup-summary-text", Static).update(" 路 ".join(view.summary))
         self.query_one("#test-connection", Button).disabled = not view.can_test
         self.query_one("#next-step", Button).disabled = not view.can_continue
-        self.query_one("#back-step", Button).disabled = self.current_step is tuple(SetupStep)[0]
+        self.query_one("#back-step", Button).disabled = self.current_step is steps[0]
         self.query_one("#review-setup", Button).disabled = not all(
-            build_setup_step_view(self._state(), step).can_continue
-            for step in tuple(SetupStep)[:-1]
+            build_setup_step_view(self._state(), step, steps=steps).can_continue
+            for step in steps[:-1]
         )
-        if self.current_step in {SetupStep.PROFILE, SetupStep.CODEX} and not self._selected_profile():
+        if self.current_step is SetupStep.PROFILE and not self._selected_profile():
             self.query_one("#test-connection", Button).disabled = True
             self.query_one("#next-step", Button).disabled = True
         self._apply_profile_busy_state()
+        save_button = self.query_one("#save-mvp-runtime", Button)
+        save_button.display = mvp_mode
+        save_button.disabled = not view.can_test or self._setup_action_busy()
+        for widget_id in (
+            "back-step",
+            "test-connection",
+            "next-step",
+            "review-setup",
+        ):
+            self.query_one(f"#{widget_id}", Button).display = not mvp_mode
+        review_nav = self.query_one("#nav-review", Button)
+        review_nav.display = not mvp_mode
 
     def _selected_profile(self) -> str:
         if not self._profile_catalog_ready:
             return ""
         selected = {
             value
-            for widget_id in ("sandbox-profile", "codex-profile")
+            for widget_id in ("sandbox-profile",)
             if type(
                 value := self.query_one(f"#{widget_id}", Select).value
             ) is str
@@ -903,7 +1140,7 @@ class SetupWizardScreen(SetupRootScreen):
         value = selected.pop()
         self._syncing_profile = True
         try:
-            for widget_id in ("sandbox-profile", "codex-profile"):
+            for widget_id in ("sandbox-profile",):
                 widget = self.query_one(f"#{widget_id}", Select)
                 if type(widget.value) is not str:
                     widget.value = value
@@ -912,7 +1149,7 @@ class SetupWizardScreen(SetupRootScreen):
         return value
 
     def _field_value(self, field_name: str) -> str:
-        if field_name in {"sandbox-profile", "codex-profile"}:
+        if field_name == "sandbox-profile":
             return self._selected_profile()
         return self.query_one(f"#{field_name}", Input).value
 
@@ -926,12 +1163,11 @@ class SetupWizardScreen(SetupRootScreen):
     def _snapshot_config_fields(self) -> Mapping[str, str]:
         """Copy only the public fields owned by the current setup step."""
 
-        return MappingProxyType(
-            {
-                field_name: self._field_value(field_name)
-                for field_name in _CONFIG_FIELDS[self.current_step]
-            }
-        )
+        fields = {
+            field_name: self._field_value(field_name)
+            for field_name in _CONFIG_FIELDS[self.current_step]
+        }
+        return MappingProxyType(fields)
 
     def _take_step_secrets(self) -> list[list[object]]:
         values: list[list[object]] = []
@@ -984,18 +1220,6 @@ class SetupWizardScreen(SetupRootScreen):
                         "git_author_name": fields["git-author-name"],
                         "git_author_email": fields["git-author-email"],
                         "provider": fields["provider-type"],
-                    }
-                ),
-            )
-        elif self.current_step is SetupStep.CODEX and callable(
-            apply_runtime_fields
-        ):
-            apply_runtime_fields(
-                SetupStep.CODEX,
-                MappingProxyType(
-                    {
-                        "codex_auth_mode": fields["codex-auth-mode"],
-                        "codex_home": fields["codex-home"],
                     }
                 ),
             )
@@ -1097,28 +1321,6 @@ class SetupWizardScreen(SetupRootScreen):
             workflow.worktree_root = Path(fields["worktree-root"])
             apply_workflow(workflow, changed_step=SetupStep.PRIVATE_PATHS)
             return
-        if self.current_step is not SetupStep.CODEX:
-            return
-        apply_runtime = getattr(self.controller, "apply_runtime", None)
-        if not callable(apply_runtime):
-            raise RuntimeError("runtime input is unavailable")
-        codex_home = fields["codex-home"]
-        runtime = RuntimePublicConfig(
-            ones_base_url=saved_runtime_fields["ones_base_url"],
-            ones_team_id=saved_runtime_fields["ones_team_id"],
-            ones_issue_type_id=saved_runtime_fields["ones_issue_type_id"],
-            ones_comment_list_path_template=(
-                DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
-            ),
-            provider_host=saved_runtime_fields["provider_host"],
-            provider_api_url=saved_runtime_fields["provider_api_url"],
-            git_author_name=saved_runtime_fields["git_author_name"],
-            git_author_email=saved_runtime_fields["git_author_email"],
-            codex_auth_mode=fields["codex-auth-mode"],
-            codex_home=Path(codex_home) if codex_home else None,
-        )
-        apply_runtime(runtime, changed_step=SetupStep.CODEX)
-
     def _build_step_transaction(
         self,
         fields: Mapping[str, str],
@@ -1141,7 +1343,7 @@ class SetupWizardScreen(SetupRootScreen):
                         "ones_team_id": fields["ones-team-id"],
                         "ones_issue_type_id": fields["ones-issue-type-id"],
                     }
-                )
+                ),
             )
         if self.current_step is SetupStep.REPOSITORIES:
             repository = build_repository(
@@ -1219,24 +1421,6 @@ class SetupWizardScreen(SetupRootScreen):
                         "provider": fields["provider-type"],
                     }
                 ),
-            )
-        if self.current_step is SetupStep.CODEX:
-            codex_home = fields["codex-home"]
-            return SetupStepTransaction(
-                runtime=RuntimePublicConfig(
-                    ones_base_url=saved_runtime_fields["ones_base_url"],
-                    ones_team_id=saved_runtime_fields["ones_team_id"],
-                    ones_issue_type_id=saved_runtime_fields["ones_issue_type_id"],
-                    ones_comment_list_path_template=(
-                        DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE
-                    ),
-                    provider_host=saved_runtime_fields["provider_host"],
-                    provider_api_url=saved_runtime_fields["provider_api_url"],
-                    git_author_name=saved_runtime_fields["git_author_name"],
-                    git_author_email=saved_runtime_fields["git_author_email"],
-                    codex_auth_mode=fields["codex-auth-mode"],
-                    codex_home=Path(codex_home) if codex_home else None,
-                )
             )
         if self.current_step is SetupStep.PRIVATE_PATHS:
             workflow.run_root = Path(fields["run-root"])
@@ -1333,6 +1517,73 @@ class SetupWizardScreen(SetupRootScreen):
 
         task.add_done_callback(completed)
 
+    def _start_mvp_save(self) -> None:
+        if not self._mvp_mode() or self._setup_action_busy():
+            return
+        task = asyncio.create_task(
+            self.action_save_mvp_runtime(), name="tui-mvp-save-action"
+        )
+        self._test_task = task
+
+        def completed(done: asyncio.Task[None]) -> None:
+            if self._test_task is done:
+                self._test_task = None
+            if not done.cancelled():
+                try:
+                    done.exception()
+                except BaseException:
+                    pass
+            if self.is_attached:
+                self._render_state()
+
+        task.add_done_callback(completed)
+
+    async def action_save_mvp_runtime(self) -> None:
+        """Validate, persist, activate, and hand off the MVP in one action."""
+
+        if not self._mvp_mode() or self.current_step is not SetupStep.ONES:
+            return
+        self.query_one("#setup-notice", Static).update(
+            "Saving configuration and starting Dashboard"
+        )
+        await self.action_test_connection()
+        result_for = getattr(self.controller, "result_for", None)
+        try:
+            result = result_for(SetupStep.ONES) if callable(result_for) else None
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            result = None
+        if getattr(result, "status", None) is not ValidationStatus.PASSED:
+            return
+        confirm = getattr(self.controller, "confirm_review", None)
+        callback = self._activation_callback
+        if not callable(confirm) or callback is None:
+            self.query_one("#setup-notice", Static).update(
+                "Configuration activation is unavailable"
+            )
+            return
+        try:
+            confirm()
+            handle = await callback()
+        except asyncio.CancelledError:
+            raise
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            handle = None
+        if handle is not None and self.is_attached:
+            self.complete(handle)
+            return
+        if self.is_attached:
+            category = getattr(self.controller, "activation_error", None)
+            fixed = {
+                "configuration save failed": "Configuration could not be saved",
+                "runtime validation failed": "Runtime could not be started",
+                "configuration changed": "Configuration changed; please save again",
+            }.get(category, "Runtime activation failed safely")
+            self.query_one("#setup-notice", Static).update(fixed)
+
     def action_start_test_connection(self) -> None:
         """Binding entry point: schedule work without occupying the message pump."""
 
@@ -1355,7 +1606,7 @@ class SetupWizardScreen(SetupRootScreen):
             return
         button = self.query_one("#test-connection", Button)
         profile_ready = (
-            self.current_step in {SetupStep.PROFILE, SetupStep.CODEX}
+            self.current_step is SetupStep.PROFILE
             and bool(self._selected_profile())
         )
         if button.disabled and not profile_ready:
@@ -1392,6 +1643,8 @@ class SetupWizardScreen(SetupRootScreen):
                 public_fields,
                 saved_runtime_fields,
             )
+            if self.current_step is SetupStep.REPOSITORIES and self.is_attached:
+                self._update_repository_list()
             if generation != self._generation or not self.is_attached:
                 raise asyncio.CancelledError
             return await self.controller.test_step(self.current_step, fields)
@@ -1405,9 +1658,21 @@ class SetupWizardScreen(SetupRootScreen):
             if isinstance(error, (KeyboardInterrupt, SystemExit)):
                 raise
             if generation == self._generation and self.is_attached:
-                self.query_one("#setup-notice", Static).update(
-                    "Connection test failed safely"
-                )
+                notice = "Connection test failed safely"
+                result_for = getattr(self.controller, "result_for", None)
+                if callable(result_for):
+                    try:
+                        failed_result = result_for(self.current_step)
+                        category = getattr(failed_result, "category", "")
+                        if getattr(failed_result, "status", None) in {
+                            ValidationStatus.FAILED,
+                            ValidationStatus.NOT_CONFIGURED,
+                        }:
+                            notice = _RESULT_TEXT.get(category, notice)
+                    except BaseException as lookup_error:
+                        if isinstance(lookup_error, (KeyboardInterrupt, SystemExit)):
+                            raise
+                self.query_one("#setup-notice", Static).update(notice)
             return
         finally:
             self._clear_inputs()
@@ -1454,6 +1719,10 @@ class SetupWizardScreen(SetupRootScreen):
             return
         self._start_test_connection()
 
+    @on(Button.Pressed, "#save-mvp-runtime")
+    def _pressed_save_mvp(self) -> None:
+        self._start_mvp_save()
+
     @on(Button.Pressed, ".setup-nav-button")
     def _pressed_navigation(self, event: Button.Pressed) -> None:
         if self._profile_setup_busy():
@@ -1462,7 +1731,7 @@ class SetupWizardScreen(SetupRootScreen):
         requested = next(
             (
                 step
-                for step in SetupStep
+                for step in self._setup_steps()
                 if button_id == f"nav-{step.value.replace('_', '-')}"
             ),
             None,
@@ -1471,11 +1740,15 @@ class SetupWizardScreen(SetupRootScreen):
             return
         if requested is SetupStep.REVIEW:
             allowed = all(
-                build_setup_step_view(self._state(), step).can_continue
-                for step in tuple(SetupStep)[:-1]
+                build_setup_step_view(
+                    self._state(), step, steps=self._setup_steps()
+                ).can_continue
+                for step in self._setup_steps()[:-1]
             )
         else:
-            allowed = build_setup_step_view(self._state(), requested).can_test
+            allowed = build_setup_step_view(
+                self._state(), requested, steps=self._setup_steps()
+            ).can_test
         if not allowed:
             self.query_one("#setup-notice", Static).update("Step is not available")
             return
@@ -1488,10 +1761,12 @@ class SetupWizardScreen(SetupRootScreen):
     def _pressed_next(self) -> None:
         if self._profile_setup_busy():
             return
-        view = build_setup_step_view(self._state(), self.current_step)
+        view = build_setup_step_view(
+            self._state(), self.current_step, steps=self._setup_steps()
+        )
         if not view.can_continue:
             return
-        order = tuple(SetupStep)
+        order = self._setup_steps()
         index = order.index(self.current_step)
         if index < len(order) - 1:
             self._leave_step()
@@ -1503,7 +1778,7 @@ class SetupWizardScreen(SetupRootScreen):
     def _pressed_back(self) -> None:
         if self._profile_setup_busy():
             return
-        order = tuple(SetupStep)
+        order = self._setup_steps()
         index = order.index(self.current_step)
         if index > 0:
             self._leave_step()

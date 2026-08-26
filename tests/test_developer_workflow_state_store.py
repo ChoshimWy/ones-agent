@@ -10,7 +10,18 @@ from pathlib import Path
 
 import pytest
 
-from src.developer_workflow.contracts import PublicationResult, StateEvent, WorkflowRun, WorkflowState, utc_now
+from src.developer_workflow.contracts import (
+    CodexResult,
+    DefectAction,
+    DefectCheckpoint,
+    PublicationResult,
+    RootCauseEvidence,
+    RootCauseSupportingPoint,
+    StateEvent,
+    WorkflowRun,
+    WorkflowState,
+    utc_now,
+)
 from src.developer_workflow.state_store import (
     ConcurrentRunUpdateError,
     FileRunStore,
@@ -77,6 +88,136 @@ def test_create_load_round_trip_and_utc_version(tmp_path: Path) -> None:
     assert loaded.updated_at.tzinfo is not None
     assert loaded.updated_at.utcoffset() == UTC.utcoffset(loaded.updated_at)
     assert json.loads((tmp_path / created.run_id / "run.json").read_text("utf-8"))["run_id"] == created.run_id
+
+
+def test_delete_removes_task_record_and_private_run_data(tmp_path: Path) -> None:
+    store = FileRunStore(tmp_path)
+    created = store.create(new_run())
+    run_dir = tmp_path / created.run_id
+    (run_dir / "codex-activity.jsonl").write_text("activity", encoding="utf-8")
+
+    store.delete(created.run_id)
+
+    assert created.run_id not in store.list_run_ids()
+    assert not run_dir.exists()
+    with pytest.raises(RunNotFoundError):
+        store.load(created.run_id, read_only=True)
+
+
+def test_delete_rejects_missing_or_unsafe_task_id(tmp_path: Path) -> None:
+    store = FileRunStore(tmp_path)
+
+    with pytest.raises(RunNotFoundError):
+        store.delete("a" * 32)
+    with pytest.raises(UnsafeRunPathError):
+        store.delete("../escape")
+
+
+def test_read_only_defect_analysis_may_complete_without_publication(tmp_path: Path) -> None:
+    store = FileRunStore(tmp_path)
+    run = WorkflowRun.new_defect("project", "iteration", "user", "defect").validated_update(
+        run_id="b" * 32,
+        defect_action=DefectAction.ANALYZE,
+    )
+    run = store.create(run)
+    with pytest.raises(InvalidRunMutationError, match="defect_action"):
+        store.save(
+            run.validated_update(
+                defect_action=DefectAction.ANALYZE_AND_REPAIR
+            ),
+            expected_version=run.version,
+        )
+    for target in (
+        WorkflowState.READING_ONES,
+        WorkflowState.VALIDATING,
+        WorkflowState.PREPARING_REPO,
+        WorkflowState.IMPLEMENTING,
+    ):
+        run = store.transition(run.run_id, run.version, target, "analysis setup")
+    evidence = RootCauseEvidence(
+        file_path="src/view.py",
+        location="render symbol",
+        symbol="render",
+        mechanism="Null state is dereferenced before the guard.",
+        code_excerpt="return state.value",
+        reproduction_test="tests/test_view.py",
+        test_selector="tests/test_view.py::test_null_state",
+        reproduction_command="pytest tests/test_view.py::test_null_state",
+        confidence=0.9,
+        insufficient_evidence=False,
+        impacted_files=("src/view.py",),
+        fix_steps=("Guard null state before dereferencing it.",),
+        supporting_points=(
+            RootCauseSupportingPoint(
+                kind="code",
+                description="The dereference is observable in the repository.",
+                source="repository",
+                file_path="src/view.py",
+                snippet="return state.value",
+                direct_root_cause=True,
+            ),
+        ),
+    )
+    run = store.save(
+        run.validated_update(
+            defect_checkpoint=DefectCheckpoint.ROOT_VERIFIED,
+            root_cause_evidence=(evidence,),
+            codex_results=(
+                CodexResult(
+                    summary="root cause",
+                    root_cause_evidence=(evidence,),
+                    unrelated_changes_checked=True,
+                ),
+            ),
+        ),
+        expected_version=run.version,
+    )
+
+    completed = store.transition(
+        run.run_id,
+        run.version,
+        WorkflowState.COMPLETED,
+        "complete read-only defect analysis",
+    )
+
+    assert completed.state is WorkflowState.COMPLETED
+    assert store.load(completed.run_id) == completed
+
+    regenerated = store.decide_completed_analysis(
+        completed.run_id,
+        completed.version,
+        accept=False,
+    )
+    assert regenerated.state is WorkflowState.IMPLEMENTING
+    assert regenerated.analysis_generation == 1
+    assert regenerated.previous_analysis_results == completed.codex_results
+    assert regenerated.codex_results == ()
+    assert regenerated.root_cause_evidence == ()
+
+    regenerated = store.save(
+        regenerated.validated_update(
+            defect_checkpoint=DefectCheckpoint.ROOT_VERIFIED,
+            root_cause_evidence=(evidence,),
+            codex_results=completed.codex_results,
+        ),
+        expected_version=regenerated.version,
+    )
+    regenerated = store.transition(
+        regenerated.run_id,
+        regenerated.version,
+        WorkflowState.COMPLETED,
+        "complete regenerated read-only defect analysis",
+    )
+    accepted = store.decide_completed_analysis(
+        regenerated.run_id,
+        regenerated.version,
+        accept=True,
+    )
+    assert accepted.state is WorkflowState.IMPLEMENTING
+    assert accepted.defect_action is DefectAction.ANALYZE_AND_REPAIR
+    assert accepted.analysis_solution_accepted is True
+    assert accepted.root_cause_evidence == (evidence,)
+    assert store.load(accepted.run_id) == accepted
 
 
 def test_create_rejects_wrong_initial_state_or_version(tmp_path: Path) -> None:

@@ -1091,22 +1091,6 @@ async def test_ui_mapping_snapshot_is_converted_to_strict_ones_probe(
 
 
 @pytest.mark.asyncio
-async def test_first_runtime_materialization_at_codex_preserves_prior_probes(
-    tmp_path: Path,
-) -> None:
-    controller, _, _, _ = _controller(tmp_path)
-    await controller.test_step(SetupStep.PROFILE)
-    await controller.test_step(SetupStep.ONES, object())
-    await controller.test_step(SetupStep.REPOSITORIES, object())
-    await controller.test_step(SetupStep.PROVIDER, object())
-    controller._draft.runtime = None
-    controller.apply_runtime(_runtime(), changed_step=SetupStep.CODEX)
-    assert controller.result_for(SetupStep.ONES).status is ValidationStatus.PASSED
-    assert controller.result_for(SetupStep.PROVIDER).status is ValidationStatus.PASSED
-    assert controller.current_step is SetupStep.CODEX
-
-
-@pytest.mark.asyncio
 async def test_controller_reaches_review_with_ui_shaped_allowlist_probes(
     tmp_path: Path,
 ) -> None:
@@ -1419,23 +1403,6 @@ def test_first_codex_materialization_rejects_missing_validated_fragments(
         )
 
 
-def test_codex_materialization_preserves_validated_legacy_runtime_prefix(
-    tmp_path: Path,
-) -> None:
-    from src.developer_workflow.setup_controller import SetupStepTransaction
-
-    controller, _, _, _ = _controller(tmp_path)
-    previous = controller.draft.runtime
-    assert previous is not None
-    changed = previous.validated_update(codex_auth_mode="file", codex_home=tmp_path)
-    controller.apply_step_transaction(
-        SetupStep.CODEX,
-        SetupStepTransaction(runtime=changed),
-        expected_revision=controller.revision,
-    )
-    assert controller.draft.runtime == changed
-
-
 def test_step_transaction_invalidates_from_actual_earliest_workflow_diff(
     tmp_path: Path,
 ) -> None:
@@ -1497,36 +1464,13 @@ async def test_complete_setup_candidate_retains_all_accepted_credentials(
 ) -> None:
     controller, _, builder, _ = _controller(tmp_path)
     controller.set_secret(SecretKind.ONES_EMAIL, "agent@example.test")
-    controller.set_secret(SecretKind.CODEX_API_KEY, "EXPLICIT-CODEX-KEY")
     await _pass_all(controller)
     await controller.save_and_activate(confirmed=True)
     assert set(builder.calls[0][0].credential_kinds) == {
         SecretKind.ONES_EMAIL,
         SecretKind.ONES_PASSWORD,
         SecretKind.PROVIDER_TOKEN,
-        SecretKind.CODEX_API_KEY,
     }
-
-
-@pytest.mark.asyncio
-async def test_codex_probe_cannot_be_passed_by_ambient_auth(
-    tmp_path: Path,
-) -> None:
-    from src.developer_workflow.runtime_bootstrap import RuntimeBootstrapper
-
-    controller, _, _, bootstrap = _controller(tmp_path)
-    for step in SetupController.STEPS[:4]:
-        await controller.test_step(step, object())
-    controller._runtime_builder = RuntimeBootstrapper(
-        ambient_environment=lambda: {"CODEX_API_KEY": "AMBIENT-MUST-NOT-WIN"}
-    )
-    result = await controller.test_step(SetupStep.CODEX, object())
-    assert result.status is ValidationStatus.FAILED
-
-    controller.set_secret(SecretKind.CODEX_API_KEY, "EXPLICIT-CODEX-KEY")
-    result = await controller.test_step(SetupStep.CODEX, object())
-    assert result.status is ValidationStatus.PASSED
-    assert bootstrap.validator.codex_auth_metadata is None
 
 
 def test_cancel_clears_transient_secrets(tmp_path: Path) -> None:
@@ -1913,8 +1857,7 @@ async def test_workflow_diff_cannot_be_hidden_by_later_changed_step(
 
     controller.apply_workflow(changed, changed_step=SetupStep.PRIVATE_PATHS)
 
-    assert controller.current_step is SetupStep.CODEX
-    assert controller.result_for(SetupStep.CODEX).status is ValidationStatus.NOT_CONFIGURED
+    assert controller.current_step is SetupStep.PRIVATE_PATHS
 
 
 class BlockingMutationBuilder(FakeRuntimeBuilder):

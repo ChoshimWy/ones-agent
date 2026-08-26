@@ -18,7 +18,7 @@ from .contracts import (
 from .repository import (
     RepositoryBoundaryError,
     WorktreeRepository,
-    build_branch_name,
+    build_run_branch_name,
 )
 
 
@@ -38,6 +38,7 @@ def repository_branch(
     work_item_id: str,
     title: str,
     repository_key: str,
+    run_id: str,
 ) -> str:
     """Return one stable, bounded branch name per repository."""
 
@@ -46,14 +47,14 @@ def repository_branch(
         for character in repository_key
     ):
         raise RepositoryGroupError("repository key is unsafe for branch construction")
-    suffix = f"-{repository_key}"
-    base = build_branch_name(workflow_type, work_item_id, title)
-    base = base[: 120 - len(suffix)].rstrip("-.")
-    if not base or base.endswith("/"):
-        raise RepositoryGroupError("repository branch could not be constructed safely")
-    branch = f"{base}{suffix}"
     try:
-        return validate_git_ref_name(branch)
+        return build_run_branch_name(
+            workflow_type,
+            work_item_id,
+            title,
+            run_id,
+            repository_key=repository_key,
+        )
     except ValueError:
         raise RepositoryGroupError("repository branch could not be constructed safely") from None
 
@@ -74,7 +75,9 @@ class RepositoryGroupWorkspace:
         prepared: list[PreparedRepository] = []
         for key in group.topological_keys():
             mapping = mappings[key]
-            branch = repository_branch(workflow_type, work_item_id, title, key)
+            branch = repository_branch(
+                workflow_type, work_item_id, title, key, run_id
+            )
             worktree = self.repository.recover(
                 run_id, mapping, branch, repository_key=key
             )

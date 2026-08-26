@@ -136,6 +136,13 @@ class DefectCheckpoint(str, Enum):
     FINAL_TESTED = "FINAL_TESTED"
 
 
+class DefectAction(str, Enum):
+    """User-selected scope for one defect workflow."""
+
+    ANALYZE = "analyze"
+    ANALYZE_AND_REPAIR = "analyze_and_repair"
+
+
 class CommandOutcome(str, Enum):
     PASSED = "passed"
     TEST_FAILED = "test_failed"
@@ -1154,6 +1161,10 @@ class WorkflowRun(WorkflowModel):
     pre_fix_test_results: tuple[CommandResult, ...] = Field(default_factory=tuple)
     reproduction_test_sha256: str = ""
     defect_checkpoint: DefectCheckpoint = DefectCheckpoint.NONE
+    defect_action: DefectAction = DefectAction.ANALYZE_AND_REPAIR
+    analysis_generation: StrictInt = 0
+    analysis_solution_accepted: StrictBool = False
+    previous_analysis_results: tuple[CodexResult, ...] = Field(default_factory=tuple)
     root_cause_evidence: tuple[RootCauseEvidence, ...] = Field(default_factory=tuple)
     investigation_suggestions: tuple[str, ...] = Field(default_factory=tuple)
     defect_preflight: CodexResult | None = None
@@ -1183,6 +1194,10 @@ class WorkflowRun(WorkflowModel):
 
     @model_validator(mode="after")
     def validate_single_selected_defect(self) -> WorkflowRun:
+        if self.analysis_generation < 0:
+            raise ValueError("analysis_generation must not be negative")
+        if self.analysis_solution_accepted and self.type is not WorkflowType.DEFECT:
+            raise ValueError("only defect analysis can accept a solution")
         if self.repository_model_version not in {1, 2}:
             raise ValueError("repository_model_version is unsupported")
         if self.repository_group is None:
@@ -1326,6 +1341,7 @@ __all__ = [
     "CommandOutcome",
     "DefectRecord",
     "DefectCandidate",
+    "DefectAction",
     "DefectCheckpoint",
     "PublicationResult",
     "RepositoryPublicationResult",

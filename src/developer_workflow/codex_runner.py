@@ -14,6 +14,7 @@ import stat
 import subprocess
 import threading
 import time
+import unicodedata
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -68,6 +69,10 @@ class CodexTimeoutError(CodexExecutionError):
 
 class CodexOutputError(CodexRunnerError):
     """Codex returned invalid or unsafe structured output."""
+
+    def __init__(self, message: str, *, validation_hint: str = "") -> None:
+        super().__init__(message)
+        self.validation_hint = validation_hint
 
 
 _COMMAND_ATTESTATION_NONCE = object()
@@ -284,6 +289,94 @@ _SECRET_ENV_TOKENS = (
     "api_key", "apikey", "private_key", "access_key", "askpass",
     "connection_string", "dsn",
 )
+_ACTIVITY_FILE = "codex-activity.jsonl"
+_MAX_ACTIVITY_BYTES = 512 * 1024
+_SENSITIVE_COMMAND_VALUE = re.compile(
+    r"(?i)\b(token|password|secret|api[_-]?key|authorization)"
+    r"(\s*[:=]\s*|\s+)\S+"
+)
+_BEARER_VALUE = re.compile(r"(?i)\bbearer\s+\S+")
+
+_PAYLOAD_DEFAULTS: dict[str, object] = {
+    "changed_files": (), "repository_changes": (), "commands": (),
+    "evidence": (), "review_findings": (), "risks": (),
+    "unresolved_items": (), "acceptance_coverage": (),
+    "unrelated_changes_checked": False, "root_cause_evidence": (),
+    "investigation_suggestions": (), "behavior_before": "",
+    "behavior_after": "", "impact_scope": (), "risk_level": "",
+}
+_ROOT_EVIDENCE_DEFAULTS: dict[str, object] = {
+    "repository_file": None, "start_line": None, "end_line": None,
+    "symbol": "", "code_excerpt": "", "call_chain": (),
+    "reproduction_file": None, "impacted_repository_files": (),
+}
+_SUPPORT_POINT_DEFAULTS: dict[str, object] = {
+    "file_path": "", "repository_file": None, "snippet": "",
+    "start_line": None, "end_line": None, "direct_root_cause": False,
+}
+
+
+def _fresh_json_default(value: object) -> object:
+    return list(value) if isinstance(value, tuple) else value
+
+
+def _normalize_structural_defaults(payload: object) -> object:
+    """Fill only contract defaults; never fabricate substantive evidence."""
+
+    if type(payload) is not dict:
+        return payload
+    for key, value in _PAYLOAD_DEFAULTS.items():
+        payload.setdefault(key, _fresh_json_default(value))
+    evidence_items = payload.get("root_cause_evidence")
+    if type(evidence_items) is list:
+        for evidence in evidence_items:
+            if type(evidence) is not dict:
+                continue
+            for key, value in _ROOT_EVIDENCE_DEFAULTS.items():
+                evidence.setdefault(key, _fresh_json_default(value))
+            supporting = evidence.get("supporting_points")
+            if type(supporting) is list:
+                for point in supporting:
+                    if type(point) is not dict:
+                        continue
+                    for key, value in _SUPPORT_POINT_DEFAULTS.items():
+                        point.setdefault(key, _fresh_json_default(value))
+    return payload
+
+
+def _safe_validation_hint(error: BaseException) -> str:
+    """Return a bounded field path and validator type, never rejected values."""
+
+    absolute_path = getattr(error, "absolute_path", None)
+    validator = getattr(error, "validator", None)
+    if absolute_path is not None and type(validator) is str:
+        segments = tuple(str(item) for item in absolute_path)
+        if all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", item) for item in segments):
+            path = ".".join(segments) or "$"
+            rule = validator if re.fullmatch(r"[A-Za-z_]{1,32}", validator) else "schema"
+            return f"{path} ({rule})"
+    errors_method = getattr(error, "errors", None)
+    if callable(errors_method):
+        try:
+            errors = errors_method(include_url=False)
+        except (TypeError, ValueError):
+            errors = ()
+        if type(errors) is list and errors and type(errors[0]) is dict:
+            location = errors[0].get("loc", ())
+            error_type = errors[0].get("type", "validation")
+            if type(location) is tuple and all(
+                re.fullmatch(r"[A-Za-z0-9_-]{1,64}", str(item))
+                for item in location
+            ):
+                path = ".".join(str(item) for item in location) or "$"
+                rule = (
+                    error_type
+                    if type(error_type) is str
+                    and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", error_type)
+                    else "validation"
+                )
+                return f"{path} ({rule})"
+    return "workflow result contract"
 
 
 def _is_positive_finite_number(value: Any) -> bool:
@@ -293,6 +386,164 @@ def _is_positive_finite_number(value: Any) -> bool:
         return math.isfinite(value) and value > 0
     except (OverflowError, TypeError, ValueError):
         return False
+
+
+def _safe_command_activity(
+    command: object, secrets_to_remove: tuple[str, ...]
+) -> str:
+    if type(command) is not str:
+        return "repository command"
+    value = " ".join(command.split())
+    for secret in secrets_to_remove:
+        if secret:
+            value = value.replace(secret, "[redacted]")
+    value = _SENSITIVE_COMMAND_VALUE.sub(r"\1=[redacted]", value)
+    value = _BEARER_VALUE.sub("Bearer [redacted]", value)
+    if not value or any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        for character in value
+    ):
+        return "repository command"
+    return value[:240] + ("..." if len(value) > 240 else "")
+
+
+def _safe_agent_activity(
+    text: object, secrets_to_remove: tuple[str, ...]
+) -> str:
+    """Return a bounded public agent update, never private reasoning text."""
+
+    if type(text) is not str:
+        return "AI produced an analysis update"
+    value = text
+    try:
+        structured = json.loads(value)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        structured = None
+    if type(structured) is dict and type(structured.get("summary")) is str:
+        value = f"Analysis result: {structured['summary']}"
+    else:
+        value = f"AI update: {value}"
+    value = " ".join(value.split())
+    for secret in secrets_to_remove:
+        if secret:
+            value = value.replace(secret, "[redacted]")
+    value = _SENSITIVE_COMMAND_VALUE.sub(r"\1=[redacted]", value)
+    value = _BEARER_VALUE.sub("Bearer [redacted]", value)
+    if not value or any(
+        unicodedata.category(character) in {"Cc", "Cf", "Cs", "Zl", "Zp"}
+        for character in value
+    ):
+        return "AI produced an analysis update"
+    return value[:480] + ("..." if len(value) > 480 else "")
+
+
+def _codex_activity_from_event(
+    line: str, secrets_to_remove: tuple[str, ...]
+) -> tuple[str, str] | None:
+    """Map Codex JSONL to an auditable event without exposing reasoning text."""
+
+    try:
+        event = json.loads(line)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if type(event) is not dict or type(event.get("type")) is not str:
+        return None
+    event_type = event["type"]
+    if event_type == "thread.started":
+        return "session", "Codex session started"
+    if event_type == "turn.started":
+        return "analysis", "AI analysis started"
+    if event_type == "turn.completed":
+        usage = event.get("usage")
+        if type(usage) is dict and type(usage.get("output_tokens")) is int:
+            return (
+                "analysis",
+                f"AI analysis completed ({usage['output_tokens']} output tokens)",
+            )
+        return "analysis", "AI analysis completed"
+    if event_type == "turn.failed":
+        return "error", "AI analysis failed safely"
+    if event_type == "error":
+        return "error", "Codex reported an execution error"
+    if event_type not in {"item.started", "item.updated", "item.completed"}:
+        return None
+    item = event.get("item")
+    if type(item) is not dict or type(item.get("type")) is not str:
+        return None
+    item_type = item["type"]
+    completed = event_type == "item.completed"
+    if item_type == "command_execution":
+        command = _safe_command_activity(item.get("command"), secrets_to_remove)
+        if completed:
+            exit_code = item.get("exit_code")
+            suffix = f" (exit {exit_code})" if type(exit_code) is int else ""
+            return "command", f"Command completed: {command}{suffix}"
+        if event_type == "item.started":
+            return "command", f"Running: {command}"
+        return None
+    if item_type == "file_change":
+        return (
+            "file",
+            "Repository file changes recorded"
+            if completed
+            else "Reviewing repository file changes",
+        )
+    if item_type == "mcp_tool_call":
+        tool = item.get("tool") or item.get("name")
+        label = (
+            tool
+            if type(tool) is str
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", tool)
+            else "external tool"
+        )
+        return (
+            "tool",
+            f"Tool completed: {label}"
+            if completed
+            else f"Calling tool: {label}",
+        )
+    if item_type == "web_search":
+        return (
+            "search",
+            "Web search completed"
+            if completed
+            else "Searching supporting documentation",
+        )
+    if item_type in {"todo_list", "plan", "plan_update"}:
+        return "plan", "Analysis plan updated"
+    if item_type == "reasoning":
+        return (
+            "reasoning",
+            "Evidence evaluation completed"
+            if completed
+            else "Evaluating repository evidence",
+        )
+    if item_type == "agent_message" and completed:
+        return "message", _safe_agent_activity(
+            item.get("text"), secrets_to_remove
+        )
+    return None
+
+
+def _final_agent_message(json_lines: str) -> str:
+    final = ""
+    for line in json_lines.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if type(event) is not dict or event.get("type") != "item.completed":
+            continue
+        item = event.get("item")
+        if (
+            type(item) is dict
+            and item.get("type") == "agent_message"
+            and type(item.get("text")) is str
+        ):
+            final = item["text"]
+    if not final:
+        raise CodexOutputError("Codex returned invalid structured output")
+    return final
 
 
 def _is_priority_failure(error: BaseException) -> bool:
@@ -560,6 +811,7 @@ def _bounded_subprocess(
     timeout: float,
     max_output_bytes: int,
     stdin: bytes | None = None,
+    on_output_line: Callable[[str, str], None] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Capture output incrementally, terminating and reaping on timeout/overflow."""
 
@@ -590,6 +842,7 @@ def _bounded_subprocess(
 
     def drain(name: str, stream: Any) -> None:
         nonlocal total
+        pending = b""
         try:
             descriptor = stream.fileno()
             while data := os.read(descriptor, 64 * 1024):
@@ -599,7 +852,22 @@ def _bounded_subprocess(
                         overflow.set()
                         return
                     chunks[name].append(data)
+                if on_output_line is not None:
+                    pending += data
+                    lines = pending.split(b"\n")
+                    pending = lines.pop()
+                    for line in lines:
+                        try:
+                            on_output_line(name, line.rstrip(b"\r").decode("utf-8", "strict"))
+                        except Exception:
+                            # Activity rendering is best-effort and must never alter execution.
+                            continue
         finally:
+            if on_output_line is not None and pending:
+                try:
+                    on_output_line(name, pending.rstrip(b"\r").decode("utf-8", "strict"))
+                except Exception:
+                    pass
             stream.close()
 
     assert process.stdout is not None and process.stderr is not None
@@ -1282,6 +1550,10 @@ class CodexRunner:
     )
     max_prompt_bytes: int = 1024 * 1024
     max_output_bytes: int = 10 * 1024 * 1024
+    sandbox_mode_override: str | None = None
+    _activity_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if not self.run_root.is_absolute():
@@ -1298,6 +1570,8 @@ class CodexRunner:
             raise ValueError("Codex environment provider is invalid")
         if not callable(self.command_resolver):
             raise ValueError("Codex command resolver is invalid")
+        if self.sandbox_mode_override not in {None, "danger-full-access"}:
+            raise ValueError("Codex sandbox override is invalid")
         try:
             schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
             Draft202012Validator.check_schema(schema)
@@ -1315,20 +1589,32 @@ class CodexRunner:
         prompt: str,
         timeout_seconds: float = 1800,
         allow_changes: bool = True,
+        _root_cause_result: bool = False,
     ) -> CodexResult:
+        if type(_root_cause_result) is not bool:
+            raise UnsafeCodexRunError("Codex result profile is invalid")
         self.repository.assert_head_unchanged(prepared)
         try:
             output, removed_secrets = self._invoke(
                 run_id=run_id,
                 prompt=prompt,
                 cwd=prepared.path,
-                sandbox="workspace-write" if allow_changes else "read-only",
-                timeout_seconds=timeout_seconds,
+                sandbox=self.sandbox_mode_override
+                or ("workspace-write" if allow_changes else "read-only"),
+            timeout_seconds=timeout_seconds,
+            skip_git_repo_check=False,
+            additional_directories=(),
             )
         finally:
             self.repository.assert_head_unchanged(prepared)
 
-        payload = self._validate_output(output, mapping)
+        try:
+            payload = self._validate_output(
+                output, mapping, root_cause_result=_root_cause_result
+            )
+        except CodexOutputError as error:
+            self._record_validation_failure(run_id, error)
+            raise
         snapshot_before_scan = self.repository.snapshot(prepared, mapping)
         if snapshot_before_scan.head_commit != prepared.head_commit:
             raise HeadChangedError("worktree HEAD changed")
@@ -1356,7 +1642,43 @@ class CodexRunner:
         claimed = tuple(payload["changed_files"])
         if set(claimed) != set(snapshot.changed_files) or len(claimed) != len(snapshot.changed_files):
             raise CodexOutputError("Codex returned invalid structured output")
-        return self._result_from_payload(payload)
+        try:
+            result = self._result_from_payload(payload)
+        except Exception as error:
+            wrapped = CodexOutputError(
+                "Codex returned invalid structured output",
+                validation_hint=_safe_validation_hint(error),
+            )
+            wrapped.__cause__ = error
+            self._record_validation_failure(run_id, wrapped)
+            raise wrapped
+        self._record_validation_success(run_id)
+        return result
+
+    def run_root_cause(
+        self,
+        prepared: PreparedWorktree,
+        mapping: RepositoryMapping,
+        *,
+        run_id: str,
+        prompt: str,
+        timeout_seconds: float = 1800,
+        allow_changes: bool = False,
+    ) -> CodexResult:
+        """Run read-only root-cause analysis with stage-irrelevant fields discarded."""
+
+        if allow_changes is not False:
+            raise UnsafeCodexRunError("root-cause analysis must be read-only")
+
+        return self.run(
+            prepared,
+            mapping,
+            run_id=run_id,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            allow_changes=False,
+            _root_cause_result=True,
+        )
 
     def run_preflight(
         self,
@@ -1371,8 +1693,10 @@ class CodexRunner:
             run_id=run_id,
             prompt=prompt,
             cwd=None,
-            sandbox="read-only",
+            sandbox=self.sandbox_mode_override or "read-only",
             timeout_seconds=timeout_seconds,
+            skip_git_repo_check=True,
+            additional_directories=(),
         )
         payload = self._validate_output(output, None)
         return self._result_from_payload(payload)
@@ -1386,7 +1710,10 @@ class CodexRunner:
         prompt: str,
         timeout_seconds: float = 1800,
         allow_changes: bool = True,
+        _root_cause_result: bool = False,
     ) -> CodexResult:
+        if type(_root_cause_result) is not bool:
+            raise UnsafeCodexRunError("Codex result profile is invalid")
         expected_keys = group.topological_keys()
         if tuple(item.repository_key for item in prepared) != expected_keys:
             raise UnsafeCodexRunError("prepared repositories do not match group topology")
@@ -1396,7 +1723,16 @@ class CodexRunner:
         parents = {item.prepared.path.parent.resolve(strict=True) for item in prepared}
         if len(parents) != 1:
             raise UnsafeCodexRunError("prepared repositories do not share one workspace")
-        workspace = next(iter(parents))
+        workspace = next(
+            item.prepared.path
+            for item in prepared
+            if item.repository_key == group.primary_repository
+        )
+        additional_directories = tuple(
+            item.prepared.path
+            for item in prepared
+            if item.repository_key != group.primary_repository
+        )
         for item in prepared:
             self.repository.assert_head_unchanged(item.prepared)
         try:
@@ -1404,14 +1740,23 @@ class CodexRunner:
                 run_id=run_id,
                 prompt=prompt,
                 cwd=workspace,
-                sandbox="workspace-write" if allow_changes else "read-only",
+                sandbox=self.sandbox_mode_override
+                or ("workspace-write" if allow_changes else "read-only"),
                 timeout_seconds=timeout_seconds,
+                skip_git_repo_check=False,
+                additional_directories=additional_directories,
             )
         finally:
             for item in prepared:
                 self.repository.assert_head_unchanged(item.prepared)
 
-        payload = self._validate_group_output(output, group)
+        try:
+            payload = self._validate_group_output(
+                output, group, root_cause_result=_root_cause_result
+            )
+        except CodexOutputError as error:
+            self._record_validation_failure(run_id, error)
+            raise
         before: dict[str, RepositorySnapshot] = {}
         sensitive = False
         for item in prepared:
@@ -1451,7 +1796,163 @@ class CodexRunner:
         )
         if len(claimed) != len(actual) or set(claimed) != set(actual):
             raise CodexOutputError("Codex returned invalid structured output")
-        return self._result_from_payload(payload)
+        try:
+            result = self._result_from_payload(payload)
+        except Exception as error:
+            wrapped = CodexOutputError(
+                "Codex returned invalid structured output",
+                validation_hint=_safe_validation_hint(error),
+            )
+            wrapped.__cause__ = error
+            self._record_validation_failure(run_id, wrapped)
+            raise wrapped
+        self._record_validation_success(run_id)
+        return result
+
+    def run_group_root_cause(
+        self,
+        group: RepositoryGroupMapping,
+        prepared: tuple[PreparedRepository, ...],
+        *,
+        run_id: str,
+        prompt: str,
+        timeout_seconds: float = 1800,
+        allow_changes: bool = False,
+    ) -> CodexResult:
+        """Run group root-cause analysis with stage-irrelevant fields discarded."""
+
+        if allow_changes is not False:
+            raise UnsafeCodexRunError("root-cause analysis must be read-only")
+
+        return self.run_group(
+            group,
+            prepared,
+            run_id=run_id,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            allow_changes=False,
+            _root_cause_result=True,
+        )
+
+    def activity(self, run_id: str, *, limit: int = 40) -> tuple[str, ...]:
+        """Return the bounded, sanitized observable activity for one Codex run."""
+
+        if (
+            not _RUN_ID.fullmatch(run_id)
+            or run_id in {".", ".."}
+            or type(limit) is not int
+            or isinstance(limit, bool)
+            or limit <= 0
+            or limit > 200
+        ):
+            return ()
+        path = self.run_root / run_id / _ACTIVITY_FILE
+        try:
+            with self._activity_lock:
+                if _is_reparse_or_link(path) or not path.is_file():
+                    return ()
+                data = path.read_bytes()
+            if len(data) > _MAX_ACTIVITY_BYTES:
+                return ()
+            messages: list[str] = []
+            for raw_line in data.splitlines():
+                record = json.loads(raw_line.decode("utf-8", "strict"))
+                if (
+                    type(record) is dict
+                    and type(record.get("message")) is str
+                    and 0 < len(record["message"]) <= 512
+                ):
+                    messages.append(record["message"])
+            return tuple(messages[-limit:])
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+            return ()
+
+    def _record_activity(self, run_directory: Path, kind: str, message: str) -> None:
+        if (
+            re.fullmatch(r"[a-z]{1,24}", kind) is None
+            or type(message) is not str
+            or not message
+            or len(message) > 512
+        ):
+            return
+        path = run_directory / _ACTIVITY_FILE
+        payload = (
+            json.dumps(
+                {
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                    "kind": kind,
+                    "message": message,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8", "strict")
+            + b"\n"
+        )
+        try:
+            with self._activity_lock:
+                if path.exists() and (
+                    _is_reparse_or_link(path)
+                    or not path.is_file()
+                    or path.stat().st_size + len(payload) > _MAX_ACTIVITY_BYTES
+                ):
+                    return
+                flags = (
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_APPEND
+                    | getattr(os, "O_BINARY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0)
+                )
+                descriptor = os.open(path, flags, 0o600)
+                try:
+                    metadata = os.fstat(descriptor)
+                    if not stat.S_ISREG(metadata.st_mode):
+                        return
+                    os.write(descriptor, payload)
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        except (OSError, UnicodeError, TypeError, ValueError):
+            return
+
+    def _record_validation_success(self, run_id: str) -> None:
+        self._record_activity(
+            self.run_root / run_id,
+            "validation",
+            "Structured analysis result validated",
+        )
+
+    def _record_validation_failure(
+        self, run_id: str, error: CodexOutputError
+    ) -> None:
+        if error.validation_hint:
+            self._record_activity(
+                self.run_root / run_id,
+                "validation",
+                f"Structured result needs correction: {error.validation_hint}",
+            )
+            return
+        cause = error.__cause__
+        detail = str(cause) if cause is not None else ""
+        if "group output must use repository change claims" in detail:
+            message = "Structured result rejected: unqualified group change claims"
+        elif "unsafe repository change claim" in detail:
+            message = "Structured result rejected: invalid repository-qualified path"
+        elif cause is not None:
+            message = "Structured result rejected: output schema mismatch"
+        else:
+            message = "Structured result rejected by workflow validation"
+        self._record_activity(self.run_root / run_id, "validation", message)
+
+    def record_structured_retry(self, run_id: str) -> None:
+        """Record that a schema repair attempt is starting."""
+
+        if _RUN_ID.fullmatch(run_id) and run_id not in {".", ".."}:
+            self._record_activity(
+                self.run_root / run_id,
+                "validation",
+                "Correcting structured analysis result automatically",
+            )
 
     def _invoke(
         self,
@@ -1461,13 +1962,22 @@ class CodexRunner:
         cwd: Path | None,
         sandbox: str,
         timeout_seconds: float,
+        skip_git_repo_check: bool,
+        additional_directories: tuple[Path, ...],
     ) -> tuple[str, tuple[str, ...]]:
         if not _RUN_ID.fullmatch(run_id) or run_id in {".", ".."}:
             raise UnsafeCodexRunError("run_id is not a safe path segment")
         if not _is_positive_finite_number(timeout_seconds):
             raise UnsafeCodexRunError("timeout must be finite and positive")
-        if sandbox not in {"workspace-write", "read-only"}:
+        if sandbox not in {"workspace-write", "read-only", "danger-full-access"}:
             raise UnsafeCodexRunError("Codex sandbox mode is invalid")
+        if type(skip_git_repo_check) is not bool:
+            raise UnsafeCodexRunError("Codex Git repository policy is invalid")
+        if type(additional_directories) is not tuple or any(
+            not isinstance(path, Path) or not path.is_absolute()
+            for path in additional_directories
+        ):
+            raise UnsafeCodexRunError("Codex additional directories are invalid")
         prompt_bytes = prompt.encode("utf-8", "strict")
         if not prompt.strip() or len(prompt_bytes) > self.max_prompt_bytes or "\x00" in prompt:
             raise UnsafeCodexRunError("prompt is empty, invalid, or exceeds its size limit")
@@ -1485,11 +1995,30 @@ class CodexRunner:
         codex_home = _resolve_codex_home(source)
         run_directory = self._prepare_run_directory(run_id)
         effective_cwd = cwd or run_directory
+        try:
+            canonical_additional = tuple(
+                path.resolve(strict=True) for path in additional_directories
+            )
+        except OSError as error:
+            raise UnsafeCodexRunError(
+                "Codex additional directories are unavailable"
+            ) from error
+        if (
+            len(set(canonical_additional)) != len(canonical_additional)
+            or any(
+                not path.is_dir()
+                or _is_reparse_or_link(path)
+                or path == effective_cwd.resolve(strict=True)
+                for path in canonical_additional
+            )
+        ):
+            raise UnsafeCodexRunError("Codex additional directories are invalid")
         isolation_root = self._prepare_isolation_directory(run_directory)
         safe_env, removed_secrets = _safe_environment(source, isolation_root, codex_home)
         if any(secret in prompt for secret in removed_secrets):
             raise UnsafeCodexRunError("prompt contains credential material")
         self._write_prompt(run_directory / "codex-prompt.txt", prompt_bytes)
+        self._record_activity(run_directory, "prepare", "Preparing verified Codex runtime")
         resolved_command = self.command_resolver()
         if type(resolved_command) is not CodexCommand:
             _raise_codex_executable_unavailable()
@@ -1510,19 +2039,46 @@ class CodexRunner:
                 verification_failed = True
             if verification_failed:
                 _raise_codex_executable_unavailable()
-            command = resolved_command.argv(
+            stream_activity = self.command_executor is _bounded_subprocess
+            arguments = [
                 "exec", "--cd", str(effective_cwd), "--sandbox", sandbox,
-                "--output-schema", str(self.schema_path), "-",
-            )
+                "--output-schema", str(self.schema_path),
+            ]
+            if skip_git_repo_check:
+                arguments.append("--skip-git-repo-check")
+            for path in canonical_additional:
+                arguments.extend(("--add-dir", str(path)))
+            if stream_activity:
+                arguments.append("--json")
+            arguments.append("-")
+            command = resolved_command.argv(*arguments)
             try:
-                completed = self.command_executor(
-                    command,
-                    cwd=effective_cwd,
-                    env=safe_env,
-                    timeout=float(timeout_seconds),
-                    max_output_bytes=self.max_output_bytes,
-                    stdin=prompt_bytes,
-                )
+                if stream_activity:
+                    def on_output_line(name: str, line: str) -> None:
+                        if name != "stdout":
+                            return
+                        activity = _codex_activity_from_event(line, removed_secrets)
+                        if activity is not None:
+                            self._record_activity(run_directory, *activity)
+
+                    completed = _bounded_subprocess(
+                        command,
+                        cwd=effective_cwd,
+                        env=safe_env,
+                        timeout=float(timeout_seconds),
+                        max_output_bytes=self.max_output_bytes,
+                        stdin=prompt_bytes,
+                        on_output_line=on_output_line,
+                    )
+                else:
+                    completed = self.command_executor(
+                        command,
+                        cwd=effective_cwd,
+                        env=safe_env,
+                        timeout=float(timeout_seconds),
+                        max_output_bytes=self.max_output_bytes,
+                        stdin=prompt_bytes,
+                    )
             except subprocess.TimeoutExpired as error:
                 raise CodexTimeoutError("Codex execution timed out") from error
             except CodexRunnerError:
@@ -1571,7 +2127,12 @@ class CodexRunner:
             for secret in removed_secrets
         ):
             raise CodexOutputError("Codex returned invalid structured output")
-        return completed.stdout, removed_secrets
+        output = (
+            _final_agent_message(completed.stdout)
+            if stream_activity
+            else completed.stdout
+        )
+        return output, removed_secrets
 
     @staticmethod
     def _result_from_payload(payload: dict[str, Any]) -> CodexResult:
@@ -1682,10 +2243,16 @@ class CodexRunner:
                 pass
 
     def _validate_output(
-        self, text: str, mapping: RepositoryMapping | None
+        self,
+        text: str,
+        mapping: RepositoryMapping | None,
+        *,
+        root_cause_result: bool = False,
     ) -> dict[str, Any]:
         try:
-            payload = self._parse_output(text)
+            payload = self._parse_output(
+                text, root_cause_result=root_cause_result
+            )
             if payload.get("repository_changes"):
                 raise ValueError("single repository output cannot contain group claims")
             if mapping is None and (payload["changed_files"] or payload["commands"]):
@@ -1697,14 +2264,23 @@ class CodexRunner:
                 ):
                     raise ValueError("unsafe changed path")
         except Exception as error:
-            raise CodexOutputError("Codex returned invalid structured output") from error
+            raise CodexOutputError(
+                "Codex returned invalid structured output",
+                validation_hint=_safe_validation_hint(error),
+            ) from error
         return payload
 
     def _validate_group_output(
-        self, text: str, group: RepositoryGroupMapping
+        self,
+        text: str,
+        group: RepositoryGroupMapping,
+        *,
+        root_cause_result: bool = False,
     ) -> dict[str, Any]:
         try:
-            payload = self._parse_output(text)
+            payload = self._parse_output(
+                text, root_cause_result=root_cause_result
+            )
             if payload["changed_files"]:
                 raise ValueError("group output must use repository change claims")
             mappings = {item.key: item for item in group.repositories}
@@ -1717,15 +2293,24 @@ class CodexRunner:
                 if mapping is None or not _path_allowed(parsed.path, mapping.allowed_paths):
                     raise ValueError("unsafe repository change claim")
         except Exception as error:
-            raise CodexOutputError("Codex returned invalid structured output") from error
+            raise CodexOutputError(
+                "Codex returned invalid structured output",
+                validation_hint=_safe_validation_hint(error),
+            ) from error
         return payload
 
-    def _parse_output(self, text: str) -> dict[str, Any]:
+    def _parse_output(
+        self, text: str, *, root_cause_result: bool = False
+    ) -> dict[str, Any]:
         payload = json.loads(
             text,
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)),
         )
+        payload = _normalize_structural_defaults(payload)
+        if root_cause_result:
+            payload = dict(payload)
+            payload["acceptance_coverage"] = []
         schema = json.loads(self.schema_path.read_text(encoding="utf-8"))
         Draft202012Validator(schema).validate(payload)
         for command in payload["commands"]:

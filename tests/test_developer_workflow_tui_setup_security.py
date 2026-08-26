@@ -777,9 +777,6 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
                 "ones-base-url": "https://ones.example.invalid",
                 "ones-team-id": "TEAM",
                 "ones-issue-type-id": "DEFECT",
-                "ones-project-id": "P",
-                "ones-status-id": "doing",
-                "ones-item-id": "REQ-UI",
                 "ones-email": "setup@example.invalid",
                 "ones-password": "Setup-Ones-Password-92731",
             },
@@ -978,9 +975,11 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
 
 
 @pytest.mark.asyncio
-async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() -> None:
+async def test_all_six_setup_surfaces_hide_complete_secrets_and_fragments() -> None:
     # Reuse the established unfiltered Rich/widget auditor with every sensitive
-    # boundary category injected into the real seven-step screen.
+    # boundary category injected into the real six-step screen.
+    from src.developer_workflow.tui.setup_models import TUI_SETUP_STEPS
+
     setup = _SetupHarness(SimpleNamespace(orchestrator=object(), close=lambda: None))
     app = DeveloperWorkflowTuiApp(
         setup_controller=setup,
@@ -989,11 +988,11 @@ async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() ->
         poll_interval=10,
     )
     async with app.run_test(size=(140, 40)) as pilot:
-        for step in tuple(SetupStep)[:-1]:
+        for step in TUI_SETUP_STEPS[:-1]:
             setup._results[step] = ConnectionTestResult(
                 step=step, status=ValidationStatus.PASSED, category="ok"
             )
-        for step in SetupStep:
+        for step in TUI_SETUP_STEPS:
             app.screen.current_step = step
             app.screen._render_state()
             # Inject credentials into the real password widgets for their owned
@@ -1001,7 +1000,6 @@ async def test_all_seven_setup_surfaces_hide_complete_secrets_and_fragments() ->
             injected = {
                 SetupStep.ONES: (("ones-email", SECRETS["email"]), ("ones-password", SECRETS["ones"])),
                 SetupStep.PROVIDER: (("provider-token", SECRETS["provider"]),),
-                SetupStep.CODEX: (("codex-api-key", SECRETS["codex"]),),
             }.get(step, ())
             for widget_id, secret in injected:
                 app.screen.query_one(f"#{widget_id}", Input).value = secret

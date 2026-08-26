@@ -8,7 +8,13 @@ import unicodedata
 
 from .approval import issue_approval
 from .config import DeveloperWorkflowConfig, RepositoryMappingNotFound
-from .contracts import PublicationResult, WorkflowRun, WorkflowState, WorkflowType
+from .contracts import (
+    DefectAction,
+    PublicationResult,
+    WorkflowRun,
+    WorkflowState,
+    WorkflowType,
+)
 from .defect_flow import DefectCandidateService, DefectFlow
 from .publisher import Publisher
 from .requirement_flow import RequirementFlow
@@ -113,7 +119,11 @@ class DeveloperWorkflowOrchestrator:
         assignee: str,
         snapshot_token: str,
         candidate_id: str,
+        *,
+        action: DefectAction = DefectAction.ANALYZE_AND_REPAIR,
     ) -> WorkflowRun:
+        if type(action) is not DefectAction:
+            raise InvalidWorkflowAction("defect action is invalid")
         selected = self.defect_candidates.select(
             snapshot_token,
             candidate_id,
@@ -137,6 +147,7 @@ class DeveloperWorkflowOrchestrator:
             raise InvalidWorkflowAction(
                 "defect selection requires a verified candidate snapshot"
             )
+        selected = selected.validated_update(defect_action=action)
         created = self.store.create(selected)
         with self.store.operation_lock(created.run_id, "orchestrate"):
             current = self.store.load(created.run_id)
@@ -146,6 +157,35 @@ class DeveloperWorkflowOrchestrator:
         """Load a run, optionally without creating storage lock artifacts."""
 
         return self.store.load(run_id, read_only=read_only)
+
+    def accept_analysis_solution(
+        self, run_id: str, *, expected_version: int
+    ) -> WorkflowRun:
+        with self.store.operation_lock(run_id, "analysis-decision"):
+            current = self.store.decide_completed_analysis(
+                run_id, expected_version, accept=True
+            )
+            return self.defect_flow.execute(current)
+
+    def regenerate_analysis_solution(
+        self, run_id: str, *, expected_version: int
+    ) -> WorkflowRun:
+        with self.store.operation_lock(run_id, "analysis-decision"):
+            current = self.store.decide_completed_analysis(
+                run_id, expected_version, accept=False
+            )
+            return self.defect_flow.execute(current)
+
+    def ai_activity(self, run_id: str) -> tuple[str, ...]:
+        """Read sanitized Codex activity without changing workflow state."""
+
+        source = getattr(self.defect_flow.codex, "activity", None)
+        if not callable(source):
+            return ()
+        result = source(run_id)
+        if type(result) is not tuple or any(type(item) is not str for item in result):
+            return ()
+        return result
 
     def confirm_repository(
         self,

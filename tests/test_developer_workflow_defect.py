@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from contextlib import nullcontext
@@ -25,12 +26,13 @@ from src.developer_workflow.config import (
     PublishingProvider,
 )
 from src.developer_workflow.approval import ApprovalValidationError, validate_for_approval
-from src.developer_workflow.codex_runner import CodexRunner
+from src.developer_workflow.codex_runner import CodexOutputError, CodexRunner
 from src.developer_workflow.command_utils import parse_command_argv
 from src.developer_workflow.contracts import (
     CodexResult,
     CommandOutcome,
     CommandResult,
+    DefectAction,
     PreparedWorktree,
     RepositoryChangeClaim,
     RepositoryGroupMapping,
@@ -54,8 +56,9 @@ from src.developer_workflow.defect_flow import (
 )
 from src.developer_workflow.requirement_flow import CodexRequirementAdapter
 from src.developer_workflow.orchestrator import DeveloperWorkflowOrchestrator
-from src.developer_workflow.repository import build_branch_name
+from src.developer_workflow.repository import build_run_branch_name
 from src.developer_workflow.state_store import ConcurrentRunUpdateError, FileRunStore
+from src.developer_workflow.tui.models import RunDetail
 from src.services.ones_gateway import OnesGateway
 
 
@@ -444,11 +447,14 @@ def test_codex_schema_and_parser_preserve_strict_root_cause_evidence() -> None:
     payload = {
         "summary": "Repository evidence identifies an unchecked empty collection.",
         "changed_files": [],
+        "repository_changes": [],
         "commands": [],
         "evidence": [],
         "review_findings": [],
         "risks": [],
         "unresolved_items": [],
+        "acceptance_coverage": [],
+        "unrelated_changes_checked": True,
         "root_cause_evidence": [_root_evidence().model_dump(mode="json")],
         "investigation_suggestions": [],
         "behavior_before": "Empty input raises an index error.",
@@ -508,6 +514,48 @@ def test_shared_codex_adapter_enforces_defect_stage_permissions(tmp_path: Path) 
             symbol="export",
             mechanism="Missing guard.",
         )
+
+
+def test_root_cause_stage_retries_invalid_structured_output_once(
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FlakyRunner:
+        def run(self, *args: object, **kwargs: object) -> CodexResult:
+            del args
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                raise CodexOutputError(
+                    "Codex returned invalid structured output",
+                    validation_hint="root_cause_evidence.0.fix_steps (minItems)",
+                )
+            return CodexResult(summary="validated report")
+
+    adapter = CodexRequirementAdapter(FlakyRunner())  # type: ignore[arg-type]
+    result = adapter.run_stage(
+        "root_cause",
+        prepared=PreparedWorktree(
+            path=tmp_path.resolve(),
+            branch="bugfix/BUG-7-export",
+            base_commit=OID,
+            head_commit=OID,
+            mirror_path=(tmp_path / "mirror.git").resolve(),
+        ),
+        mapping=_mapping(tmp_path),
+        run_id="8" * 32,
+        prompt="analyze",
+        allow_changes=False,
+    )
+
+    assert result.summary == "validated report"
+    assert len(calls) == 2
+    assert calls[0]["prompt"] == "analyze"
+    assert "AUTOMATIC_STRUCTURED_OUTPUT_RETRY" in str(calls[1]["prompt"])
+    assert "root_cause_evidence.0.fix_steps (minItems)" in str(
+        calls[1]["prompt"]
+    )
+    assert calls[1]["allow_changes"] is False
 
 
 def test_new_defect_run_cannot_hold_more_than_one_selected_work_item() -> None:
@@ -1144,6 +1192,136 @@ def test_insufficient_root_cause_persists_investigation_and_blocks_before_change
     assert tests.commands == []
 
 
+def test_analysis_only_completes_after_read_only_root_cause(tmp_path: Path) -> None:
+    flow, store, repository, codex, tests = _flow(tmp_path)
+    store.run = store.run.validated_update(defect_action=DefectAction.ANALYZE)
+
+    result = flow.execute(store.run)
+
+    assert result.state is WorkflowState.COMPLETED
+    assert result.defect_action is DefectAction.ANALYZE
+    assert result.defect_checkpoint.value == "ROOT_VERIFIED"
+    assert codex.preflight_prompts == []
+    assert codex.stages == ["root_cause"]
+    assert codex.allow_changes == [False]
+    assert "COMPLETE_ONES_DEFECT_CONTEXT" in codex.prompts[0]
+    assert "Exporting an empty report crashes" in codex.prompts[0]
+    assert "FINAL_ANALYSIS_REPORT is required" in codex.prompts[0]
+    assert "fix_steps must describe one best solution" in codex.prompts[0]
+    assert "root_cause_evidence.mechanism must state the precise root cause" in codex.prompts[0]
+    assert "ROOT_CAUSE_RESULT_CONTRACT" in codex.prompts[0]
+    assert "MULTI_AGENT_ANALYSIS_CONTRACT" in codex.prompts[0]
+    assert "at least three read-only sub-agents in parallel" in codex.prompts[0]
+    assert "adversarial verifier" in codex.prompts[0]
+    assert "perform one critique round" in codex.prompts[0]
+    assert "return exactly one best final solution" in codex.prompts[0]
+    assert "Do not invoke or read the ones-dev-workflow skill" in codex.prompts[0]
+    assert "The first fix_steps entry is the single best solution" in codex.prompts[0]
+    assert repository.current.is_clean
+    assert result.changed_files == ()
+    assert result.test_results == ()
+    assert result.approval is None
+    assert tests.commands == []
+
+
+def test_analysis_only_real_store_reaches_mapping_before_repository_work(
+    tmp_path: Path,
+) -> None:
+    class Gateway:
+        async def list_open_defects(self, **kwargs: object) -> list[DefectRecord]:
+            return [_defect("1" * 32, key="BUG-7", number="7")]
+
+    candidates = DefectCandidateService(gateway=Gateway(), issue_type_id="bug")
+    listed = asyncio.run(candidates.list_candidates("project", "sprint", "alice"))
+    store = FileRunStore(tmp_path / "runs")
+    repository = FakeRepository((tmp_path / "worktree").resolve())
+    codex = FakeDefectCodex(repository)
+    flow = DefectFlow(
+        store=store,
+        config=_config(tmp_path),
+        repository=repository,
+        codex=codex,
+        test_runner=FakeTestRunner([1, 0]),
+    )
+    orchestrator = DeveloperWorkflowOrchestrator(
+        store=store,
+        requirement_flow=object(),  # type: ignore[arg-type]
+        defect_flow=flow,
+        publisher=object(),  # type: ignore[arg-type]
+        config=_config(tmp_path),
+        defect_candidates=candidates,
+    )
+
+    result = orchestrator.start_defect(
+        "project",
+        "sprint",
+        "alice",
+        listed[0].snapshot_token,
+        listed[0].uuid,
+        action=DefectAction.ANALYZE,
+    )
+
+    assert result.state is WorkflowState.VALIDATING
+    assert result.defect_action is DefectAction.ANALYZE
+    assert result.repository_candidates
+    assert repository.prepare_calls == 0
+    assert codex.preflight_prompts == []
+    assert codex.stages == []
+
+
+def test_workspace_mapping_hides_overlapping_legacy_repository_candidate(
+    tmp_path: Path,
+) -> None:
+    class Gateway:
+        async def list_open_defects(self, **kwargs: object) -> list[DefectRecord]:
+            return [_defect("2" * 32, key="BUG-8", number="8")]
+
+    legacy = _mapping(tmp_path).validated_update(iteration_id="*")
+    mapping = _mapping(tmp_path)
+    workspace = RepositoryGroupMapping(
+        key="desktop-workspace",
+        project_id="project",
+        iteration_id="sprint",
+        primary_repository=mapping.key,
+        repositories=(mapping,),
+    )
+    config = _config(tmp_path).validated_update(
+        repositories=(legacy,), repository_groups=(workspace,)
+    )
+    candidates = DefectCandidateService(gateway=Gateway(), issue_type_id="bug")
+    listed = asyncio.run(candidates.list_candidates("project", "sprint", "alice"))
+    store = FileRunStore(tmp_path / "runs")
+    repository = FakeRepository((tmp_path / "worktree").resolve())
+    flow = DefectFlow(
+        store=store,
+        config=config,
+        repository=repository,
+        codex=FakeDefectCodex(repository),
+        test_runner=FakeTestRunner([1, 0]),
+    )
+    orchestrator = DeveloperWorkflowOrchestrator(
+        store=store,
+        requirement_flow=object(),  # type: ignore[arg-type]
+        defect_flow=flow,
+        publisher=object(),  # type: ignore[arg-type]
+        config=config,
+        defect_candidates=candidates,
+    )
+
+    result = orchestrator.start_defect(
+        "project",
+        "sprint",
+        "alice",
+        listed[0].snapshot_token,
+        listed[0].uuid,
+        action=DefectAction.ANALYZE,
+    )
+
+    assert result.repository_candidates == ()
+    assert result.repository_group_candidates == (workspace,)
+    assert RunDetail.from_run(result).mapping_candidates[0].key == "desktop-workspace"
+
+
 @pytest.mark.parametrize(
     "evidence_update",
     [
@@ -1257,6 +1435,17 @@ def test_revision_feedback_is_delimited_untrusted_data_in_defect_repair_prompt(
     flow, store, _, _, _ = _flow(tmp_path)
     completed = flow.execute(store.run)
     normal_prompt = flow._repair_prompt(completed)
+    review_prompt = flow._review_prompt(completed)
+    competing = _root_evidence().model_copy(
+        update={"fix_steps": ("replace the accepted solution",)}
+    )
+    multi_evidence = completed.model_copy(
+        update={"root_cause_evidence": (*completed.root_cause_evidence, competing)}
+    )
+    multi_evidence_prompt = flow._repair_prompt(multi_evidence)
+    multi_evidence_context = json.loads(
+        multi_evidence_prompt.split("Evidence:\n", maxsplit=1)[1]
+    )
     revised = completed.validated_update(
         revisions=(RevisionRecord(feedback=feedback, occurred_at=NOW),)
     )
@@ -1264,6 +1453,19 @@ def test_revision_feedback_is_delimited_untrusted_data_in_defect_repair_prompt(
     prompt = flow._repair_prompt(revised)
 
     assert "UNTRUSTED_REVISION_FEEDBACK" not in normal_prompt
+    assert '"accepted_solution"' in normal_prompt
+    assert "Apply the accepted_solution exactly as the authoritative implementation plan" in normal_prompt
+    assert multi_evidence_context["accepted_solution"] == list(
+        completed.root_cause_evidence[0].fix_steps
+    )
+    assert "MULTI_AGENT_REVIEW_CONTRACT" in review_prompt
+    assert "at least two independent read-only review sub-agents in parallel" in review_prompt
+    assert "actual repair follows accepted_solution" in review_prompt
+    assert "aggregate their findings into review_findings" in review_prompt
+    assert "ones-dev-workflow skill" in review_prompt
+    assert "copy root_cause_evidence, behavior_before, behavior_after" in review_prompt
+    assert "set unrelated_changes_checked=true" in review_prompt
+    assert "non-empty review_findings" in review_prompt
     assert "UNTRUSTED_REVISION_FEEDBACK" in prompt
     assert "REVISION_SCOPE=repair-only" in prompt
     assert feedback in prompt
@@ -1660,7 +1862,9 @@ def test_prepare_resume_recovers_crash_created_worktree_without_recreating(
     )
     repository.recovered = PreparedWorktree(
         path=repository.root,
-        branch=build_branch_name("defect", run.work_item_id, run.defect.title),
+        branch=build_run_branch_name(
+            "defect", run.work_item_id, run.defect.title, run.run_id
+        ),
         base_commit=OID,
         head_commit=OID,
         mirror_path=(tmp_path / "mirror.git").resolve(),

@@ -17,6 +17,7 @@ from typing import Iterator
 
 from pydantic import ValidationError
 
+from .config import DeveloperWorkflowConfig
 from .credential_store import CredentialStore, CredentialStoreError
 from .private_paths import (
     PrivatePathError,
@@ -211,6 +212,34 @@ class SetupStore:
             )
         except CredentialStoreError:
             raise SetupStoreError("active credentials are unavailable") from None
+
+    def replace_active_workflow(
+        self,
+        profile_id: str,
+        expected_generation: str,
+        workflow: DeveloperWorkflowConfig,
+    ) -> SetupDocument:
+        """Atomically replace only the finalized active workflow configuration."""
+
+        if type(workflow) is not DeveloperWorkflowConfig:
+            raise SetupStoreError("configuration save failed")
+        with self._locked():
+            current = self._load_unlocked_for_profile(profile_id)
+            active = current.active
+            if (
+                type(expected_generation) is not str
+                or _GENERATION.fullmatch(expected_generation) is None
+                or active is None
+                or active.generation != expected_generation
+                or current.activation_owner_generation is not None
+            ):
+                raise SetupStoreError("configuration generation is superseded")
+            try:
+                replacement = active.validated_update(workflow=workflow)
+                document = current.validated_update(active=replacement)
+            except (TypeError, ValueError, ValidationError):
+                raise SetupStoreError("configuration save failed") from None
+            return self._write_confirmed_monotonic(document)
 
     def restore_previous(
         self, profile_id: str, expected_generation: str

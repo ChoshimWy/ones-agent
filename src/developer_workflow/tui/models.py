@@ -18,10 +18,12 @@ from ..command_utils import CommandArgvError, parse_command_argv
 from ..contracts import (
     ApprovalPackage,
     CommandResult,
+    DefectAction,
     DefectCandidate,
     PublicationResult,
     RepositoryMapping,
     RepositoryPublicationResult,
+    RequirementRecord,
     WorkflowRun,
     WorkflowState,
     WorkflowType,
@@ -45,6 +47,49 @@ class RunActivity(str, Enum):
     IDLE = "idle"
     QUEUED = "queued"
     RUNNING = "running"
+
+
+@dataclass(frozen=True, slots=True)
+class FilterChoice:
+    """One trusted ONES identifier paired with a display-only name."""
+
+    id: str
+    name: str
+    selected: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class DefectFilterOptions:
+    iterations: tuple[FilterChoice, ...]
+    assignees: tuple[FilterChoice, ...]
+    statuses: tuple[FilterChoice, ...]
+    unavailable: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceRepositoryInput:
+    """One local or remote repository selected while creating a workspace."""
+
+    key: str
+    name: str
+    source: str
+    local: bool
+    branch: str = "main"
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceSummary:
+    """Credential-free workspace projection for the top-level TUI."""
+
+    key: str
+    project_id: str
+    iteration_id: str
+    repositories: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceProjectOptions:
+    projects: tuple[FilterChoice, ...]
 
 
 def safe_tui_text(
@@ -188,8 +233,12 @@ class RunDetail:
     fingerprint: str
     risk_count: int
     unresolved_count: int
+    status_message: str = ""
     mapping_candidates: tuple[MappingCandidateView, ...] = ()
     resume_state: WorkflowState | None = None
+    ai_activity: tuple[str, ...] = ()
+    can_accept_analysis: bool = False
+    can_regenerate_analysis: bool = False
 
     @classmethod
     def from_run(cls, run: WorkflowRun) -> RunDetail:
@@ -210,6 +259,27 @@ class DefectChoice:
             title=safe_tui_text(candidate.title, maximum=512),
             status_id=safe_tui_text(candidate.status_id, maximum=128, allow_empty=True),
             priority=safe_tui_text(candidate.priority, maximum=128),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RequirementChoice:
+    requirement_id: str
+    number: str
+    title: str
+    project_id: str
+    iteration_id: str
+    status_id: str
+
+    @classmethod
+    def from_requirement(cls, requirement: RequirementRecord) -> RequirementChoice:
+        return cls(
+            requirement_id=safe_tui_text(requirement.requirement_id, maximum=128),
+            number=safe_tui_text(requirement.number, maximum=128, allow_empty=True),
+            title=safe_tui_text(requirement.title, maximum=512),
+            project_id=safe_tui_text(requirement.project.id, maximum=128),
+            iteration_id=safe_tui_text(requirement.iteration.id, maximum=128, allow_empty=True),
+            status_id=safe_tui_text(requirement.status.id, maximum=128),
         )
 
 
@@ -463,11 +533,103 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
         comment = "delivered" if run.group_publication.comment_id else ""
 
     review_count = len(approval.review) if approval is not None else 0
+    analysis_review: tuple[str, ...] = ()
+    if run.defect_action is DefectAction.ANALYZE and run.codex_results:
+        result = run.codex_results[0]
+        defect = run.defect
+        defect_label = run.work_item_id
+        if defect is not None:
+            number = f"#{defect.number} " if defect.number else ""
+            defect_label = f"{number}{defect.title}".strip() or run.work_item_id
+        lines = [
+            "AI ANALYSIS REPORT",
+            "Analysis mode: read-only; no repository files were modified",
+            "Defect: " + safe_tui_text(defect_label, maximum=1024),
+            "",
+            "CONCLUSION",
+            safe_tui_text(result.summary or "No conclusion returned", maximum=8192),
+        ]
+        if result.behavior_before:
+            lines.extend((
+                "",
+                "OBSERVED BEHAVIOR",
+                safe_tui_text(result.behavior_before, maximum=4096),
+            ))
+        if run.root_cause_evidence:
+            lines.extend(("", "ROOT CAUSE"))
+            for index, evidence in enumerate(run.root_cause_evidence, 1):
+                location = evidence.file_path
+                if evidence.start_line is not None:
+                    location += f":{evidence.start_line}"
+                lines.append(
+                    f"{index}. "
+                    + safe_tui_text(location, maximum=512)
+                    + " — "
+                    + safe_tui_text(evidence.mechanism, maximum=4096)
+                )
+        else:
+            lines.extend((
+                "",
+                "ROOT CAUSE",
+                "No repository-verified root cause is available.",
+            ))
+        solution_steps = tuple(dict.fromkeys(
+            step
+            for evidence in run.root_cause_evidence
+            for step in evidence.fix_steps
+        ))
+        lines.extend(("", "BEST SOLUTION"))
+        if solution_steps:
+            lines.extend(
+                f"{index}. " + safe_tui_text(step, maximum=4096)
+                for index, step in enumerate(solution_steps, 1)
+            )
+        elif result.investigation_suggestions:
+            lines.extend(
+                f"{index}. " + safe_tui_text(step, maximum=4096)
+                for index, step in enumerate(
+                    result.investigation_suggestions, 1
+                )
+            )
+        else:
+            lines.append(
+                "No evidence-backed solution can be recommended until the root cause is verified."
+            )
+        if result.impact_scope:
+            lines.extend(("", "IMPACT SCOPE"))
+            lines.extend(
+                "- " + safe_tui_text(path, maximum=512)
+                for path in result.impact_scope
+            )
+        lines.extend((
+            "",
+            "RISK",
+            safe_tui_text(result.risk_level or "not assessed", maximum=128),
+        ))
+        if result.risks:
+            lines.extend(
+                "- " + safe_tui_text(item, maximum=2048)
+                for item in result.risks
+            )
+        if result.unresolved_items:
+            lines.extend(("", "UNRESOLVED / UNKNOWN"))
+            lines.extend(
+                "- " + safe_tui_text(item, maximum=2048)
+                for item in result.unresolved_items
+            )
+        if result.investigation_suggestions:
+            lines.extend(("", "RECOMMENDED NEXT STEPS"))
+            lines.extend(
+                "- " + safe_tui_text(item, maximum=2048)
+                for item in result.investigation_suggestions
+            )
+        analysis_review = tuple(lines)
     return RunDetail(
         summary=RunSummary.from_run(run, activity=RunActivity.IDLE),
         repositories=repositories,
         tests=tests,
-        review=tuple("review recorded" for _ in range(review_count)),
+        review=analysis_review
+        or tuple("review recorded" for _ in range(review_count)),
         publication=PublicationView(
             repositories=repositories,
             comment_id=comment,
@@ -483,12 +645,54 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
         ),
         blocked_reason=_BLOCKED if run.blocked_reason or run.error else "",
         fingerprint=fingerprint,
-        risk_count=len(approval.risks) if approval is not None else 0,
-        unresolved_count=(
-            len(approval.unresolved_items) if approval is not None else 0
+        risk_count=(
+            len(approval.risks)
+            if approval is not None
+            else len(run.codex_results[0].risks)
+            if run.defect_action is DefectAction.ANALYZE and run.codex_results
+            else 0
         ),
+        unresolved_count=(
+            len(approval.unresolved_items)
+            if approval is not None
+            else len(run.codex_results[0].unresolved_items)
+            if run.defect_action is DefectAction.ANALYZE and run.codex_results
+            else 0
+        ),
+        status_message={
+            "defect source evidence is insufficient": (
+                "ONES defect description is missing or lacks reproducible details"
+            ),
+            "Codex process could not be started": "Codex process could not be started",
+            "Codex analysis timed out": "Codex analysis timed out",
+            "Codex analysis returned invalid structured output": (
+                "Codex analysis returned invalid structured output"
+            ),
+            "Codex runtime safety validation failed": (
+                "Codex runtime safety validation failed"
+            ),
+            "Codex analysis exited unsuccessfully": (
+                "Codex analysis exited unsuccessfully"
+            ),
+            "repository safety validation failed": (
+                "Repository safety validation failed"
+            ),
+        }.get(run.blocked_reason, ""),
         mapping_candidates=_mapping_candidate_views(run),
         resume_state=run.resume_state,
+        can_accept_analysis=(
+            run.state is WorkflowState.COMPLETED
+            and run.defect_action is DefectAction.ANALYZE
+            and bool(run.root_cause_evidence)
+            and not run.codex_results[0].unresolved_items
+            if run.codex_results
+            else False
+        ),
+        can_regenerate_analysis=(
+            run.state is WorkflowState.COMPLETED
+            and run.defect_action is DefectAction.ANALYZE
+            and bool(run.codex_results)
+        ),
     )
 
 

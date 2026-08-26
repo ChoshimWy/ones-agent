@@ -39,6 +39,7 @@ from .publisher import Publisher
 from .repository import WorktreeRepository, validate_git_identity_environment
 from .repository_group import RepositoryGroupWorkspace
 from .requirement_flow import (
+    CodexRequirementAdapter,
     RequirementFlow,
     SandboxCommandExecutor,
     sandbox_preflight_command,
@@ -227,6 +228,9 @@ class RuntimeHandle:
     orchestrator: DeveloperWorkflowOrchestrator | None
     gateway: OnesGateway | None
     close_callback: Callable[[], None] | None = field(repr=False)
+    workflow_saver: Callable[[DeveloperWorkflowConfig], None] | None = field(
+        default=None, repr=False
+    )
     _condition: threading.Condition = field(
         default_factory=threading.Condition, init=False, repr=False
     )
@@ -271,6 +275,7 @@ class RuntimeHandle:
                     self._close_failed = failed
                     self._state = "closed"
                     self.close_callback = None
+                    self.workflow_saver = None
                     self.orchestrator = None
                     self.gateway = None
                 self._condition.notify_all()
@@ -291,6 +296,9 @@ class RuntimeBootstrapper:
         default_factory=CodexRuntimePreparer,
         repr=False,
     )
+    workflow_saver: (
+        Callable[[ActiveSetup, DeveloperWorkflowConfig], None] | None
+    ) = field(default=None, repr=False)
 
     @staticmethod
     def _profile_provenance(
@@ -440,11 +448,7 @@ class RuntimeBootstrapper:
             if public.codex_auth_mode == "credential":
                 if len(codex_kinds) != 1 or public.codex_home is not None:
                     raise ValueError
-            elif (
-                public.codex_auth_mode != "file"
-                or codex_kinds
-                or public.codex_home is None
-            ):
+            elif public.codex_auth_mode != "file" or codex_kinds:
                 raise ValueError
             validated_secrets = {
                 kind: _validate_runtime_secret(value)
@@ -467,7 +471,7 @@ class RuntimeBootstrapper:
                     "comment_max_payload_bytes": 10 * 1024 * 1024,
                 }
             )
-            provider_token = validated_secrets[SecretKind.PROVIDER_TOKEN]
+            provider_token = validated_secrets.get(SecretKind.PROVIDER_TOKEN, "")
             codex_environment = self._codex_environment(public, secrets)
             git_credentials = {
                 name: value
@@ -482,11 +486,19 @@ class RuntimeBootstrapper:
             }
             validate_git_identity_environment(identity_values)
             validate_codex_auth_source(codex_environment)
+            publishing_enabled = bool(provider_token) and self.adapters.pr_factory is None
             for mapping in (
                 *workflow.repositories,
                 *(repo for group in workflow.repository_groups for repo in group.repositories),
             ):
-                parse_repository_identity(mapping.repo_url, public.provider_host)
+                if Path(mapping.repo_url).is_absolute():
+                    if provider_token:
+                        raise ValueError
+                else:
+                    parse_repository_identity(
+                        mapping.repo_url,
+                        public.provider_host if publishing_enabled else None,
+                    )
             self._validate_sandbox_capability(
                 persisted_profile,
                 persisted_source,
@@ -519,7 +531,7 @@ class RuntimeBootstrapper:
                 else self.adapters.gateway_factory(settings)
             )
             environment_provider = lambda: dict(codex_environment)
-            codex = (
+            codex_backend = (
                 CodexRunner(
                     run_root,
                     repository,
@@ -532,6 +544,11 @@ class RuntimeBootstrapper:
                 else self.adapters.codex_factory(
                     run_root, repository, environment_provider
                 )
+            )
+            codex = (
+                CodexRequirementAdapter(codex_backend)
+                if isinstance(codex_backend, CodexRunner)
+                else codex_backend
             )
             test_runner = (
                 SandboxCommandExecutor(
@@ -594,7 +611,11 @@ class RuntimeBootstrapper:
                 finally:
                     self.gateway_close(gateway)
 
-            return RuntimeHandle(orchestrator, gateway, close)
+            saver = self.workflow_saver
+            save_workflow = (
+                None if saver is None else lambda candidate: saver(active, candidate)
+            )
+            return RuntimeHandle(orchestrator, gateway, close, save_workflow)
         except BaseException as error:
             if pr_client is not None:
                 try:
@@ -639,7 +660,12 @@ class RuntimeBootstrapper:
         elif public.codex_home is not None:
             environment["CODEX_HOME"] = str(public.codex_home)
         else:
-            raise ValueError
+            # Discover the normal local CLI profile once, validate it through
+            # the same boundary, then pass only its canonical home to workers.
+            discovered_home = validate_codex_auth_source(ambient)
+            if discovered_home is None:
+                raise ValueError
+            environment["CODEX_HOME"] = str(discovered_home)
         return environment
 
 

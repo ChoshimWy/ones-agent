@@ -66,7 +66,11 @@ class TuiRuntimeSession:
         event_sink: Callable[[TaskEvent], None],
     ) -> "TuiRuntimeSession":
         index = RunIndex(handle.orchestrator.store)
-        controller = TuiController(handle.orchestrator, index)
+        controller = TuiController(
+            handle.orchestrator,
+            index,
+            workflow_saver=getattr(handle, "workflow_saver", None),
+        )
         session: TuiRuntimeSession
 
         def emit(event: TaskEvent) -> None:

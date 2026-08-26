@@ -401,6 +401,49 @@ class OnesGateway:
         )
         return await self._list_defects_async(query)
 
+    async def list_requirements(
+        self,
+        *,
+        project_id: str | None = None,
+        issue_type_id: str | None = None,
+        sprint_id: str | None = None,
+        assignee: str | None = None,
+        status_ids: Iterable[str] | None = None,
+        limit: int = 50,
+        page_size: int | None = None,
+    ) -> list[RequirementRecord]:
+        """List normalized ONES requirements for a read-only TUI picker.
+
+        The list endpoint returns compact task rows, while the requirement
+        workflow needs the canonical detail shape. Re-read each bounded row
+        through the same gateway before exposing it to callers.
+        """
+
+        if type(limit) is not int or limit <= 0 or limit > 100:
+            raise ValueError("requirement limit is invalid")
+        query = self._build_defect_query(
+            project_id=project_id,
+            project_ids=None,
+            issue_type_id=issue_type_id,
+            sprint_id=sprint_id,
+            assignee=assignee,
+            assign=None,
+            status_ids=status_ids,
+            current_user=None,
+            mine=False,
+            limit=limit,
+            page_size=page_size,
+        )
+        rows = await self._list_defects_async(query)
+        requirements: list[RequirementRecord] = []
+        for row in rows[:limit]:
+            identity = str(row.get("uuid") or row.get("key") or "").strip()
+            if not identity:
+                raise OnesGatewayPayloadError("requirement list item has no identity")
+            detail = await self._call_async("fetch_issue_detail", identity)
+            requirements.append(self.normalize_requirement(detail))
+        return requirements
+
     async def list_current_user_defects(
         self,
         *,
@@ -467,6 +510,13 @@ class OnesGateway:
 
     async def list_team_members(self, uuids: list[str] | None = None) -> list[dict]:
         return await self._call_async("fetch_team_members", uuids=uuids)
+
+    async def get_current_user_id(self) -> str:
+        payload = await self._call_async("fetch_current_user_identity")
+        identity = payload.get("uuid") if isinstance(payload, dict) else None
+        if type(identity) is not str or not identity.strip():
+            raise OnesGatewayPayloadError("Malformed ONES current user identity")
+        return self._required_scalar(identity, context="current user uuid")
 
     async def list_role_members(self, project_id: str) -> list[dict]:
         return await self._call_async("fetch_role_members", project_id)
@@ -694,6 +744,12 @@ class OnesGateway:
             if updated_at_raw not in (None, "")
             else ""
         )
+        created_at_raw = defect.get("createTime", "")
+        created_at = (
+            self._normalize_timestamp(created_at_raw, context="defect created_at")
+            if created_at_raw not in (None, "")
+            else ""
+        )
 
         return DefectRecord(
             defect_id=defect_id,
@@ -722,8 +778,10 @@ class OnesGateway:
             parent=self._identity_ref(defect.get("parent")),
             path=defect.get("path", ""),
             description=defect.get("description", ""),
-            deadline=defect.get("deadline", ""),
-            created_at=defect.get("createTime", ""),
+            deadline=self._optional_scalar(
+                defect.get("deadline"), context="defect deadline"
+            ),
+            created_at=created_at,
             updated_at=updated_at,
             source="ones",
             raw=defect,
@@ -1533,10 +1591,18 @@ class OnesGateway:
     def _identity_ref(payload: dict | None) -> IdentityRef | None:
         if not payload:
             return None
+
+        def optional_identity_value(value: object) -> str:
+            if value is None or isinstance(value, bool):
+                return ""
+            if isinstance(value, (str, int, float)):
+                return str(value)
+            return ""
+
         return IdentityRef(
-            id=payload.get("uuid", ""),
-            name=payload.get("name", ""),
-            avatar=payload.get("avatar", ""),
+            id=optional_identity_value(payload.get("uuid")),
+            name=optional_identity_value(payload.get("name")),
+            avatar=optional_identity_value(payload.get("avatar")),
         )
 
     @staticmethod

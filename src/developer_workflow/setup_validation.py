@@ -168,9 +168,9 @@ class OnesProbeInput(SetupModel):
     model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True)
 
     team_id: StrictStr
-    project_id: StrictStr
-    status_id: StrictStr
-    item_id: StrictStr
+    project_id: StrictStr | None = None
+    status_id: StrictStr | None = None
+    item_id: StrictStr | None = None
     issue_type_id: StrictStr | None = None
 
     @field_validator("team_id", "project_id", "status_id", "item_id", "issue_type_id")
@@ -1394,23 +1394,31 @@ class SetupValidator:
                     await _invoke(gateway.authenticate)
                 if hasattr(gateway, "get_team"):
                     await _invoke(gateway.get_team, probe.team_id)
-                if hasattr(gateway, "get_project"):
+                if probe.project_id is not None and hasattr(gateway, "get_project"):
                     await _invoke(gateway.get_project, probe.project_id)
                 else:
                     projects = await _invoke(gateway.list_projects, include_archived=False)
-                    if not any(str(item.get("uuid", item.get("id", ""))) == probe.project_id for item in projects):
+                    if probe.project_id is not None and not any(
+                        str(item.get("uuid", item.get("id", ""))) == probe.project_id
+                        for item in projects
+                    ):
                         raise ValueError
-                if hasattr(gateway, "get_status"):
-                    await _invoke(gateway.get_status, probe.status_id)
-                else:
-                    statuses = await _invoke(
-                        gateway.list_defect_statuses,
-                        probe.project_id,
-                        probe.issue_type_id or probe.status_id,
-                    )
-                    if not any(str(getattr(item, "id", "")) == probe.status_id for item in statuses):
-                        raise ValueError
-                await _invoke(gateway.list_comments, probe.item_id, page_size=1)
+                if probe.project_id is not None and probe.status_id is not None:
+                    if hasattr(gateway, "get_status"):
+                        await _invoke(gateway.get_status, probe.status_id)
+                    else:
+                        statuses = await _invoke(
+                            gateway.list_defect_statuses,
+                            probe.project_id,
+                            probe.issue_type_id or probe.status_id,
+                        )
+                        if not any(
+                            str(getattr(item, "id", "")) == probe.status_id
+                            for item in statuses
+                        ):
+                            raise ValueError
+                if probe.item_id is not None:
+                    await _invoke(gateway.list_comments, probe.item_id, page_size=1)
             return _result(SetupStep.ONES)
         except BaseException as error:
             if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):

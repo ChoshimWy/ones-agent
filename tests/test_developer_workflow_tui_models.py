@@ -18,7 +18,10 @@ from src.developer_workflow.contracts import (
     ApprovalPackage,
     CommandOutcome,
     CommandResult,
+    CodexResult,
+    DefectAction,
     DefectCandidate,
+    DefectCheckpoint,
     MultiRepositoryPublicationResult,
     PreparedWorktree,
     PublicationResult,
@@ -50,6 +53,78 @@ from src.developer_workflow.tui.models import (
 NOW = datetime(2026, 8, 11, 4, 0, tzinfo=UTC)
 EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 SENTINEL = "LEAK-ME-9f3d7e"
+
+
+def test_analysis_only_detail_exposes_ai_summary_without_publication() -> None:
+    run = WorkflowRun.new_defect("project", "iteration", "user", "defect").validated_update(
+        state=WorkflowState.COMPLETED,
+        defect_action=DefectAction.ANALYZE,
+        defect_checkpoint=DefectCheckpoint.ROOT_VERIFIED,
+        codex_results=(
+            CodexResult(
+                summary="Null state is dereferenced before the guard.",
+                behavior_before="Opening the view crashes.",
+                impact_scope=("src/view.py",),
+                risk_level="medium",
+                unrelated_changes_checked=True,
+            ),
+        ),
+    )
+
+    detail = RunDetail.from_run(run)
+
+    assert detail.summary.state is WorkflowState.COMPLETED
+    assert detail.tests == ()
+    assert detail.publication.comment_id == ""
+    assert detail.review == (
+        "AI ANALYSIS REPORT",
+        "Analysis mode: read-only; no repository files were modified",
+        "Defect: defect",
+        "",
+        "CONCLUSION",
+        "Null state is dereferenced before the guard.",
+        "",
+        "OBSERVED BEHAVIOR",
+        "Opening the view crashes.",
+        "",
+        "ROOT CAUSE",
+        "No repository-verified root cause is available.",
+        "",
+        "BEST SOLUTION",
+        "No evidence-backed solution can be recommended until the root cause is verified.",
+        "",
+        "IMPACT SCOPE",
+        "- src/view.py",
+        "",
+        "RISK",
+        "medium",
+    )
+
+
+def test_analysis_report_uses_investigation_steps_as_best_available_solution() -> None:
+    run = WorkflowRun.new_defect(
+        "project", "iteration", "user", "defect"
+    ).validated_update(
+        state=WorkflowState.BLOCKED,
+        resume_state=WorkflowState.IMPLEMENTING,
+        defect_action=DefectAction.ANALYZE,
+        codex_results=(
+            CodexResult(
+                summary="The exact dependency revision is not available.",
+                investigation_suggestions=(
+                    "Pin the dependency revision and verify the uninstall state mapping.",
+                    "Add a regression test for RestartRequired handling.",
+                ),
+            ),
+        ),
+    )
+
+    detail = RunDetail.from_run(run)
+    solution_index = detail.review.index("BEST SOLUTION")
+    assert detail.review[solution_index + 1 : solution_index + 3] == (
+        "1. Pin the dependency revision and verify the uninstall state mapping.",
+        "2. Add a regression test for RestartRequired handling.",
+    )
 
 
 @pytest.mark.parametrize(

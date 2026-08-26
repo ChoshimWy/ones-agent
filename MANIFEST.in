@@ -12,4 +12,4 @@ prune dist
 prune .agents
 prune .codex
 prune .git
-global-exclude .env .env.* *.py[cod] *.pem *.key
+global-exclude .env .env.* *.py[cod] *.pem *.key AGENTS.md

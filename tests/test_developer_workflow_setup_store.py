@@ -315,6 +315,34 @@ def test_commit_switches_generation_and_reads_only_active_kinds(
     assert setup.read_active_secrets(second).require(SecretKind.ONES_PASSWORD) == "new"
 
 
+def test_replace_active_workflow_persists_without_rotating_credentials(
+    store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
+) -> None:
+    setup, credentials, _ = store
+    committed = setup.commit(
+        "profile-1", _candidate(tmp_path, "a" * 32), _secrets("stable")
+    )
+    setup.finalize_activation("profile-1", "a" * 32)
+    assert committed.active is not None
+    workflow = DeveloperWorkflowConfig.model_validate(
+        committed.active.workflow.model_dump(mode="python", round_trip=True)
+    )
+    workflow.tui_max_concurrency = 4
+
+    updated = setup.replace_active_workflow(
+        "profile-1", "a" * 32, workflow
+    )
+
+    assert updated.active is not None
+    assert updated.active.generation == "a" * 32
+    assert updated.active.workflow.tui_max_concurrency == 4
+    assert credentials.writes == [("profile-1", "a" * 32)]
+    assert credentials.deletes == []
+    assert setup.read_active_secrets(updated).require(SecretKind.ONES_PASSWORD) == (
+        "stable"
+    )
+
+
 def test_restore_previous_clears_first_failed_generation(
     store: tuple[SetupStore, FakeCredentials, Path], tmp_path: Path
 ) -> None:

@@ -31,6 +31,7 @@ from src.developer_workflow.repository import (
     TargetExists,
     WorktreeRepository,
     build_branch_name,
+    build_run_branch_name,
 )
 
 
@@ -942,6 +943,16 @@ def test_build_branch_name_is_stable_ascii_and_valid(
     branch = build_branch_name(workflow_type, work_item_id, title)
     assert branch == expected
     assert len(branch) <= 120
+
+
+def test_build_run_branch_name_is_unique_across_runs() -> None:
+    first = build_run_branch_name("defect", "DEF-1", "same defect", "a" * 32)
+    second = build_run_branch_name("defect", "DEF-1", "same defect", "b" * 32)
+
+    assert first != second
+    assert first.endswith("-" + "a" * 32)
+    assert second.endswith("-" + "b" * 32)
+    assert len(first) <= 120
 
 
 @pytest.mark.parametrize("work_item_id", ["", "   ", "../REQ", "REQ/1", "REQ\\1", "-danger"])

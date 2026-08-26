@@ -4,23 +4,41 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, wait
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import secrets
+import subprocess
+from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 from typing import Literal
 
-from ..contracts import WorkflowRun, WorkflowState
+from ..config import DeveloperWorkflowConfig
+from ..contracts import (
+    DefectAction,
+    RepositoryGroupMapping,
+    RepositoryMapping,
+    RepositoryRole,
+    WorkflowRun,
+    WorkflowState,
+)
+from ..defect_flow import DefectCandidateError
 from ..orchestrator import DeveloperWorkflowOrchestrator, InvalidWorkflowAction
 from .models import (
     DangerousActionRequest,
     DefectChoice,
+    DefectFilterOptions,
+    FilterChoice,
+    RequirementChoice,
     RunActivity,
     RunDetail,
     RunFilter,
     RunSummary,
     TuiDisplayError,
+    WorkspaceRepositoryInput,
+    WorkspaceSummary,
+    safe_tui_text,
+    validate_tui_input_text,
 )
 from .run_index import RunIndex
 
@@ -28,6 +46,7 @@ from .run_index import RunIndex
 _STALE = "workflow changed; review again"
 _CANDIDATE_ERROR = "candidate snapshot is invalid"
 _ACTION_ERROR = "workflow action failed safely"
+_DEFECT_START_ERROR = "defect workflow could not be started"
 _LIST_ERROR = "workflow list is unavailable"
 _DISPLAY_ERROR = "workflow display is unavailable"
 _ACTION_UNAVAILABLE = "workflow action is unavailable"
@@ -35,8 +54,39 @@ _QUERY_UNAVAILABLE = "candidate query is unavailable"
 _RUNTIME_CLOSE_TIMEOUT = 5.0
 
 
+def _local_repository_url(source: Path) -> str:
+    """Use a local checkout for cloning while retaining its publishable origin."""
+
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(source), "remote", "get-url", "origin"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+            check=False,
+            shell=False,
+        )
+        if completed.returncode == 0:
+            value = completed.stdout.decode("utf-8", "strict").strip()
+            if (
+                value
+                and len(value.encode("utf-8", "strict")) <= 4096
+                and "\x00" not in value
+                and not any(character in "\r\n" for character in value)
+            ):
+                return value
+    except (OSError, subprocess.SubprocessError, UnicodeError, ValueError):
+        pass
+    return str(source)
+
+
 class TuiControllerError(RuntimeError):
     """Fixed-message failure at the interactive application boundary."""
+
+
+class StaleCandidateError(TuiControllerError):
+    """The one-shot defect candidate capability is invalid or expired."""
 
 
 class StaleTuiActionError(TuiControllerError):
@@ -202,6 +252,11 @@ class _CandidateSession:
     candidate_ids: frozenset[str]
 
 
+@dataclass(frozen=True, slots=True)
+class _RequirementSession:
+    candidate_ids: frozenset[str]
+
+
 class TuiController:
     """Adapt workflow services to immutable TUI view models."""
 
@@ -211,14 +266,18 @@ class TuiController:
         run_index: RunIndex,
         *,
         max_candidate_sessions: int = 8,
+        workflow_saver: Callable[[DeveloperWorkflowConfig], None] | None = None,
     ) -> None:
         if type(max_candidate_sessions) is not int or max_candidate_sessions <= 0:
             raise TuiControllerError("candidate session capacity is invalid")
         self._orchestrator = orchestrator
         self._run_index = run_index
         self._max_candidate_sessions = max_candidate_sessions
+        self._workflow_saver = workflow_saver
         self._candidate_sessions: OrderedDict[str, _CandidateSession] = OrderedDict()
+        self._requirement_sessions: OrderedDict[str, _RequirementSession] = OrderedDict()
         self._candidate_lock = Lock()
+        self._workspace_lock = Lock()
         self._closed = False
         self._async_runtime = _AsyncRuntime()
 
@@ -228,6 +287,7 @@ class TuiController:
         with self._candidate_lock:
             self._closed = True
             self._candidate_sessions.clear()
+            self._requirement_sessions.clear()
         try:
             self._async_runtime.close()
         except _AsyncRuntimeError:
@@ -243,6 +303,228 @@ class TuiController:
         except Exception:
             raise TuiControllerError(_LIST_ERROR) from None
 
+    def delete_task(self, run_id: str) -> None:
+        """Delete one local task record without touching repositories or ONES."""
+
+        try:
+            self._run_index.delete(run_id)
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError):
+            raise
+        except Exception:
+            raise TuiControllerError("task could not be deleted safely") from None
+
+    @property
+    def default_defect_project(self) -> str:
+        """Expose the single configured project as a value-only form default."""
+
+        try:
+            projects = {
+                item.project_id
+                for item in self._orchestrator.config.normalized_groups()
+                if type(item.project_id) is str and item.project_id
+            }
+        except Exception:
+            return ""
+        return next(iter(projects)) if len(projects) == 1 else ""
+
+    def list_workspaces(self) -> tuple[WorkspaceSummary, ...]:
+        """Return configured repository groups as top-level workspaces."""
+
+        try:
+            config = self._orchestrator.config
+            workspaces = [
+                WorkspaceSummary(
+                    key=safe_tui_text(group.key, maximum=128),
+                    project_id=safe_tui_text(group.project_id, maximum=128),
+                    iteration_id=safe_tui_text(group.iteration_id, maximum=128),
+                    repositories=tuple(
+                        safe_tui_text(item.repo_name, maximum=128)
+                        for item in group.repositories
+                    ),
+                )
+                for group in config.repository_groups
+            ]
+            grouped = {
+                item.key
+                for group in config.repository_groups
+                for item in group.repositories
+            }
+            workspaces.extend(
+                WorkspaceSummary(
+                    key=safe_tui_text(item.key, maximum=128),
+                    project_id=safe_tui_text(item.project_id, maximum=128),
+                    iteration_id=safe_tui_text(item.iteration_id, maximum=128),
+                    repositories=(safe_tui_text(item.repo_name, maximum=128),),
+                )
+                for item in config.repositories
+                if item.key not in grouped and item.project_id != "pending-project"
+            )
+            return tuple(workspaces)
+        except Exception:
+            raise TuiControllerError("workspace list is unavailable") from None
+
+    def load_workspace_projects(self) -> tuple[FilterChoice, ...]:
+        """Load selectable ONES projects without exposing raw payloads."""
+
+        gateway = getattr(self._orchestrator.defect_candidates, "gateway", None)
+        if gateway is None:
+            raise TuiControllerError(_QUERY_UNAVAILABLE)
+        try:
+            projects = self._async_runtime.submit(gateway.list_projects())
+            return self._named_choices(projects, name_keys=("name", "title", "key"))
+        except (_AsyncRuntimeError, Exception):
+            raise TuiControllerError(_QUERY_UNAVAILABLE) from None
+
+    def load_workspace_iterations(self, project_id: str) -> tuple[FilterChoice, ...]:
+        """Load iterations for one selected ONES project."""
+
+        if type(project_id) is not str or not project_id:
+            raise TuiControllerError(_QUERY_UNAVAILABLE)
+        gateway = getattr(self._orchestrator.defect_candidates, "gateway", None)
+        if gateway is None:
+            raise TuiControllerError(_QUERY_UNAVAILABLE)
+        try:
+            iterations = self._async_runtime.submit(
+                gateway.list_iterations(project_id)
+            )
+            return self._named_choices(
+                iterations, name_keys=("title", "name", "key")
+            )
+        except (_AsyncRuntimeError, Exception):
+            raise TuiControllerError(_QUERY_UNAVAILABLE) from None
+
+    @staticmethod
+    def _named_choices(
+        values: object, *, name_keys: tuple[str, ...]
+    ) -> tuple[FilterChoice, ...]:
+        if not isinstance(values, list):
+            raise ValueError
+        choices: dict[str, FilterChoice] = {}
+        for value in values:
+            if not isinstance(value, dict):
+                raise ValueError
+            identity = value.get("uuid", value.get("id"))
+            name = next(
+                (
+                    value.get(key)
+                    for key in name_keys
+                    if type(value.get(key)) is str and value.get(key).strip()
+                ),
+                None,
+            )
+            if type(identity) is not str or not identity or type(name) is not str:
+                raise ValueError
+            choices[identity] = FilterChoice(
+                id=validate_tui_input_text(identity, maximum=128),
+                name=safe_tui_text(name, maximum=256),
+            )
+        return tuple(sorted(choices.values(), key=lambda item: item.name.casefold()))
+
+    def create_workspace(
+        self,
+        key: str,
+        project_id: str,
+        iteration_id: str,
+        repositories: tuple[WorkspaceRepositoryInput, ...],
+    ) -> WorkspaceSummary:
+        """Persist one project/iteration workspace containing one or more repos."""
+
+        saver = self._workflow_saver
+        if (
+            saver is None
+            or type(key) is not str
+            or type(project_id) is not str
+            or type(iteration_id) is not str
+            or type(repositories) is not tuple
+            or not repositories
+            or any(type(item) is not WorkspaceRepositoryInput for item in repositories)
+        ):
+            raise TuiControllerError("workspace configuration is unavailable")
+        try:
+            project_id = validate_tui_input_text(project_id, maximum=128)
+            iteration_id = validate_tui_input_text(iteration_id, maximum=128)
+            mappings: list[RepositoryMapping] = []
+            for index, item in enumerate(repositories):
+                source_path: Path | None = None
+                repo_url = item.source
+                if item.local:
+                    source_path = Path(item.source).resolve(strict=True)
+                    if not source_path.is_dir() or not (source_path / ".git").exists():
+                        raise ValueError
+                    repo_url = _local_repository_url(source_path)
+                mappings.append(
+                    RepositoryMapping(
+                        key=item.key,
+                        project_id=project_id,
+                        iteration_id=iteration_id,
+                        repo_url=repo_url,
+                        repo_name=item.name,
+                        base_branch=item.branch,
+                        source_path=source_path,
+                        role=(
+                            RepositoryRole.PRIMARY
+                            if index == 0
+                            else RepositoryRole.DEPENDENCY
+                        ),
+                    )
+                )
+            group = RepositoryGroupMapping(
+                key=key,
+                project_id=project_id,
+                iteration_id=iteration_id,
+                primary_repository=mappings[0].key,
+                repositories=tuple(mappings),
+            )
+            with self._workspace_lock:
+                current = self._orchestrator.config
+                if any(item.key == key for item in current.repository_groups):
+                    raise ValueError
+                data = current.model_dump(mode="python", round_trip=True)
+                data["repository_groups"] = (*current.repository_groups, group)
+                candidate = DeveloperWorkflowConfig.model_validate(data)
+                saver(candidate)
+                current.repository_groups = candidate.repository_groups
+                return WorkspaceSummary(
+                    key=safe_tui_text(group.key, maximum=128),
+                    project_id=safe_tui_text(group.project_id, maximum=128),
+                    iteration_id=safe_tui_text(group.iteration_id, maximum=128),
+                    repositories=tuple(
+                        safe_tui_text(item.repo_name, maximum=128)
+                        for item in group.repositories
+                    ),
+                )
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError):
+            raise
+        except Exception:
+            raise TuiControllerError("workspace configuration could not be saved") from None
+
+    def delete_workspace(self, key: str) -> None:
+        """Remove one workspace mapping without touching repositories or ONES data."""
+
+        saver = self._workflow_saver
+        if saver is None or type(key) is not str:
+            raise TuiControllerError("workspace configuration is unavailable")
+        try:
+            key = validate_tui_input_text(key, maximum=128)
+            with self._workspace_lock:
+                current = self._orchestrator.config
+                matches = tuple(
+                    item for item in current.repository_groups if item.key == key
+                )
+                if len(matches) != 1:
+                    raise ValueError
+                data = current.model_dump(mode="python", round_trip=True)
+                data["repository_groups"] = tuple(
+                    item for item in current.repository_groups if item.key != key
+                )
+                candidate = DeveloperWorkflowConfig.model_validate(data)
+                saver(candidate)
+                current.repository_groups = candidate.repository_groups
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError):
+            raise
+        except Exception:
+            raise TuiControllerError("workspace configuration could not be saved") from None
+
     def show(self, run_id: str) -> RunDetail:
         try:
             return self._detail(
@@ -250,6 +532,17 @@ class TuiController:
             )
         except Exception:
             raise TuiControllerError(_DISPLAY_ERROR) from None
+
+    def ai_activity(self, run_id: str) -> tuple[str, ...]:
+        """Return only bounded, display-safe observable AI actions."""
+
+        try:
+            values = self._orchestrator.ai_activity(run_id)
+            return tuple(safe_tui_text(value, maximum=512) for value in values[-40:])
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError):
+            raise
+        except Exception:
+            return ()
 
     def query_defects(
         self,
@@ -303,33 +596,234 @@ class TuiController:
                 self._candidate_sessions.popitem(last=False)
         return CandidateSessionView(session_id=session_id, items=items)
 
+    def load_defect_filter_options(self, project: str) -> DefectFilterOptions:
+        """Read project-scoped iteration, member, and open-status choices."""
+
+        if type(project) is not str or not project.strip():
+            raise TuiControllerError(_QUERY_UNAVAILABLE)
+        candidates = self._orchestrator.defect_candidates
+        gateway = getattr(candidates, "gateway", None)
+        issue_type = getattr(candidates, "issue_type_id", None)
+        if gateway is None or type(issue_type) is not str or not issue_type:
+            raise TuiControllerError(_QUERY_UNAVAILABLE)
+
+        async def load() -> tuple[object, object, object, tuple[str, ...]]:
+            unavailable: list[str] = []
+            try:
+                iterations = await gateway.list_iterations(project)
+            except Exception:
+                iterations = []
+                unavailable.append("iterations")
+            try:
+                roles = await gateway.list_role_members(project)
+            except Exception:
+                roles = []
+                unavailable.append("project roles")
+            try:
+                current_user_id = await gateway.get_current_user_id()
+            except Exception:
+                current_user_id = ""
+                unavailable.append("current user")
+            member_ids = sorted(
+                {
+                    identity
+                    for role in roles
+                    if isinstance(role, dict) and isinstance(role.get("members"), list)
+                    for member in role["members"]
+                    for identity in (
+                        member
+                        if type(member) is str
+                        else member.get("uuid", member.get("id"))
+                        if isinstance(member, dict)
+                        else None,
+                    )
+                    if type(identity) is str and identity
+                }
+            )
+            if current_user_id and current_user_id not in member_ids:
+                member_ids.append(current_user_id)
+                member_ids.sort()
+            try:
+                members = await gateway.list_team_members(
+                    uuids=member_ids if member_ids else None
+                )
+                if not members and member_ids:
+                    members = await gateway.list_team_members(uuids=None)
+            except Exception:
+                members = []
+                unavailable.append("users")
+            if not members and current_user_id:
+                members = [{"uuid": current_user_id, "name": "Current user"}]
+            try:
+                statuses = await gateway.list_defect_statuses(project, issue_type)
+            except Exception:
+                statuses = []
+                unavailable.append("statuses")
+            return iterations, members, (statuses, current_user_id), tuple(unavailable)
+
+        try:
+            iterations, members, status_payload, unavailable = self._async_runtime.submit(load())
+            statuses, current_user_id = status_payload
+
+            def raw_choices(
+                values: object, *, name_keys: tuple[str, ...]
+            ) -> tuple[FilterChoice, ...]:
+                if not isinstance(values, list):
+                    raise ValueError
+                choices: dict[str, FilterChoice] = {}
+                for value in values:
+                    if not isinstance(value, dict):
+                        continue
+                    identity = value.get("uuid", value.get("id"))
+                    name = next(
+                        (
+                            value.get(key)
+                            for key in name_keys
+                            if type(value.get(key)) is str and value.get(key).strip()
+                        ),
+                        None,
+                    )
+                    if type(identity) is not str or not identity or type(name) is not str:
+                        continue
+                    choices[identity] = FilterChoice(
+                        id=validate_tui_input_text(identity, maximum=128),
+                        name=safe_tui_text(name, maximum=256),
+                    )
+                return tuple(sorted(choices.values(), key=lambda item: item.name.casefold()))
+
+            iteration_choices = raw_choices(
+                iterations, name_keys=("title", "name", "key")
+            )
+            assignee_choices = tuple(
+                FilterChoice(
+                    id=item.id,
+                    name=item.name,
+                    selected=item.id == current_user_id,
+                )
+                for item in raw_choices(members, name_keys=("name", "email"))
+            )
+            status_choices = tuple(
+                FilterChoice(
+                    id=validate_tui_input_text(status.id, maximum=128),
+                    name=safe_tui_text(status.name or status.id, maximum=256),
+                    selected=status.default is True,
+                )
+                for status in statuses
+                if type(status.category) is str
+                and status.category.strip().casefold()
+                in {"open", "todo", "to_do", "doing", "in_progress", "pending"}
+            )
+            return DefectFilterOptions(
+                iterations=iteration_choices,
+                assignees=assignee_choices,
+                statuses=status_choices,
+                unavailable=unavailable,
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            raise TuiControllerError(_QUERY_UNAVAILABLE) from None
+
     def start_defect(self, session_id: str, candidate_id: str) -> RunDetail:
+        return self._start_defect(session_id, candidate_id, analyze_only=False)
+
+    def analyze_defect(self, session_id: str, candidate_id: str) -> RunDetail:
+        """Start a read-only AI root-cause analysis for one selected defect."""
+
+        return self._start_defect(session_id, candidate_id, analyze_only=True)
+
+    def _start_defect(
+        self,
+        session_id: str,
+        candidate_id: str,
+        *,
+        analyze_only: bool,
+    ) -> RunDetail:
         if (
             type(session_id) is not str
             or not session_id
             or type(candidate_id) is not str
             or not candidate_id
         ):
-            raise TuiControllerError(_CANDIDATE_ERROR)
+            raise StaleCandidateError(_CANDIDATE_ERROR)
         with self._candidate_lock:
             if self._closed:
                 raise TuiControllerError(_QUERY_UNAVAILABLE)
             session = self._candidate_sessions.pop(session_id, None)
             if session is None or candidate_id not in session.candidate_ids:
-                raise TuiControllerError(_CANDIDATE_ERROR)
+                raise StaleCandidateError(_CANDIDATE_ERROR)
         try:
-            run = self._orchestrator.start_defect(
+            args = (
                 session.project,
                 session.iteration,
                 session.assignee,
                 session.snapshot_token,
                 candidate_id,
             )
+            if analyze_only:
+                run = self._orchestrator.start_defect(
+                    *args,
+                    action=DefectAction.ANALYZE,
+                )
+            else:
+                run = self._orchestrator.start_defect(*args)
             return self._detail(run)
+        except (DefectCandidateError, InvalidWorkflowAction):
+            raise StaleCandidateError(_CANDIDATE_ERROR) from None
+        except (KeyboardInterrupt, SystemExit, GeneratorExit, MemoryError):
+            raise
+        except Exception:
+            raise TuiControllerError(_DEFECT_START_ERROR) from None
+
+    def query_requirements(
+        self,
+        project: str,
+        iteration: str,
+        assignee: str,
+        status_ids: tuple[str, ...],
+        issue_type_id: str,
+    ) -> tuple[str, tuple[RequirementChoice, ...]]:
+        with self._candidate_lock:
+            if self._closed:
+                raise TuiControllerError(_QUERY_UNAVAILABLE)
+        gateway = getattr(getattr(self._orchestrator, "requirement_flow", None), "gateway", None)
+        list_requirements = getattr(gateway, "list_requirements", None)
+        if not callable(list_requirements):
+            raise TuiControllerError(_QUERY_UNAVAILABLE)
+        try:
+            records = self._async_runtime.submit(
+                list_requirements(
+                    project_id=project or None,
+                    issue_type_id=issue_type_id or None,
+                    sprint_id=iteration or None,
+                    assignee=assignee or None,
+                    status_ids=None if status_ids == () else status_ids,
+                )
+            )
+            items = tuple(RequirementChoice.from_requirement(item) for item in records)
+            if len({item.requirement_id for item in items}) != len(items):
+                raise ValueError
+        except _AsyncRuntimeError:
+            raise TuiControllerError(_QUERY_UNAVAILABLE) from None
         except Exception:
             raise TuiControllerError(_CANDIDATE_ERROR) from None
+        session_id = secrets.token_urlsafe(32)
+        with self._candidate_lock:
+            if self._closed:
+                raise TuiControllerError(_QUERY_UNAVAILABLE)
+            self._requirement_sessions[session_id] = _RequirementSession(
+                candidate_ids=frozenset(item.requirement_id for item in items)
+            )
+            while len(self._requirement_sessions) > self._max_candidate_sessions:
+                self._requirement_sessions.popitem(last=False)
+        return session_id, items
 
-    def start_requirement(self, requirement_id: str) -> RunDetail:
+    def start_requirement(self, requirement_id: str, session_id: str | None = None) -> RunDetail:
+        if session_id is not None:
+            with self._candidate_lock:
+                session = self._requirement_sessions.pop(session_id, None)
+                if session is None or requirement_id not in session.candidate_ids:
+                    raise TuiControllerError(_CANDIDATE_ERROR)
         return self._command(self._orchestrator.start_requirement, requirement_id)
 
     def confirm_repository(
@@ -339,6 +833,24 @@ class TuiController:
             self._orchestrator.confirm_repository,
             run_id,
             mapping_key,
+            expected_version=expected_version,
+        )
+
+    def accept_analysis_solution(
+        self, run_id: str, expected_version: int
+    ) -> RunDetail:
+        return self._command(
+            self._orchestrator.accept_analysis_solution,
+            run_id,
+            expected_version=expected_version,
+        )
+
+    def regenerate_analysis_solution(
+        self, run_id: str, expected_version: int
+    ) -> RunDetail:
+        return self._command(
+            self._orchestrator.regenerate_analysis_solution,
+            run_id,
             expected_version=expected_version,
         )
 
@@ -448,16 +960,17 @@ class TuiController:
         except Exception:
             raise TuiControllerError(_ACTION_ERROR) from None
 
-    @staticmethod
-    def _detail(run: WorkflowRun) -> RunDetail:
+    def _detail(self, run: WorkflowRun) -> RunDetail:
         try:
-            return RunDetail.from_run(run)
+            detail = RunDetail.from_run(run)
+            return replace(detail, ai_activity=self.ai_activity(run.run_id))
         except (TuiDisplayError, TypeError, AttributeError):
             raise TuiControllerError(_ACTION_ERROR) from None
 
 
 __all__ = [
     "CandidateSessionView",
+    "StaleCandidateError",
     "StaleTuiActionError",
     "TuiController",
     "TuiControllerError",

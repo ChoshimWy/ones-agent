@@ -17,8 +17,16 @@ class PullRequestProviderError(RuntimeError):
     """A redacted provider-boundary failure."""
 
 
-def parse_repository_identity(repo_url: str, expected_host: str) -> tuple[str, str]:
-    """Parse a provider repository URL without weakening host/path identity."""
+def parse_repository_identity(
+    repo_url: str, expected_host: str | None
+) -> tuple[str, str]:
+    """Parse a repository URL and optionally bind it to a publishing host.
+
+    Analysis-only runtimes still validate the URL shape, credentials, and path,
+    but do not need to pretend that every local source publishes through the
+    globally configured provider.  Publishing callers continue to pass a host
+    and therefore retain the strict identity check.
+    """
 
     if type(repo_url) is not str or not repo_url.strip() or any(
         ord(character) < 32 or ord(character) == 127 for character in repo_url
@@ -44,7 +52,7 @@ def parse_repository_identity(repo_url: str, expected_host: str) -> tuple[str, s
         if parsed.password is not None:
             raise PullRequestProviderError("Repository URL credentials are forbidden")
         host, path = parsed.hostname.casefold(), parsed.path
-    if host != expected_host.casefold():
+    if expected_host is not None and host != expected_host.casefold():
         raise PullRequestProviderError("Repository host does not match provider")
     if "?" in path or "#" in path or "\\" in path:
         raise PullRequestProviderError("Repository path is invalid")

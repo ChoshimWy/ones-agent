@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
-from dataclasses import dataclass, field
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 import re
 from typing import Literal
 import unicodedata
+from urllib.parse import urlsplit
 
 from rich.text import Text
 from textual import events, on
@@ -24,23 +25,34 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    Select,
+    SelectionList,
     Static,
     TabbedContent,
     TabPane,
 )
 
 from ..contracts import WorkflowState, WorkflowType
-from .controller import StaleTuiActionError, TuiController, TuiControllerError
+from .controller import (
+    StaleCandidateError,
+    StaleTuiActionError,
+    TuiController,
+    TuiControllerError,
+)
 from .models import (
     DangerousActionRequest,
     DefectChoice,
+    FilterChoice,
     MappingCandidateView,
+    RequirementChoice,
     RepositoryView,
     RunActivity,
     RunDetail,
     RunFilter,
     RunSummary,
     TuiDisplayError,
+    WorkspaceRepositoryInput,
+    WorkspaceSummary,
     validate_tui_input_text,
 )
 from .supervisor import RunTaskSupervisor
@@ -48,6 +60,7 @@ from .supervisor import RunTaskSupervisor
 
 _DETAIL_TABS = (
     "overview",
+    "ai-activity",
     "repositories",
     "tests",
     "review",
@@ -67,7 +80,177 @@ _ACTION_UNAVAILABLE = "workflow action is unavailable"
 _ACTION_FAILED = "workflow action failed safely"
 _ACTION_STALE = "workflow changed; review again"
 _ACTION_INPUT_REQUIRED = "required action fields are missing"
+
+
+def _workflow_phase(detail: RunDetail) -> str:
+    if detail.summary.state is WorkflowState.BLOCKED:
+        return "workflow stopped safely"
+    state = (
+        detail.resume_state
+        if detail.summary.state is WorkflowState.BLOCKED
+        and detail.resume_state is not None
+        else detail.summary.state
+    )
+    return {
+        WorkflowState.CREATED: "creating analysis run",
+        WorkflowState.READING_ONES: "reading ONES defect details",
+        WorkflowState.VALIDATING: "validating repository mapping",
+        WorkflowState.PREPARING_REPO: "preparing isolated repositories",
+        WorkflowState.IMPLEMENTING: "AI root-cause analysis in progress",
+        WorkflowState.TESTING: "verifying repository evidence",
+        WorkflowState.AI_REVIEW: "reviewing analysis evidence",
+        WorkflowState.WAITING_APPROVAL: "waiting for approval",
+        WorkflowState.PUBLISHING: "publishing approved changes",
+        WorkflowState.COMPLETED: "workflow completed",
+        WorkflowState.BLOCKED: "workflow stopped safely",
+        WorkflowState.CANCELLED: "workflow cancelled",
+        WorkflowState.FAILED: "workflow failed safely",
+    }.get(state, state.value)
+
+
+def _workflow_progress_text(
+    detail: RunDetail, activity: tuple[str, ...] = ()
+) -> str:
+    lines = [
+        f"phase: {_workflow_phase(detail)}",
+        f"state: {detail.summary.state.value}",
+        f"version: {detail.summary.version}",
+    ]
+    lines.extend(
+        f"{item.source} -> {item.target}  {item.occurred_at.isoformat()}"
+        for item in detail.history[-4:]
+    )
+    if activity:
+        lines.append("")
+        lines.append("AI activity:")
+        lines.extend(f"  {item}" for item in activity[-12:])
+    return "\n".join(lines)
+
+
+_POWERSHELL_COMMAND = re.compile(
+    r'^"[^"]*powershell(?:\.exe)?"\s+-Command\s+"(?P<command>.*)"$',
+    re.IGNORECASE,
+)
+_COMMAND_EXIT = re.compile(r"\s+\(exit\s+(?P<code>-?\d+)\)\s*$")
+
+
+def _compact_activity_command(command: str) -> str:
+    """Hide the repetitive shell launcher while preserving the real command."""
+
+    match = _POWERSHELL_COMMAND.fullmatch(command.strip())
+    return match.group("command") if match is not None else command.strip()
+
+
+def _ai_activity_renderable(activity: tuple[str, ...]) -> Text:
+    """Build a readable, styled activity stream from sanitized runtime events."""
+
+    rendered = Text()
+    rendered.append("AI ANALYSIS\n", style="bold cyan")
+    rendered.append(
+        "Live repository investigation and reasoning\n\n",
+        style="dim",
+    )
+    for event in activity:
+        line = event.strip()
+        if line.startswith("Running: "):
+            command = _compact_activity_command(line.removeprefix("Running: "))
+            rendered.append("› ", style="bold cyan")
+            rendered.append("Running: ", style="bold cyan")
+            rendered.append(command, style="cyan")
+        elif line.startswith("Command completed: "):
+            command = line.removeprefix("Command completed: ")
+            exit_match = _COMMAND_EXIT.search(command)
+            exit_code = int(exit_match.group("code")) if exit_match else None
+            if exit_match is not None:
+                command = command[: exit_match.start()]
+            command = _compact_activity_command(command)
+            successful = exit_code == 0
+            rendered.append("✓ " if successful else "✕ ", style=(
+                "bold green" if successful else "bold red"
+            ))
+            rendered.append("Command completed: ", style="bold")
+            rendered.append(command)
+            if exit_code is not None:
+                rendered.append(
+                    f"  [exit {exit_code}]",
+                    style="green" if successful else "red",
+                )
+        elif line.startswith("Analysis result: "):
+            rendered.append("◆ Analysis result: ", style="bold magenta")
+            rendered.append(line.removeprefix("Analysis result: "))
+        elif line == "Codex session started":
+            rendered.append("● Codex session started", style="bold blue")
+        elif line == "AI analysis started":
+            rendered.append("● AI analysis started", style="bold cyan")
+        elif line.startswith("AI analysis completed"):
+            rendered.append(f"✓ {line}", style="bold green")
+        elif line.startswith("Structured analysis result validated"):
+            rendered.append(f"✓ {line}", style="bold green")
+        elif line.startswith("Structured result needs correction"):
+            rendered.append(f"↻ {line}", style="bold yellow")
+        elif line.startswith("Correcting structured analysis result"):
+            rendered.append(f"↻ {line}", style="bold yellow")
+        elif "mismatch" in line.casefold() or "failed" in line.casefold():
+            rendered.append(f"! {line}", style="bold red")
+        elif line.startswith("Preparing "):
+            rendered.append(f"● {line}", style="blue")
+        else:
+            rendered.append(f"· {line}", style="dim")
+        rendered.append("\n")
+    return rendered
+
+
 _SAFE_MAPPING_KEY = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
+
+
+def _repository_name_from_source(
+    source: str,
+    existing: tuple[WorkspaceRepositoryInput, ...],
+) -> str:
+    """Derive a stable safe repository name from a local path or remote URL."""
+
+    normalized = source.replace("\\", "/").rstrip("/")
+    if "://" in normalized:
+        normalized = urlsplit(normalized).path.rstrip("/")
+    elif re.match(r"[^/@:]+@[^/:]+:", normalized):
+        normalized = normalized.split(":", 1)[1].rstrip("/")
+    leaf = normalized.rsplit("/", 1)[-1]
+    if leaf.casefold().endswith(".git"):
+        leaf = leaf[:-4]
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", leaf).strip("._-")
+    if not base:
+        base = "repository"
+    if base.casefold().endswith(".lock"):
+        base = f"{base[:-5]}-repository".strip("-") or "repository"
+    base = base[:128].rstrip("._-") or "repository"
+
+    occupied = {item.key.casefold() for item in existing}
+    candidate = base
+    suffix = 2
+    while candidate.casefold() in occupied:
+        marker = f"-{suffix}"
+        candidate = f"{base[: 128 - len(marker)].rstrip('._-')}{marker}"
+        suffix += 1
+    return candidate
+
+
+def _workspace_key_from_scope(
+    project_id: str,
+    iteration_id: str,
+    preferred_name: str = "",
+) -> str:
+    """Build a safe internal key from a friendly name or the ONES scope."""
+
+    raw = preferred_name or f"{project_id}-{iteration_id}"
+    key = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("._-")
+    if not key:
+        raw = f"{project_id}-{iteration_id}"
+        key = re.sub(r"[^A-Za-z0-9._-]+", "-", raw).strip("._-")
+    if not key:
+        key = "workspace"
+    if key.casefold().endswith(".lock"):
+        key = f"{key[:-5]}-workspace".strip("-") or "workspace"
+    return key[:128].rstrip("._-") or "workspace"
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,39 +291,97 @@ class SettingsView:
 class NavigationPane(Vertical):
     """Mouse and keyboard reachable top-level destinations."""
 
+    def __init__(self, *, workspace_mode: bool, **kwargs: object) -> None:
+        super().__init__(**kwargs)
+        self._workspace_mode = workspace_mode
+
     def compose(self) -> ComposeResult:
-        yield Button("Runs", id="nav-runs", variant="primary")
-        yield Button("Defects", id="nav-defects")
-        yield Button("New Run", id="nav-new-run")
-        yield Button("Settings", id="nav-settings")
+        if self._workspace_mode:
+            yield Button("Workspaces", id="nav-workspaces", variant="primary")
+            yield Button("Tasks", id="nav-runs")
+            yield Button("Configuration", id="nav-settings")
+        else:
+            yield Button("Tasks", id="nav-runs", variant="primary")
+            yield Button("Defects", id="nav-defects")
+            yield Button("Requirements", id="nav-requirements")
+            yield Button("New Run", id="nav-new-run")
+            yield Button("Runtime setup", id="nav-runtime-setup")
+            yield Button("Settings", id="nav-settings")
+
+
+class WorkspaceListPane(Vertical):
+    """Top-level list of project/iteration workspaces."""
+
+    def compose(self) -> ComposeResult:
+        yield Label("Workspaces", classes="pane-title")
+        yield Button("Create workspace", id="create-workspace", variant="primary")
+        yield ListView(id="workspace-list")
+
+    async def replace_workspaces(
+        self, workspaces: tuple[WorkspaceSummary, ...]
+    ) -> None:
+        listing = self.query_one("#workspace-list", ListView)
+        await listing.clear()
+        await listing.extend(
+            ListItem(
+                Label(
+                    "  ".join(
+                        (
+                            item.key,
+                            f"project: {item.project_id}",
+                            f"iteration: {item.iteration_id}",
+                            f"repos: {len(item.repositories)}",
+                        )
+                    ),
+                    markup=False,
+                ),
+                id=f"workspace-item-{index}",
+            )
+            for index, item in enumerate(workspaces)
+        )
 
 
 class RunListPane(Vertical):
     """Selectable workflow summaries."""
 
     def compose(self) -> ComposeResult:
-        yield Label("Runs", classes="pane-title")
+        yield Label("Tasks", classes="pane-title")
+        yield Button("Delete task", id="delete-task", variant="error")
         yield ListView(id="run-list")
+
+    @staticmethod
+    def _summary_text(item: RunSummary) -> Text:
+        return Text.from_markup(
+            "  ".join(
+                (
+                    item.state.value,
+                    item.work_item_id,
+                    item.updated_at.astimezone(UTC)
+                    .isoformat(timespec="seconds")
+                    .replace("+00:00", "Z"),
+                    item.activity.value,
+                )
+            )
+        )
 
     async def replace_runs(self, runs: tuple[RunSummary, ...]) -> None:
         run_list = self.query_one("#run-list", ListView)
+        existing = tuple(run_list.query("ListItem"))
+        if tuple(item.name for item in existing) == tuple(
+            item.run_id for item in runs
+        ):
+            for row, summary in zip(existing, runs, strict=True):
+                row.query_one(Label).update(self._summary_text(summary))
+            if runs and run_list.index is None:
+                run_list.index = 0
+            return
+
         await run_list.clear()
         await run_list.extend(
             [
                 ListItem(
                     Label(
-                        Text.from_markup(
-                            "  ".join(
-                                (
-                                    item.state.value,
-                                    item.work_item_id,
-                                    item.updated_at.astimezone(UTC)
-                                    .isoformat(timespec="seconds")
-                                    .replace("+00:00", "Z"),
-                                    item.activity.value,
-                                )
-                            )
-                        ),
+                        self._summary_text(item),
                         markup=False,
                     ),
                     id=f"run-item-{index}",
@@ -154,31 +395,45 @@ class RunListPane(Vertical):
 
 
 class RunDetailPane(Vertical):
-    """Six fixed evidence tabs backed only by safe view-model fields."""
+    """Fixed evidence tabs backed only by safe view-model fields."""
+
+    def __init__(self, *args, initial_tab: str = "overview", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._initial_tab = initial_tab
+        self._report_opened = False
 
     def compose(self) -> ComposeResult:
-        yield Label("Run detail", classes="pane-title")
-        with TabbedContent(initial="overview", id="detail-tabs"):
+        yield Label("Task detail", classes="pane-title")
+        with TabbedContent(initial=self._initial_tab, id="detail-tabs"):
             with TabPane("Overview", id="overview"):
-                yield Static("No run selected", id="overview-content", markup=True)
+                with VerticalScroll(classes="detail-scroll", id="overview-scroll"):
+                    yield Static("No run selected", id="overview-content", markup=True)
+            with TabPane("AI activity", id="ai-activity"):
+                with VerticalScroll(classes="detail-scroll", id="ai-activity-scroll"):
+                    yield Static("No AI activity", id="ai-activity-content", markup=False)
             with TabPane("Repositories", id="repositories"):
-                yield Static(
-                    "No repository evidence",
-                    id="repositories-content",
-                    markup=True,
-                )
+                with VerticalScroll(classes="detail-scroll", id="repositories-scroll"):
+                    yield Static(
+                        "No repository evidence",
+                        id="repositories-content",
+                        markup=True,
+                    )
             with TabPane("Tests", id="tests"):
-                yield Static("No test evidence", id="tests-content", markup=True)
+                with VerticalScroll(classes="detail-scroll", id="tests-scroll"):
+                    yield Static("No test evidence", id="tests-content", markup=True)
             with TabPane("Review", id="review"):
-                yield Static("No review evidence", id="review-content", markup=True)
+                with VerticalScroll(classes="detail-scroll", id="review-scroll"):
+                    yield Static("No review evidence", id="review-content", markup=True)
             with TabPane("Publication", id="publication"):
-                yield Static(
-                    "No publication evidence",
-                    id="publication-content",
-                    markup=True,
-                )
+                with VerticalScroll(classes="detail-scroll", id="publication-scroll"):
+                    yield Static(
+                        "No publication evidence",
+                        id="publication-content",
+                        markup=True,
+                    )
             with TabPane("History", id="history"):
-                yield Static("No history", id="history-content", markup=True)
+                with VerticalScroll(classes="detail-scroll", id="history-scroll"):
+                    yield Static("No history", id="history-content", markup=True)
 
     def set_detail(self, detail: RunDetail) -> None:
         summary = detail.summary
@@ -192,6 +447,7 @@ class RunDetailPane(Vertical):
                     f"risks: {detail.risk_count}",
                     f"unresolved: {detail.unresolved_count}",
                     f"blocked: {detail.blocked_reason or 'no'}",
+                    f"status: {detail.status_message or _workflow_phase(detail)}",
                     "resume state: "
                     + (
                         detail.resume_state.value
@@ -205,6 +461,24 @@ class RunDetailPane(Vertical):
             _repository_text(item)
             for item in detail.repositories
         )
+        if detail.ai_activity:
+            activity_text: str | Text = _ai_activity_renderable(
+                detail.ai_activity
+            )
+        else:
+            activity_text = "\n".join(
+                (
+                    "Workflow started",
+                    f"Current phase: {_workflow_phase(detail)}",
+                    "Preparing the workflow before the Codex session starts...",
+                    "AI activity will appear here as soon as it is available.",
+                )
+            )
+        activity_scroll = self.query_one("#ai-activity-scroll", VerticalScroll)
+        follow_latest = activity_scroll.scroll_y >= activity_scroll.max_scroll_y - 1
+        if follow_latest:
+            activity_scroll.anchor(animate=False)
+        self.query_one("#ai-activity-content", Static).update(activity_text)
         test_lines = tuple(
             f"{item.command}  {item.outcome}  exit: {item.exit_code}"
             for item in detail.tests
@@ -235,9 +509,19 @@ class RunDetailPane(Vertical):
             )
             or "No history"
         )
+        if (
+            not self._report_opened
+            and summary.state is WorkflowState.COMPLETED
+            and detail.review
+        ):
+            tabs = self.query_one("#detail-tabs", TabbedContent)
+            if tabs.active == "ai-activity":
+                tabs.active = "review"
+                self._report_opened = True
 
     def clear_detail(self) -> None:
         self.query_one("#overview-content", Static).update("No run selected")
+        self.query_one("#ai-activity-content", Static).update("No AI activity")
         self.query_one("#repositories-content", Static).update(
             "No repository evidence"
         )
@@ -316,13 +600,33 @@ class RunDetailScreen(Screen[None]):
         Binding("shift+tab", "previous_tab", "Previous tab", show=False, priority=True),
     ]
 
-    def __init__(self, detail: RunDetail | None, *, error: str = "") -> None:
+    def __init__(
+        self,
+        detail: RunDetail | None,
+        *,
+        error: str = "",
+        controller: TuiController | None = None,
+        supervisor: RunTaskSupervisor | None = None,
+    ) -> None:
         super().__init__(id="run-detail-screen")
         self._detail = detail
         self._error = error
+        self._controller = controller
+        self._supervisor = supervisor
 
     def compose(self) -> ComposeResult:
         yield RunDetailPane(id="run-detail")
+        with Horizontal(id="analysis-decision-bar"):
+            yield Button(
+                "Accept solution",
+                id="detail-accept-analysis",
+                variant="success",
+            )
+            yield Button(
+                "Regenerate solution",
+                id="detail-regenerate-analysis",
+            )
+        yield Static("", id="detail-action-notice", markup=False)
 
     def on_mount(self) -> None:
         pane = self.query_one(RunDetailPane)
@@ -330,6 +634,60 @@ class RunDetailScreen(Screen[None]):
             pane.set_detail(self._detail)
         else:
             pane.show_error(self._error or _DISPLAY_UNAVAILABLE)
+        self._update_analysis_actions()
+
+    def _update_analysis_actions(self) -> None:
+        enabled = self._controller is not None and self._supervisor is not None
+        detail = self._detail
+        self.query_one("#detail-accept-analysis", Button).display = bool(
+            enabled and detail and detail.can_accept_analysis
+        )
+        self.query_one("#detail-regenerate-analysis", Button).display = bool(
+            enabled and detail and detail.can_regenerate_analysis
+        )
+
+    async def _analysis_decision(self, *, accept: bool) -> None:
+        detail = self._detail
+        controller = self._controller
+        supervisor = self._supervisor
+        if detail is None or controller is None or supervisor is None:
+            return
+        allowed = detail.can_accept_analysis if accept else detail.can_regenerate_analysis
+        if not allowed:
+            return
+        self.query_one("#detail-accept-analysis", Button).display = False
+        self.query_one("#detail-regenerate-analysis", Button).display = False
+        self.query_one("#detail-action-notice", Static).update(
+            "Repair workflow started" if accept else "Regenerating analysis solution"
+        )
+        call = (
+            controller.accept_analysis_solution
+            if accept
+            else controller.regenerate_analysis_solution
+        )
+        try:
+            self._detail = await supervisor.run_mutation(
+                detail.summary.run_id,
+                "accept-analysis" if accept else "regenerate-analysis",
+                call,
+                detail.summary.run_id,
+                detail.summary.version,
+            )
+        except Exception:
+            self.query_one("#detail-action-notice", Static).update(_ACTION_FAILED)
+            self._update_analysis_actions()
+            return
+        self.query_one(RunDetailPane).set_detail(self._detail)
+        self.query_one("#detail-action-notice", Static).update("")
+        self._update_analysis_actions()
+
+    @on(Button.Pressed, "#detail-accept-analysis")
+    async def _accept_analysis(self) -> None:
+        await self._analysis_decision(accept=True)
+
+    @on(Button.Pressed, "#detail-regenerate-analysis")
+    async def _regenerate_analysis(self) -> None:
+        await self._analysis_decision(accept=False)
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -366,6 +724,7 @@ class _MappingWizardScreen(Screen[RunDetail | None]):
         self._mapping_key = ""
         self._mapping_candidates: tuple[MappingCandidateView, ...] = ()
         self._step = self.STEP_FILTER
+        self._confirmation_task: asyncio.Task[None] | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="wizard-body"):
@@ -441,19 +800,71 @@ class _MappingWizardScreen(Screen[RunDetail | None]):
         if preview is None or not self._mapping_key:
             self._show_notice(_WIZARD_UNAVAILABLE)
             return
-        try:
-            detail = await self._supervisor.run_mutation(
-                preview.summary.run_id,
-                "confirm-repository",
-                self._controller.confirm_repository,
+        body = self.query_one("#wizard-body", VerticalScroll)
+        await body.remove_children()
+        running_detail = RunDetailPane(
+            id="running-detail", initial_tab="ai-activity"
+        )
+        await body.mount(running_detail)
+        running_detail.set_detail(preview)
+        task = self._supervisor.submit(
+            preview.summary.run_id,
+            "confirm-repository",
+            lambda: self._controller.confirm_repository(
                 preview.summary.run_id,
                 self._mapping_key,
                 preview.summary.version,
-            )
+            ),
+        )
+
+        # Do not await the workflow from the button handler.  Textual may defer
+        # painting widget changes until that handler returns, which made the
+        # confirmation page appear frozen for the whole Codex run.
+        self._confirmation_task = asyncio.create_task(
+            self._finish_confirmation(task, preview),
+            name=f"tui-confirm-{preview.summary.run_id}",
+        )
+
+    async def _finish_confirmation(
+        self, task: asyncio.Task[RunDetail], preview: RunDetail
+    ) -> None:
+
+        async def refresh_progress() -> None:
+            while True:
+                await asyncio.sleep(0.2)
+                if not self.is_attached:
+                    continue
+                try:
+                    progress = await asyncio.to_thread(
+                        self._controller.show, preview.summary.run_id
+                    )
+                except Exception:
+                    continue
+                activity: tuple[str, ...] = ()
+                activity_source = getattr(self._controller, "ai_activity", None)
+                if callable(activity_source):
+                    try:
+                        activity = await asyncio.to_thread(
+                            activity_source, preview.summary.run_id
+                        )
+                    except Exception:
+                        activity = ()
+                if activity:
+                    progress = replace(progress, ai_activity=activity)
+                self.query_one("#running-detail", RunDetailPane).set_detail(progress)
+
+        progress_task = asyncio.create_task(refresh_progress())
+        try:
+            detail = await task
         except Exception:
-            self._show_notice(_WIZARD_UNAVAILABLE)
+            if self.is_attached:
+                self._show_notice(_WIZARD_UNAVAILABLE)
             return
-        self.dismiss(detail)
+        finally:
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
+        if self.is_attached:
+            self.dismiss(detail)
 
     def _show_notice(self, message: str) -> None:
         self.query_one("#wizard-notice", Static).update(message)
@@ -480,7 +891,13 @@ class _MappingWizardScreen(Screen[RunDetail | None]):
 class DefectWizardScreen(_MappingWizardScreen):
     """Four-stage defect wizard with a read-only candidate query."""
 
-    def __init__(self, controller: TuiController, supervisor: RunTaskSupervisor) -> None:
+    def __init__(
+        self,
+        controller: TuiController,
+        supervisor: RunTaskSupervisor,
+        *,
+        workspace: WorkspaceSummary | None = None,
+    ) -> None:
         super().__init__(
             controller,
             supervisor,
@@ -488,29 +905,116 @@ class DefectWizardScreen(_MappingWizardScreen):
         )
         self._candidate_session_id: str | None = None
         self._candidates: tuple[DefectChoice, ...] = ()
+        self._workspace = workspace
 
     def _initial_widgets(self) -> tuple[Widget, ...]:
+        project = (
+            self._workspace.project_id
+            if self._workspace is not None
+            else getattr(self._controller, "default_defect_project", "")
+        )
+        if type(project) is not str:
+            project = ""
         return (
-            Label("New defect workflow"),
-            Input(placeholder="ONES project ID", id="project"),
-            Input(placeholder="ONES iteration ID", id="iteration"),
-            Input(placeholder="ONES assignee ID", id="assignee"),
+            Label("Analyze and repair an ONES defect in the current workspace"),
             Input(
-                placeholder="ONES status IDs, comma-separated",
-                id="status-ids",
+                value=project,
+                placeholder="ONES project ID",
+                id="project",
+                disabled=bool(project),
             ),
+            Select([], prompt="Loading ONES iterations…", id="iteration", disabled=True),
+            Select([], prompt="Loading ONES users…", id="assignee", disabled=True),
+            Label("Open defect statuses"),
+            SelectionList(id="status-ids", disabled=True),
+            Button("Reload ONES options", id="reload-defect-options"),
             Button("Query defects", id="query-defects", variant="primary"),
         )
 
+    async def on_mount(self) -> None:
+        await self._load_filter_options()
+
+    async def _load_filter_options(self) -> None:
+        project = self.query_one("#project", Input).value.strip()
+        if not project:
+            self._show_notice(_INPUT_REQUIRED)
+            return
+        self._show_notice("Loading iterations, users, and statuses from ONES")
+        query_button = self.query_one("#query-defects", Button)
+        query_button.disabled = True
+        try:
+            options = await self._supervisor.run_readonly(
+                "load-defect-options",
+                self._controller.load_defect_filter_options,
+                project,
+            )
+        except Exception:
+            self._show_notice("ONES filter options are unavailable")
+            return
+        iteration = self.query_one("#iteration", Select)
+        assignee = self.query_one("#assignee", Select)
+        statuses = self.query_one("#status-ids", SelectionList)
+        configured_iteration = (
+            self._workspace.iteration_id if self._workspace is not None else ""
+        )
+        iteration_options = options.iterations
+        if configured_iteration and not any(
+            item.id == configured_iteration for item in iteration_options
+        ):
+            iteration_options = (
+                FilterChoice(configured_iteration, "Configured iteration"),
+                *iteration_options,
+            )
+        iteration.set_options((item.name, item.id) for item in iteration_options)
+        assignee.set_options((item.name, item.id) for item in options.assignees)
+        statuses.clear_options()
+        statuses.add_options(
+            (
+                item.name,
+                item.id,
+                item.selected
+                or not any(candidate.selected for candidate in options.statuses)
+                and index == 0,
+            )
+            for index, item in enumerate(options.statuses)
+        )
+        if iteration_options:
+            iteration.value = next(
+                (
+                    item.id
+                    for item in iteration_options
+                    if item.id == configured_iteration
+                ),
+                iteration_options[0].id,
+            )
+        iteration.disabled = not iteration_options or self._workspace is not None
+        if options.assignees:
+            assignee.value = next(
+                (item.id for item in options.assignees if item.selected),
+                options.assignees[0].id,
+            )
+        assignee.disabled = not options.assignees
+        statuses.disabled = False
+        query_button.disabled = not iteration_options or not options.assignees
+        if options.unavailable:
+            self._show_notice(
+                "Some ONES options are unavailable: " + ", ".join(options.unavailable)
+            )
+        else:
+            self._show_notice("")
+
     async def _query(self) -> None:
         project = self.query_one("#project", Input).value.strip()
-        iteration = self.query_one("#iteration", Input).value.strip()
-        assignee = self.query_one("#assignee", Input).value.strip()
-        status_values = self.query_one("#status-ids", Input).value
-        status_ids = tuple(
-            item.strip() for item in status_values.split(",") if item.strip()
-        )
-        if not project or not iteration or not assignee:
+        iteration = self.query_one("#iteration", Select).value
+        assignee = self.query_one("#assignee", Select).value
+        status_ids = tuple(self.query_one("#status-ids", SelectionList).selected)
+        if (
+            not project
+            or type(iteration) is not str
+            or not iteration
+            or type(assignee) is not str
+            or not assignee
+        ):
             self._show_notice(_INPUT_REQUIRED)
             return
         if any(not _SAFE_MAPPING_KEY.fullmatch(item) for item in status_ids):
@@ -537,10 +1041,10 @@ class DefectWizardScreen(_MappingWizardScreen):
         self._show_notice("")
         body = self.query_one("#wizard-body", VerticalScroll)
         await body.remove_children()
-        await body.mount(Label("Select one defect"))
+        await body.mount(Label("Select an action for a defect"))
         for index, candidate in enumerate(session.items):
             await body.mount(
-                Button(
+                Static(
                     "  ".join(
                         (
                             candidate.priority,
@@ -548,11 +1052,20 @@ class DefectWizardScreen(_MappingWizardScreen):
                             candidate.title,
                         )
                     ),
-                    id=f"candidate-{index}",
-                )
+                    markup=False,
+                ),
+                Horizontal(
+                    Button("AI analysis", id=f"analyze-candidate-{index}"),
+                    Button(
+                        "Analyze and repair",
+                        id=f"candidate-{index}",
+                        variant="primary",
+                    ),
+                    classes="candidate-actions",
+                ),
             )
 
-    async def _select_candidate(self, index: int) -> None:
+    async def _select_candidate(self, index: int, *, analyze_only: bool) -> None:
         session_id = self._candidate_session_id
         if (
             self._step != self.STEP_CANDIDATE
@@ -565,34 +1078,51 @@ class DefectWizardScreen(_MappingWizardScreen):
         # Make the UI-side capability one-shot before yielding to background work.
         self._candidate_session_id = None
         try:
+            action_name = "analyze-defect" if analyze_only else "start-defect"
+            action = (
+                self._controller.analyze_defect
+                if analyze_only
+                else self._controller.start_defect
+            )
             preview = await self._supervisor.run_mutation(
                 "new-defect",
-                "start-defect",
-                self._controller.start_defect,
+                action_name,
+                action,
                 session_id,
                 candidate_id,
             )
-        except Exception:
+        except StaleCandidateError:
             self._show_notice(_CANDIDATE_STALE)
+            return
+        except Exception:
+            self._show_notice(
+                "AI analysis could not be started"
+                if analyze_only
+                else "Analysis and repair could not be started"
+            )
             return
         await self._show_mapping(preview)
 
     @on(Button.Pressed)
     async def _handle_defect_button(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
-        if button_id == "query-defects" and self._step == self.STEP_FILTER:
+        if button_id == "reload-defect-options" and self._step == self.STEP_FILTER:
+            await self._load_filter_options()
+        elif button_id == "query-defects" and self._step == self.STEP_FILTER:
             await self._query()
-        elif button_id.startswith("candidate-"):
+        elif button_id.startswith(("candidate-", "analyze-candidate-")):
             try:
-                index = int(button_id.removeprefix("candidate-"))
+                analyze_only = button_id.startswith("analyze-candidate-")
+                prefix = "analyze-candidate-" if analyze_only else "candidate-"
+                index = int(button_id.removeprefix(prefix))
             except ValueError:
                 self._show_notice(_CANDIDATE_STALE)
                 return
-            await self._select_candidate(index)
+            await self._select_candidate(index, analyze_only=analyze_only)
 
 
 class RequirementWizardScreen(_MappingWizardScreen):
-    """Requirement entry followed by the shared mapping confirmation flow."""
+    """List ONES requirements, then enter the shared mapping flow."""
 
     def __init__(self, controller: TuiController, supervisor: RunTaskSupervisor) -> None:
         super().__init__(
@@ -600,13 +1130,60 @@ class RequirementWizardScreen(_MappingWizardScreen):
             supervisor,
             screen_id="requirement-wizard-screen",
         )
+        self._requirement_session_id: str | None = None
+        self._requirements: tuple[RequirementChoice, ...] = ()
 
     def _initial_widgets(self) -> tuple[Widget, ...]:
         return (
-            Label("New requirement workflow"),
+            Label("Requirements from ONES"),
             Input(placeholder="ONES requirement ID", id="requirement-id"),
-            Button("Continue", id="start-requirement", variant="primary"),
+            Button("Fetch requirement", id="start-requirement"),
+            Label("Or query the requirement list"),
+            Input(placeholder="Optional ONES project ID", id="requirement-project"),
+            Input(placeholder="Optional ONES iteration ID", id="requirement-iteration"),
+            Input(placeholder="Optional ONES assignee ID", id="requirement-assignee"),
+            Input(placeholder="Optional status IDs, comma-separated", id="requirement-status-ids"),
+            Input(placeholder="Requirement issue type ID", id="requirement-type-id"),
+            Button("Query requirements", id="query-requirements", variant="primary"),
         )
+
+    async def _query_requirements(self) -> None:
+        issue_type_id = self.query_one("#requirement-type-id", Input).value.strip()
+        status_values = self.query_one("#requirement-status-ids", Input).value
+        status_ids = tuple(item.strip() for item in status_values.split(",") if item.strip())
+        if not issue_type_id or any(not _SAFE_MAPPING_KEY.fullmatch(item) for item in status_ids):
+            self._show_notice(_INPUT_REQUIRED)
+            return
+        try:
+            session_id, items = await self._supervisor.run_readonly(
+                "query-requirements",
+                self._controller.query_requirements,
+                self.query_one("#requirement-project", Input).value.strip(),
+                self.query_one("#requirement-iteration", Input).value.strip(),
+                self.query_one("#requirement-assignee", Input).value.strip(),
+                status_ids,
+                issue_type_id,
+            )
+        except Exception:
+            self._show_notice(_WIZARD_UNAVAILABLE)
+            return
+        if not items:
+            self._show_notice(_NO_CANDIDATES)
+            return
+        self._requirement_session_id = session_id
+        self._requirements = tuple(items)
+        self._step = self.STEP_CANDIDATE
+        body = self.query_one("#wizard-body", VerticalScroll)
+        await body.remove_children()
+        await body.mount(Label("Select a requirement to analyze"))
+        for index, item in enumerate(self._requirements):
+            await body.mount(
+                Button(
+                    "  ".join((item.number or item.requirement_id, item.status_id, item.title)),
+                    id=f"requirement-candidate-{index}",
+                    classes="requirement-candidate",
+                )
+            )
 
     async def _start_requirement(self) -> None:
         requirement_id = self.query_one("#requirement-id", Input).value.strip()
@@ -625,10 +1202,47 @@ class RequirementWizardScreen(_MappingWizardScreen):
             return
         await self._show_mapping(preview)
 
+    async def _select_requirement(self, index: int) -> None:
+        session_id = self._requirement_session_id
+        if self._step != self.STEP_CANDIDATE or session_id is None or not 0 <= index < len(self._requirements):
+            self._show_notice(_CANDIDATE_STALE)
+            return
+        requirement_id = self._requirements[index].requirement_id
+        self._requirement_session_id = None
+        try:
+            preview = await self._supervisor.run_mutation(
+                "new-requirement",
+                "start-requirement",
+                self._controller.start_requirement,
+                requirement_id,
+                session_id,
+            )
+        except Exception:
+            self._show_notice(_CANDIDATE_STALE)
+            return
+        await self._show_mapping(preview)
+
+    @on(Button.Pressed, "#query-requirements")
+    async def _handle_requirement_query(self) -> None:
+        if self._step == self.STEP_FILTER:
+            await self._query_requirements()
+
     @on(Button.Pressed, "#start-requirement")
-    async def _handle_requirement_button(self) -> None:
+    async def _handle_requirement_direct_start(self) -> None:
         if self._step == self.STEP_FILTER:
             await self._start_requirement()
+
+    @on(Button.Pressed, ".requirement-candidate")
+    async def _handle_requirement_candidate(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if not button_id.startswith("requirement-candidate-"):
+            return
+        try:
+            index = int(button_id.removeprefix("requirement-candidate-"))
+        except ValueError:
+            self._show_notice(_CANDIDATE_STALE)
+            return
+        await self._select_requirement(index)
 
 
 class WorkflowTypeScreen(Screen[RunDetail | None]):
@@ -673,17 +1287,20 @@ class WorkflowTypeScreen(Screen[RunDetail | None]):
 
 _HELP_TEXT = """Developer workflow help
 
-n  new workflow
-/  search by run ID or work item ID
-f  filter by state, workflow type, work item, and updated time
-r  resume selected run
-v  revise selected run
-a  approve selected run
-x  cancel selected run
+Workspaces  list or create workspaces
+Create workspace  choose ONES Project, iteration, and local/remote repositories
+Query defects  open a workspace, query defects, then choose AI analysis or analysis and repair
+Configuration  view or edit global ONES configuration
+g  return to workspace list
+s  show configuration
+n  legacy new workflow shortcut
+/  legacy run search
+f  legacy run filter
+r/v/a/x  legacy run resume, revise, approve, and cancel actions
 q  quit without cancelling running workflow work
 Escape  return
 
-Listing, search, and filter are read-only. Repository changes use managed worktrees.
+Defect queries and run listing are read-only. Repository changes use managed worktrees.
 Remote publication requires explicit approval.
 """
 
@@ -1059,6 +1676,309 @@ class PublicationResumeModal(_DangerousActionModal):
             self.action_back()
 
 
+class WorkspaceCreateScreen(Screen[WorkspaceSummary | None]):
+    """Create one workspace with an ONES scope and multiple repositories."""
+
+    BINDINGS = [Binding("escape", "cancel", "Back", priority=True)]
+
+    def __init__(
+        self, controller: TuiController, supervisor: RunTaskSupervisor
+    ) -> None:
+        super().__init__(id="workspace-create-screen")
+        self._controller = controller
+        self._supervisor = supervisor
+        self._repositories: list[WorkspaceRepositoryInput] = []
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="workspace-create-body"):
+            yield Label("Create workspace", classes="pane-title")
+            yield Input(placeholder="Workspace name", id="workspace-name")
+            yield Select([], prompt="Loading ONES projects…", id="workspace-project", disabled=True)
+            yield Select([], prompt="Select project first", id="workspace-iteration", disabled=True)
+            yield Label("Repositories (the first repository is primary)")
+            yield Select(
+                (("Local repository", "local"), ("Remote repository", "remote")),
+                value="local",
+                id="workspace-repository-kind",
+            )
+            yield Input(
+                placeholder="Absolute local path or remote Git URL (name detected automatically)",
+                id="workspace-repository-source",
+            )
+            yield Input(value="main", placeholder="Base branch", id="workspace-repository-branch")
+            yield Button("Add repository", id="workspace-add-repository")
+            yield Static("No repositories added", id="workspace-repositories", markup=False)
+            yield Button("Create workspace", id="workspace-save", variant="primary", disabled=True)
+            yield Button("Back", id="workspace-cancel")
+            yield Static("", id="workspace-create-notice", markup=False)
+
+    async def on_mount(self) -> None:
+        try:
+            projects = await self._supervisor.run_readonly(
+                "load-workspace-projects",
+                self._controller.load_workspace_projects,
+            )
+        except Exception:
+            self._notice("ONES projects are unavailable")
+            return
+        select = self.query_one("#workspace-project", Select)
+        select.set_options((item.name, item.id) for item in projects)
+        select.disabled = not projects
+        if projects:
+            select.value = projects[0].id
+
+    @on(Select.Changed, "#workspace-project")
+    async def _project_changed(self, event: Select.Changed) -> None:
+        if type(event.value) is not str or not event.value:
+            return
+        iteration = self.query_one("#workspace-iteration", Select)
+        iteration.disabled = True
+        try:
+            choices = await self._supervisor.run_readonly(
+                "load-workspace-iterations",
+                self._controller.load_workspace_iterations,
+                event.value,
+            )
+        except Exception:
+            self._notice("ONES iterations are unavailable")
+            return
+        iteration.set_options((item.name, item.id) for item in choices)
+        iteration.disabled = not choices
+        if choices:
+            iteration.value = choices[0].id
+            workspace_name = self.query_one("#workspace-name", Input)
+            if not workspace_name.value.strip():
+                workspace_name.value = _workspace_key_from_scope(
+                    event.value, choices[0].id
+                )
+        self._notice("")
+
+    @on(Button.Pressed, "#workspace-add-repository")
+    def _add_repository(self) -> None:
+        kind = self.query_one("#workspace-repository-kind", Select).value
+        source = self.query_one("#workspace-repository-source", Input).value.strip()
+        branch = self.query_one("#workspace-repository-branch", Input).value.strip()
+        if (
+            type(kind) is not str
+            or kind not in {"local", "remote"}
+            or not source
+            or not branch
+        ):
+            self._notice("Repository fields are invalid")
+            return
+        key = _repository_name_from_source(source, tuple(self._repositories))
+        self._repositories.append(
+            WorkspaceRepositoryInput(
+                key=key,
+                name=key,
+                source=source,
+                local=kind == "local",
+                branch=branch,
+            )
+        )
+        self.query_one("#workspace-repository-source", Input).value = ""
+        self.query_one("#workspace-save", Button).disabled = False
+        self.query_one("#workspace-repositories", Static).update(
+            "\n".join(
+                f"{index + 1}. {item.name} ({'local' if item.local else 'remote'})"
+                for index, item in enumerate(self._repositories)
+            )
+        )
+        self._notice("")
+
+    @on(Button.Pressed, "#workspace-save")
+    async def _save(self) -> None:
+        project = self.query_one("#workspace-project", Select).value
+        iteration = self.query_one("#workspace-iteration", Select).value
+        if type(project) is not str or not project:
+            self._notice("Select an ONES project")
+            return
+        if type(iteration) is not str or not iteration:
+            self._notice("Select an ONES iteration")
+            return
+        if not self._repositories:
+            self._notice("Add at least one repository")
+            return
+        entered_name = self.query_one("#workspace-name", Input).value.strip()
+        key = _workspace_key_from_scope(project, iteration, entered_name)
+        self.query_one("#workspace-name", Input).value = key
+        try:
+            created = await asyncio.to_thread(
+                self._controller.create_workspace,
+                key,
+                project,
+                iteration,
+                tuple(self._repositories),
+            )
+        except Exception:
+            self._notice("Workspace could not be saved")
+            return
+        self.dismiss(created)
+
+    @on(Button.Pressed, "#workspace-cancel")
+    def _cancel_pressed(self) -> None:
+        self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _notice(self, value: str) -> None:
+        self.query_one("#workspace-create-notice", Static).update(value)
+
+
+class TaskDeleteConfirmation(ModalScreen[bool]):
+    """Require explicit confirmation before deleting local task data."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, summary: RunSummary) -> None:
+        super().__init__(id="task-delete-confirmation")
+        self.summary = summary
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Delete task", classes="pane-title")
+            yield Static(
+                f"Delete task for '{self.summary.work_item_id}'?\n"
+                "Task history, prompts, and analysis logs will be removed. "
+                "Repositories, worktrees, and ONES data will not be deleted.",
+                markup=False,
+            )
+            yield Button(
+                "Delete task",
+                id="confirm-task-delete",
+                variant="error",
+            )
+            yield Button("Keep task", id="cancel-task-delete")
+
+    @on(Button.Pressed, "#confirm-task-delete")
+    def _confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel-task-delete")
+    def _cancel_pressed(self) -> None:
+        self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class WorkspaceDeleteConfirmation(ModalScreen[bool]):
+    """Require an explicit click before removing a workspace configuration."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, workspace: WorkspaceSummary) -> None:
+        super().__init__(id="workspace-delete-confirmation")
+        self.workspace = workspace
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Delete workspace", classes="pane-title")
+            yield Static(
+                f"Delete workspace '{self.workspace.key}' from this app?\n"
+                "Local repositories, remote repositories, and ONES data will not be deleted.",
+                markup=False,
+            )
+            yield Button(
+                "Delete workspace",
+                id="confirm-workspace-delete",
+                variant="error",
+            )
+            yield Button("Keep workspace", id="cancel-workspace-delete")
+
+    @on(Button.Pressed, "#confirm-workspace-delete")
+    def _confirm(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#cancel-workspace-delete")
+    def _cancel_pressed(self) -> None:
+        self.action_cancel()
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class WorkspaceDetailScreen(Screen[bool]):
+    """Workspace-scoped entry point for defect queries."""
+
+    BINDINGS = [Binding("escape", "back", "Back", priority=True)]
+
+    def __init__(
+        self,
+        controller: TuiController,
+        supervisor: RunTaskSupervisor,
+        workspace: WorkspaceSummary,
+    ) -> None:
+        super().__init__(id="workspace-detail-screen")
+        self._controller = controller
+        self._supervisor = supervisor
+        self.workspace = workspace
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="workspace-detail-body"):
+            yield Label(self.workspace.key, classes="pane-title")
+            yield Static(f"Project: {self.workspace.project_id}", markup=False)
+            yield Static(f"Iteration: {self.workspace.iteration_id}", markup=False)
+            yield Label("Repositories")
+            yield Static("\n".join(self.workspace.repositories), markup=False)
+            yield Button("Query defects", id="workspace-query-defects", variant="primary")
+            yield Button("Delete workspace", id="workspace-delete", variant="error")
+            yield Button("Back to workspaces", id="workspace-detail-back")
+            yield Static("", id="workspace-detail-notice", markup=False)
+
+    @on(Button.Pressed, "#workspace-query-defects")
+    def _query_defects(self) -> None:
+        self.app.push_screen(
+            DefectWizardScreen(
+                self._controller,
+                self._supervisor,
+                workspace=self.workspace,
+            ),
+            callback=self._workflow_started,
+        )
+
+    def _workflow_started(self, detail: RunDetail | None) -> None:
+        if detail is not None:
+            self.app.push_screen(RunDetailScreen(
+                detail,
+                controller=self._controller,
+                supervisor=self._supervisor,
+            ))
+
+    @on(Button.Pressed, "#workspace-delete")
+    def _delete_workspace(self) -> None:
+        self.app.push_screen(
+            WorkspaceDeleteConfirmation(self.workspace),
+            callback=self._delete_confirmed,
+        )
+
+    async def _delete_confirmed(self, confirmed: bool | None) -> None:
+        if confirmed is not True:
+            return
+        delete_button = self.query_one("#workspace-delete", Button)
+        delete_button.disabled = True
+        try:
+            await asyncio.to_thread(
+                self._controller.delete_workspace,
+                self.workspace.key,
+            )
+        except Exception:
+            delete_button.disabled = False
+            self.query_one("#workspace-detail-notice", Static).update(
+                "Workspace could not be deleted"
+            )
+            return
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#workspace-detail-back")
+    def _back_pressed(self) -> None:
+        self.action_back()
+
+    def action_back(self) -> None:
+        self.dismiss(False)
+
+
 class DashboardScreen(Screen[None]):
     """Responsive three/two/one-column workflow dashboard."""
 
@@ -1071,12 +1991,13 @@ class DashboardScreen(Screen[None]):
         Binding("tab", "next_tab", "Next tab", show=False, priority=True),
         Binding("shift+tab", "previous_tab", "Previous tab", show=False, priority=True),
         Binding("s", "show_settings", "Settings", show=False, priority=True),
-        Binding("g", "show_runs", "Runs", show=False, priority=True),
+        Binding("g", "show_runs", "Workspaces", show=False, priority=True),
         Binding("n", "new_run", "New run", show=False, priority=True),
         Binding("r", "resume", "Resume", show=False, priority=True),
         Binding("v", "revise", "Revise", show=False, priority=True),
         Binding("a", "approve", "Approve", show=False, priority=True),
         Binding("x", "cancel_run", "Cancel", show=False, priority=True),
+        Binding("delete", "delete_task", "Delete task", show=False, priority=True),
     ]
 
     def __init__(
@@ -1103,24 +2024,49 @@ class DashboardScreen(Screen[None]):
         self._lifecycle_active = False
         self._teardown_started = False
         self._filters = RunFilter()
+        self._workspaces: tuple[WorkspaceSummary, ...] = ()
+        self._workspace_mode = callable(getattr(controller, "list_workspaces", None))
+        self._selected_detail: RunDetail | None = None
+        self._workflow_watchers: set[asyncio.Task[None]] = set()
+        self._workflow_running_run_ids: set[str] = set()
+        self._pending_delete_run_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="dashboard", classes="three"):
-            yield NavigationPane(id="navigation")
+            yield NavigationPane(workspace_mode=self._workspace_mode, id="navigation")
+            with Vertical(id="workspace-home"):
+                yield WorkspaceListPane(id="workspace-list-pane")
             with Horizontal(id="workspace"):
                 yield RunListPane(id="run-list-pane")
-                yield RunDetailPane(id="run-detail")
-            yield Static(
-                Text(self._settings.display_text()),
-                id="settings",
-                markup=False,
-            )
-        with Horizontal(id="action-bar"):
-            yield Button("Resume", id="action-resume")
-            yield Button("Revise", id="action-revise")
-            yield Button("Approve", id="action-approve")
-            yield Button("Cancel", id="action-cancel")
-            yield Button("Configure Runtime", id="configure-runtime")
+                with Vertical(id="task-detail-column"):
+                    yield RunDetailPane(id="run-detail")
+                    with Horizontal(id="action-bar"):
+                        yield Button(
+                            "Accept solution",
+                            id="action-accept-analysis",
+                            variant="success",
+                        )
+                        yield Button(
+                            "Regenerate solution",
+                            id="action-regenerate-analysis",
+                        )
+                        yield Button(
+                            "Retry analysis",
+                            id="action-retry-analysis",
+                            variant="warning",
+                        )
+            with Vertical(id="settings-page"):
+                yield Static(
+                    Text(self._settings.display_text()),
+                    id="settings",
+                    markup=False,
+                )
+                if self._workspace_mode:
+                    yield Button(
+                        "Edit global configuration",
+                        id="nav-runtime-setup",
+                        variant="primary",
+                    )
         yield Static("", id="notice", markup=False)
 
     def on_mount(self) -> None:
@@ -1128,6 +2074,63 @@ class DashboardScreen(Screen[None]):
         self._lifecycle_active = True
         self._teardown_started = False
         self._set_mode(self.size.width)
+        self.query_one("#workspace-home").display = self._workspace_mode
+        self.query_one("#workspace").display = not self._workspace_mode
+        self.query_one("#settings-page").display = False
+        self._set_analysis_actions(None)
+
+    def _set_analysis_actions(self, detail: RunDetail | None) -> None:
+        self._selected_detail = detail
+        accept = self.query_one("#action-accept-analysis", Button)
+        regenerate = self.query_one("#action-regenerate-analysis", Button)
+        retry = self.query_one("#action-retry-analysis", Button)
+        workflow_running = bool(
+            detail
+            and detail.summary.run_id in self._workflow_running_run_ids
+        )
+        accept.display = bool(
+            detail and detail.can_accept_analysis and not workflow_running
+        )
+        regenerate.display = bool(
+            detail and detail.can_regenerate_analysis and not workflow_running
+        )
+        retry.display = bool(
+            detail
+            and not workflow_running
+            and detail.summary.state is WorkflowState.BLOCKED
+            and detail.resume_state is WorkflowState.IMPLEMENTING
+            and detail.status_message
+            == "Codex analysis returned invalid structured output"
+        )
+        self.query_one("#action-bar").display = bool(
+            self.query_one("#workspace").display
+            and (accept.display or regenerate.display or retry.display)
+        )
+
+    def _set_active_navigation(self, active_id: str) -> None:
+        """Keep the selected navigation highlight aligned with the visible page."""
+
+        for button in self.query("#navigation Button"):
+            if isinstance(button, Button):
+                button.variant = (
+                    "primary" if button.id == active_id else "default"
+                )
+
+    async def refresh_workspaces(self) -> None:
+        """Refresh only the top-level workspace list."""
+
+        if not self._lifecycle_active or not self._workspace_mode:
+            return
+        try:
+            workspaces = await asyncio.to_thread(self._controller.list_workspaces)
+        except Exception:
+            self.query_one("#notice", Static).update(
+                "Workspace list is unavailable"
+            )
+            return
+        self._workspaces = workspaces
+        await self.query_one(WorkspaceListPane).replace_workspaces(workspaces)
+        self.query_one("#notice", Static).update("")
 
     def on_unmount(self) -> None:
         self.begin_teardown()
@@ -1261,6 +2264,7 @@ class DashboardScreen(Screen[None]):
         if not runs:
             self._detail_error = ""
             self.query_one(RunDetailPane).clear_detail()
+            self._set_analysis_actions(None)
             return
         target = next(
             (
@@ -1270,7 +2274,9 @@ class DashboardScreen(Screen[None]):
             ),
             0,
         )
-        self.query_one("#run-list", ListView).index = target
+        run_list = self.query_one("#run-list", ListView)
+        if run_list.index != target:
+            run_list.index = target
         await self._show_detail(target)
 
     def _selected_index(self) -> int | None:
@@ -1298,6 +2304,7 @@ class DashboardScreen(Screen[None]):
             return None
         self._detail_error = ""
         self.query_one(RunDetailPane).set_detail(detail)
+        self._set_analysis_actions(detail)
         return detail
 
     def action_cursor_down(self) -> None:
@@ -1315,7 +2322,12 @@ class DashboardScreen(Screen[None]):
         detail = await self._show_detail(index)
         if self.query_one("#dashboard").has_class("one"):
             self.app.push_screen(
-                RunDetailScreen(detail, error=self._detail_error)
+                RunDetailScreen(
+                    detail,
+                    error=self._detail_error,
+                    controller=self._controller,
+                    supervisor=self._supervisor,
+                )
             )
 
     def action_next_tab(self) -> None:
@@ -1325,12 +2337,27 @@ class DashboardScreen(Screen[None]):
         self.query_one(RunDetailPane).previous_tab()
 
     def action_show_settings(self) -> None:
+        self.query_one("#workspace-home").display = False
         self.query_one("#workspace").display = False
-        self.query_one("#settings").display = True
+        self.query_one("#settings-page").display = True
+        self.query_one("#action-bar").display = False
+        self._set_active_navigation("nav-settings")
 
     def action_show_runs(self) -> None:
-        self.query_one("#settings").display = False
+        self.query_one("#settings-page").display = False
+        self.query_one("#workspace-home").display = False
         self.query_one("#workspace").display = True
+        self._set_analysis_actions(self._selected_detail)
+        self._set_active_navigation("nav-runs")
+
+    def action_show_workspaces(self) -> None:
+        if not self._workspace_mode:
+            return
+        self.query_one("#settings-page").display = False
+        self.query_one("#workspace").display = False
+        self.query_one("#workspace-home").display = True
+        self.query_one("#action-bar").display = False
+        self._set_active_navigation("nav-workspaces")
 
     def action_new_run(self) -> None:
         self.app.push_screen(
@@ -1341,6 +2368,12 @@ class DashboardScreen(Screen[None]):
     def action_defects(self) -> None:
         self.app.push_screen(
             DefectWizardScreen(self._controller, self._supervisor),
+            callback=lambda detail: None,
+        )
+
+    def action_requirements(self) -> None:
+        self.app.push_screen(
+            RequirementWizardScreen(self._controller, self._supervisor),
             callback=lambda detail: None,
         )
 
@@ -1452,6 +2485,51 @@ class DashboardScreen(Screen[None]):
         elif request is not None:
             self._show_action_notice(_ACTION_UNAVAILABLE)
 
+    def action_delete_task(self) -> None:
+        summary = self._selected_summary()
+        if summary is None:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        if (
+            summary.run_id in self._workflow_running_run_ids
+            or self._supervisor.is_run_active(summary.run_id)
+        ):
+            self._show_action_notice("Running tasks cannot be deleted")
+            return
+        self._pending_delete_run_id = summary.run_id
+        self.app.push_screen(
+            TaskDeleteConfirmation(summary),
+            callback=self._task_delete_confirmed,
+        )
+
+    async def _task_delete_confirmed(self, confirmed: bool | None) -> None:
+        run_id = self._pending_delete_run_id
+        self._pending_delete_run_id = None
+        if confirmed is not True:
+            return
+        if run_id is None or not any(item.run_id == run_id for item in self._runs):
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        if (
+            run_id in self._workflow_running_run_ids
+            or self._supervisor.is_run_active(run_id)
+        ):
+            self._show_action_notice("Running tasks cannot be deleted")
+            return
+        try:
+            await self._supervisor.run_mutation(
+                run_id,
+                "delete-task",
+                self._controller.delete_task,
+                run_id,
+            )
+        except Exception:
+            self._show_action_notice("Task could not be deleted")
+            return
+        self._selected_detail = None
+        self._show_action_notice("Task deleted")
+        await self.refresh_runs()
+
     async def action_resume(self) -> None:
         summary = self._selected_summary()
         if (
@@ -1508,6 +2586,99 @@ class DashboardScreen(Screen[None]):
         except Exception:
             self._show_action_notice(_ACTION_FAILED)
         await self.refresh_runs()
+
+    async def _run_analysis_decision(self, *, accept: bool) -> None:
+        detail = self._selected_detail
+        allowed = (
+            detail is not None
+            and (
+                detail.can_accept_analysis
+                if accept
+                else detail.can_regenerate_analysis
+            )
+        )
+        if not allowed:
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        assert detail is not None
+        self._set_analysis_actions(None)
+        self._show_action_notice(
+            "Repair workflow started" if accept else "Regenerating analysis solution"
+        )
+        call = (
+            self._controller.accept_analysis_solution
+            if accept
+            else self._controller.regenerate_analysis_solution
+        )
+        self._submit_workflow_task(
+            detail.summary.run_id,
+            "accept-analysis" if accept else "regenerate-analysis",
+            lambda: call(
+                detail.summary.run_id,
+                detail.summary.version,
+            ),
+        )
+
+    def _submit_workflow_task(
+        self,
+        run_id: str,
+        action: str,
+        call: Callable[[], RunDetail],
+    ) -> None:
+        """Submit a long workflow without blocking Textual's event loop."""
+
+        try:
+            task = self._supervisor.submit(run_id, action, call)
+        except Exception:
+            self._show_action_notice(_ACTION_FAILED)
+            return
+        self._workflow_running_run_ids.add(run_id)
+        watcher = asyncio.create_task(
+            self._finish_workflow_task(run_id, task),
+            name=f"tui-watch-{action}-{run_id}",
+        )
+        self._workflow_watchers.add(watcher)
+        watcher.add_done_callback(self._workflow_watchers.discard)
+
+    async def _finish_workflow_task(
+        self, run_id: str, task: asyncio.Task[RunDetail]
+    ) -> None:
+        try:
+            await task
+        except asyncio.CancelledError:
+            return
+        except StaleTuiActionError:
+            if self._lifecycle_active:
+                self._show_action_notice(_ACTION_STALE)
+        except Exception:
+            if self._lifecycle_active:
+                self._show_action_notice(_ACTION_FAILED)
+        finally:
+            self._workflow_running_run_ids.discard(run_id)
+        if self._lifecycle_active:
+            await self.refresh_runs()
+
+    def _retry_analysis(self) -> None:
+        detail = self._selected_detail
+        if (
+            detail is None
+            or detail.summary.state is not WorkflowState.BLOCKED
+            or detail.resume_state is not WorkflowState.IMPLEMENTING
+            or detail.status_message
+            != "Codex analysis returned invalid structured output"
+        ):
+            self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        self._set_analysis_actions(None)
+        self._show_action_notice("Retrying AI analysis")
+        self._submit_workflow_task(
+            detail.summary.run_id,
+            "retry-analysis",
+            lambda: self._controller.resume(
+                detail.summary.run_id,
+                detail.summary.version,
+            ),
+        )
 
     async def _approval_done(self, submission: object | None) -> None:
         if not isinstance(submission, ApprovalSubmission):
@@ -1599,9 +2770,51 @@ class DashboardScreen(Screen[None]):
         self.query_one("#run-list", ListView).index = index
         await self._show_detail(index)
 
+    @on(Button.Pressed, "#create-workspace")
+    def create_workspace(self) -> None:
+        self.app.push_screen(
+            WorkspaceCreateScreen(self._controller, self._supervisor),
+            callback=self._workspace_created,
+        )
+
+    @on(Button.Pressed, "#delete-task")
+    def delete_task_button(self) -> None:
+        self.action_delete_task()
+
+    async def _workspace_created(self, workspace: WorkspaceSummary | None) -> None:
+        if workspace is None:
+            return
+        await self.refresh_workspaces()
+        self.app.push_screen(
+            WorkspaceDetailScreen(self._controller, self._supervisor, workspace),
+            callback=self._workspace_detail_closed,
+        )
+
+    async def _workspace_detail_closed(self, deleted: bool | None) -> None:
+        if deleted is True:
+            await self.refresh_workspaces()
+
+    @on(ListView.Selected, "#workspace-list")
+    def select_workspace(self, event: ListView.Selected) -> None:
+        index = event.list_view.index
+        if index is None or not 0 <= index < len(self._workspaces):
+            return
+        self.app.push_screen(
+            WorkspaceDetailScreen(
+                self._controller,
+                self._supervisor,
+                self._workspaces[index],
+            ),
+            callback=self._workspace_detail_closed,
+        )
+
     @on(Button.Pressed, "#nav-runs")
     def show_runs(self) -> None:
         self.action_show_runs()
+
+    @on(Button.Pressed, "#nav-workspaces")
+    def show_workspaces(self) -> None:
+        self.action_show_workspaces()
 
     @on(Button.Pressed, "#nav-settings")
     def show_settings(self) -> None:
@@ -1610,6 +2823,10 @@ class DashboardScreen(Screen[None]):
     @on(Button.Pressed, "#nav-defects")
     def defects(self) -> None:
         self.action_defects()
+
+    @on(Button.Pressed, "#nav-requirements")
+    def requirements(self) -> None:
+        self.action_requirements()
 
     @on(Button.Pressed, "#nav-new-run")
     def new_run(self) -> None:
@@ -1631,6 +2848,18 @@ class DashboardScreen(Screen[None]):
     async def cancel_button(self) -> None:
         await self.action_cancel_run()
 
+    @on(Button.Pressed, "#action-accept-analysis")
+    async def accept_analysis_button(self) -> None:
+        await self._run_analysis_decision(accept=True)
+
+    @on(Button.Pressed, "#action-regenerate-analysis")
+    async def regenerate_analysis_button(self) -> None:
+        await self._run_analysis_decision(accept=False)
+
+    @on(Button.Pressed, "#action-retry-analysis")
+    def retry_analysis_button(self) -> None:
+        self._retry_analysis()
+
 
 __all__ = [
     "ApprovalModal",
@@ -1647,5 +2876,9 @@ __all__ = [
     "RequirementWizardScreen",
     "RevisionModal",
     "SettingsView",
+    "TaskDeleteConfirmation",
     "WorkflowTypeScreen",
+    "WorkspaceCreateScreen",
+    "WorkspaceDetailScreen",
+    "WorkspaceListPane",
 ]

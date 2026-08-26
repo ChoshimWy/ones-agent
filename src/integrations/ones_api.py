@@ -815,6 +815,7 @@ class OnesAsyncClient:
         self._issue_type_id = self._settings.issue_type_id
         self._token: str | None = None
         self._org_uuid: str = ""
+        self._org_user_uuid: str = ""
         self._client: httpx.AsyncClient | None = None
         self._init_lock = asyncio.Lock()
         self._reauth_lock = asyncio.Lock()
@@ -881,6 +882,7 @@ class OnesAsyncClient:
         org_uuid = org_user["org_uuid"]
         self._org_uuid = org_uuid
         org_user_uuid = org_user["org_user"]["org_user_uuid"]
+        self._org_user_uuid = str(org_user_uuid)
 
         verifier = _code_verifier()
         challenge = _code_challenge(verifier)
@@ -1275,6 +1277,12 @@ class OnesAsyncClient:
             if isinstance(data.get("data"), list):
                 return data["data"]
         return []
+
+    async def fetch_current_user_identity(self) -> dict[str, str]:
+        await self._get_client()
+        if not self._org_user_uuid:
+            return {}
+        return {"uuid": self._org_user_uuid}
 
     async def fetch_my_defects(self, **kwargs) -> list[dict]:
         return await self.fetch_defects(assign="$currentUser", **kwargs)

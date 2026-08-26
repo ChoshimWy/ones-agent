@@ -35,6 +35,7 @@ from .approval import ApprovalValidationError, validate_for_approval
 from .command_utils import CommandArgvError, parse_command_argv
 from .codex_runner import (
     CodexCommand,
+    CodexOutputError,
     CodexRunner,
     CommandExecutor,
     _bounded_subprocess,
@@ -62,7 +63,7 @@ from .contracts import (
     WorkflowState,
     WorkflowType,
 )
-from .repository import build_branch_name
+from .repository import build_run_branch_name
 from .repository_group import PreparedRepository, RepositoryGroupWorkspace
 from .group_evidence import (
     GroupEvidenceError,
@@ -305,6 +306,36 @@ class CodexRequirementAdapter:
 
     runner: CodexRunner
 
+    _STRUCTURED_RETRY_SUFFIX = (
+        "\n\nAUTOMATIC_STRUCTURED_OUTPUT_RETRY:\n"
+        "The previous response could not be accepted by the workflow result contract. "
+        "Repeat the read-only analysis and return only an object matching the supplied "
+        "output schema. Include every required top-level field. Every root_cause_evidence "
+        "item must include all required location, reproduction, impacted-file, fix_steps, "
+        "and supporting_points fields. fix_steps must contain one concrete best solution "
+        "and its validation steps. If repository evidence is genuinely insufficient, "
+        "return an empty root_cause_evidence array and put concrete evidence-gathering "
+        "steps in investigation_suggestions. Do not return a prose wrapper."
+    )
+
+    def _structured_retry_prompt(
+        self, run_id: str, prompt: str, error: CodexOutputError
+    ) -> str:
+        recorder = getattr(self.runner, "record_structured_retry", None)
+        if callable(recorder):
+            recorder(run_id)
+        hint = error.validation_hint or "workflow result contract"
+        return (
+            prompt
+            + self._STRUCTURED_RETRY_SUFFIX
+            + f"\nVALIDATION_FIELD_HINT: {hint}"
+        )
+
+    def activity(self, run_id: str, *, limit: int = 40) -> tuple[str, ...]:
+        """Expose the runner's sanitized observable activity to the TUI."""
+
+        return self.runner.activity(run_id, limit=limit)
+
     def preflight(
         self,
         *,
@@ -338,13 +369,30 @@ class CodexRequirementAdapter:
             raise RequirementFlowError("read-only Codex stage cannot modify files")
         if stage in {"implementation", "reproduction"} and not allow_changes:
             raise RequirementFlowError("mutable Codex stage requires the worktree sandbox")
-        return self.runner.run(
-            prepared,
-            mapping,
-            run_id=run_id,
-            prompt=prompt,
-            allow_changes=allow_changes,
+        run_root_cause = getattr(self.runner, "run_root_cause", None)
+        operation = (
+            run_root_cause
+            if stage == "root_cause" and callable(run_root_cause)
+            else self.runner.run
         )
+        try:
+            return operation(
+                prepared,
+                mapping,
+                run_id=run_id,
+                prompt=prompt,
+                allow_changes=allow_changes,
+            )
+        except CodexOutputError as error:
+            if stage != "root_cause" or allow_changes:
+                raise
+            return operation(
+                prepared,
+                mapping,
+                run_id=run_id,
+                prompt=self._structured_retry_prompt(run_id, prompt, error),
+                allow_changes=False,
+            )
 
     def analyze_testing(self, *, run_id: str, prompt: str) -> CodexResult:
         return self.runner.run_preflight(run_id=run_id, prompt=prompt)
@@ -367,13 +415,30 @@ class CodexRequirementAdapter:
             raise RequirementFlowError("read-only Codex stage cannot modify files")
         if stage in {"implementation", "reproduction"} and not allow_changes:
             raise RequirementFlowError("mutable Codex stage requires the workspace sandbox")
-        return self.runner.run_group(
-            group,
-            prepared,
-            run_id=run_id,
-            prompt=prompt,
-            allow_changes=allow_changes,
+        run_group_root_cause = getattr(self.runner, "run_group_root_cause", None)
+        operation = (
+            run_group_root_cause
+            if stage == "root_cause" and callable(run_group_root_cause)
+            else self.runner.run_group
         )
+        try:
+            return operation(
+                group,
+                prepared,
+                run_id=run_id,
+                prompt=prompt,
+                allow_changes=allow_changes,
+            )
+        except CodexOutputError as error:
+            if stage != "root_cause" or allow_changes:
+                raise
+            return operation(
+                group,
+                prepared,
+                run_id=run_id,
+                prompt=self._structured_retry_prompt(run_id, prompt, error),
+                allow_changes=False,
+            )
 
 
 _TEST_ENV_KEYS = frozenset(
@@ -1345,6 +1410,17 @@ class SubprocessConfiguredTestRunner:
         )
 
 
+@dataclass(slots=True)
+class DirectConfiguredTestRunner(SubprocessConfiguredTestRunner):
+    """Run bounded argv directly for the explicitly unsandboxed MVP."""
+
+    command_executor: CommandExecutor = field(default=_bounded_subprocess, repr=False)
+
+    def __post_init__(self) -> None:
+        if not callable(self.command_executor):
+            raise RequirementFlowError("direct test executor is invalid")
+
+
 class RequirementRunStore(Protocol):
     def save(self, run: WorkflowRun, expected_version: int) -> WorkflowRun: ...
 
@@ -1613,7 +1689,9 @@ class RequirementFlow:
         prepared = run.prepared_worktree
         if prepared is None:
             requirement = self._requirement(run)
-            branch = build_branch_name("requirement", run.work_item_id, requirement.title)
+            branch = build_run_branch_name(
+                "requirement", run.work_item_id, requirement.title, run.run_id
+            )
             prepared = self.repository.recover(run.run_id, mapping, branch)
             if prepared is None:
                 prepared = self.repository.prepare(run.run_id, mapping, branch)
@@ -2646,6 +2724,7 @@ def _split_configured_command(command: str) -> list[str]:
 __all__ = [
     "ConfiguredTestRunner",
     "CodexRequirementAdapter",
+    "DirectConfiguredTestRunner",
     "PreflightAnalyzer",
     "RequirementCodex",
     "RequirementFlow",

@@ -7,12 +7,20 @@ from dataclasses import dataclass
 from ..setup_validation import SetupStep, ValidationStatus
 
 
+TUI_SETUP_STEPS = (
+    SetupStep.PROFILE,
+    SetupStep.ONES,
+    SetupStep.REPOSITORIES,
+    SetupStep.PROVIDER,
+    SetupStep.PRIVATE_PATHS,
+    SetupStep.REVIEW,
+)
+
 _STEP_LABELS = {
     SetupStep.PROFILE: "Workflow profile",
     SetupStep.ONES: "ONES",
     SetupStep.REPOSITORIES: "Repositories",
     SetupStep.PROVIDER: "Git provider",
-    SetupStep.CODEX: "Codex",
     SetupStep.PRIVATE_PATHS: "Private paths",
     SetupStep.REVIEW: "Review",
 }
@@ -37,7 +45,12 @@ class SetupStepView:
     can_continue: bool
 
 
-def build_setup_step_view(state: object, step: SetupStep) -> SetupStepView:
+def build_setup_step_view(
+    state: object,
+    step: SetupStep,
+    *,
+    steps: tuple[SetupStep, ...] = TUI_SETUP_STEPS,
+) -> SetupStepView:
     """Project controller state without copying user-controlled values."""
 
     results = tuple(getattr(state, "results", ()))
@@ -51,13 +64,19 @@ def build_setup_step_view(state: object, step: SetupStep) -> SetupStepView:
     status = (
         result.status if result is not None else ValidationStatus.NOT_CONFIGURED
     )
-    order = tuple(SetupStep)
-    prior = order[: order.index(step)]
-    prior_passed = all(
-        candidate in by_step
-        and by_step[candidate].status is ValidationStatus.PASSED
-        for candidate in prior
-    )
+    order = steps
+    if step is SetupStep.REVIEW:
+        prior = order[: order.index(step)]
+        prior_passed = all(
+            candidate in by_step
+            and by_step[candidate].status is ValidationStatus.PASSED
+            for candidate in prior
+        )
+    else:
+        # Each visible configuration surface is independently editable. Remote
+        # credentials, Git mappings, and private roots can be prepared
+        # before the operator decides to complete the full runtime review.
+        prior_passed = True
     if step is SetupStep.REVIEW:
         can_test = False
         can_continue = prior_passed and bool(
@@ -90,4 +109,9 @@ def setup_step_label(step: SetupStep) -> str:
     return _STEP_LABELS[step]
 
 
-__all__ = ["SetupStepView", "build_setup_step_view", "setup_step_label"]
+__all__ = [
+    "SetupStepView",
+    "TUI_SETUP_STEPS",
+    "build_setup_step_view",
+    "setup_step_label",
+]

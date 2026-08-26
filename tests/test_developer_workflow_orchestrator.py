@@ -401,6 +401,43 @@ def test_start_defect_selects_scoped_snapshot_before_create(tmp_path: Path) -> N
     assert defect.calls == [run]
 
 
+def test_start_defect_analysis_persists_action_with_real_store(tmp_path: Path) -> None:
+    from src.developer_workflow.contracts import DefectAction
+    from src.developer_workflow.state_store import FileRunStore
+
+    class Gateway:
+        async def list_open_defects(self, **kwargs: object) -> list[DefectRecord]:
+            return [_defect()]
+
+    candidates = DefectCandidateService(gateway=Gateway(), issue_type_id="bug")
+    listed = asyncio.run(candidates.list_candidates("PROJ-1", "ITER-1", "USER-1"))
+    requirement, defect, publisher = (
+        RecordingFlow(),
+        RecordingFlow(),
+        RecordingPublisher(),
+    )
+    orchestrator = DeveloperWorkflowOrchestrator(
+        FileRunStore(tmp_path / "runs"),
+        requirement,
+        defect,
+        publisher,
+        _config(tmp_path),
+        candidates,
+    )
+
+    run = orchestrator.start_defect(
+        "PROJ-1",
+        "ITER-1",
+        "USER-1",
+        listed[0].snapshot_token,
+        "BUG-7",
+        action=DefectAction.ANALYZE,
+    )
+
+    assert run.defect_action is DefectAction.ANALYZE
+    assert defect.calls == [run]
+
+
 def test_start_defect_rejects_candidate_service_without_frozen_defect(
     tmp_path: Path,
 ) -> None:

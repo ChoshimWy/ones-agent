@@ -577,11 +577,20 @@ def _payload(**updates: object) -> dict[str, object]:
     value: dict[str, object] = {
         "summary": "implemented safely",
         "changed_files": ["src/app.py"],
+        "repository_changes": [],
         "commands": [{"command": "pytest", "exit_code": 0, "summary": "passed"}],
         "evidence": ["tests pass"],
         "review_findings": [],
         "risks": [],
         "unresolved_items": [],
+        "acceptance_coverage": [],
+        "unrelated_changes_checked": False,
+        "root_cause_evidence": [],
+        "investigation_suggestions": [],
+        "behavior_before": "",
+        "behavior_after": "",
+        "impact_scope": [],
+        "risk_level": "",
     }
     value.update(updates)
     return value
@@ -775,8 +784,50 @@ def test_group_run_requires_exact_repository_qualified_claims(tmp_path: Path) ->
     )
     assert result.acceptance_coverage[0].files == ()
     assert len(result.acceptance_coverage[0].repository_files) == 2
-    assert executor.calls[0][1] == prepared[0].prepared.path.parent
+    group_command, group_cwd, *_ = executor.calls[0]
+    primary = next(
+        item.prepared.path
+        for item in prepared
+        if item.repository_key == group.primary_repository
+    )
+    additional = tuple(
+        item.prepared.path
+        for item in prepared
+        if item.repository_key != group.primary_repository
+    )
+    assert group_cwd == primary
+    assert "--skip-git-repo-check" not in group_command
+    assert tuple(
+        Path(group_command[index + 1])
+        for index, argument in enumerate(group_command)
+        if argument == "--add-dir"
+    ) == additional
     assert repository.head_checks == 6
+
+
+def test_group_root_cause_discards_stage_irrelevant_acceptance_coverage(
+    tmp_path: Path,
+) -> None:
+    group, prepared = _prepared_group(tmp_path)
+    payload = _payload(
+        changed_files=[],
+        repository_changes=[],
+        acceptance_coverage=[{"criterion_id": 9}],
+    )
+
+    repository = FakeRepository(
+        changed_by_mapping={"shared-sdk": (), "desktop-app": ()}
+    )
+    result = _runner(
+        tmp_path, FakeExecutor(json.dumps(payload)), repository
+    ).run_group_root_cause(
+        group,
+        prepared,
+        run_id="group-root-cause-coverage",
+        prompt="analyze",
+    )
+
+    assert result.acceptance_coverage == ()
 
 
 def test_group_run_rejects_unknown_repository_and_claim_drift(tmp_path: Path) -> None:
@@ -887,6 +938,7 @@ def test_preflight_runs_without_worktree_in_read_only_sandbox(tmp_path: Path) ->
 
     command, cwd, _, timeout, _, _ = executor.calls[0]
     assert command[command.index("--sandbox") + 1] == "read-only"
+    assert "--skip-git-repo-check" in command
     assert cwd == (tmp_path / "runs" / "preflight-1").resolve()
     assert timeout == 30
     assert result.changed_files == ()
@@ -906,6 +958,7 @@ def test_run_parses_optional_strict_acceptance_coverage_and_review_flag(tmp_path
                 "criterion_id": "AC-1",
                 "criterion_text": "works",
                 "files": ["src/app.py"],
+                "repository_files": [],
                 "tests": ["pytest"],
             }
         ],
@@ -918,6 +971,21 @@ def test_run_parses_optional_strict_acceptance_coverage_and_review_flag(tmp_path
 
     assert result.acceptance_coverage[0].criterion_id == "AC-1"
     assert result.unrelated_changes_checked is True
+
+
+def test_root_cause_discards_stage_irrelevant_acceptance_coverage(tmp_path: Path) -> None:
+    payload = _payload(
+        acceptance_coverage=[{"criterion_id": 9}]
+    )
+
+    result = _runner(tmp_path, FakeExecutor(json.dumps(payload))).run_root_cause(
+        _prepared(tmp_path),
+        _mapping(tmp_path),
+        run_id="root-cause-coverage",
+        prompt="analyze",
+    )
+
+    assert result.acceptance_coverage == ()
 
 
 def test_run_parses_repository_qualified_root_cause_evidence(tmp_path: Path) -> None:
@@ -983,6 +1051,35 @@ def test_run_rejects_invalid_or_unsafe_structured_output(tmp_path: Path, stdout:
         _runner(tmp_path, FakeExecutor(stdout)).run(
             _prepared(tmp_path), _mapping(tmp_path), run_id="run-1", prompt="safe prompt",
         )
+
+
+def test_parser_fills_only_safe_structural_defaults(tmp_path: Path) -> None:
+    runner = _runner(tmp_path, FakeExecutor())
+
+    payload = runner._parse_output(json.dumps({"summary": "verified analysis"}))
+
+    assert payload["summary"] == "verified analysis"
+    assert payload["root_cause_evidence"] == []
+    assert payload["changed_files"] == []
+    assert payload["commands"] == []
+    assert payload["unrelated_changes_checked"] is False
+
+
+def test_schema_rejection_exposes_only_safe_field_hint(tmp_path: Path) -> None:
+    invalid = _payload(
+        commands=[{"command": "pytest", "exit_code": 0}]
+    )
+
+    with pytest.raises(CodexOutputError) as caught:
+        _runner(tmp_path, FakeExecutor(json.dumps(invalid))).run(
+            _prepared(tmp_path),
+            _mapping(tmp_path),
+            run_id="hint",
+            prompt="safe prompt",
+        )
+
+    assert caught.value.validation_hint == "commands.0 (required)"
+    assert "pytest" not in caught.value.validation_hint
 
 
 def test_run_rejects_claimed_files_that_do_not_match_repository_snapshot(tmp_path: Path) -> None:
@@ -1444,6 +1541,33 @@ def test_default_executor_streams_stdin_larger_than_windows_command_line_limit(
     assert completed.stdout.strip() == str(len(content))
 
 
+def test_default_executor_delivers_stdout_jsonl_while_process_runs(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.codex_runner import _bounded_subprocess
+
+    observed: list[tuple[str, str]] = []
+    completed = _bounded_subprocess(
+        [
+            sys.executable,
+            "-c",
+            "print('{\"type\":\"turn.started\"}'); "
+            "print('{\"type\":\"turn.completed\"}')",
+        ],
+        cwd=tmp_path,
+        env=dict(os.environ),
+        timeout=5,
+        max_output_bytes=1024,
+        on_output_line=lambda name, line: observed.append((name, line)),
+    )
+
+    assert completed.returncode == 0
+    assert observed == [
+        ("stdout", '{"type":"turn.started"}'),
+        ("stdout", '{"type":"turn.completed"}'),
+    ]
+
+
 def test_default_executor_timeout_kills_child_blocking_stdin_writer(tmp_path: Path) -> None:
     from src.developer_workflow.codex_runner import _bounded_subprocess
 
@@ -1797,3 +1921,85 @@ def test_existing_symlinked_run_directory_is_rejected(tmp_path: Path) -> None:
         _runner(tmp_path, FakeExecutor()).run(
             _prepared(tmp_path), _mapping(tmp_path), run_id="run-1", prompt="safe",
         )
+
+
+def test_jsonl_activity_exposes_actions_without_reasoning_or_command_secrets() -> None:
+    reasoning = codex_runner_module._codex_activity_from_event(
+        json.dumps({
+            "type": "item.started",
+            "item": {"type": "reasoning", "text": "private chain of thought"},
+        }),
+        (),
+    )
+    command = codex_runner_module._codex_activity_from_event(
+        json.dumps({
+            "type": "item.started",
+            "item": {
+                "type": "command_execution",
+                "command": "curl -H Authorization=secret-value https://example.test",
+            },
+        }),
+        ("secret-value",),
+    )
+
+    assert reasoning == ("reasoning", "Evaluating repository evidence")
+    assert "private chain of thought" not in reasoning[1]
+    assert command is not None
+    assert "secret-value" not in command[1]
+    assert "[redacted]" in command[1]
+
+
+def test_jsonl_activity_exposes_safe_agent_updates_and_structured_summary() -> None:
+    update = codex_runner_module._codex_activity_from_event(
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "I found the failing call path in src/window.py; token=TOKEN-VALUE",
+            },
+        }),
+        ("TOKEN-VALUE",),
+    )
+    result = codex_runner_module._codex_activity_from_event(
+        json.dumps({
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": json.dumps({"summary": "The stale handle is reused."}),
+            },
+        }),
+        (),
+    )
+
+    assert update == (
+        "message",
+        "AI update: I found the failing call path in src/window.py; token=[redacted]",
+    )
+    assert result == ("message", "Analysis result: The stale handle is reused.")
+
+
+def test_jsonl_final_agent_message_is_used_as_structured_result() -> None:
+    expected = json.dumps(_payload(changed_files=[], commands=[]))
+    stream = "\n".join((
+        json.dumps({"type": "thread.started", "thread_id": "thread-1"}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": expected,
+        }}),
+        json.dumps({"type": "turn.completed", "usage": {"output_tokens": 42}}),
+    ))
+
+    assert codex_runner_module._final_agent_message(stream) == expected
+
+
+def test_codex_activity_is_persisted_as_a_bounded_sanitized_trace(
+    tmp_path: Path,
+) -> None:
+    runner = _runner(tmp_path, FakeExecutor())
+    directory = runner._prepare_run_directory("activity-run")
+    runner._record_activity(directory, "command", "Running: rg -n defect src")
+    runner._record_activity(directory, "command", "Command completed: rg (exit 0)")
+
+    assert runner.activity("activity-run") == (
+        "Running: rg -n defect src",
+        "Command completed: rg (exit 0)",
+    )

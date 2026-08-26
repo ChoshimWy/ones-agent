@@ -123,11 +123,63 @@ def test_bootstrap_normalizes_committed_workflow_to_public_runtime_contracts(
         sandbox_profile_validator=lambda profile, source, environment: None,
     ).build(active, _secrets())
     try:
+        from src.developer_workflow.requirement_flow import CodexRequirementAdapter
+
         assert type(handle.orchestrator.config) is DeveloperWorkflowConfig
+        assert isinstance(
+            handle.orchestrator.defect_flow.codex, CodexRequirementAdapter
+        )
         assert type(handle.orchestrator.config.repositories[0]) is RepositoryMapping
         assert handle.orchestrator.config.repositories[0] == _workflow(
             tmp_path
         ).repositories[0]
+    finally:
+        handle.close()
+
+
+def test_analysis_runtime_accepts_valid_repository_on_a_different_host(
+    tmp_path: Path,
+) -> None:
+    from src.developer_workflow.runtime_bootstrap import (
+        RuntimeAdapterBundle,
+        RuntimeBootstrapper,
+    )
+
+    active = _active(tmp_path)
+    workflow = active.workflow.model_dump(mode="python", round_trip=True)
+    workflow["repositories"][0]["repo_url"] = (
+        "ssh://git@gitlab.example.invalid:222/team/repo.git"
+    )
+    active = active.validated_update(
+        workflow=DeveloperWorkflowConfig.model_validate(workflow),
+        credential_kinds=tuple(
+            kind
+            for kind in active.credential_kinds
+            if kind is not SecretKind.PROVIDER_TOKEN
+        ),
+    )
+    secrets = _secrets()
+    secrets = RuntimeSecrets(
+        {
+            kind: value
+            for kind, value in secrets.values.items()
+            if kind is not SecretKind.PROVIDER_TOKEN
+        }
+    )
+
+    class LocalOnlyPublisher:
+        def close(self) -> None:
+            return None
+
+    handle = RuntimeBootstrapper(
+        private_root_preparer=lambda roots: tuple(Path(root) for root in roots),
+        sandbox_profile_validator=lambda profile, source, environment: None,
+        adapters=RuntimeAdapterBundle(
+            pr_factory=lambda **_kwargs: LocalOnlyPublisher()
+        ),
+    ).build(active, secrets)
+    try:
+        assert handle.orchestrator is not None
     finally:
         handle.close()
 
@@ -196,7 +248,7 @@ def test_bootstrap_uses_explicit_inputs_without_mutating_parent_environment(
             "STORED-PROVIDER-TOKEN"
         )
         codex = handle.orchestrator.requirement_flow.codex
-        environment = codex.environment_provider()
+        environment = codex.runner.environment_provider()
         assert environment["CODEX_API_KEY"] == "STORED-CODEX-KEY"
         assert "PARENT-CODEX-KEY" not in environment.values()
         assert os.environ == before
@@ -467,7 +519,7 @@ def test_bootstrap_shares_one_codex_preparer_across_fresh_runtime_leases(
     try:
         flow = handle.orchestrator.requirement_flow
         assert flow.test_runner.codex_preparer is preparer
-        assert flow.codex.command_resolver() is marker
+        assert flow.codex.runner.command_resolver() is marker
         assert resolver_calls == [preparer]
     finally:
         handle.close()
@@ -556,7 +608,6 @@ def test_legacy_sandbox_adapter_forwards_only_sanitized_preflight_environment(
     [
         ("credential", "present", (SecretKind.CODEX_API_KEY,)),
         ("credential", None, (SecretKind.CODEX_API_KEY, SecretKind.CODEX_AUTH_TOKEN)),
-        ("file", None, ()),
         ("file", "present", (SecretKind.CODEX_API_KEY,)),
     ],
 )

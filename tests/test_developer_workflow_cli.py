@@ -444,6 +444,11 @@ def test_production_tui_host_shares_validation_codex_preparer_with_runtime(
         SandboxPermissionProfileSource.MANAGED,
         {},
     )
+    runtime.sandbox_profile_validator(
+        "ones-dev-workspace",
+        SandboxPermissionProfileSource.BUILTIN_WORKSPACE,
+        {},
+    )
 
     assert factory is not None
     assert runtime.codex_runtime_preparer is shared_preparer

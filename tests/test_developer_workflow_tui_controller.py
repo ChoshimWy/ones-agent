@@ -16,6 +16,7 @@ from src.developer_workflow.contracts import (
     WorkflowState,
     WorkflowType,
 )
+from src.contracts import ProjectRef, RequirementRecord, StatusRef, WorkflowStatusRef
 from src.developer_workflow.orchestrator import (
     DeveloperWorkflowOrchestrator,
     InvalidWorkflowAction,
@@ -23,6 +24,7 @@ from src.developer_workflow.orchestrator import (
 from src.developer_workflow.state_store import FileRunStore
 from src.developer_workflow.tui.controller import (
     CandidateSessionView,
+    StaleCandidateError,
     StaleTuiActionError,
     TuiController,
     TuiControllerError,
@@ -47,6 +49,21 @@ class Candidates:
         if isinstance(value, Exception):
             raise value
         return value
+
+
+class Requirements:
+    async def list_requirements(self, **kwargs):
+        self.kwargs = kwargs
+        return [
+            RequirementRecord(
+                requirement_id="R-1",
+                number="REQ-1",
+                title="Export requirement",
+                project=ProjectRef(id="P-1", name="Project"),
+                iteration=ProjectRef(id="I-1", name="Iteration"),
+                status=StatusRef(id="todo", name="Todo"),
+            )
+        ]
 
 
 class LoopRecordingCandidates:
@@ -112,6 +129,109 @@ def candidate(candidate_id="D-1", token="SECRET-TOKEN"):
     )
 
 
+def test_load_defect_filter_options_reads_project_scoped_ones_metadata() -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class Gateway:
+        async def list_iterations(self, project: str):
+            calls.append(("iterations", project))
+            return [{"uuid": "iter-1", "title": "Iteration One"}]
+
+        async def list_role_members(self, project: str):
+            calls.append(("roles", project))
+            return [{"members": ["user-2", "user-1", "user-1"]}]
+
+        async def get_current_user_id(self):
+            calls.append(("current-user",))
+            return "user-2"
+
+        async def list_team_members(self, *, uuids):
+            calls.append(("members", tuple(uuids)))
+            return [
+                {"uuid": "user-2", "name": "Bob"},
+                {"uuid": "user-1", "name": "Alice"},
+            ]
+
+        async def list_defect_statuses(self, project: str, issue_type: str):
+            calls.append(("statuses", project, issue_type))
+            return [
+                WorkflowStatusRef(
+                    id="todo", name="Todo", category="open", default=True
+                ),
+                WorkflowStatusRef(id="done", name="Done", category="done"),
+            ]
+
+    orchestrator = Orchestrator()
+    orchestrator.defect_candidates = SimpleNamespace(
+        gateway=Gateway(), issue_type_id="defect-type"
+    )
+    controller = TuiController(orchestrator, Index())  # type: ignore[arg-type]
+    try:
+        options = controller.load_defect_filter_options("project-1")
+    finally:
+        controller.close()
+
+    assert tuple((item.id, item.name) for item in options.iterations) == (
+        ("iter-1", "Iteration One"),
+    )
+    assert tuple((item.id, item.name) for item in options.assignees) == (
+        ("user-1", "Alice"),
+        ("user-2", "Bob"),
+    )
+    assert tuple((item.id, item.name) for item in options.statuses) == (
+        ("todo", "Todo"),
+    )
+    assert tuple(item.id for item in options.assignees if item.selected) == (
+        "user-2",
+    )
+    assert tuple(item.id for item in options.statuses if item.selected) == ("todo",)
+    assert calls == [
+        ("iterations", "project-1"),
+        ("roles", "project-1"),
+        ("current-user",),
+        ("members", ("user-1", "user-2")),
+        ("statuses", "project-1", "defect-type"),
+    ]
+
+
+def test_load_defect_filter_options_keeps_partial_ones_metadata() -> None:
+    class Gateway:
+        async def list_iterations(self, project: str):
+            assert project == "project-1"
+            return [None, {"uuid": "iter-1", "title": "Iteration One"}]
+
+        async def list_role_members(self, project: str):
+            raise RuntimeError("role endpoint unavailable")
+
+        async def get_current_user_id(self):
+            return "user-2"
+
+        async def list_team_members(self, *, uuids):
+            raise RuntimeError("member endpoint unavailable")
+
+        async def list_defect_statuses(self, project: str, issue_type: str):
+            raise RuntimeError("status endpoint unavailable")
+
+    orchestrator = Orchestrator()
+    orchestrator.defect_candidates = SimpleNamespace(
+        gateway=Gateway(), issue_type_id="defect-type"
+    )
+    controller = TuiController(orchestrator, Index())  # type: ignore[arg-type]
+    try:
+        options = controller.load_defect_filter_options("project-1")
+    finally:
+        controller.close()
+
+    assert tuple((item.id, item.name) for item in options.iterations) == (
+        ("iter-1", "Iteration One"),
+    )
+    assert tuple((item.id, item.name, item.selected) for item in options.assignees) == (
+        ("user-2", "Current user", True),
+    )
+    assert options.statuses == ()
+    assert options.unavailable == ("project roles", "users", "statuses")
+
+
 def test_show_projects_persisted_repository_candidates_without_config_access() -> None:
     mapping = RepositoryMapping(
         key="primary",
@@ -152,6 +272,29 @@ def test_query_hides_token_and_forwards_exact_status_ids():
     assert "SECRET-TOKEN" not in repr(view)
     assert all(field.name != "snapshot_token" for field in fields(view))
     assert view.items[0].candidate_id == "D-1"
+
+
+def test_query_requirements_uses_bounded_gateway_session():
+    orchestrator = Orchestrator()
+    gateway = Requirements()
+    orchestrator.requirement_flow = SimpleNamespace(gateway=gateway)
+    controller = TuiController(orchestrator, Index())
+    try:
+        session_id, items = controller.query_requirements(
+            "P", "I", "A", ("todo",), "requirement-type"
+        )
+        assert session_id
+        assert items[0].requirement_id == "R-1"
+        assert items[0].number == "REQ-1"
+        assert gateway.kwargs == {
+            "project_id": "P",
+            "issue_type_id": "requirement-type",
+            "sprint_id": "I",
+            "assignee": "A",
+            "status_ids": ("todo",),
+        }
+    finally:
+        controller.close()
 
 
 def test_query_passes_none_for_empty_status_ids():
@@ -211,6 +354,27 @@ def test_close_revokes_existing_candidate_session_and_hidden_token():
     with pytest.raises(TuiControllerError):
         controller.start_defect(view.session_id, "D-1")
     assert not any(call[0] == "start_defect" for call in orchestrator.calls)
+
+
+def test_analyze_defect_forwards_explicit_read_only_action() -> None:
+    from src.developer_workflow.contracts import DefectAction
+
+    class AnalysisOrchestrator(Orchestrator):
+        def start_defect(self, *args, **kwargs):
+            self.calls.append(("start_defect", args, kwargs))
+            return self.run
+
+    orchestrator = AnalysisOrchestrator(
+        [(candidate(token="TOKEN-ANALYSIS"),)]
+    )
+    controller = TuiController(orchestrator, Index())
+    view = controller.query_defects("P", "I", "A", ())
+
+    controller.analyze_defect(view.session_id, "D-1")
+
+    assert orchestrator.calls[-1][0] == "start_defect"
+    assert orchestrator.calls[-1][2] == {"action": DefectAction.ANALYZE}
+    controller.close()
 
 
 def test_inflight_query_cannot_publish_session_after_close_begins():
@@ -549,11 +713,24 @@ def test_start_defect_sanitizes_lower_layer_controller_error():
 
     with pytest.raises(TuiControllerError) as caught:
         controller.start_defect(view.session_id, "D-1")
-    assert str(caught.value) == "candidate snapshot is invalid"
+    assert str(caught.value) == "defect workflow could not be started"
     assert "TOKEN-INNER" not in str(caught.value)
     assert "TOKEN-INNER" not in str(caught.value)
     with pytest.raises(TuiControllerError, match="candidate snapshot is invalid"):
         controller.start_defect(view.session_id, "D-1")
+
+
+def test_start_defect_classifies_expired_candidate_separately():
+    orchestrator = Orchestrator([(candidate(),)])
+    controller = TuiController(orchestrator, Index())
+    view = controller.query_defects("P", "I", "A", ())
+    orchestrator.start_defect = lambda *args: (_ for _ in ()).throw(
+        InvalidWorkflowAction("TOKEN-STALE")
+    )
+
+    with pytest.raises(StaleCandidateError, match="^candidate snapshot is invalid$") as caught:
+        controller.start_defect(view.session_id, "D-1")
+    assert "TOKEN-STALE" not in str(caught.value)
 
 
 def test_start_defect_rejects_malformed_identifiers_with_fixed_error():
@@ -657,6 +834,19 @@ def test_constructor_requires_strict_positive_capacity():
     for value in (0, -1, True, 1.5):
         with pytest.raises(TuiControllerError):
             TuiController(Orchestrator(), Index(), max_candidate_sessions=value)
+
+
+def test_controller_deletes_local_task_through_authoritative_index(tmp_path):
+    store = FileRunStore(tmp_path / "runs")
+    run = store.create(WorkflowRun.new(WorkflowType.REQUIREMENT, "REQ-1"))
+    controller = TuiController(Orchestrator(), RunIndex(store))
+    try:
+        controller.delete_task(run.run_id)
+        assert run.run_id not in store.list_run_ids()
+        with pytest.raises(TuiControllerError, match="task could not be deleted safely"):
+            controller.delete_task(run.run_id)
+    finally:
+        controller.close()
 
 
 def test_controller_precheck_cannot_race_orchestrator_version_gate(tmp_path):

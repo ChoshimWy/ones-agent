@@ -264,18 +264,24 @@ async def test_setup_cancel_clears_secret_and_controller_exactly_once() -> None:
 
 
 @pytest.mark.asyncio
-async def test_setup_has_seven_independent_steps_and_cannot_skip_controller_gate() -> None:
+async def test_setup_has_six_steps_and_ones_is_independent_of_profile_gate() -> None:
     from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
 
     controller = _WizardSetupController()
     async with _wizard_app(controller).run_test() as pilot:
         screen = pilot.app.screen
-        assert len(screen.query(".setup-step")) == 7
+        assert len(screen.query(".setup-step")) == 6
+        assert not screen.query("#nav-codex")
+        assert not screen.query("#codex-auth-mode")
         await pilot.click("#nav-review")
         await pilot.pause()
         assert screen.current_step is SetupStep.PROFILE
         assert screen.query_one("#profile-step").display
         assert not screen.query_one("#review-step").display
+        await pilot.click("#nav-ones")
+        await pilot.pause()
+        assert screen.current_step is SetupStep.ONES
+        assert screen.query_one("#ones-step").display
         controller._results[SetupStep.PROFILE] = controller._results[
             SetupStep.PROFILE
         ].model_copy(update={"status": ValidationStatus.PASSED, "category": "ok"})
@@ -285,14 +291,33 @@ async def test_setup_has_seven_independent_steps_and_cannot_skip_controller_gate
 
 
 @pytest.mark.asyncio
+async def test_setup_configuration_steps_are_independently_reachable() -> None:
+    from src.developer_workflow.setup_validation import SetupStep
+
+    controller = _WizardSetupController()
+    async with _wizard_app(controller).run_test() as pilot:
+        screen = pilot.app.screen
+        for step, button_id in (
+            (SetupStep.ONES, "#nav-ones"),
+            (SetupStep.REPOSITORIES, "#nav-repositories"),
+            (SetupStep.PROVIDER, "#nav-provider"),
+            (SetupStep.PRIVATE_PATHS, "#nav-private-paths"),
+        ):
+            await pilot.click(button_id)
+            await pilot.pause()
+            assert screen.current_step is step
+
+
+@pytest.mark.asyncio
 async def test_setup_review_activation_uses_explicit_host_callback() -> None:
     from textual.app import App
 
     from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
+    from src.developer_workflow.tui.setup_models import TUI_SETUP_STEPS
     from src.developer_workflow.tui.setup_screens import SetupWizardScreen
 
     controller = _WizardSetupController()
-    for step in tuple(SetupStep)[:-1]:
+    for step in TUI_SETUP_STEPS[:-1]:
         controller._results[step] = controller._results[step].model_copy(
             update={"status": ValidationStatus.PASSED, "category": "ok"}
         )
@@ -381,9 +406,6 @@ async def test_setup_consumes_secrets_before_probe_without_recording_them() -> N
         screen.query_one("#ones-password").value = "FRAME-SECRET-CANARY"
         for widget_id, value in {
             "#ones-team-id": "team-1",
-            "#ones-project-id": "project-1",
-            "#ones-status-id": "status-1",
-            "#ones-item-id": "item-1",
         }.items():
             screen.query_one(widget_id).value = value
         await pilot.click("#test-connection")
@@ -395,55 +417,12 @@ async def test_setup_consumes_secrets_before_probe_without_recording_them() -> N
         _, probe = controller.calls[-1]
         assert set(probe) == {
             "ones-team-id",
-            "ones-project-id",
-            "ones-status-id",
-            "ones-item-id",
             "ones-issue-type-id",
         }
         assert "FRAME-SECRET-CANARY" not in repr(probe)
         assert "private@example.invalid" not in repr(probe)
         assert screen.query_one("#ones-email").value == ""
         assert screen.query_one("#ones-password").value == ""
-
-
-@pytest.mark.asyncio
-async def test_setup_codex_applies_complete_public_runtime() -> None:
-    from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
-
-    controller = _WizardSetupController()
-    controller.runtime_public_fields = MappingProxyType(
-        {
-            "ones_base_url": "https://ones.example.invalid",
-            "ones_team_id": "team-1",
-            "ones_issue_type_id": "defect-1",
-            "provider_host": "git.example.invalid",
-            "provider_api_url": "https://git.example.invalid/api",
-            "git_author_name": "ONES Developer",
-            "git_author_email": "developer@example.invalid",
-            "provider": "github",
-        }
-    )
-    controller.current_step = SetupStep.CODEX
-    for step in tuple(SetupStep)[:4]:
-        controller._results[step] = controller._results[step].model_copy(
-            update={"status": ValidationStatus.PASSED, "category": "ok"}
-        )
-    async with _wizard_app(controller).run_test() as pilot:
-        screen = pilot.app.screen
-        values = {
-            "#codex-auth-mode": "credential",
-            "#codex-profile": "managed-profile",
-            "#codex-worktree": "C:/safe/probe",
-        }
-        for widget_id, value in values.items():
-            screen.query_one(widget_id).value = value
-        await screen.action_test_connection()
-        await pilot.pause()
-        assert len(controller.runtime_calls) == 1
-        runtime = controller.runtime_calls[0]
-        assert runtime.ones_team_id == "team-1"
-        assert runtime.provider_host == "git.example.invalid"
-        assert runtime.codex_auth_mode == "credential"
 
 
 @pytest.mark.asyncio
@@ -521,7 +500,6 @@ async def test_setup_profiles_are_catalog_backed_and_shared_between_steps() -> N
         await pilot.pause()
         screen = pilot.app.screen
         profile = screen.query_one("#sandbox-profile", Select)
-        codex = screen.query_one("#codex-profile", Select)
 
         assert tuple(value for _, value in profile._options if type(value) is str) == (
             "managed-profile",
@@ -529,7 +507,7 @@ async def test_setup_profiles_are_catalog_backed_and_shared_between_steps() -> N
         )
         profile.value = "restricted-profile"
         await pilot.pause()
-        assert codex.value == "restricted-profile"
+        assert profile.value == "restricted-profile"
 
 
 @pytest.mark.asyncio
@@ -561,7 +539,6 @@ async def test_empty_profile_catalog_offers_explicit_runtime_creation() -> None:
         await pilot.pause()
         screen = pilot.app.screen
         assert screen.query_one("#sandbox-profile", Select).disabled
-        assert screen.query_one("#codex-profile", Select).disabled
         create = screen.query_one("#create-workspace-profile", Button)
         assert create.disabled is False
         assert create.label.plain == "Create safe workspace profile"
@@ -624,9 +601,7 @@ async def test_runtime_profile_success_reads_authoritative_draft_and_enables_tes
             ).value == BUILTIN_WORKSPACE_PROFILE,
         )
         screen = pilot.app.screen
-        assert screen.query_one("#codex-profile", Select).value == BUILTIN_WORKSPACE_PROFILE
         assert screen.query_one("#sandbox-profile", Select).disabled is False
-        assert screen.query_one("#codex-profile", Select).disabled is False
         assert screen.query_one("#test-connection", Button).disabled is False
         assert screen.query_one("#next-step", Button).disabled is True
         assert screen.query_one("#create-workspace-profile", Button).disabled is False
@@ -671,7 +646,6 @@ async def test_runtime_profile_failure_is_redacted_and_retry_can_succeed() -> No
             lambda: screen.query_one("#sandbox-profile", Select).value
             == BUILTIN_WORKSPACE_PROFILE,
         )
-        assert screen.query_one("#codex-profile", Select).value == BUILTIN_WORKSPACE_PROFILE
 
 
 @pytest.mark.asyncio
@@ -695,7 +669,6 @@ async def test_runtime_profile_does_not_trust_success_return_without_draft_bindi
         )
         screen = pilot.app.screen
         assert screen.query_one("#sandbox-profile", Select).disabled
-        assert screen.query_one("#codex-profile", Select).disabled
         assert screen.query_one("#setup-notice", Static).renderable == (
             "Safe workspace profile could not be verified"
         )
@@ -1120,7 +1093,6 @@ async def test_failed_runtime_profile_keeps_existing_managed_selection() -> None
         await pilot.click("#confirm-workspace-profile")
         await _wait_until(pilot, lambda: controller.profile_confirm_calls == 1)
         assert screen.query_one("#sandbox-profile", Select).value == "restricted-profile"
-        assert screen.query_one("#codex-profile", Select).value == "restricted-profile"
 
 
 @pytest.mark.asyncio
@@ -1160,9 +1132,6 @@ async def test_setup_cancel_keeps_attached_wizard_reusable() -> None:
         await pilot.press("escape")
         for widget_id, value in {
             "#ones-team-id": "team-1",
-            "#ones-project-id": "project-1",
-            "#ones-status-id": "status-1",
-            "#ones-item-id": "item-1",
         }.items():
             screen.query_one(widget_id).value = value
         await screen.action_test_connection()
@@ -1343,12 +1312,12 @@ async def test_each_step_candidate_receives_only_its_exact_config_fields(
 ) -> None:
     from src.developer_workflow.setup_validation import SetupStep, ValidationStatus
     from src.developer_workflow.tui.setup_screens import SetupWizardScreen
+    from src.developer_workflow.tui.setup_models import TUI_SETUP_STEPS
 
     expected = {
         SetupStep.PROFILE: {"sandbox-profile"},
         SetupStep.ONES: {
             "ones-base-url", "ones-team-id", "ones-issue-type-id",
-            "ones-project-id", "ones-status-id", "ones-item-id",
         },
         SetupStep.REPOSITORIES: {
             "repository-key", "repository-project-id", "repository-iteration-id",
@@ -1362,9 +1331,6 @@ async def test_each_step_candidate_receives_only_its_exact_config_fields(
         SetupStep.PROVIDER: {
             "provider-host", "provider-api-url", "git-author-name",
             "git-author-email", "provider-type", "repository-branch",
-        },
-        SetupStep.CODEX: {
-            "codex-auth-mode", "codex-profile", "codex-worktree", "codex-home",
         },
         SetupStep.PRIVATE_PATHS: {"run-root", "mirror-root", "worktree-root"},
     }
@@ -1387,14 +1353,14 @@ async def test_each_step_candidate_receives_only_its_exact_config_fields(
     controller.draft = SimpleNamespace(workflow=__import__(
         "src.developer_workflow.setup_models", fromlist=["WorkflowDraft"]
     ).WorkflowDraft())
-    for step in tuple(SetupStep)[:-1]:
+    for step in TUI_SETUP_STEPS[:-1]:
         controller._results[step] = controller._results[step].model_copy(
             update={"status": ValidationStatus.PASSED, "category": "ok"}
         )
     async with _wizard_app(controller).run_test() as pilot:
         screen = pilot.app.screen
         screen.query_one("#sandbox-profile").value = "managed-profile"
-        for step in tuple(SetupStep)[:-1]:
+        for step in TUI_SETUP_STEPS[:-1]:
             screen.current_step = step
             screen._render_state()
             try:

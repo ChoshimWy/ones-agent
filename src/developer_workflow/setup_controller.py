@@ -1,4 +1,4 @@
-"""Secret-safe seven-step setup orchestration without UI dependencies."""
+"""Secret-safe six-step setup orchestration without UI dependencies."""
 
 from __future__ import annotations
 
@@ -204,7 +204,11 @@ _TRANSACTION_MEMBERS: dict[SetupStep, frozenset[str]] = {
 }
 _TRANSACTION_RUNTIME_FIELDS: dict[SetupStep, frozenset[str]] = {
     SetupStep.ONES: frozenset(
-        {"ones_base_url", "ones_team_id", "ones_issue_type_id"}
+        {
+            "ones_base_url",
+            "ones_team_id",
+            "ones_issue_type_id",
+        }
     ),
     SetupStep.PROVIDER: frozenset(
         {
@@ -260,7 +264,6 @@ class SetupController:
         SetupStep.ONES,
         SetupStep.REPOSITORIES,
         SetupStep.PROVIDER,
-        SetupStep.CODEX,
         SetupStep.PRIVATE_PATHS,
         SetupStep.REVIEW,
     )
@@ -277,6 +280,7 @@ class SetupController:
         activation_timeout: float = 30.0,
         cleanup_timeout: float = 0.25,
         draft: SetupDraft | None = None,
+        steps: tuple[SetupStep, ...] | None = None,
     ) -> None:
         if (
             type(profile_id) is not str
@@ -289,6 +293,15 @@ class SetupController:
             or cleanup_timeout <= 0
         ):
             raise SetupActionError("setup configuration is invalid")
+        selected_steps = self.STEPS if steps is None else steps
+        if (
+            type(selected_steps) is not tuple
+            or not selected_steps
+            or selected_steps[-1] is not SetupStep.REVIEW
+            or len(selected_steps) != len(set(selected_steps))
+            or any(type(step) is not SetupStep for step in selected_steps)
+        ):
+            raise SetupActionError("setup configuration is invalid")
         bootstrap_validator = getattr(runtime_bootstrap, "validator", None)
         bootstrap_catalog = getattr(runtime_bootstrap, "catalog", None)
         actual_validator = validator or bootstrap_validator
@@ -296,6 +309,7 @@ class SetupController:
         if actual_validator is None or actual_catalog is None:
             raise SetupActionError("setup configuration is invalid")
         self._profile_id = profile_id
+        self.STEPS = selected_steps
         self._store = store
         self._runtime_builder = runtime_builder
         self._validator = actual_validator
@@ -530,7 +544,7 @@ class SetupController:
             or transaction.runtime_fields is not None
             and (
                 expected_runtime_fields is None
-                or set(transaction.runtime_fields) != expected_runtime_fields
+                or frozenset(transaction.runtime_fields) != expected_runtime_fields
             )
             or transaction.repository is not None
             and transaction.repository_group is not None
@@ -574,6 +588,46 @@ class SetupController:
                 draft.workflow = transaction.workflow.model_copy(deep=True)
             if transaction.runtime_fields is not None:
                 runtime_fields.update(dict(transaction.runtime_fields))
+                if step is SetupStep.ONES and draft.runtime is not None:
+                    runtime_data = draft.runtime.model_dump(
+                        mode="python", round_trip=True
+                    )
+                    runtime_data.update(
+                        {
+                            "ones_base_url": runtime_fields["ones_base_url"],
+                            "ones_team_id": runtime_fields["ones_team_id"],
+                            "ones_issue_type_id": runtime_fields[
+                                "ones_issue_type_id"
+                            ],
+                        }
+                    )
+                    draft.runtime = RuntimePublicConfig.model_validate(runtime_data)
+            if draft.runtime is None and all(
+                name in runtime_fields
+                for name in (
+                    "ones_base_url",
+                    "ones_team_id",
+                    "ones_issue_type_id",
+                    "provider_host",
+                    "provider_api_url",
+                    "git_author_name",
+                    "git_author_email",
+                )
+            ):
+                # Codex is deliberately not a setup surface. The runtime uses
+                # the local CLI's ambient auth/configuration instead.
+                draft.runtime = RuntimePublicConfig(
+                    ones_base_url=runtime_fields["ones_base_url"],
+                    ones_team_id=runtime_fields["ones_team_id"],
+                    ones_issue_type_id=runtime_fields["ones_issue_type_id"],
+                    ones_comment_list_path_template=DEFAULT_ONES_COMMENT_LIST_PATH_TEMPLATE,
+                    provider_host=runtime_fields["provider_host"],
+                    provider_api_url=runtime_fields["provider_api_url"],
+                    git_author_name=runtime_fields["git_author_name"],
+                    git_author_email=runtime_fields["git_author_email"],
+                    codex_auth_mode="file",
+                    codex_home=None,
+                )
             workflow = draft.workflow
             if transaction.repository is not None:
                 repository = transaction.repository.model_copy(deep=True)
@@ -1494,10 +1548,10 @@ class SetupController:
             if step is SetupStep.ONES:
                 return OnesProbeInput(
                     team_id=values["ones-team-id"],
-                    project_id=values["ones-project-id"],
-                    status_id=values["ones-status-id"],
-                    item_id=values["ones-item-id"],
-                    issue_type_id=values["ones-issue-type-id"],
+                    project_id=values.get("ones-project-id") or None,
+                    status_id=values.get("ones-status-id") or None,
+                    item_id=values.get("ones-item-id") or None,
+                    issue_type_id=values.get("ones-issue-type-id") or None,
                 )
             if step is SetupStep.PROVIDER:
                 return ProviderProbeInput(
@@ -1784,7 +1838,6 @@ class SetupController:
                 "git_author_name",
                 "git_author_email",
             ),
-            SetupStep.CODEX: ("codex_auth_mode", "codex_home"),
         }
         for step, fields in field_steps.items():
             if any(
@@ -1806,8 +1859,8 @@ class SetupController:
             "repositories": SetupStep.REPOSITORIES,
             "repository_groups": SetupStep.REPOSITORIES,
             "publishing": SetupStep.PROVIDER,
-            "max_codex_attempts": SetupStep.CODEX,
-            "tui_max_concurrency": SetupStep.CODEX,
+            "max_codex_attempts": SetupStep.PRIVATE_PATHS,
+            "tui_max_concurrency": SetupStep.PRIVATE_PATHS,
             "run_root": SetupStep.PRIVATE_PATHS,
             "mirror_root": SetupStep.PRIVATE_PATHS,
             "worktree_root": SetupStep.PRIVATE_PATHS,

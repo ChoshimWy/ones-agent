@@ -24,6 +24,7 @@ NATIVE_CODEX_RELATIVE_PATH = Path(
     "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/"
     "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
 )
+CODE_MODE_HOST_NAME = "codex-code-mode-host.exe"
 
 
 @dataclass(frozen=True, slots=True)
@@ -747,6 +748,8 @@ class CodexRuntimePreparer:
                             quarantine=rebuildable.get(source_sha256),
                         )
                     )
+                if type(locked) is LockedNativeCodex:
+                    self._ensure_code_mode_host(result, locked, adapter)
             except BaseException as error:
                 if _is_priority_failure(error) or not isinstance(error, OSError):
                     raise
@@ -776,6 +779,88 @@ class CodexRuntimePreparer:
             raise cleanup.with_traceback(cleanup_traceback)
         assert result is not None
         return result
+
+    def _ensure_code_mode_host(
+        self,
+        executable: Path,
+        locked: LockedNativeCodex,
+        adapter: _CacheRuntimeAdapter,
+    ) -> None:
+        """Stage the signed companion required by current Codex desktop builds."""
+
+        runtime = locked._adapter
+        source_main = runtime.final_path(locked.descriptor)
+        source = source_main.with_name(CODE_MODE_HOST_NAME)
+        descriptor = runtime.open_locked(source)
+        temporary = executable.parent / f"code-mode-host-{uuid.uuid4().hex}.tmp"
+        primary: BaseException | None = None
+        try:
+            if not runtime.is_disk_regular_non_reparse(descriptor):
+                raise OSError("native Codex companion is unavailable")
+            initial = runtime.identity(descriptor)
+            final_path = runtime.final_path(descriptor)
+            if (
+                initial.size < 0
+                or final_path.parent != source_main.parent
+                or final_path.name.casefold() != CODE_MODE_HOST_NAME
+                or not runtime.same_file(final_path, source)
+                or runtime.verify_publisher(descriptor, final_path)
+                != OPENAI_AUTHENTICODE_PUBLISHER
+            ):
+                raise OSError("native Codex companion is unavailable")
+            runtime.rewind(descriptor)
+            digest = hashlib.sha256()
+            copied = 0
+            with temporary.open("xb", buffering=0) as destination:
+                while True:
+                    chunk = runtime.read(descriptor, self._chunk_size)
+                    if not chunk:
+                        break
+                    _write_all(destination, chunk)
+                    digest.update(chunk)
+                    copied += len(chunk)
+                destination.flush()
+                os.fsync(destination.fileno())
+            if copied != initial.size or runtime.identity(descriptor) != initial:
+                raise OSError("native Codex companion changed")
+
+            target = executable.parent / CODE_MODE_HOST_NAME
+            expected_digest = digest.hexdigest()
+            reuse = False
+            try:
+                target_identity, target_publisher = (
+                    adapter.inspect_private_executable(target)
+                )
+                reuse = (
+                    target_identity.size == copied
+                    and target_publisher == OPENAI_AUTHENTICODE_PUBLISHER
+                    and _hash_file(target) == expected_digest
+                )
+            except (FileNotFoundError, OSError, ValueError):
+                reuse = False
+            if not reuse:
+                adapter.protect_private_file(temporary)
+                os.replace(temporary, target)
+                adapter.fsync_directory(executable.parent)
+            target_identity, target_publisher = adapter.inspect_private_executable(
+                target,
+            )
+            if (
+                target_identity.size != copied
+                or target_publisher != OPENAI_AUTHENTICODE_PUBLISHER
+                or _hash_file(target) != expected_digest
+            ):
+                raise OSError("private Codex companion is unavailable")
+        except BaseException as error:
+            primary = error
+        finally:
+            runtime.close(descriptor)
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+        if primary is not None:
+            raise primary
 
     def prepare_verified(self) -> _PreparedCodexRuntime:
         path = self.prepare()
