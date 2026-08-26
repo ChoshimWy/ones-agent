@@ -178,6 +178,20 @@ def _ai_activity_renderable(activity: tuple[str, ...]) -> Text:
         elif line.startswith("Analysis result: "):
             rendered.append("◆ Analysis result: ", style="bold magenta")
             rendered.append(line.removeprefix("Analysis result: "))
+        elif line.startswith("Verified root cause: "):
+            rendered.append("ROOT CAUSE  ", style="bold magenta")
+            rendered.append(line.removeprefix("Verified root cause: "))
+        elif line.startswith("Recommended fix "):
+            label, _, value = line.partition(": ")
+            rendered.append(label.upper() + "  ", style="bold green")
+            rendered.append(value)
+        elif line.startswith("Validation: "):
+            rendered.append("VALIDATION  ", style="bold cyan")
+            rendered.append(line.removeprefix("Validation: "))
+        elif line.startswith("Next investigation "):
+            label, _, value = line.partition(": ")
+            rendered.append(label.upper() + "  ", style="bold yellow")
+            rendered.append(value)
         elif line == "Codex session started":
             rendered.append("● Codex session started", style="bold blue")
         elif line == "AI analysis started":
@@ -2051,7 +2065,7 @@ class DashboardScreen(Screen[None]):
                             id="action-regenerate-analysis",
                         )
                         yield Button(
-                            "Retry analysis",
+                            "Repair result format",
                             id="action-retry-analysis",
                             variant="warning",
                         )
@@ -2099,8 +2113,7 @@ class DashboardScreen(Screen[None]):
             and not workflow_running
             and detail.summary.state is WorkflowState.BLOCKED
             and detail.resume_state is WorkflowState.IMPLEMENTING
-            and detail.status_message
-            == "Codex analysis returned invalid structured output"
+            and detail.status_message == "Codex result format repair failed"
         )
         self.query_one("#action-bar").display = bool(
             self.query_one("#workspace").display
@@ -2664,16 +2677,15 @@ class DashboardScreen(Screen[None]):
             detail is None
             or detail.summary.state is not WorkflowState.BLOCKED
             or detail.resume_state is not WorkflowState.IMPLEMENTING
-            or detail.status_message
-            != "Codex analysis returned invalid structured output"
+            or detail.status_message != "Codex result format repair failed"
         ):
             self._show_action_notice(_ACTION_UNAVAILABLE)
             return
         self._set_analysis_actions(None)
-        self._show_action_notice("Retrying AI analysis")
+        self._show_action_notice("Repairing structured analysis result")
         self._submit_workflow_task(
             detail.summary.run_id,
-            "retry-analysis",
+            "repair-analysis-format",
             lambda: self._controller.resume(
                 detail.summary.run_id,
                 detail.summary.version,

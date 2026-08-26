@@ -485,6 +485,9 @@ async def test_ai_activity_styles_events_and_compacts_shell_launcher() -> None:
                 'Command completed: "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "git status --short" (exit 0)',
                 "Analysis result: repository evidence collected",
                 "Structured analysis result validated",
+                "Verified root cause: stale environment identity is reused",
+                "Recommended fix 1: namespace persisted login state by environment",
+                "Validation: pytest tests/test_login.py",
             ),
         ))
 
@@ -494,6 +497,9 @@ async def test_ai_activity_styles_events_and_compacts_shell_launcher() -> None:
         assert "Running: git status --short" in plain
         assert "Command completed: git status --short  [exit 0]" in plain
         assert "powershell.exe" not in plain.casefold()
+        assert "ROOT CAUSE  stale environment identity is reused" in plain
+        assert "RECOMMENDED FIX 1  namespace persisted login state by environment" in plain
+        assert "VALIDATION  pytest tests/test_login.py" in plain
         assert getattr(activity, "spans", ())
 
 
@@ -1706,7 +1712,7 @@ async def test_invalid_analysis_task_offers_visible_retry_action() -> None:
         def _detail(self) -> RunDetail:
             return replace(
                 super()._detail(),
-                status_message="Codex analysis returned invalid structured output",
+                status_message="Codex result format repair failed",
             )
 
     controller = RetryController(
@@ -1716,6 +1722,7 @@ async def test_invalid_analysis_task_offers_visible_retry_action() -> None:
     async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
         retry = pilot.app.screen.query_one("#action-retry-analysis", Button)
         assert retry.display
+        assert retry.label.plain == "Repair result format"
         assert retry.parent is pilot.app.screen.query_one("#action-bar")
         assert retry.region.width < pilot.app.screen.query_one("#action-bar").region.width
         await pilot.click("#action-retry-analysis")
@@ -1733,7 +1740,7 @@ async def test_retry_analysis_does_not_block_the_textual_event_loop() -> None:
         def _detail(self) -> RunDetail:
             return replace(
                 super()._detail(),
-                status_message="Codex analysis returned invalid structured output",
+                status_message="Codex result format repair failed",
             )
 
         def resume(self, run_id: str, expected_version: int) -> RunDetail:
@@ -1751,7 +1758,7 @@ async def test_retry_analysis_does_not_block_the_textual_event_loop() -> None:
             assert await asyncio.to_thread(entered.wait, 2)
             await asyncio.wait_for(click, timeout=1)
             assert _plain(pilot.app.screen.query_one("#notice")) == (
-                "Retrying AI analysis"
+                "Repairing structured analysis result"
             )
             assert not pilot.app.screen.query_one(
                 "#action-retry-analysis", Button

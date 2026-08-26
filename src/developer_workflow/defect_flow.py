@@ -87,9 +87,9 @@ _ROOT_CAUSE_RESULT_CONTRACT = (
     "Do not invoke or read the ones-dev-workflow skill, its scripts, or any ONES "
     "client. The complete defect snapshot is already present in this prompt; use "
     "only that snapshot and the supplied repository worktrees. "
-    "For this read-only stage changed_files, repository_changes, commands, and "
-    "acceptance_coverage must all be empty arrays. Include every top-level field "
-    "required by the supplied schema. Each root_cause_evidence item must include: "
+    "Use only the fields declared by the supplied root-cause schema; stage-irrelevant "
+    "mutation, command, review, and acceptance fields are filled deterministically by "
+    "the workflow and must not be included. Each root_cause_evidence item must include: "
     "file_path; repository_file "
     "for a repository group; a non-empty location; either a valid start_line/end_line "
     "pair or symbol; mechanism; reproduction_test; test_selector beginning with the "
@@ -99,7 +99,12 @@ _ROOT_CAUSE_RESULT_CONTRACT = (
     "and supporting_points with observable repository evidence. The first fix_steps "
     "entry is the single best solution. If those evidence requirements cannot be met, "
     "return root_cause_evidence as an empty array and put concrete next actions in "
-    "investigation_suggestions instead of inventing fields."
+    "investigation_suggestions instead of inventing fields. Every file_path contains "
+    "exactly one repository-relative POSIX path, never a list or semicolon-separated "
+    "paths. When repository_file is present, file_path must exactly equal its path; "
+    "when reproduction_file is present, reproduction_test must exactly equal its path; "
+    "each supporting point describes exactly one file and its file_path must exactly "
+    "equal repository_file.path. Emit separate supporting_points for separate files."
 )
 
 _ANALYSIS_COLLABORATION_CONTRACT = (
@@ -753,7 +758,11 @@ def _safe_unexpected_block(error: Exception, state: WorkflowState) -> _Blocked:
     elif isinstance(error, CodexTimeoutError):
         reason = "Codex analysis timed out"
     elif isinstance(error, CodexOutputError):
-        reason = "Codex analysis returned invalid structured output"
+        reason = (
+            "Codex result format repair failed"
+            if str(error) == "Codex result format repair failed"
+            else "Codex analysis returned invalid structured output"
+        )
     elif isinstance(error, UnsafeCodexRunError):
         reason = "Codex runtime safety validation failed"
     elif isinstance(error, CodexExecutionError):
@@ -2267,7 +2276,9 @@ class DefectFlow:
             "as an ordered minimal implementation plan; the first step must state the proposed "
             "change and why it is preferable to plausible alternatives. Include affected files, "
             "validation, compatibility concerns, and residual risk. Do not put competing options "
-            "in fix_steps unless evidence is insufficient. FINAL_ANALYSIS_REPORT is required.\n"
+            "in fix_steps unless evidence is insufficient. The final response must be exactly "
+            "one JSON object matching the supplied root-cause schema, with no report label, "
+            "Markdown fence, or prose wrapper.\n"
             "If previous_reports is non-empty, independently re-check repository evidence and "
             "generate a materially improved or alternative best solution. Reuse a previous "
             "solution only when the evidence makes it uniquely preferable, and explain why.\n"
@@ -2320,9 +2331,10 @@ class DefectFlow:
             "multi-repository root-cause analysis. Do not modify files. "
             "While working, emit concise progress updates naming the repository, file, "
             "or symbol being inspected and state only evidence-backed interim findings. "
-            "This stage has no mutation claims: return empty changed_files, "
-            "repository_changes, and commands arrays. changed_files describes actual "
-            "file mutations, never files merely inspected as evidence. "
+            "This stage has no mutation claims: omit changed_files, repository_changes, "
+            "commands, review, and acceptance fields because the workflow fills their empty "
+            "defaults deterministically. Files inspected as evidence belong only in the "
+            "root-cause evidence fields. "
             "Every RootCauseEvidence item must set repository_file and "
             "reproduction_file, and every impacted path must be represented in "
             "impacted_repository_files using an exact repository key and path. "
@@ -2337,7 +2349,8 @@ class DefectFlow:
             "If previous_reports is non-empty, independently re-check the repositories and "
             "produce a materially improved or alternative solution, retaining an older solution "
             "only when the evidence makes it uniquely preferable. "
-            "FINAL_ANALYSIS_REPORT is required. Context:\n"
+            "The final response must be exactly one JSON object matching the supplied "
+            "root-cause schema, with no report label, Markdown fence, or prose wrapper. Context:\n"
             + json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
             + _ANALYSIS_COLLABORATION_CONTRACT
             + _ROOT_CAUSE_RESULT_CONTRACT

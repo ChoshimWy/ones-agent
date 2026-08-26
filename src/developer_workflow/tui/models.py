@@ -668,6 +668,9 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
             "Codex analysis returned invalid structured output": (
                 "Codex analysis returned invalid structured output"
             ),
+            "Codex result format repair failed": (
+                "Codex result format repair failed"
+            ),
             "Codex runtime safety validation failed": (
                 "Codex runtime safety validation failed"
             ),

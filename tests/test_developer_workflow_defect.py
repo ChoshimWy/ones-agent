@@ -516,24 +516,64 @@ def test_shared_codex_adapter_enforces_defect_stage_permissions(tmp_path: Path) 
         )
 
 
-def test_root_cause_stage_retries_invalid_structured_output_once(
+def test_root_cause_stage_does_not_retry_invalid_output(
     tmp_path: Path,
 ) -> None:
-    calls: list[dict[str, object]] = []
+    analysis_calls: list[dict[str, object]] = []
+    repair_calls: list[dict[str, object]] = []
 
     class FlakyRunner:
         def run(self, *args: object, **kwargs: object) -> CodexResult:
             del args
-            calls.append(dict(kwargs))
-            if len(calls) == 1:
-                raise CodexOutputError(
-                    "Codex returned invalid structured output",
-                    validation_hint="root_cause_evidence.0.fix_steps (minItems)",
-                )
+            analysis_calls.append(dict(kwargs))
+            raise CodexOutputError(
+                "Codex returned invalid structured output",
+                validation_hint="root_cause_evidence.0.fix_steps (minItems)",
+                raw_output="FINAL_ANALYSIS_REPORT: verified root cause",
+            )
+
+        def repair_root_cause_result(self, **kwargs: object) -> CodexResult:
+            repair_calls.append(dict(kwargs))
             return CodexResult(summary="validated report")
 
     adapter = CodexRequirementAdapter(FlakyRunner())  # type: ignore[arg-type]
-    result = adapter.run_stage(
+    with pytest.raises(CodexOutputError, match="invalid structured output"):
+        adapter.run_stage(
+            "root_cause",
+            prepared=PreparedWorktree(
+                path=tmp_path.resolve(),
+                branch="bugfix/BUG-7-export",
+                base_commit=OID,
+                head_commit=OID,
+                mirror_path=(tmp_path / "mirror.git").resolve(),
+            ),
+            mapping=_mapping(tmp_path),
+            run_id="8" * 32,
+            prompt="analyze",
+            allow_changes=False,
+        )
+
+    assert len(analysis_calls) == 1
+    assert analysis_calls[0]["prompt"] == "analyze"
+    assert analysis_calls[0]["allow_changes"] is False
+    assert repair_calls == []
+
+
+def test_root_cause_resume_prefers_pending_format_repair(
+    tmp_path: Path,
+) -> None:
+    analysis_calls: list[object] = []
+
+    class PendingRunner:
+        def repair_pending_root_cause_result(self, *, run_id: str) -> CodexResult:
+            assert run_id == "9" * 32
+            return CodexResult(summary="recovered pending report")
+
+        def run(self, *args: object, **kwargs: object) -> CodexResult:
+            analysis_calls.append((args, kwargs))
+            raise AssertionError("repository analysis must not restart")
+
+    result = CodexRequirementAdapter(PendingRunner()).run_stage(  # type: ignore[arg-type]
         "root_cause",
         prepared=PreparedWorktree(
             path=tmp_path.resolve(),
@@ -543,19 +583,13 @@ def test_root_cause_stage_retries_invalid_structured_output_once(
             mirror_path=(tmp_path / "mirror.git").resolve(),
         ),
         mapping=_mapping(tmp_path),
-        run_id="8" * 32,
+        run_id="9" * 32,
         prompt="analyze",
         allow_changes=False,
     )
 
-    assert result.summary == "validated report"
-    assert len(calls) == 2
-    assert calls[0]["prompt"] == "analyze"
-    assert "AUTOMATIC_STRUCTURED_OUTPUT_RETRY" in str(calls[1]["prompt"])
-    assert "root_cause_evidence.0.fix_steps (minItems)" in str(
-        calls[1]["prompt"]
-    )
-    assert calls[1]["allow_changes"] is False
+    assert result.summary == "recovered pending report"
+    assert analysis_calls == []
 
 
 def test_new_defect_run_cannot_hold_more_than_one_selected_work_item() -> None:
@@ -1206,7 +1240,8 @@ def test_analysis_only_completes_after_read_only_root_cause(tmp_path: Path) -> N
     assert codex.allow_changes == [False]
     assert "COMPLETE_ONES_DEFECT_CONTEXT" in codex.prompts[0]
     assert "Exporting an empty report crashes" in codex.prompts[0]
-    assert "FINAL_ANALYSIS_REPORT is required" in codex.prompts[0]
+    assert "final response must be exactly one JSON object" in codex.prompts[0]
+    assert "FINAL_ANALYSIS_REPORT" not in codex.prompts[0]
     assert "fix_steps must describe one best solution" in codex.prompts[0]
     assert "root_cause_evidence.mechanism must state the precise root cause" in codex.prompts[0]
     assert "ROOT_CAUSE_RESULT_CONTRACT" in codex.prompts[0]

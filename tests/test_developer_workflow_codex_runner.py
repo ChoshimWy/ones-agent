@@ -16,6 +16,7 @@ from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
+from jsonschema import ValidationError
 
 import src.developer_workflow.codex_runner as codex_runner_module
 from src.developer_workflow.codex_runtime import NativeCodexIdentity
@@ -978,7 +979,11 @@ def test_root_cause_discards_stage_irrelevant_acceptance_coverage(tmp_path: Path
         acceptance_coverage=[{"criterion_id": 9}]
     )
 
-    result = _runner(tmp_path, FakeExecutor(json.dumps(payload))).run_root_cause(
+    result = _runner(
+        tmp_path,
+        FakeExecutor(json.dumps(payload)),
+        FakeRepository(changed_files=()),
+    ).run_root_cause(
         _prepared(tmp_path),
         _mapping(tmp_path),
         run_id="root-cause-coverage",
@@ -986,6 +991,117 @@ def test_root_cause_discards_stage_irrelevant_acceptance_coverage(tmp_path: Path
     )
 
     assert result.acceptance_coverage == ()
+
+
+def test_root_cause_uses_stage_specific_output_schema(tmp_path: Path) -> None:
+    executor = FakeExecutor(
+        json.dumps(
+            {
+                "summary": "verified analysis",
+                "risks": [],
+                "unresolved_items": [],
+                "root_cause_evidence": [],
+                "investigation_suggestions": ["collect reproduction evidence"],
+                "behavior_before": "login state crosses environments",
+                "impact_scope": ["src/app.py"],
+                "risk_level": "medium",
+            }
+        )
+    )
+    runner = _runner(tmp_path, executor, FakeRepository(changed_files=()))
+
+    result = runner.run_root_cause(
+        _prepared(tmp_path),
+        _mapping(tmp_path),
+        run_id="root-schema",
+        prompt="analyze",
+    )
+
+    command = executor.calls[0][0]
+    schema = Path(command[command.index("--output-schema") + 1])
+    assert schema.name == "root-cause-result.schema.json"
+    assert result.summary == "verified analysis"
+    assert result.changed_files == ()
+
+
+def test_format_repair_isolated_from_repositories_and_returns_valid_result(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor(
+        json.dumps(
+            {
+                "summary": "converted existing report",
+                "risks": [],
+                "unresolved_items": [],
+                "root_cause_evidence": [],
+                "investigation_suggestions": ["add exact reproduction evidence"],
+                "behavior_before": "login state crosses environments",
+                "impact_scope": ["src/app.py"],
+                "risk_level": "medium",
+            }
+        )
+    )
+    runner = _runner(tmp_path, executor, FakeRepository(changed_files=()))
+
+    result = runner.repair_root_cause_result(
+        run_id="format-repair",
+        raw_output="FINAL_ANALYSIS_REPORT: verified root cause",
+        validation_hint="workflow result contract",
+    )
+
+    command, cwd, _, timeout, _, stdin = executor.calls[0]
+    schema = Path(command[command.index("--output-schema") + 1])
+    assert schema.name == "root-cause-result.schema.json"
+    assert "--skip-git-repo-check" in command
+    assert cwd == (tmp_path / "runs" / "format-repair").resolve()
+    assert timeout == 300
+    assert stdin is not None
+    prompt = stdin.decode("utf-8")
+    assert "FORMAT_REPAIR_ONLY" in prompt
+    assert "Do not repeat the analysis" in prompt
+    assert "FINAL_ANALYSIS_REPORT: verified root cause" in prompt
+    assert result.summary == "converted existing report"
+    assert result.root_cause_evidence == ()
+
+
+def test_pending_invalid_report_resumes_format_repair_without_repository_analysis(
+    tmp_path: Path,
+) -> None:
+    executor = FakeExecutor("FINAL_ANALYSIS_REPORT: verified root cause")
+    runner = _runner(tmp_path, executor, FakeRepository(changed_files=()))
+
+    with pytest.raises(CodexOutputError, match="invalid structured output"):
+        runner.run_root_cause(
+            _prepared(tmp_path),
+            _mapping(tmp_path),
+            run_id="pending-format",
+            prompt="analyze repositories",
+        )
+
+    pending = tmp_path / "runs" / "pending-format" / "pending-root-cause-output.txt"
+    assert pending.read_text(encoding="utf-8") == (
+        "FINAL_ANALYSIS_REPORT: verified root cause"
+    )
+    executor.stdout = json.dumps(
+        {
+            "summary": "recovered without reanalysis",
+            "risks": [],
+            "unresolved_items": [],
+            "root_cause_evidence": [],
+            "investigation_suggestions": ["collect exact evidence"],
+            "behavior_before": "login state crosses environments",
+            "impact_scope": ["src/app.py"],
+            "risk_level": "medium",
+        }
+    )
+
+    result = runner.repair_pending_root_cause_result(run_id="pending-format")
+
+    assert result is not None
+    assert result.summary == "recovered without reanalysis"
+    assert len(executor.calls) == 2
+    assert "FORMAT_REPAIR_ONLY" in executor.calls[1][5].decode("utf-8")
+    assert not pending.exists()
 
 
 def test_run_parses_repository_qualified_root_cause_evidence(tmp_path: Path) -> None:
@@ -1024,13 +1140,137 @@ def test_run_parses_repository_qualified_root_cause_evidence(tmp_path: Path) -> 
             "direct_root_cause": True,
         }],
     }
-    result = _runner(
+    runner = _runner(
         tmp_path,
         FakeExecutor(json.dumps(_payload(root_cause_evidence=[root]))),
-    ).run(_prepared(tmp_path), _mapping(tmp_path), run_id="root", prompt="analyze")
+        FakeRepository(changed_files=()),
+    )
+    result = runner.run_root_cause(
+        _prepared(tmp_path), _mapping(tmp_path), run_id="root", prompt="analyze"
+    )
 
     assert result.root_cause_evidence[0].repository_file is not None
     assert result.root_cause_evidence[0].reproduction_file is not None
+    activity = runner.activity("root")
+    assert "Verified root cause: invalid lifecycle" in activity
+    assert "Recommended fix 1: guard lifecycle" in activity
+    assert "Validation: pytest" in activity
+
+
+def test_root_cause_canonicalizes_duplicate_group_paths_before_contract_validation(
+    tmp_path: Path,
+) -> None:
+    root = {
+        "file_path": "src/app.py; src/legacy.py",
+        "repository_file": {"repository_key": "repo", "path": "src/app.py"},
+        "location": "run:1",
+        "start_line": 1,
+        "end_line": 1,
+        "symbol": "run",
+        "mechanism": "invalid lifecycle",
+        "code_excerpt": "run()",
+        "call_chain": [],
+        "reproduction_test": "wrong/test.py",
+        "reproduction_file": {
+            "repository_key": "repo", "path": "tests/test_app.py"
+        },
+        "test_selector": "wrong/test.py::test_lifecycle",
+        "reproduction_command": "pytest",
+        "confidence": 0.9,
+        "insufficient_evidence": False,
+        "impacted_files": ["src/app.py; src/legacy.py"],
+        "impacted_repository_files": [
+            {"repository_key": "repo", "path": "src/app.py"}
+        ],
+        "fix_steps": ["guard lifecycle"],
+        "supporting_points": [{
+            "kind": "cross_file",
+            "description": "unsafe call",
+            "source": "repo",
+            "file_path": "src/app.py; src/legacy.py",
+            "repository_file": {"repository_key": "repo", "path": "src/app.py"},
+            "snippet": "run()",
+            "start_line": 1,
+            "end_line": 1,
+            "direct_root_cause": True,
+        }],
+    }
+    runner = _runner(tmp_path, FakeExecutor())
+
+    payload = runner._parse_output(
+        json.dumps({
+            "summary": "verified analysis",
+            "risks": [],
+            "unresolved_items": [],
+            "root_cause_evidence": [root],
+            "investigation_suggestions": [],
+            "behavior_before": "unsafe lifecycle",
+            "impact_scope": ["src/app.py"],
+            "risk_level": "medium",
+        }),
+        root_cause_result=True,
+    )
+    evidence = payload["root_cause_evidence"][0]
+
+    assert evidence["file_path"] == "src/app.py"
+    assert evidence["reproduction_test"] == "tests/test_app.py"
+    assert evidence["test_selector"] == "tests/test_app.py::test_lifecycle"
+    assert evidence["impacted_files"] == ["src/app.py"]
+    assert evidence["supporting_points"][0]["file_path"] == "src/app.py"
+    result = runner._result_from_payload(payload)
+    assert result.root_cause_evidence[0].supporting_points[0].file_path == "src/app.py"
+
+
+def test_root_cause_schema_rejects_multi_path_without_qualified_claim(
+    tmp_path: Path,
+) -> None:
+    root = {
+        "file_path": "src/app.py",
+        "repository_file": None,
+        "location": "run:1",
+        "start_line": 1,
+        "end_line": 1,
+        "symbol": "run",
+        "mechanism": "invalid lifecycle",
+        "code_excerpt": "run()",
+        "call_chain": [],
+        "reproduction_test": "tests/test_app.py",
+        "reproduction_file": None,
+        "test_selector": "tests/test_app.py::test_lifecycle",
+        "reproduction_command": "pytest",
+        "confidence": 0.9,
+        "insufficient_evidence": False,
+        "impacted_files": ["src/app.py"],
+        "impacted_repository_files": [],
+        "fix_steps": ["guard lifecycle"],
+        "supporting_points": [{
+            "kind": "cross_file",
+            "description": "unsafe call",
+            "source": "repo",
+            "file_path": "src/app.py; src/legacy.py",
+            "repository_file": None,
+            "snippet": "run()",
+            "start_line": 1,
+            "end_line": 1,
+            "direct_root_cause": True,
+        }],
+    }
+    runner = _runner(tmp_path, FakeExecutor())
+
+    with pytest.raises(ValidationError):
+        runner._parse_output(
+            json.dumps({
+                "summary": "verified analysis",
+                "risks": [],
+                "unresolved_items": [],
+                "root_cause_evidence": [root],
+                "investigation_suggestions": [],
+                "behavior_before": "unsafe lifecycle",
+                "impact_scope": ["src/app.py"],
+                "risk_level": "medium",
+            }),
+            root_cause_result=True,
+        )
 
 
 @pytest.mark.parametrize(
