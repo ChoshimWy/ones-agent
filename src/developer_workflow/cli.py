@@ -705,7 +705,7 @@ def build_production_defect_list_client(
 def build_production_tui_host(template_path: Path) -> tuple[object, object]:
     """Build only the private setup host; no workflow runtime is opened here."""
 
-    from .credential_store import WindowsCredentialStore
+    from .credential_store import create_credential_store
     from .codex_runner import CodexRunner, resolve_codex_command
     from .config import (
         BUILTIN_WORKSPACE_PROFILE,
@@ -829,7 +829,7 @@ def build_production_tui_host(template_path: Path) -> tuple[object, object]:
         codex_runtime_preparer=preparer,
         sandbox_profile_validator=validate_mvp_sandbox_profile,
     )
-    store = SetupStore(WindowsCredentialStore())
+    store = SetupStore(create_credential_store())
     runtime_builder.workflow_saver = lambda active, workflow: (
         store.replace_active_workflow("default", active.generation, workflow)
     )

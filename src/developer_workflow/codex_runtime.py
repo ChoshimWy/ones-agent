@@ -1,4 +1,4 @@
-"""Discovery and locking for the signed native Codex npm payload on Windows."""
+"""Discovery and staging of signed native Codex payloads on Windows and macOS."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import secrets
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -24,7 +25,20 @@ NATIVE_CODEX_RELATIVE_PATH = Path(
     "node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/"
     "vendor/x86_64-pc-windows-msvc/bin/codex.exe"
 )
-CODE_MODE_HOST_NAME = "codex-code-mode-host.exe"
+CODEX_EXECUTABLE_NAME = "codex" if sys.platform == "darwin" else "codex.exe"
+CODE_MODE_HOST_NAME = "codex-code-mode-host" if sys.platform == "darwin" else "codex-code-mode-host.exe"
+
+
+def _native_adapter_types() -> tuple[type, type]:
+    if sys.platform == "darwin":
+        from .macos_runtime import MacOSRuntimeAdapter, MacOSCacheRuntimeAdapter
+
+        return MacOSRuntimeAdapter, MacOSCacheRuntimeAdapter
+    return _WindowsRuntimeAdapter, _WindowsCacheRuntimeAdapter
+
+
+def _default_cache_adapter() -> _CacheRuntimeAdapter:
+    return _native_adapter_types()[1]()
 
 
 @dataclass(frozen=True, slots=True)
@@ -272,7 +286,7 @@ class LockedPrivateCodex:
         adapter.validate_private_file(canonical)
         runtime = (
             adapter._runtime  # type: ignore[attr-defined]
-            if type(adapter) is _WindowsCacheRuntimeAdapter
+            if type(adapter) is _native_adapter_types()[1]
             else None
         )
         descriptor: object
@@ -428,34 +442,26 @@ def verify_locked_private_codex_for_execution(
     """Authorize execution using fresh OS checks, never lease callbacks."""
 
     if (
-        os.name != "nt"
+        (os.name != "nt" and sys.platform != "darwin")
         or type(lease) is not LockedPrivateCodex
         or lease._closed
-        or type(lease._runtime_adapter) is not _WindowsRuntimeAdapter
-        or type(lease._cache_adapter) is not _WindowsCacheRuntimeAdapter
+        or type(lease._runtime_adapter) is not _native_adapter_types()[0]
+        or type(lease._cache_adapter) is not _native_adapter_types()[1]
     ):
         raise OSError("private Codex OS verification failed")
-    runtime = _WindowsRuntimeAdapter()
-    cache = _WindowsCacheRuntimeAdapter(_runtime_adapter=runtime)
+    runtime = _native_adapter_types()[0]()
+    cache = _native_adapter_types()[1](_runtime_adapter=runtime)
     try:
-        local_app_data = os.environ.get("LOCALAPPDATA")
-        if (
-            type(local_app_data) is not str
-            or not local_app_data
-            or "\x00" in local_app_data
-            or not Path(local_app_data).is_absolute()
-        ):
-            raise OSError("private Codex OS verification failed")
-        expected_root = (
-            Path(local_app_data) / "ones-dev" / "codex-runtime"
-        ).resolve(strict=True)
+        from .platform_support import user_data_directory
+
+        expected_root = (user_data_directory() / "codex-runtime").resolve(strict=True)
         path = lease.path.resolve(strict=True)
         root = lease._cache_root.resolve(strict=True)
         if (
             root != expected_root
             or path.parent.parent != root
             or path.parent.name != lease.sha256
-            or path.name.casefold() != "codex.exe"
+            or path.name.casefold() != CODEX_EXECUTABLE_NAME
             or not _is_sha256(lease.sha256)
         ):
             raise OSError("private Codex OS verification failed")
@@ -572,7 +578,7 @@ class _PreparedCodexRuntime:
         canonical = path.resolve(strict=True)
         canonical_root = cache_root.resolve(strict=True)
         if (
-            canonical.name.casefold() != "codex.exe"
+            canonical.name.casefold() != CODEX_EXECUTABLE_NAME
             or not _is_sha256(sha256)
             or type(identity) is not NativeCodexIdentity
             or any(
@@ -625,7 +631,7 @@ class _PreparedCodexRuntime:
                 or type(self._seal) is not bytes
                 or self.path.resolve(strict=True) != self.path
                 or self._cache_root.resolve(strict=True) != self._cache_root
-                or self.path.name.casefold() != "codex.exe"
+                or self.path.name.casefold() != CODEX_EXECUTABLE_NAME
                 or self.path.parent.name != self.sha256
                 or self.path.parent.parent != self._cache_root
             ):
@@ -683,10 +689,9 @@ class CodexRuntimePreparer:
         ):
             raise ValueError("private runtime lease timing is invalid")
         if cache_root is None:
-            local_app_data = os.environ.get("LOCALAPPDATA")
-            if not local_app_data:
-                raise OSError("private Codex runtime is unavailable")
-            cache_root = Path(local_app_data) / "ones-dev" / "codex-runtime"
+            from .platform_support import user_data_directory
+
+            cache_root = user_data_directory() / "codex-runtime"
         if "\x00" in os.fspath(cache_root):
             raise OSError("private Codex runtime is unavailable")
         self._cache_root = Path(cache_root)
@@ -698,7 +703,7 @@ class CodexRuntimePreparer:
         self._lease_grace_ns = _lease_grace_ns
 
     def prepare(self) -> Path:
-        adapter = self._cache_adapter or _WindowsCacheRuntimeAdapter()
+        adapter = self._cache_adapter or _default_cache_adapter()
         root = self._prepare_root(adapter)
         self._cleanup_stale_owned_entries(root, adapter)
         quarantined, rebuildable = self._scan_quarantines(root, adapter)
@@ -791,6 +796,13 @@ class CodexRuntimePreparer:
         runtime = locked._adapter
         source_main = runtime.final_path(locked.descriptor)
         source = source_main.with_name(CODE_MODE_HOST_NAME)
+        if sys.platform == "darwin":
+            # Older macOS releases are monolithic. If a companion exists it
+            # must still pass the same signature and content checks below.
+            try:
+                source.lstat()
+            except FileNotFoundError:
+                return
         descriptor = runtime.open_locked(source)
         temporary = executable.parent / f"code-mode-host-{uuid.uuid4().hex}.tmp"
         primary: BaseException | None = None
@@ -864,7 +876,7 @@ class CodexRuntimePreparer:
 
     def prepare_verified(self) -> _PreparedCodexRuntime:
         path = self.prepare()
-        adapter = self._cache_adapter or _WindowsCacheRuntimeAdapter()
+        adapter = self._cache_adapter or _default_cache_adapter()
         sha256 = path.parent.name
         lease = LockedPrivateCodex._acquire(
             path, sha256, path.parent.parent, adapter,
@@ -945,7 +957,7 @@ class CodexRuntimePreparer:
             sha256 = digest.hexdigest()
             if sha256 != source_sha256:
                 raise OSError("native Codex payload changed")
-            executable = staging / "codex.exe"
+            executable = staging / CODEX_EXECUTABLE_NAME
             os.replace(temporary, executable)
             adapter.fsync_directory(staging)
             self._validate_executable(
@@ -957,7 +969,7 @@ class CodexRuntimePreparer:
                 "sha256": sha256,
                 "size": copied,
                 "source_identity": _identity_manifest(locked.identity),
-                "target": "codex.exe",
+                "target": CODEX_EXECUTABLE_NAME,
             }
             manifest_temp = staging / f"manifest-{uuid.uuid4().hex}.tmp"
             with manifest_temp.open("x", encoding="utf-8", newline="\n") as stream:
@@ -1299,7 +1311,7 @@ class CodexRuntimePreparer:
         ):
             raise OSError("private Codex runtime is unavailable")
         self._validate_executable(
-            directory / "codex.exe",
+            directory / CODEX_EXECUTABLE_NAME,
             sha256=sha256,
             size=size,
             adapter=adapter,
@@ -1321,7 +1333,7 @@ class CodexRuntimePreparer:
             raise OSError("manifest changed")
         if not _is_valid_manifest(manifest, digest):
             raise OSError("invalid manifest")
-        executable = directory / "codex.exe"
+        executable = directory / CODEX_EXECUTABLE_NAME
         self._validate_executable(
             executable,
             sha256=digest,
@@ -1700,7 +1712,7 @@ def _descriptor_file_identity(stream: object) -> tuple[int, int, int, int]:
 def _is_owned_staging_child(path: Path) -> bool:
     name = path.name
     return (
-        name in {".stage.lock", "codex.exe", "manifest.json"}
+        name in {".stage.lock", CODEX_EXECUTABLE_NAME, "manifest.json"}
         or name.startswith("codex-") and name.endswith(".tmp")
         or name.startswith("manifest-") and name.endswith(".tmp")
     )
@@ -1765,7 +1777,7 @@ def _is_valid_manifest(manifest: dict[str, object], directory_name: str) -> bool
         and type(manifest.get("publisher")) is str
         and manifest["publisher"] == OPENAI_AUTHENTICODE_PUBLISHER
         and type(manifest.get("target")) is str
-        and manifest["target"] == "codex.exe"
+        and manifest["target"] == CODEX_EXECUTABLE_NAME
         and type(manifest.get("size")) is int
         and manifest["size"] >= 0
         and source_identity is not None
@@ -2055,6 +2067,11 @@ def discover_locked_native_codex(
     _adapter: _RuntimeAdapter | None = None,
 ) -> LockedNativeCodex:
     """Return a verified native payload while retaining its source handle lock."""
+
+    if sys.platform == "darwin" and _adapter is None:
+        from .macos_runtime import discover_native_codex
+
+        return discover_native_codex(which=which, repository_roots=repository_roots)
 
     failed = False
     try:

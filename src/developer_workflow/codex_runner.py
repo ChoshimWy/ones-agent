@@ -27,6 +27,7 @@ from urllib.parse import unquote, urlsplit
 from jsonschema import Draft202012Validator
 
 from .codex_runtime import (
+    CODEX_EXECUTABLE_NAME,
     CodexRuntimePreparer,
     LockedPrivateCodex,
     NativeCodexIdentity,
@@ -138,7 +139,7 @@ class CodexCommand:
             type(runtime) is not _PreparedCodexRuntime
             or not runtime._is_attested()
             or runtime.path != runtime.path.resolve(strict=True)
-            or runtime.path.name.casefold() != "codex.exe"
+            or runtime.path.name.casefold() != CODEX_EXECUTABLE_NAME
         ):
             raise TypeError("Codex runtime attestation is invalid")
         prefix = (str(runtime.path),)
@@ -184,7 +185,7 @@ class CodexCommand:
                 or self.prefix != (str(self._path),)
                 or self._path.resolve(strict=True) != self._path
                 or self._cache_root.resolve(strict=True) != self._cache_root
-                or self._path.name.casefold() != "codex.exe"
+                or self._path.name.casefold() != CODEX_EXECUTABLE_NAME
                 or self._path.parent.name != self._sha256
                 or self._path.parent.parent != self._cache_root
             ):

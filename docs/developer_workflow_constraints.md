@@ -41,12 +41,14 @@
 
 ## 环境和界面
 
+- TUI 同时维护 Windows/macOS 平台适配；macOS 使用系统账号目录和 Keychain，不调用 Windows 凭据 API，不把秘密落盘。原生 Codex 使用平台签名校验、私有缓存与执行前快照校验，不能以跨平台为由跳过。模拟测试不等同于 macOS 实机验收。
+
 - 验证按实际需求动态选择 macOS、Windows 或其它环境，不固定平台。节点用表单、节点列表和详情管理，不要求手填 JSON。
 - Configuration 按模块分 tab；任务 Overview 展示缺陷信息；状态、暂停原因、下一步、按钮必须一致。
 - ONES 配置 tab 直接展示编辑表单，不再以按钮跳转到另一编辑页。公开字段回填；账号/密码不回显，留空保留已有凭据，更换服务地址须显式提供新凭据。保存复用配置校验、凭据存储及运行环境切换，保留节点、仓库和工作流配置；不能把浏览配置等同于保存。
 - 外部验证与代码问题分别展示。列表存在待验证项，不代表它们就是当前阻断原因。
 - 无法确定异常原因时明确写“未知/内部检查失败”，不把通用异常改述为“需要人工验证”。
-- Git 配置隔离不能导致本机已授权凭据完全不可用。Windows 通过固定的 Git Credential Manager 接入系统凭据库；显式 GIT_ASKPASS 优先。不继承任意 helper 脚本、全局配置、hooks 或环境注入，仍禁止交互登录，不输出/持久化明文凭据。其它平台的凭据通道需单独实现，不声称已有同等支持。
+- Git 配置隔离不能导致本机已授权凭据完全不可用。Windows 通过固定的 Git Credential Manager、macOS 通过 osxkeychain 接入系统凭据库；显式 GIT_ASKPASS 优先。不继承任意 helper 脚本、全局配置、hooks 或环境注入，仍禁止交互登录，不输出/持久化明文凭据。其它平台的凭据通道需单独实现，不声称已有同等支持。
 - Windows SSH 默认通道从系统 API 定位当前用户配置目录，仅使用已有普通文件 known_hosts 和标准命名密钥；不读取密钥内容，不继承 ssh config/ProxyCommand，不信任任务传入的 HOME。保持 StrictHostKeyChecking=yes、BatchMode=yes、UpdateHostKeys=no；显式 SSH 配置优先。没有信任记录或可用密钥时仍失败，不关闭校验、不自动接受主机指纹。
 
 ## 必须保持的回归覆盖

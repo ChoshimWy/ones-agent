@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import hashlib
 import os
 import re
+import sys
 from collections.abc import Callable, Iterator
 from threading import RLock
 from typing import ContextManager, Protocol, TypeVar, cast, runtime_checkable
@@ -193,6 +194,15 @@ def _validated_generation_write(
     canonical_generation = _validate_generation(generation)
     prefix = f"{_TARGET_PREFIX}/{profile}/{canonical_generation}/"
     return entries, profile, canonical_generation, prefix
+
+
+def create_credential_store() -> CredentialStore:
+    """Select the native OS vault; never fall back to plaintext storage."""
+    if sys.platform == "darwin":
+        from .macos_credentials import MacOSCredentialStore
+
+        return MacOSCredentialStore()
+    return WindowsCredentialStore()
 
 
 class WindowsCredentialStore:

@@ -12,12 +12,18 @@ ONES 缺陷/需求驱动的安全开发工作台，提供 `ones-dev tui` 终端�
 
 ## 启动
 
-Windows、Python 3.11+：
+Windows 或 macOS、Python 3.11+：
 
 ```powershell
 uv sync
 uv run ones-dev tui
 ```
+
+macOS 使用 Terminal 或 iTerm2 执行相同命令；Apple Silicon 和 Intel 的原生
+Codex 发现路径均已适配。首次运行需先安装 Git、uv 和 Codex CLI 并完成本机
+Codex 登录。macOS 凭据保存到系统 Keychain，配置保存到
+`~/Library/Application Support/ones-dev/config.json`，不使用 Windows 的
+`LOCALAPPDATA`。安装、认证和实机验收步骤见 [macOS TUI 指南](docs/ones_dev_tui_macos.md)。
 
 首次启动会进入 MVP 全局配置页。填写 ONES 站点根地址、Team ID、缺陷 Issue Type ID、账号和密码，然后点击 **Save and open Dashboard**。Dashboard 首页只展示工作区列表和配置入口；点击 **Create workspace** 后从 ONES 选择 Project 和迭代，并添加一个或多个本地仓库或远程 Git 仓库。点击工作区进入详情，再从详情打开缺陷查询。Status ID 不属于全局配置，由工作区内的缺陷查询筛选器从 ONES 加载；Task/Defect ID 也不保存为全局配置，而是在查询结果中选择。TUI 自动使用本机 Codex CLI 登录状态、内置安全 workspace profile，以及 `%LOCALAPPDATA%\ones-dev\mvp-runtime` 下的私有运行目录。配置阶段只读访问 ONES，不创建 run、mirror、worktree，也不执行远端写操作。
 

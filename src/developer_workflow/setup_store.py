@@ -104,10 +104,12 @@ class SetupStore:
         if lock_timeout < 0 or lock_poll_interval <= 0:
             raise ValueError("lock timing values must be positive")
         if config_path is None:
-            local = os.environ.get("LOCALAPPDATA")
-            if not local:
-                raise SetupStoreError("configuration path is unavailable")
-            config_path = Path(local) / "ones-dev" / "config.json"
+            from .platform_support import user_data_directory
+
+            try:
+                config_path = user_data_directory() / "config.json"
+            except OSError:
+                raise SetupStoreError("configuration path is unavailable") from None
         candidate = Path(config_path).absolute()
         if candidate.name != "config.json" or _has_unsafe_ancestor(candidate):
             raise SetupStoreError("configuration path is unsafe")

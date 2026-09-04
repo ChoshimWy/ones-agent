@@ -8,6 +8,7 @@ import re
 import shlex
 import stat
 import subprocess
+import sys
 import tempfile
 import threading
 import unicodedata
@@ -267,6 +268,36 @@ def _windows_ssh_command() -> str | None:
     return shlex.join(args)
 
 
+def _macos_ssh_command() -> str:
+    """Reuse existing account trust/keys, without importing SSH configuration."""
+    import pwd
+    from .private_paths import _has_link_or_reparse_ancestor
+
+    directory = Path(pwd.getpwuid(os.geteuid()).pw_dir) / ".ssh"
+
+    def safe(path: Path, *, private: bool = False) -> bool:
+        try:
+            info = path.lstat()
+            return (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+                    and not info.st_mode & (0o077 if private else 0o022)
+                    and not _has_link_or_reparse_ancestor(path))
+        except OSError:
+            return False
+
+    known_hosts = directory / "known_hosts"
+    args = ["/usr/bin/ssh", "-F", "/dev/null", "-oBatchMode=yes", "-oIdentitiesOnly=yes",
+            "-oStrictHostKeyChecking=yes", "-oUpdateHostKeys=no", "-oIdentityAgent=none",
+            "-oGlobalKnownHostsFile=/dev/null",
+            "-oUserKnownHostsFile=" + (str(known_hosts) if safe(known_hosts) else "/dev/null")]
+    keys = [directory / name for name in ("id_ed25519", "id_ecdsa", "id_rsa")]
+    for key in keys:
+        if safe(key, private=True):
+            args.extend(("-i", str(key)))
+    if "-i" not in args:
+        args.extend(("-oIdentityFile=none",))
+    return shlex.join(args)
+
+
 def _isolated_git_environment(
     credential_environment: Mapping[str, str] | None = None,
     *,
@@ -333,6 +364,12 @@ def _isolated_git_environment(
             "GIT_CONFIG_KEY_3": "credential.helper",
             "GIT_CONFIG_VALUE_3": "manager",
         })
+    elif sys.platform == "darwin" and "GIT_ASKPASS" not in supplied:
+        environment.update({
+            "GIT_CONFIG_COUNT": "4",
+            "GIT_CONFIG_KEY_3": "credential.helper",
+            "GIT_CONFIG_VALUE_3": "osxkeychain",
+        })
     if "GIT_SSH" in supplied and "GIT_SSH_COMMAND" not in supplied:
         # Git gives SSH_COMMAND precedence; the built-in default must not hide
         # an explicitly configured SSH executable.
@@ -341,6 +378,8 @@ def _isolated_git_environment(
         native_ssh = _windows_ssh_command()
         if native_ssh:
             environment["GIT_SSH_COMMAND"] = native_ssh
+    elif sys.platform == "darwin" and not any(name in supplied for name in ("GIT_SSH", "GIT_SSH_COMMAND", "SSH_AUTH_SOCK", "SSH_ASKPASS")):
+        environment["GIT_SSH_COMMAND"] = _macos_ssh_command()
     return environment
 
 
