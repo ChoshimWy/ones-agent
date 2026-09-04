@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
 from typing import Literal
 import unicodedata
 
@@ -19,6 +21,8 @@ from .defect_flow import DefectCandidateService, DefectFlow
 from .publisher import Publisher
 from .requirement_flow import RequirementFlow
 from .state_store import FileRunStore
+from . import verification, pr_handoff
+from .verification_models import VerificationRecord
 
 
 class InvalidWorkflowAction(RuntimeError):
@@ -156,7 +160,10 @@ class DeveloperWorkflowOrchestrator:
     def show(self, run_id: str, *, read_only: bool = False) -> WorkflowRun:
         """Load a run, optionally without creating storage lock artifacts."""
 
-        return self.store.load(run_id, read_only=read_only)
+        run = self.store.load(run_id, read_only=read_only)
+        if run.state is WorkflowState.BLOCKED and run.blocked_reason in verification.VERIFICATION_REASONS:
+            run = run.validated_update(verification_plan=verification.plan(run, self.config.verification_nodes))
+        return run
 
     def accept_analysis_solution(
         self, run_id: str, *, expected_version: int
@@ -186,6 +193,72 @@ class DeveloperWorkflowOrchestrator:
         if type(result) is not tuple or any(type(item) is not str for item in result):
             return ()
         return result
+
+    def verification_nodes(self) -> tuple[dict, ...]:
+        return tuple(node.model_dump(mode="json") for node in self.config.verification_nodes)
+
+    def replan_verification(self, run_id: str, *, expected_version: int) -> WorkflowRun:
+        """Explicit one-shot review refresh for legacy free-text environment needs."""
+        with self.store.operation_lock(run_id, "orchestrate"):
+            run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
+            if (run.state is not WorkflowState.BLOCKED or run.blocked_reason not in verification.VERIFICATION_REASONS
+                    or run.review is None or run.review.unresolved_items):
+                raise InvalidWorkflowAction("verification planning is unavailable")
+            run = self.store.save(run.validated_update(review=None, verification_plan=(), approval=None), run.version)
+            return self._flow_for(run).execute(run)
+
+    def probe_verification_node(self, node_key: str) -> dict:
+        node = next((item for item in self.config.verification_nodes if item.key == node_key and item.enabled), None)
+        if node is None:
+            raise InvalidWorkflowAction("verification node is unavailable")
+        return verification.invoke(node, {"operation": "probe"}, 20)
+
+    def verify(self, run_id: str, task_key: str, actor: str, *, expected_version: int,
+               manual_evidence: str | None = None, passed: bool = True,
+               expected_recipe_digest: str | None = None) -> WorkflowRun:
+        """Explicitly authorize one configured verifier or attest manual evidence."""
+        if type(passed) is not bool:
+            raise InvalidWorkflowAction("verification result must be a boolean")
+        actor = _validated_text(actor, kind="verification actor", max_length=128)
+        with self.store.operation_lock(run_id, "orchestrate"):
+            run = self.store.load(run_id)
+            _require_expected_version(run, expected_version)
+            if (run.state is not WorkflowState.BLOCKED or run.resume_state is not WorkflowState.AI_REVIEW
+                    or run.review is None or run.review.unresolved_items or run.approval is not None):
+                raise InvalidWorkflowAction("verification requires a clean review waiting for environment validation")
+            flow = self._flow_for(run)
+            verification.assert_current(run, flow.repository)
+            tasks = verification.plan(run, self.config.verification_nodes)
+            task = next((item for item in tasks if item.key == task_key), None)
+            if task is None or task.status == "passed":
+                raise InvalidWorkflowAction("verification task is absent or already passed")
+            if manual_evidence is not None:
+                evidence = _validated_text(manual_evidence, kind="manual verification evidence", max_length=4096)
+                record = VerificationRecord(task_key=task.key, snapshot_digest=task.snapshot_digest,
+                    node_key="manual", actor=actor, status="passed" if passed else "failed", evidence=verification.public_text(evidence, 4096),
+                    output_sha256=hashlib.sha256(evidence.encode()).hexdigest(), occurred_at=datetime.now(timezone.utc).isoformat())
+            else:
+                node = next((item for item in self.config.verification_nodes if item.key == task.node_key and item.enabled), None)
+                if node is None or not task.recipe_key:
+                    raise InvalidWorkflowAction("no authorized matching validation node/recipe")
+                if expected_recipe_digest != task.recipe_digest:
+                    raise InvalidWorkflowAction("verification recipe changed; inspect and confirm its digest")
+                run = self.store.save(run.validated_update(verification_plan=tuple(
+                    item.model_copy(update={"status": "running"}) if item.key == task.key else item for item in tasks
+                )), run.version)
+                try:
+                    record = verification.execute(run, task, node, actor)
+                    verification.assert_current(run, flow.repository)
+                except Exception as error:
+                    record = VerificationRecord(task_key=task.key, snapshot_digest=task.snapshot_digest,
+                        node_key=node.key, recipe_key=task.recipe_key, recipe_digest=task.recipe_digest,
+                        actor=actor, status="error", evidence=verification.failure_message(error),
+                        output_sha256=hashlib.sha256(b"verification error").hexdigest(), occurred_at=datetime.now(timezone.utc).isoformat())
+            run = self.store.save(run.validated_update(verification_records=(*run.verification_records, record),
+                # A test failure is assessed by review, not assumed to be a code defect.
+                review=None if record.status == "failed" else run.review), run.version)
+            return flow.execute(run)
 
     def confirm_repository(
         self,
@@ -254,6 +327,9 @@ class DeveloperWorkflowOrchestrator:
         with self.store.operation_lock(run_id, "orchestrate"):
             run = self.store.load(run_id)
             _require_expected_version(run, expected_version)
+            if run.state is WorkflowState.WAITING_PR_VERIFICATION:
+                # Handoff is complete; human/CI verification now belongs to the PR.
+                return run
             if run.state is WorkflowState.PARTIAL_SUCCESS:
                 return (
                     self.publisher.publish(run)
@@ -365,6 +441,14 @@ class DeveloperWorkflowOrchestrator:
                 raise InvalidWorkflowAction("approve requires WAITING_APPROVAL")
             if run.approval is None:
                 raise InvalidWorkflowAction("approval package is missing")
+            tasks = verification.plan(run, self.config.verification_nodes)
+            if (pr_handoff.blocking_reason(tasks, defer=self.config.publishing.defer_external_verification_to_pr)
+                    or tasks != run.verification_plan):
+                run = self.store.save(run.validated_update(approval=None, verification_plan=tasks), run.version)
+                return self.store.transition(run.run_id, run.version, WorkflowState.BLOCKED,
+                    verification.pending_reason(tasks) or verification.VERIFICATION_READY,
+                    resume_state=WorkflowState.AI_REVIEW)
+            pr_handoff.assert_bound(run)
             approval = issue_approval(run.approval, approved_by=approved_by)
             saved = self.store.save(
                 run.validated_update(approval=approval), expected_version=run.version

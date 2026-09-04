@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from ..verification_models import VerificationTask
+from ..verification import VERIFICATION_REASONS, public_text
+
 import hmac
 import re
 import unicodedata
@@ -20,6 +23,7 @@ from ..contracts import (
     CommandResult,
     DefectAction,
     DefectCandidate,
+    DefectRecord,
     PublicationResult,
     RepositoryMapping,
     RepositoryPublicationResult,
@@ -29,6 +33,7 @@ from ..contracts import (
     WorkflowType,
 )
 from ..pr_provider import PullRequestProviderError, parse_repository_identity
+from .defect_text import defect_display_text
 
 
 _INVALID_DISPLAY = "display value is invalid"
@@ -222,6 +227,47 @@ class HistoryView:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewView:
+    """Keep actionable findings separate from release/environment limitations."""
+
+    summary: str
+    findings: tuple[str, ...]
+    blockers: tuple[str, ...]
+    external_validation: tuple[str, ...]
+    verification_only: bool
+    review_repair_attempts: int = 0
+    pause_reason: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class DefectInfoView:
+    """Allowlisted fields from the stored ONES snapshot, not a live fetch."""
+
+    defect_id: str
+    number: str
+    title: str
+    status: str
+    priority: str
+    project: str
+    assignee: str
+    description: str
+    updated_at: str
+
+    @classmethod
+    def from_record(cls, defect: DefectRecord) -> DefectInfoView:
+        clean = defect_display_text
+        return cls(
+            defect_id=clean(defect.defect_id), number=clean(defect.number),
+            title=clean(defect.title, maximum=1024), status=clean(defect.status.name or defect.status.id),
+            priority=clean(defect.priority.value or defect.priority.id),
+            project=clean(defect.project.name or defect.project.id),
+            assignee=clean((defect.assignee.name or defect.assignee.id) if defect.assignee else ""),
+            description=clean(defect.description, multiline=True, maximum=8000),
+            updated_at=clean(defect.updated_at),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RunDetail:
     summary: RunSummary
     repositories: tuple[RepositoryView, ...]
@@ -239,6 +285,15 @@ class RunDetail:
     ai_activity: tuple[str, ...] = ()
     can_accept_analysis: bool = False
     can_regenerate_analysis: bool = False
+    review_report: ReviewView | None = None
+    can_request_review_repair: bool = False
+    verification_tasks: tuple[VerificationTask, ...] = ()
+    can_verify: bool = False
+    verification_results: tuple[str, ...] = ()
+    defect_info: DefectInfoView | None = None
+    draft_pr: bool = False
+    can_defer_verification: bool = False
+    baseline_refresh_history: tuple[str, ...] = ()
 
     @classmethod
     def from_run(cls, run: WorkflowRun) -> RunDetail:
@@ -391,6 +446,11 @@ class DangerousActionRequest:
     unresolved_count: int
     comment_status: str = "not delivered"
     publication_error: str = ""
+    draft_pr: bool = False
+    deferred_check_count: int = 0
+    baseline_evidence_missing: bool = False
+    approvers: tuple[FilterChoice, ...] = ()
+    approver_error: str = ""
     state: WorkflowState = WorkflowState.CREATED
     resume_state: WorkflowState | None = None
 
@@ -444,6 +504,9 @@ class DangerousActionRequest:
                 "delivered" if detail.publication.comment_id else "not delivered"
             ),
             publication_error=detail.publication.error,
+            draft_pr=bool(run.approval and run.approval.draft_pr),
+            deferred_check_count=len(run.approval.deferred_verification) if run.approval else 0,
+            baseline_evidence_missing=bool(run.approval and run.approval.baseline_evidence_missing),
             state=detail.summary.state,
             resume_state=detail.resume_state,
         )
@@ -452,7 +515,9 @@ class DangerousActionRequest:
         current = type(self).from_run(
             run, action=self.action, expected_version=self.version
         )
-        if current != self:
+        # Member choices are live ONES directory data, not persisted run facts.
+        # The controller revalidates the chosen ID separately before approval.
+        if current != replace(self, approvers=(), approver_error=""):
             raise TuiDisplayError("workflow action is stale")
 
 
@@ -624,8 +689,43 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
                 for item in result.investigation_suggestions
             )
         analysis_review = tuple(lines)
+    if run.verification_only and run.review is not None:
+        analysis_review = (
+            "CURRENT CHECKOUT VERIFICATION — NO PRODUCTION REPAIR",
+            safe_tui_text(run.review.summary, maximum=8192),
+            *(safe_tui_text(item, maximum=2048) for item in run.review.review_findings),
+            "LIMITATIONS / EXTERNAL VALIDATION",
+            *(safe_tui_text(item, maximum=2048) for item in run.review.review_external_validation),
+            *(safe_tui_text(item, maximum=2048) for item in run.review.unresolved_items),
+        )
     return RunDetail(
         summary=RunSummary.from_run(run, activity=RunActivity.IDLE),
+        baseline_refresh_history=tuple(safe_tui_text(public_text(
+            f"第 {index + 1} 轮 · " + {"preparing": "准备迁移", "migrated": "迁移完成，重新验证", "conflicts": "冲突交回修复", "failed": "迁移暂停"}[record.status]
+            + f" · {record.failure_reason}\n" + "\n".join(
+                f"{item.repository_key}：旧基线 {item.prepared_worktree.base_commit[:12]} · 保留于 {item.prepared_worktree.path}"
+                for item in record.source_repositories) + "\n" + "\n".join(
+                f"{item.repository_key}：新基线 {item.prepared_worktree.base_commit[:12]} · 工作区 {item.prepared_worktree.path}"
+                for item in record.destinations), 8192).replace("\n", " · "), maximum=16000)
+            for index, record in enumerate(run.baseline_refreshes)),
+        defect_info=DefectInfoView.from_record(run.defect) if run.type is WorkflowType.DEFECT and run.defect is not None else None,
+        review_report=(
+            ReviewView(
+                summary=safe_tui_text(run.review.summary, maximum=8192),
+                findings=tuple(safe_tui_text(item, maximum=8192) for item in run.review.review_findings),
+                blockers=tuple(safe_tui_text(item, maximum=8192) for item in run.review.unresolved_items),
+                external_validation=tuple(safe_tui_text(public_text(item, 8192).replace("\n", " "), maximum=8192)
+                    for item in dict.fromkeys((*run.review.review_external_validation,
+                                              *(need.description for need in run.review.verification_needs),
+                                              *(task.need.description for task in run.verification_plan)))),
+                verification_only=run.verification_only,
+                review_repair_attempts=run.review_repair_attempts,
+                pause_reason=({
+                    "automatic review repair limit reached": "已达到本轮自动回修上限",
+                    "automatic review repair made no progress": "代码与测试未变化，复审仍有待处理问题",
+                }.get(run.blocked_reason, "") if run.state is WorkflowState.BLOCKED else ""),
+            ) if run.review is not None else None
+        ),
         repositories=repositories,
         tests=tests,
         review=analysis_review
@@ -655,11 +755,55 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
         unresolved_count=(
             len(approval.unresolved_items)
             if approval is not None
+            else (
+                len(run.review.unresolved_items)
+                + len(run.review.review_external_validation)
+            )
+            if run.review is not None
             else len(run.codex_results[0].unresolved_items)
             if run.defect_action is DefectAction.ANALYZE and run.codex_results
             else 0
         ),
         status_message={
+            "automatic review repair made no progress": (
+                "Automatic repair paused: code/test content is unchanged and review still has unresolved issues. "
+                "See Review for the remaining issues; explicit direction is needed."
+            ),
+            "automatic review repair limit reached": (
+                "Automatic review/repair attempt limit reached. See Review for remaining issues and provide direction."
+            ),
+            "current checkout verification needs investigation": (
+                "The baseline already passes, but Review found correctness or coverage issues. "
+                "Inspect the Review tab; no artificial repair was applied."
+            ),
+            "AI review found blocking issues": (
+                "Review found unresolved issues; see the Review tab. Publication is blocked."
+            ),
+            "AI review requires external validation": (
+                "The code review found no further repair to apply, but external or platform "
+                "validation is still missing. See the Review tab; publication remains blocked."
+            ),
+            "AI review evidence is incomplete": (
+                "Review found unresolved issues; see the Review tab. Publication is blocked."
+                if run.review is not None and run.review.unresolved_items else
+                "Review evidence is incomplete; see the Review tab before continuing."
+            ),
+            "pre-fix reproduction evidence is missing": (
+                "缺少修复前失败复现记录：不等于当前测试失败。可重新检查审批条件，"
+                "在 Draft PR 中披露证据缺口并交由人工审核；严格模式下仍需补齐历史复现证据。"
+            ),
+            "repair modified the reproduction test": (
+                "Repair changed the frozen reproduction test. Restore its original bytes; "
+                "put additional regression tests in a separate file, then continue repair."
+            ),
+            "reproduction checkpoint is incomplete": (
+                "Reproduction checkpoint is missing or its frozen test has changed; "
+                "repair cannot continue until the original evidence is verified."
+            ),
+            "repair evidence is incomplete": (
+                "Code changes were not accepted as a completed repair; "
+                "repair scope, reported evidence, or the frozen reproduction test did not match."
+            ),
             "defect source evidence is insufficient": (
                 "ONES defect description is missing or lacks reproducible details"
             ),
@@ -680,9 +824,62 @@ def run_detail_from_run(run: WorkflowRun) -> RunDetail:
             "repository safety validation failed": (
                 "Repository safety validation failed"
             ),
-        }.get(run.blocked_reason, ""),
+            "remote target branch changed since baseline": (
+                "远程目标分支已变化：当前任务保存的基线已过期。这不是人工验证门禁；"
+                "继续后将保留旧工作区，自动迁移修复到新基线并重新测试、审查；自动恢复关闭时需人工处理。"
+            ),
+            "automatic baseline refresh limit reached": "自动基线更新已达上限：已保留各轮工作区，请检查目标分支是否持续变化，再决定如何继续。",
+            "baseline migration needs attention": "基线迁移未完成：旧修复与已创建的新工作区均已保留，请检查迁移记录；不会覆盖旧修复或沿用旧审批。",
+            "baseline conflict resolution is incomplete": "基线冲突尚未解决：新工作区仍存在冲突标记，需要继续修复，不能直接审批。",
+            "repository command failed": "Git 命令执行失败：请检查仓库连接、认证及本地 Git 环境。这不是人工验证门禁。",
+            "defect workflow safety validation failed": "流程内部检查失败：尚未确定具体原因，不应归因于待人工验证。请重新检查审批条件。",
+            "waiting for verification environment": "等待验证环境：配置匹配节点，或完成实机验证后记录人工证据。",
+            "verification execution requires confirmation": "已匹配验证节点，等待确认本次执行。",
+            "external verification did not pass": "环境验证未通过：查看验证记录，排查节点环境或处理测试失败。",
+            "external verification is running": "正在执行环境验证。",
+            "root cause evidence is insufficient": (
+                "AI root-cause evidence did not meet repository safety checks"
+            ),
+        }.get(run.blocked_reason, (
+            (
+                "Review-driven corrections verified locally; no publication. See Review for limitations."
+                if run.review_repair_attempts else
+                "Current checkout verified; no production repair or publication. See Review for limitations."
+            )
+            if run.verification_only and run.state is WorkflowState.COMPLETED else (
+                "Draft PR 已交付，等待 PR 人工验证；未标记通过，不自动合并或发布。"
+                if run.state is WorkflowState.WAITING_PR_VERIFICATION else ""
+            )
+        )),
         mapping_candidates=_mapping_candidate_views(run),
-        resume_state=run.resume_state,
+        can_request_review_repair=(
+            run.type is WorkflowType.DEFECT
+            and run.state is WorkflowState.BLOCKED
+            and run.resume_state is WorkflowState.AI_REVIEW
+            and run.blocked_reason in {
+                "automatic review repair limit reached", "automatic review repair made no progress",
+            }
+            and run.review is not None and bool(run.review.unresolved_items)
+        ),
+        verification_tasks=run.verification_plan,
+        draft_pr=bool(approval and approval.draft_pr),
+        verification_results=tuple(public_text(
+            f"{r.status} · {r.node_key} · {r.occurred_at}\n快照：{r.snapshot_digest}\n输出 SHA-256：{r.output_sha256}\n{r.evidence}", 18000
+        ) for r in run.verification_records[-8:]),
+        can_verify=(run.state is WorkflowState.BLOCKED
+                    and run.resume_state is WorkflowState.AI_REVIEW
+                    and run.blocked_reason in VERIFICATION_REASONS
+                    and run.review is not None and not run.review.unresolved_items),
+        resume_state=(
+            WorkflowState.IMPLEMENTING
+            if run.blocked_reason in {
+                "AI review found blocking issues", "AI review evidence is incomplete",
+                "current checkout verification needs investigation",
+            }
+            and run.review is not None
+            and run.review.unresolved_items
+            else run.resume_state
+        ),
         can_accept_analysis=(
             run.state is WorkflowState.COMPLETED
             and run.defect_action is DefectAction.ANALYZE

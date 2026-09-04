@@ -183,7 +183,7 @@ async def test_external_store_update_refreshes_list_and_selected_detail(
             if updated.state.value in overview:
                 break
         assert updated.state.value in overview
-        assert f"version: {updated.version}" in overview
+        assert "状态版本" in overview and str(updated.version) in overview
         assert controller.list_calls >= 2
 
 

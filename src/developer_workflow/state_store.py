@@ -17,8 +17,10 @@ from typing import Iterator
 from pydantic import ValidationError
 
 from .contracts import (
+    CommandOutcome,
     DefectAction,
     DefectCheckpoint,
+    PublicationResult,
     StateEvent,
     WorkflowRun,
     WorkflowState,
@@ -114,6 +116,79 @@ _TERMINAL = {
     WorkflowState.COMPLETED,
     WorkflowState.FAILED,
 }
+
+
+def _is_completed_verification(run: WorkflowRun) -> bool:
+    """Local verification, including review corrections, cannot grant publication."""
+    review = run.review
+    if not (
+        run.type is WorkflowType.DEFECT and run.verification_only
+        and run.defect_action is DefectAction.ANALYZE_AND_REPAIR
+        and run.defect_checkpoint is DefectCheckpoint.FINAL_TESTED
+        and len(run.codex_results) >= 2 and run.root_cause_evidence
+        and run.reproduction_test_sha256 and len(run.pre_fix_test_results) == 1
+        and run.pre_fix_snapshot is not None
+        and run.test_results and run.tested_snapshot is not None
+        and review is not None and review.summary.strip() and review.review_findings
+        and review.unrelated_changes_checked and not review.unresolved_items
+        and review.root_cause_evidence == run.root_cause_evidence
+        and review.behavior_before == run.behavior_before
+        and review.behavior_after == run.behavior_after
+        and review.impact_scope == run.impact_scope
+        and review.risk_level == run.risk_level
+        and run.approval is None and run.group_publication is None
+        and run.publication == PublicationResult()
+    ):
+        return False
+    baseline = run.pre_fix_test_results[0]
+    if (
+        not baseline.argv or baseline.argv != run.test_results[0].argv
+        or any(test.exit_code != 0 or test.outcome is not CommandOutcome.PASSED
+               for test in (*run.pre_fix_test_results, *run.test_results))
+    ):
+        return False
+    target = run.root_cause_evidence[0]
+    if run.review_repair_attempts:
+        # A passing baseline may subsequently receive review-driven code/test
+        # corrections. This remains local validation and cannot publish.
+        return (
+            len(run.codex_results) >= 3
+            and any(item.source == "system_review" for item in run.revisions)
+            and bool(run.review_repair_snapshot_sha256)
+            and (
+                run.repository_group is None or (
+                    {item.repository_key for item in run.repository_evidence}
+                    == {item.key for item in run.repository_group.repositories}
+                    and all(item.tested_snapshot is not None for item in run.repository_evidence)
+                )
+            )
+        )
+    if len(run.codex_results) != 2:
+        return False
+    if run.repository_group is not None:
+        if target.reproduction_file is None:
+            return False
+        return (
+            {item.repository_key for item in run.repository_evidence}
+            == {item.key for item in run.repository_group.repositories}
+            and all(
+                item.tested_snapshot is not None
+                and (
+                    item.repository_key != target.reproduction_file.repository_key
+                    or item.tested_snapshot == run.pre_fix_snapshot
+                )
+                and all(
+                    item.repository_key == target.reproduction_file.repository_key
+                    and path == target.reproduction_test
+                    for path in item.tested_snapshot.changed_files
+                )
+                for item in run.repository_evidence
+            )
+        )
+    return (
+        run.tested_snapshot == run.pre_fix_snapshot
+        and all(path == target.reproduction_test for path in run.tested_snapshot.changed_files)
+    )
 
 
 def _is_completed_analysis(run: WorkflowRun) -> bool:
@@ -551,6 +626,16 @@ class FileRunStore:
         source = current.state
         if source in _TERMINAL:
             raise InvalidRunTransitionError("terminal workflow state cannot transition")
+        if source is WorkflowState.PUBLISHING and target is WorkflowState.WAITING_PR_VERIFICATION:
+            if current.approval is None or not current.approval.draft_pr:
+                raise InvalidRunTransitionError("PR verification wait requires a draft approval")
+            return None
+        if (
+            source is WorkflowState.AI_REVIEW
+            and target is WorkflowState.COMPLETED
+            and _is_completed_verification(current)
+        ):
+            return None
         if (
             source is WorkflowState.IMPLEMENTING
             and target is WorkflowState.COMPLETED
@@ -963,6 +1048,15 @@ def _validate_persisted_run_invariants(run: WorkflowRun) -> None:
         raise InvalidRunMutationError("retry_count must not be negative")
     publication = run.publication
     group_publication = run.group_publication
+    delivered = run.state in {WorkflowState.COMPLETED, WorkflowState.WAITING_PR_VERIFICATION}
+    if run.state is WorkflowState.WAITING_PR_VERIFICATION:
+        if run.approval is None or not run.approval.draft_pr:
+            raise InvalidRunMutationError("PR verification wait requires deferred checks")
+    if run.state is WorkflowState.COMPLETED and run.approval is not None and run.approval.draft_pr:
+        raise InvalidRunMutationError("Draft handoff must not be marked completed")
+    intents = group_publication.repositories if group_publication else (publication,)
+    if run.approval is not None and any(item.approved_fingerprint and item.draft_pr != run.approval.draft_pr for item in intents):
+        raise InvalidRunMutationError("Publication draft mode must match approval")
     if group_publication is not None:
         _validate_group_publication_binding(run, group_publication)
         complete = (
@@ -981,12 +1075,12 @@ def _validate_persisted_run_invariants(run: WorkflowRun) -> None:
             and not group_publication.comment_id
             and bool(group_publication.error.strip())
         )
-        if run.state is WorkflowState.COMPLETED and not complete:
+        if delivered and not complete:
             raise InvalidRunMutationError("completed group publication facts are incomplete")
         if run.state is WorkflowState.PARTIAL_SUCCESS and not partial:
             raise InvalidRunMutationError("partial group publication facts are invalid")
     else:
-        if run.state is WorkflowState.COMPLETED and not _is_completed_analysis(run) and not (
+        if delivered and not _is_completed_analysis(run) and not _is_completed_verification(run) and not (
             publication.approved_fingerprint and publication.commit_hash
             and publication.push_completed_at is not None and publication.pr_url
             and publication.comment_id and not publication.error
@@ -1023,6 +1117,7 @@ def _validate_publication_progress(current: WorkflowRun, incoming: WorkflowRun) 
     """Enforce immutable intent and monotonic external-effect facts."""
 
     intent_fields = (
+        "draft_pr",
         "approved_fingerprint", "repo_url", "provider", "provider_host",
         "expected_parent", "expected_tree", "commit_message", "remote_branch",
         "pr_marker", "pr_base", "pr_head", "pr_title", "pr_body", "comment_marker",
@@ -1065,6 +1160,7 @@ def _validate_group_publication_progress(
     if old_by_key.keys() != new_by_key.keys():
         raise InvalidRunMutationError("group publication repositories are immutable")
     intent_fields = (
+        "draft_pr",
         "approved_fingerprint", "repo_url", "provider", "provider_host",
         "expected_parent", "expected_tree", "commit_message", "remote_branch",
         "pr_marker", "pr_base", "pr_head", "pr_title", "pr_body", "comment_marker",
@@ -1133,6 +1229,7 @@ def _validate_group_publication_binding(
         expected = approved_by_key[item.repository_key]
         if (
             item.approved_fingerprint != approval.fingerprint
+            or item.draft_pr != approval.draft_pr
             or item.repo_url != expected.mapping.repo_url
             or item.expected_parent != expected.head_commit
             or item.expected_tree != expected.tree_hash
@@ -1168,8 +1265,20 @@ def _validate_persisted_edge(
         return
     if source in _TERMINAL:
         raise InvalidRunMutationError("terminal state cannot have outgoing history")
+    if source is WorkflowState.PUBLISHING and target is WorkflowState.WAITING_PR_VERIFICATION:
+        if run.approval is None or not run.approval.draft_pr:
+            raise InvalidRunMutationError("PR verification history requires draft approval")
+        return
+    if source is WorkflowState.WAITING_PR_VERIFICATION and target is WorkflowState.CANCELLED:
+        return
 
     if source in _MAIN_INDEX:
+        if (
+            source is WorkflowState.AI_REVIEW
+            and target is WorkflowState.COMPLETED
+            and _is_completed_verification(run)
+        ):
+            return
         if (
             source is WorkflowState.IMPLEMENTING
             and target is WorkflowState.COMPLETED

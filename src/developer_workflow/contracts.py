@@ -26,6 +26,7 @@ from pydantic import (
 
 from src.contracts import DefectRecord, RequirementRecord, WikiPageRef, WikiPageSnapshot
 from .command_utils import CommandArgvError, parse_command_argv
+from .verification_models import VerificationNeed, VerificationRecord, VerificationTask
 
 
 def utc_now() -> datetime:
@@ -116,6 +117,7 @@ class WorkflowState(str, Enum):
     WAITING_APPROVAL = "WAITING_APPROVAL"
     PUBLISHING = "PUBLISHING"
     COMPLETED = "COMPLETED"
+    WAITING_PR_VERIFICATION = "WAITING_PR_VERIFICATION"
     BLOCKED = "BLOCKED"
     CANCELLED = "CANCELLED"
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
@@ -820,6 +822,12 @@ class CodexResult(WorkflowModel):
     commands: tuple[CommandResult, ...] = Field(default_factory=tuple)
     evidence: tuple[str, ...] = Field(default_factory=tuple)
     review_findings: tuple[str, ...] = Field(default_factory=tuple)
+    review_repair_scope: tuple[RepositoryChangeClaim, ...] = Field(default_factory=tuple)
+    review_external_validation: tuple[str, ...] = Field(default_factory=tuple)
+    verification_needs: tuple[VerificationNeed, ...] = Field(default_factory=tuple)
+    # Read compatibility for runs persisted by the short-lived boolean
+    # classification contract. New Codex output uses the two disjoint lists.
+    review_requires_repair: StrictBool | None = Field(default=None, exclude=True)
     risks: tuple[str, ...] = Field(default_factory=tuple)
     unresolved_items: tuple[str, ...] = Field(default_factory=tuple)
     acceptance_coverage: tuple[AcceptanceCoverage, ...] = Field(default_factory=tuple)
@@ -928,6 +936,10 @@ class RepositoryApprovalEvidence(WorkflowModel):
 
 
 class ApprovalPackage(WorkflowModel):
+    verification_records: tuple[VerificationRecord, ...] = Field(default=())
+    deferred_verification: tuple[VerificationTask, ...] = Field(default=())
+    baseline_evidence_missing: StrictBool = False
+
     work_item_id: str
     work_item_title: str = ""
     work_item_status: str = ""
@@ -969,6 +981,10 @@ class ApprovalPackage(WorkflowModel):
     approved_by: str | None = None
     approved_at: datetime | None = None
 
+    @property
+    def draft_pr(self) -> bool:
+        return bool(self.deferred_verification)
+
     @field_validator("impact_scope")
     @classmethod
     def validate_defect_impact_scope(cls, paths: tuple[str, ...]) -> tuple[str, ...]:
@@ -1002,6 +1018,7 @@ class ApprovalPackage(WorkflowModel):
 
 
 class PublicationResult(WorkflowModel):
+    draft_pr: StrictBool = False
     approved_fingerprint: str = ""
     repo_url: str = ""
     provider: str = ""
@@ -1130,9 +1147,28 @@ class MultiRepositoryPublicationResult(WorkflowModel):
 class RevisionRecord(WorkflowModel):
     feedback: str
     occurred_at: datetime
+    source: Literal["human", "system_review", "system_verification"] = "human"
+
+
+class BaselineRefreshRecord(WorkflowModel):
+    workspace_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    source_repositories: tuple[RepositoryRunEvidence, ...]
+    source_tests: tuple[CommandResult, ...] = ()
+    source_pre_fix_tests: tuple[CommandResult, ...] = ()
+    source_pre_fix_snapshot: RepositorySnapshot | None = None
+    source_review: CodexResult | None = None
+    source_approval: ApprovalPackage | None = None
+    source_verification_records: tuple[VerificationRecord, ...] = ()
+    destinations: tuple[RepositoryRunEvidence, ...] = ()
+    conflicts: tuple[RepositoryChangeClaim, ...] = ()
+    failure_reason: str = ""
+    status: Literal["preparing", "migrated", "conflicts", "failed"] = "preparing"
+    occurred_at: datetime = Field(default_factory=utc_now)
 
 
 class WorkflowRun(WorkflowModel):
+    verification_plan: tuple[VerificationTask, ...] = Field(default=())
+    verification_records: tuple[VerificationRecord, ...] = Field(default=())
     run_id: str
     type: WorkflowType
     repository_model_version: StrictInt = 1
@@ -1154,6 +1190,7 @@ class WorkflowRun(WorkflowModel):
     )
     repository_group: RepositoryGroupMapping | None = None
     repository_evidence: tuple[RepositoryRunEvidence, ...] = Field(default_factory=tuple)
+    repair_scope_extensions: tuple[RepositoryChangeClaim, ...] = Field(default_factory=tuple)
     integration_test_results: tuple[CommandResult, ...] = Field(default_factory=tuple)
     prepared_worktree: PreparedWorktree | None = None
     tested_snapshot: RepositorySnapshot | None = None
@@ -1161,6 +1198,11 @@ class WorkflowRun(WorkflowModel):
     pre_fix_test_results: tuple[CommandResult, ...] = Field(default_factory=tuple)
     reproduction_test_sha256: str = ""
     defect_checkpoint: DefectCheckpoint = DefectCheckpoint.NONE
+    verification_only: StrictBool = False
+    review_repair_attempts: StrictInt = Field(default=0, ge=0)
+    baseline_refreshes: tuple[BaselineRefreshRecord, ...] = ()
+    review_repair_budget_start: StrictInt = Field(default=0, ge=0)
+    review_repair_snapshot_sha256: str = Field(default="", pattern=r"^(?:[0-9a-f]{64})?$")
     defect_action: DefectAction = DefectAction.ANALYZE_AND_REPAIR
     analysis_generation: StrictInt = 0
     analysis_solution_accepted: StrictBool = False
@@ -1200,7 +1242,21 @@ class WorkflowRun(WorkflowModel):
             raise ValueError("only defect analysis can accept a solution")
         if self.repository_model_version not in {1, 2}:
             raise ValueError("repository_model_version is unsupported")
+        extension_keys = tuple(
+            (claim.repository_key, claim.path)
+            for claim in self.repair_scope_extensions
+        )
+        if len(extension_keys) != len(set(extension_keys)):
+            raise ValueError("repair scope extensions must be unique")
         if self.repository_group is None:
+            if self.repair_scope_extensions and (
+                self.repository is None
+                or any(
+                    claim.repository_key != self.repository.key
+                    for claim in self.repair_scope_extensions
+                )
+            ):
+                raise ValueError("repair scope extension repository is invalid")
             if self.repository_evidence or self.integration_test_results or self.group_publication:
                 raise ValueError("repository group facts require a repository group")
         else:
@@ -1211,6 +1267,11 @@ class WorkflowRun(WorkflowModel):
             if evidence_keys and evidence_keys != expected:
                 raise ValueError("repository evidence must follow complete group topology")
             configured = {item.key: item for item in self.repository_group.repositories}
+            if any(
+                claim.repository_key not in configured
+                for claim in self.repair_scope_extensions
+            ):
+                raise ValueError("repair scope extension repository is invalid")
             if any(
                 item.mapping != configured[item.repository_key]
                 for item in self.repository_evidence
@@ -1300,9 +1361,12 @@ class WorkflowRun(WorkflowModel):
         data.update(
             state=WorkflowState.BLOCKED,
             resume_state=WorkflowState.IMPLEMENTING,
+            review_repair_budget_start=self.review_repair_attempts,
             revisions=(
                 *data["revisions"],
-                RevisionRecord(feedback=feedback, occurred_at=utc_now()).model_dump(),
+                RevisionRecord(
+                    feedback=feedback, occurred_at=utc_now(), source="human"
+                ).model_dump(),
             ),
             updated_at=utc_now(),
         )

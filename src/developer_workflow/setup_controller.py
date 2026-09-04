@@ -815,6 +815,41 @@ class SetupController:
         if failed:
             raise SetupActionError("active configuration is unavailable") from None
 
+    async def prepare_inline_ones(
+        self, fields: Mapping[str, str], replacements: Mapping[SecretKind, str],
+    ) -> None:
+        """Validate an ONES-only edit while retaining unrelated saved secrets."""
+        if set(fields) != {"ones_base_url", "ones_team_id", "ones_issue_type_id"}:
+            raise SetupActionError("ONES configuration is invalid")
+        if not set(replacements) <= {SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD}:
+            raise SetupActionError("ONES credentials are invalid")
+        await asyncio.to_thread(self.load_active_public_draft)
+        document = await asyncio.to_thread(self._store.load_or_empty, profile_id=self._profile_id)
+        if document.active is None or document.activation_owner_generation is not None:
+            raise SetupActionError("active configuration is unavailable")
+        if (fields["ones_base_url"].rstrip("/") != document.active.runtime.ones_base_url.rstrip("/")
+                and not all(replacements.get(kind) for kind in (SecretKind.ONES_EMAIL, SecretKind.ONES_PASSWORD))):
+            raise SetupActionError("a new ONES endpoint requires explicit credentials")
+        # Never send retained credentials back to the UI or a public document.
+        retained = await asyncio.to_thread(self._store.read_active_secrets, document)
+        try:
+            for kind, value in retained.values.items():
+                self.set_secret(kind, value)
+            for kind, value in replacements.items():
+                if value:
+                    self.set_secret(kind, value)
+            self.apply_runtime_fields(SetupStep.ONES, fields)
+            for step in self.STEPS:
+                if step is SetupStep.REVIEW:
+                    break
+                result = await self.test_step(step)
+                if result.status is not ValidationStatus.PASSED:
+                    raise SetupActionError("configuration validation failed")
+            self.confirm_review()
+        except BaseException:
+            self._clear_transient_secrets()
+            raise
+
     async def list_orphan_generations(self) -> tuple[str, ...]:
         self._ensure_open()
         failed = False

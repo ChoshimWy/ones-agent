@@ -82,8 +82,13 @@ def build_comment_text(
     summary = _safe_text(summary.strip(), label="summary")
     tests_summary = _safe_text(tests_summary.strip(), label="tests summary")
     marker = comment_marker(run.run_id)
+    handoff = ""
+    if run.approval is not None and run.approval.draft_pr:
+        handoff = (f"\n交付状态：Draft PR，等待 PR 人工验证（{len(run.approval.deferred_verification)} 项）。"
+                   "未完成的实机/环境验证不视为通过；请在对应提交上验证，合并和发布仍受门禁约束。\n")
     body = (
         f"AI 开发工作流已创建 PR：{pr_url}\n\n"
+        f"{handoff}"
         f"实现摘要：{summary or '见 PR 描述'}\n"
         f"测试结果：{tests_summary or '见审批包'}\n\n{marker}"
     )

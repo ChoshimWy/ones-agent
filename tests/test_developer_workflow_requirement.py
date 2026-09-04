@@ -876,6 +876,29 @@ def test_structured_pytest_selector_classifies_only_associated_exit_one_as_test_
     ).hexdigest()
 
 
+@pytest.mark.parametrize("output,expected", [
+    ("FAILED tests/test_first.py::test_bug - AssertionError", CommandOutcome.TEST_FAILED),
+    ("tests/test_first.py::test_bug FAILED", CommandOutcome.TEST_FAILED),
+    ("Could not launch tests/test_last.py: missing dependency", CommandOutcome.COMMAND_ERROR),
+    ("FAILED tests/test_unrelated.py::test_bug - AssertionError", CommandOutcome.COMMAND_ERROR),
+])
+def test_multi_file_pytest_classifies_failure_in_any_selected_file(
+    tmp_path: Path, output: str, expected: CommandOutcome,
+) -> None:
+    from src.developer_workflow.requirement_flow import DirectConfiguredTestRunner
+
+    def executor(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 1, output, "")
+
+    runner = DirectConfiguredTestRunner(command_executor=executor)
+    result = runner.run_argv(
+        ("python", "-m", "pytest", "tests/test_first.py", "tests/test_last.py"),
+        display_command="python -m pytest tests/test_first.py tests/test_last.py",
+        cwd=tmp_path.resolve(),
+    )
+    assert result.outcome is expected
+
+
 def test_subprocess_test_runner_fails_closed_without_a_sandbox_backend() -> None:
     with pytest.raises(Exception, match="sandbox"):
         SubprocessConfiguredTestRunner()

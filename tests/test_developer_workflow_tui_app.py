@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from io import StringIO
 from datetime import UTC, datetime
 from threading import Event
 from types import SimpleNamespace
 
 import pytest
+from rich.console import Console
 from textual.containers import VerticalScroll
 from textual.widgets import (
     Button,
@@ -41,6 +43,7 @@ from src.developer_workflow.tui.models import (
     RunDetail,
     RunFilter,
     RunSummary,
+    ReviewView,
     TestView as TuiTestView,
     safe_tui_text,
 )
@@ -52,6 +55,7 @@ from src.developer_workflow.tui.screens import (
     HelpScreen,
     RequirementWizardScreen,
     PublicationResumeModal,
+    RepositoryMappingModal,
     RunDetailPane,
     RunDetailScreen,
     RunFilterScreen,
@@ -215,10 +219,10 @@ async def test_workspace_mode_exposes_persisted_tasks_and_reopens_detail() -> No
         assert screen.query_one("#nav-runs", Button).variant == "primary"
         assert screen.query_one("#nav-workspaces", Button).variant == "default"
         assert len(screen.query("#run-list ListItem")) == 2
-        assert not screen.query_one("#action-bar").display
-        assert not screen.query("#action-resume")
+        assert screen.query_one("#action-bar").display
+        assert not screen.query_one("#action-resume", Button).display
         assert not screen.query("#action-revise")
-        assert not screen.query("#action-approve")
+        assert screen.query_one("#action-approve", Button).display
         assert not screen.query("#action-cancel")
         assert not screen.query("#configure-runtime")
         await pilot.click("#run-item-0")
@@ -242,9 +246,8 @@ async def test_workspace_mode_exposes_persisted_tasks_and_reopens_detail() -> No
         assert screen.query_one("#nav-settings", Button).variant == "primary"
         assert screen.query_one("#nav-runs", Button).variant == "default"
         assert screen.query_one("#settings-page").display
-        assert screen.query_one("#nav-runtime-setup", Button).label.plain == (
-            "Edit global configuration"
-        )
+        assert screen.query_one("#inline-ones-base_url", Input).visible
+        assert not screen.query("#settings-ones #nav-runtime-setup")
 
 
 @pytest.mark.asyncio
@@ -275,6 +278,8 @@ async def test_task_delete_requires_confirmation_and_refreshes_list() -> None:
         assert len(controller.runs) == 2
 
         await pilot.click("#delete-task")
+        await pilot.pause()  # The replacement modal must finish mounting/layout before clicking.
+        assert app.screen.id == "task-delete-confirmation"
         await pilot.click("#confirm-task-delete")
         async with asyncio.timeout(2):
             while len(controller.runs) != 1:
@@ -470,6 +475,54 @@ async def test_ai_activity_supports_keyboard_and_mouse_scrolling() -> None:
         await pilot.press("pagedown")
         await pilot.pause()
         assert scroll.scroll_y > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(80, 24), (120, 38)])
+async def test_review_cards_keep_blockers_separate_and_status_visible(size) -> None:
+    report = ReviewView(
+        summary=safe_tui_text("Current code passed the focused test; regression coverage needs one more case."),
+        findings=(safe_tui_text("No production regression was found."),),
+        blockers=(safe_tui_text("Add `repair` to tests/infra/virtual_camera/test_installation.py; [bold]literal[/bold]."),),
+        external_validation=(safe_tui_text("Validate the signed package on real Macs."), safe_tui_text("Private dependencies unavailable.")),
+        verification_only=True,
+    )
+    detail = replace(_detail(_summary(1)), review_report=report)
+    controller = FakeController()
+    # Polling must return the same report instead of replacing the manually
+    # rendered fixture with an empty detail midway through the scroll check.
+    controller.show = lambda _run_id: detail
+    app = DeveloperWorkflowTuiApp(controller, 3)
+    async with app.run_test(size=size) as pilot:
+        pane = app.screen.query_one("#run-detail", RunDetailPane)
+        app.screen.query_one("#detail-tabs", TabbedContent).active = "review"
+        pane.set_detail(detail)
+        await pilot.pause()
+        status = pane.query_one("#review-status", Static)
+        assert "1 项问题" in _plain(status)
+        assert "2 项外部验证" in _plain(status)
+        assert status.region.width <= pane.region.width
+        output = StringIO()
+        console = Console(file=output, width=max(30, pane.size.width - 2), color_system=None)
+        console.print(pane.query_one("#review-content", Static).renderable)
+        text = output.getvalue()
+        assert text.index("待处理问题") < text.index("审查结论") < text.index("外部验证")
+        assert "[bold]literal[/bold]" in text.replace("\n", "").replace(" ", "")
+        scroll = pane.query_one("#review-scroll", VerticalScroll)
+        scroll.scroll_end(animate=False, immediate=True)
+        await pilot.pause()
+        assert scroll.scroll_y > 0
+        assert status.region.bottom <= scroll.region.y
+        previous_offset = scroll.scroll_y
+        pane.set_detail(detail)
+        await pilot.pause()
+        assert scroll.scroll_y == previous_offset  # Background polling must not jump to the top.
+        detail = replace(detail, review_report=replace(report, blockers=()))
+        pane.set_detail(detail)
+        await pilot.pause()
+        assert scroll.scroll_y == 0
+        pane.clear_detail()
+        assert not status.display
 
 
 @pytest.mark.asyncio
@@ -815,20 +868,20 @@ async def test_detail_tabs_render_complete_safe_evidence() -> None:
         tests = str(screen.query_one("#tests-content").renderable)
         publication = str(screen.query_one("#publication-content").renderable)
         history = str(screen.query_one("#history-content").renderable)
-        assert "workflow blocked safely" in overview
+        assert "流程已安全暂停" in overview
         assert "e" * 64 in overview
-        assert "risks: 2" in overview
-        assert "unresolved: 1" in overview
+        assert "风险项：2" in overview
+        assert "未解决项：1" in overview
         assert "a" * 40 in repositories
         assert "b" * 40 in repositories
         assert "c" * 64 in repositories
         assert "src/fix.py" in repositories
         assert "d" * 40 in repositories
         assert repository.pr_url in repositories
-        assert "test command  passed  exit: 0" in tests
-        assert "primary" in publication
-        assert "comment delivered" in publication
-        assert "TESTING -> AI_REVIEW" in history
+        assert "通过" in tests and "passed" in tests and "退出码" in tests
+        assert "主仓库" in publication
+        assert "ONES 回写" in publication and "已送达" in publication
+        assert "TESTING" in history and "AI_REVIEW" in history and "→" in history
 
 
 @pytest.mark.asyncio
@@ -857,7 +910,7 @@ async def test_refresh_replaces_list_atomically_and_preserves_selected_run() -> 
         assert screen.query_one("#run-list").index is None
         assert len(screen.query("#run-list ListItem")) == 0
         overview = screen.query_one("#overview-content")
-        assert str(overview.renderable) == "No run selected"
+        assert str(overview.renderable) == "请选择一个任务查看详情。"
 
 
 @pytest.mark.asyncio
@@ -1023,7 +1076,7 @@ async def test_factory_escaped_markup_renders_as_literal_without_backslashes() -
 
     async with app.run_test(size=(120, 32)):
         overview = app.screen.query_one("#overview-content")
-        assert _plain(overview).splitlines()[0] == raw
+        assert raw in _plain(overview)
         assert "\\[bold]" not in _plain(overview)
 
 
@@ -1661,6 +1714,7 @@ class ActionController(FakeController):
             risk_count=detail.risk_count,
             unresolved_count=detail.unresolved_count,
             comment_status="not delivered",
+            approvers=(FilterChoice("operator", "操作员"), FilterChoice("reviewer", "审核员")),
             publication_error=detail.publication.error,
             state=detail.summary.state,
             resume_state=detail.resume_state,
@@ -1781,23 +1835,63 @@ async def test_approval_modal_renders_complete_signed_multi_repository_facts() -
         assert isinstance(pilot.app.screen, ApprovalModal)
         assert _plain(pilot.app.screen.query_one("#fingerprint")) == "f" * 64
         rendered = "\n".join(_plain(item) for item in pilot.app.screen.query(Static))
-        assert "work item: BUG-42" in rendered
-        assert "repositories: 2" in rendered
-        assert "changed files: 2" in rendered
-        assert "tests: 2" in rendered
-        assert "risks: 2" in rendered
-        assert "unresolved: 1" in rendered
+        assert "工作项 BUG-42" in rendered
+        assert "关联仓库 2" in rendered
+        assert "变更文件 2" in rendered
+        assert "测试记录 2" in rendered
+        assert "风险提示 2" in rendered
+        assert "未解决项 1" in rendered
         assert [
             _plain(item) for item in pilot.app.screen.query(".tree-hash")
         ] == ["a" * 64, "b" * 64]
-        assert "base: " + "a" * 40 in rendered
-        assert "head: " + "A" * 40 in rendered
-        assert "1 verified test fact" in rendered
-        assert "PR target: main" in rendered
-        assert "commit: not created" in rendered
-        assert "push: not completed" in rendered
-        assert "PR: not created" in rendered
-        assert "comment: not delivered" in rendered
+        assert "基线：" + "a" * 40 in rendered
+        assert "HEAD：" + "A" * 40 in rendered
+        assert "1 条已核验测试记录" in rendered
+        assert "目标分支：main" in rendered
+        assert "提交：尚未创建" in rendered
+        assert "推送：尚未完成" in rendered
+        assert "PR：尚未创建" in rendered
+        assert "评论状态：" in rendered
+        assert controller.remote_effects == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", [(160, 45), (80, 24), (60, 20)])
+async def test_approval_cards_keep_scope_and_footer_accessible(size) -> None:
+    class DraftController(ActionController):
+        def prepare_action(self, run_id, action):
+            request = super().prepare_action(run_id, action)
+            unchanged = replace(request.repositories[1], changed_files=(), changed_file_count=0)
+            changed = replace(request.repositories[0], key=r"\[bold]repo[/bold]")
+            return replace(request, repositories=(changed, unchanged), draft_pr=True,
+                           deferred_check_count=8, baseline_evidence_missing=True)
+
+    controller = DraftController()
+    async with action_app_factory(controller).run_test(size=size) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        screen = pilot.app.screen
+        rendered = "\n".join(_plain(item) for item in screen.query(Static))
+        assert "不授权合并或发布，不视为实机验证通过" in rendered
+        assert "缺少修复前失败复现记录" in rendered
+        assert "待人工验证 8 项" in rendered
+        assert "无代码变更 · 不创建 PR" in rendered
+        assert "[bold]repo[/bold]" in rendered
+        assert controller.prepare_action("run-action", "approve").repositories[0].changed_files[0] in rendered
+        footer = screen.query_one("#approval-footer")
+        confirm = screen.query_one("#confirm-approve", Button)
+        assert 0 <= confirm.region.x < confirm.region.right <= size[0]
+        assert 0 <= footer.region.y < footer.region.bottom <= size[1]
+        body = screen.query_one("#approval-body")
+        assert body.region.height >= 3
+        initial_region = confirm.region
+        body.scroll_end(animate=False)
+        await pilot.pause()
+        assert confirm.region == initial_region
+        screen.query_one("#actor", Select).value = "reviewer"
+        await pilot.press("enter")
+        assert controller.remote_effects == []
+        await pilot.click("#cancel-action")
         assert controller.remote_effects == []
 
 
@@ -1812,6 +1906,41 @@ async def test_plain_enter_never_confirms_dangerous_actions_and_escape_returns()
         assert controller.action_calls == []
         await pilot.press("escape")
         assert pilot.app.screen.id == "dashboard-screen"
+
+
+@pytest.mark.asyncio
+async def test_approval_member_selection_supports_keyboard_without_approving() -> None:
+    controller = ActionController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("a")
+        actor = pilot.app.screen.query_one("#actor", Select)
+        assert actor.value is Select.BLANK
+        actor.focus()
+        await pilot.press("enter", "down", "enter")
+        assert actor.value == "operator"
+        assert not actor.expanded
+        assert controller.remote_effects == []
+        pilot.app.screen.query_one("#confirm-approve", Button).focus()
+        await pilot.press("enter")
+        assert controller.remote_effects == []
+
+
+@pytest.mark.asyncio
+async def test_approval_members_failure_has_no_free_text_fallback() -> None:
+    class UnavailableController(ActionController):
+        def prepare_action(self, run_id, action):
+            return replace(super().prepare_action(run_id, action), approvers=(),
+                           approver_error="ONES 成员加载失败，请检查连接与账号权限后重新打开审批。")
+
+    controller = UnavailableController()
+    async with action_app_factory(controller).run_test() as pilot:
+        await pilot.press("a")
+        assert pilot.app.screen.query_one("#actor", Select).disabled
+        assert not pilot.app.screen.query(Input)
+        assert pilot.app.screen.query_one("#confirm-approve", Button).disabled
+        assert "ONES 成员加载失败" in _plain(pilot.app.screen.query_one("#modal-notice"))
+        await pilot.press("ctrl+enter")
+        assert controller.remote_effects == []
 
 
 @pytest.mark.asyncio
@@ -1833,7 +1962,7 @@ async def test_approval_stale_confirmation_is_fixed_and_has_zero_effects() -> No
     async with action_app_factory(controller).run_test() as pilot:
         await pilot.press("a")
         controller.advance_authoritative_version()
-        pilot.app.screen.query_one("#actor", Input).value = "operator"
+        pilot.app.screen.query_one("#actor", Select).value = "operator"
         await pilot.click("#confirm-approve")
         await pilot.pause(0.1)
         assert pilot.app.screen.id == "dashboard-screen"
@@ -1881,10 +2010,10 @@ async def test_approval_requires_actor_and_mouse_confirmation() -> None:
         await pilot.press("a")
         await pilot.click("#confirm-approve")
         assert _plain(pilot.app.screen.query_one("#modal-notice")) == (
-            "required action fields are missing"
+            "请从 ONES 成员列表选择审批人"
         )
         await pilot.press("escape", "a")
-        pilot.app.screen.query_one("#actor", Input).value = "operator"
+        pilot.app.screen.query_one("#actor", Select).value = "operator"
         await pilot.click("#confirm-approve")
         await pilot.pause(0.1)
         assert controller.action_calls == [("approve", 7, "operator")]
@@ -1927,18 +2056,202 @@ async def test_blocked_publication_or_unknown_checkpoint_cannot_be_revised(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("decision", ["cancel", "confirm", "stale"])
+async def test_capped_review_requests_confirmed_repair_instead_of_replaying_review(decision) -> None:
+    class CappedController(ActionController):
+        def _detail(self) -> RunDetail:
+            return replace(super()._detail(), can_request_review_repair=True,
+                review_report=ReviewView(summary="Latest code defect remains", findings=(),
+                    blockers=("Fix the final GPU stage report",), external_validation=(),
+                    verification_only=False, review_repair_attempts=3,
+                    pause_reason="已达到本轮自动回修上限"))
+
+    controller = CappedController(WorkflowState.BLOCKED, resume_state=WorkflowState.AI_REVIEW)
+    async with action_app_factory(controller).run_test(size=(120, 38)) as pilot:
+        pane = pilot.app.screen.query_one("#run-detail", RunDetailPane)
+        output = StringIO()
+        Console(file=output, width=100).print(pane.query_one("#review-content", Static).renderable)
+        assert "已达到本轮自动回修上限" in output.getvalue()
+        button = pilot.app.screen.query_one("#action-resume", Button)
+        assert button.label.plain == "Continue repair"
+        await pilot.click("#action-resume")
+        # Preparing the request runs off the UI thread; click completion does
+        # not guarantee that its modal has mounted yet.
+        for _ in range(50):
+            if isinstance(pilot.app.screen, RevisionModal):
+                break
+            await pilot.pause(0.02)
+        assert isinstance(pilot.app.screen, RevisionModal)
+        await pilot.pause()  # Wait for the newly mounted modal's layout.
+        assert controller.action_calls == []
+        assert pilot.app.screen.query_one("#scope", Input).value == "repair"
+        if decision == "cancel":
+            await pilot.press("escape")
+        else:
+            if decision == "stale":
+                controller.advance_authoritative_version()
+            await pilot.click("#confirm-revise")
+            await pilot.pause()
+    if decision == "confirm":
+        assert controller.action_calls == [("revise", 7, "继续修复最新 Review 中的待处理问题，保留已完成修复和冻结测试。", "repair")]
+    else:
+        assert controller.action_calls == []
+    assert controller.remote_effects == []
+
+
+@pytest.mark.asyncio
 async def test_ordinary_resume_has_no_modal_and_passes_expected_version() -> None:
     controller = ActionController(
         WorkflowState.BLOCKED, resume_state=WorkflowState.IMPLEMENTING
     )
     async with action_app_factory(controller).run_test() as pilot:
-        assert "resume state: IMPLEMENTING" in _plain(
+        assert "代码修复 / 实现 · IMPLEMENTING" in _plain(
             pilot.app.screen.query_one("#overview-content")
         )
+        resume = pilot.app.screen.query_one("#action-resume", Button)
+        assert resume.display
+        assert resume.label.plain == "Continue repair"
+        assert resume.parent is pilot.app.screen.query_one("#action-bar")
         await pilot.press("r")
         await pilot.pause()
         assert pilot.app.screen.id == "dashboard-screen"
         assert controller.action_calls == [("resume", "run-action", 7)]
+
+
+@pytest.mark.asyncio
+async def test_validating_task_can_resume_repository_selection_from_dashboard() -> None:
+    candidate = MappingCandidateView(
+        key="suite",
+        kind="repository-group",
+        primary_repository="primary",
+        repositories=(RepositoryCandidateView(
+            key="primary",
+            role="primary",
+            source="E:/workspace/primary",
+            depends_on=(),
+            lint_summary="not configured",
+            build_summary="not configured",
+            test_summary="not configured",
+            allowed_paths=(),
+            side_effects="managed worktree",
+        ),),
+        integration_test_summary="not configured",
+    )
+
+    class MappingController(ActionController):
+        def __init__(self) -> None:
+            super().__init__(WorkflowState.VALIDATING)
+
+        def _detail(self) -> RunDetail:
+            return replace(super()._detail(), mapping_candidates=(candidate,))
+
+        def confirm_repository(
+            self, run_id: str, mapping_key: str, expected_version: int
+        ) -> RunDetail:
+            self._current(expected_version)
+            self.action_calls.append(
+                ("confirm-repository", run_id, mapping_key, expected_version)
+            )
+            return self._detail()
+
+    controller = MappingController()
+    async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        resume = pilot.app.screen.query_one("#action-resume", Button)
+        assert resume.display
+        assert resume.label.plain == "Select repository"
+
+        await pilot.click("#action-resume")
+        await pilot.pause()
+        assert isinstance(pilot.app.screen, RepositoryMappingModal)
+        await pilot.click("#resume-mapping-0")
+        for _ in range(50):
+            await pilot.pause()
+            if controller.action_calls:
+                break
+
+    assert controller.action_calls == [
+        ("confirm-repository", "run-action", "suite", 7)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_visible_resume_action_does_not_block_the_textual_event_loop() -> None:
+    entered = Event()
+    release = Event()
+
+    class BlockingResumeController(ActionController):
+        def resume(self, run_id: str, expected_version: int) -> RunDetail:
+            entered.set()
+            assert release.wait(5)
+            return super().resume(run_id, expected_version)
+
+    controller = BlockingResumeController(
+        WorkflowState.BLOCKED, resume_state=WorkflowState.IMPLEMENTING
+    )
+    async with action_app_factory(controller).run_test(size=(120, 32)) as pilot:
+        click = asyncio.create_task(pilot.click("#action-resume"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 2)
+            await asyncio.wait_for(click, timeout=1)
+            assert _plain(pilot.app.screen.query_one("#notice")) == (
+                "Continuing workflow from IMPLEMENTING"
+            )
+            assert not pilot.app.screen.query_one("#action-resume", Button).display
+        finally:
+            release.set()
+        for _ in range(50):
+            await pilot.pause()
+            if controller.action_calls:
+                break
+
+    assert controller.action_calls == [("resume", "run-action", 7)]
+
+
+@pytest.mark.asyncio
+async def test_confirmed_review_repair_does_not_wait_in_the_modal_callback() -> None:
+    entered, release = Event(), Event()
+
+    class SlowRevisionController(ActionController):
+        def _detail(self) -> RunDetail:
+            return replace(super()._detail(), can_request_review_repair=not entered.is_set(),
+                ai_activity=("Repair is running",) if entered.is_set() else ())
+
+        def revise(self, request, feedback, scope):
+            entered.set()
+            assert release.wait(10)
+            return super().revise(request, feedback, scope)
+
+    controller = SlowRevisionController(WorkflowState.BLOCKED, resume_state=WorkflowState.AI_REVIEW)
+    async with action_app_factory(controller).run_test(size=(120, 38)) as pilot:
+        await pilot.click("#action-resume")
+        await pilot.pause()
+        click = asyncio.create_task(pilot.click("#confirm-revise"))
+        try:
+            async with asyncio.timeout(2):
+                while not entered.is_set():
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(asyncio.shield(click), 2)
+            assert pilot.app.screen.id == "dashboard-screen"
+            assert not pilot.app.screen.query_one("#action-resume", Button).display
+            await pilot.app.refresh_runs()
+            await pilot.pause()
+            assert "Repair is running" in _plain(pilot.app.screen.query_one("#ai-activity-content"))
+            await pilot.app.screen.action_resume()
+            await pilot.app.screen.action_revise()
+            assert pilot.app.screen.id == "dashboard-screen"
+            await pilot.press("?")
+            assert isinstance(pilot.app.screen, HelpScreen)
+            await pilot.press("escape")
+            assert controller.action_calls == []  # Worker is still blocked, UI is responsive.
+        finally:
+            release.set()
+            await click
+        for _ in range(30):
+            await pilot.pause()
+            if controller.action_calls:
+                break
+    assert len(controller.action_calls) == 1
+    assert controller.action_calls[0][0] == "revise"
 
 
 @pytest.mark.asyncio

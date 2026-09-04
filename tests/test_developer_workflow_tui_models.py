@@ -55,6 +55,133 @@ EMPTY_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 SENTINEL = "LEAK-ME-9f3d7e"
 
 
+@pytest.mark.parametrize("reason, expected", [
+    ("repair modified the reproduction test", "frozen reproduction test"),
+    ("reproduction checkpoint is incomplete", "checkpoint is missing"),
+    ("repair evidence is incomplete", "not accepted as a completed repair"),
+    ("pre-fix reproduction evidence is missing", "缺少修复前失败复现记录"),
+    ("automatic review repair made no progress", "code/test content is unchanged"),
+    ("automatic review repair limit reached", "attempt limit reached"),
+])
+def test_repair_block_exposes_specific_safe_reason(reason: str, expected: str) -> None:
+    run = WorkflowRun.new_defect("project", "iteration", "user", "defect").validated_update(
+        state=WorkflowState.BLOCKED, resume_state=WorkflowState.IMPLEMENTING,
+        blocked_reason=reason,
+    )
+    assert expected in RunDetail.from_run(run).status_message
+
+
+@pytest.mark.parametrize("reason", [
+    "AI review found blocking issues",
+    "AI review evidence is incomplete",
+    "current checkout verification needs investigation",
+])
+def test_negative_review_is_exposed_as_repair_resume_with_unresolved_count(reason: str) -> None:
+    review = CodexResult(
+        summary="The repair still loses a legacy session.",
+        review_findings=("Legacy compatibility path remains unsafe.",),
+        unresolved_items=("Preserve the legacy production session.",),
+        unrelated_changes_checked=True,
+    )
+    run = WorkflowRun.new_defect(
+        "project", "iteration", "user", "defect"
+    ).validated_update(
+        state=WorkflowState.BLOCKED,
+        resume_state=WorkflowState.AI_REVIEW,
+        blocked_reason=reason,
+        review=review,
+    )
+
+    detail = RunDetail.from_run(run)
+
+    assert detail.resume_state is WorkflowState.IMPLEMENTING
+    assert detail.unresolved_count == 1
+    if reason == "AI review found blocking issues":
+        assert "Publication is blocked" in detail.status_message
+
+
+def test_external_review_gap_stays_in_review_instead_of_repair() -> None:
+    review = CodexResult(
+        summary="The code repair is complete; platform validation is pending.",
+        review_findings=("Repository review found no further code defect.",),
+        review_external_validation=("Run the signed macOS package matrix.",),
+        unrelated_changes_checked=True,
+    )
+    run = WorkflowRun.new_defect(
+        "project", "iteration", "user", "defect"
+    ).validated_update(
+        state=WorkflowState.BLOCKED,
+        resume_state=WorkflowState.AI_REVIEW,
+        blocked_reason="AI review requires external validation",
+        review=review,
+    )
+
+    detail = RunDetail.from_run(run)
+
+    assert detail.resume_state is WorkflowState.AI_REVIEW
+    assert detail.unresolved_count == 1
+    assert "no further repair" in detail.status_message
+    assert "publication remains blocked" in detail.status_message
+
+
+@pytest.mark.parametrize("reason", ["automatic review repair limit reached", "automatic review repair made no progress"])
+def test_review_pause_exposes_explicit_repair_request(reason: str) -> None:
+    run = WorkflowRun.new_defect("p", "i", "u", "d").validated_update(
+        state=WorkflowState.BLOCKED, resume_state=WorkflowState.AI_REVIEW,
+        blocked_reason=reason, review_repair_attempts=3,
+        review=CodexResult(summary="Still incorrect", unresolved_items=("Fix GPU stage reporting",)),
+    )
+    detail = RunDetail.from_run(run)
+    assert detail.can_request_review_repair
+    assert detail.review_report.pause_reason
+    assert detail.review_report.review_repair_attempts == 3
+    assert detail.resume_state is WorkflowState.AI_REVIEW  # Do not falsify persisted state.
+    assert not RunDetail.from_run(run.validated_update(
+        review=CodexResult(summary="Only external validation remains")
+    )).can_request_review_repair
+
+
+def test_verification_only_detail_exposes_local_completion_and_limitations() -> None:
+    review = CodexResult(
+        summary="The current checkout already handles the reported input.",
+        review_findings=("Focused baseline and final tests passed.",),
+        review_external_validation=("Validate the originally installed macOS package.",),
+        unrelated_changes_checked=True,
+    )
+    run = WorkflowRun.new_defect("project", "iteration", "user", "defect").validated_update(
+        state=WorkflowState.COMPLETED, verification_only=True, review=review,
+    )
+    detail = RunDetail.from_run(run)
+    assert "no production repair or publication" in detail.status_message
+    assert review.summary in detail.review
+    assert review.review_findings[0] in detail.review
+    assert review.review_external_validation[0] in detail.review
+    assert detail.resume_state is None
+    assert detail.publication.comment_id == ""
+    assert detail.review_report is not None
+    assert detail.review_report.blockers == ()
+    assert detail.review_report.external_validation == review.review_external_validation
+
+
+def test_review_projection_separates_actual_blocker_from_external_limitations() -> None:
+    review = CodexResult(
+        summary="Production code is correct but regression coverage is incomplete.",
+        review_findings=("The frozen test passed.",),
+        unresolved_items=("Add the missing `repair` test case.",),
+        review_external_validation=("Validate the signed macOS package.", "Private dependencies unavailable."),
+        unrelated_changes_checked=True,
+    )
+    run = WorkflowRun.new_defect("project", "iteration", "user", "defect").validated_update(
+        state=WorkflowState.BLOCKED, resume_state=WorkflowState.AI_REVIEW,
+        blocked_reason="current checkout verification needs investigation",
+        verification_only=True, review=review,
+    )
+    report = RunDetail.from_run(run).review_report
+    assert report.blockers == review.unresolved_items
+    assert report.external_validation == review.review_external_validation
+    assert report.findings == review.review_findings
+
+
 def test_analysis_only_detail_exposes_ai_summary_without_publication() -> None:
     run = WorkflowRun.new_defect("project", "iteration", "user", "defect").validated_update(
         state=WorkflowState.COMPLETED,

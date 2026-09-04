@@ -121,6 +121,21 @@ def _parser(stdout: TextIO, stderr: TextIO) -> _SafeParser:
         item = command(name)
         item.add_argument("run_id")
 
+    command("verification-nodes")
+    probe = command("probe-node")
+    probe.add_argument("node_key")
+    replan = command("plan-verification")
+    replan.add_argument("run_id")
+    replan.add_argument("--version", type=int, required=True)
+    verify = command("verify")
+    verify.add_argument("run_id")
+    verify.add_argument("--task", required=True)
+    verify.add_argument("--actor", required=True)
+    verify.add_argument("--version", type=int, required=True)
+    verify.add_argument("--recipe-digest")
+    verify.add_argument("--manual-evidence")
+    verify.add_argument("--failed", action="store_true")
+
     revise = command("revise")
     revise.add_argument("run_id")
     revise.add_argument("--feedback", required=True)
@@ -168,6 +183,13 @@ def _show_run(run: WorkflowRun, stdout: TextIO) -> None:
 
     _line(stdout, "run_id", run.run_id)
     _line(stdout, "state", run.state.value)
+    _line(stdout, "version", run.version)
+    if run.approval is not None and run.approval.draft_pr:
+        _line(stdout, "publication_mode", "Draft PR; external verification pending; no merge/release authorization")
+        _line(stdout, "deferred_checks", len(run.approval.deferred_verification))
+    for task in run.verification_plan:
+        _line(stdout, "verification", f"{task.key} | {task.status} | {task.node_key}/{task.recipe_key} | {task.need.description} | {task.need.acceptance}")
+        _line(stdout, "recipe_digest", task.recipe_digest)
     if run.blocked_reason:
         _line(stdout, "blocked_reason", run.blocked_reason)
     if run.worktree_path:
@@ -465,7 +487,21 @@ def _execute(
             _show_run(run, stdout)
         return code
 
-    if args.command == "show":
+    if args.command == "verification-nodes":
+        for node in orchestrator.verification_nodes():
+            _line(stdout, "node", json.dumps(node, ensure_ascii=False))
+        return 0
+    if args.command == "probe-node":
+        _line(stdout, "node", json.dumps(orchestrator.probe_verification_node(args.node_key)))
+        return 0
+    if args.command == "plan-verification":
+        run = orchestrator.replan_verification(args.run_id, expected_version=args.version)
+    elif args.command == "verify":
+        if args.failed and not args.manual_evidence:
+            raise ValueError("--failed requires --manual-evidence")
+        run = orchestrator.verify(args.run_id, args.task, args.actor, expected_version=args.version,
+            manual_evidence=args.manual_evidence, passed=not args.failed, expected_recipe_digest=args.recipe_digest)
+    elif args.command == "show":
         run = orchestrator.show(args.run_id)
     elif args.command == "resume":
         run = orchestrator.resume(args.run_id)

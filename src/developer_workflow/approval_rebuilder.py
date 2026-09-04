@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from . import pr_handoff
+
 import hashlib
 import json
 from dataclasses import asdict, dataclass
@@ -9,7 +11,7 @@ from typing import Protocol
 
 from src.contracts import DefectRecord, RequirementRecord, WikiPageSnapshot
 
-from .approval import validate_for_approval
+from .approval import collect_defect_risks, validate_for_approval
 from .command_utils import display_argv, parse_command_argv
 from .contracts import (
     ApprovalPackage,
@@ -21,6 +23,7 @@ from .contracts import (
 from .group_evidence import GroupEvidenceError, assert_group_snapshots_equal
 from .test_evidence import (
     FinalTestEvidenceError,
+    defect_reproduction_argv,
     select_defect_final_tests,
     select_group_final_tests,
     select_requirement_final_tests,
@@ -64,6 +67,10 @@ class WorkflowApprovalRebuilder:
     repository: ApprovalSnapshotRepository
 
     def rebuild(self, run: WorkflowRun) -> ApprovalPackage:
+        try:
+            pr_handoff.assert_bound(run)
+        except ValueError as error:
+            raise ApprovalRebuildError("external verification evidence is incomplete or stale") from error
         if run.repository_group is not None:
             return self._rebuild_group(run)
         current = run.approval
@@ -169,9 +176,10 @@ class WorkflowApprovalRebuilder:
                     mapping,
                     reproduction_command=reproduction_command,
                     reproduction_argv=self._defect_reproduction_argv(run),
+                    changed_files=snapshot.changed_files,
                 ),
                 "review": review_findings,
-                "risks": (*risks, f"risk_level={run.risk_level}"),
+                "risks": collect_defect_risks(run),
                 "root_cause_evidence": run.root_cause_evidence,
                 "behavior_before": run.behavior_before,
                 "behavior_after": run.behavior_after,
@@ -241,7 +249,8 @@ class WorkflowApprovalRebuilder:
         try:
             assert_group_snapshots_equal(run.repository_evidence, snapshots, group)
             select_group_final_tests(
-                run.repository_evidence, run.integration_test_results, group
+                run.repository_evidence, run.integration_test_results, group,
+                reproduction_evidence=(run.root_cause_evidence if run.type is WorkflowType.DEFECT else ()),
             )
         except (GroupEvidenceError, FinalTestEvidenceError):
             raise ApprovalRebuildError(
@@ -319,6 +328,7 @@ class WorkflowApprovalRebuilder:
                 "work_item_title": source.title,
                 "work_item_status": source.status.name or source.status.id,
                 "source_versions": {"defect_sha256": _digest(source)},
+                "risks": collect_defect_risks(run),
                 "evidence": tuple(
                     f"{item.repository_file.repository_key}:{item.file_path}:"
                     f"{item.location} - {item.mechanism}"
@@ -358,29 +368,19 @@ class WorkflowApprovalRebuilder:
 
     @staticmethod
     def _defect_reproduction_command(run: WorkflowRun) -> str:
-        invocations = {
-            (item.reproduction_command, item.test_selector)
-            for item in run.root_cause_evidence
-        }
-        if len(invocations) != 1:
-            raise ApprovalRebuildError("defect reproduction evidence is inconsistent")
-        command, selector = next(iter(invocations))
-        try:
-            return display_argv((*parse_command_argv(command), selector))
-        except (ValueError, OSError):
-            raise ApprovalRebuildError("defect reproduction evidence is invalid") from None
+        return display_argv(WorkflowApprovalRebuilder._defect_reproduction_argv(run))
 
     @staticmethod
     def _defect_reproduction_argv(run: WorkflowRun) -> tuple[str, ...]:
-        invocations = {
-            (item.reproduction_command, item.test_selector)
-            for item in run.root_cause_evidence
-        }
-        if len(invocations) != 1:
-            raise ApprovalRebuildError("defect reproduction evidence is inconsistent")
-        command, selector = next(iter(invocations))
+        mapping = run.repository
+        if run.repository_group is not None and run.root_cause_evidence:
+            owner = run.root_cause_evidence[0].reproduction_file
+            mapping = next((item for item in run.repository_group.repositories
+                            if owner is not None and item.key == owner.repository_key), None)
+        if mapping is None:
+            raise ApprovalRebuildError("defect reproduction repository is invalid")
         try:
-            return (*parse_command_argv(command), selector)
+            return defect_reproduction_argv(run.root_cause_evidence, mapping)
         except ValueError:
             raise ApprovalRebuildError("defect reproduction evidence is invalid") from None
 

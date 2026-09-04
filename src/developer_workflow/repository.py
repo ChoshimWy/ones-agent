@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -59,6 +60,10 @@ class RepositoryBoundaryError(RepositoryError):
 
 class RepositoryIdentityError(RepositoryError):
     """A mirror or worktree does not have the expected Git identity."""
+
+
+class RemoteBaseChangedError(RepositoryIdentityError):
+    """The target branch moved since this task's baseline was recorded."""
 
 
 class RepositoryCommandError(RepositoryError):
@@ -235,6 +240,33 @@ def validate_git_identity_environment(
     return identity_values
 
 
+def _windows_ssh_command() -> str | None:
+    """Use native profile trust/key files, never ambient HOME or ssh config."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    profile = ctypes.create_unicode_buffer(32768)
+    # CSIDL_PROFILE: resolve the signed-in user's profile independently of the
+    # environment handed to a task. No secret file contents enter this process.
+    if ctypes.windll.shell32.SHGetFolderPathW(None, 0x28, None, 0, profile) != 0:
+        return None
+    directory = Path(profile.value) / ".ssh"
+    if not directory.is_dir() or _is_link_or_reparse(directory):
+        return None
+    known_hosts = directory / "known_hosts"
+    if not known_hosts.is_file() or _is_link_or_reparse(known_hosts):
+        return None
+    args = ["ssh", "-F", "none", "-oBatchMode=yes", "-oIdentitiesOnly=yes",
+            "-oStrictHostKeyChecking=yes", "-oUpdateHostKeys=no",
+            "-oUserKnownHostsFile=" + known_hosts.as_posix()]
+    for name in ("id_ed25519", "id_ecdsa", "id_rsa"):
+        key = directory / name
+        if key.is_file() and not _is_link_or_reparse(key):
+            args.extend(("-i", key.as_posix()))
+    return shlex.join(args)
+
+
 def _isolated_git_environment(
     credential_environment: Mapping[str, str] | None = None,
     *,
@@ -284,6 +316,31 @@ def _isolated_git_environment(
         }
     )
     environment.update(supplied)
+    # Retain config isolation: never inherit arbitrary credential helper shell
+    # commands from user/system/repository configuration. Git for Windows ships
+    # GCM, whose OS vault is available even with the controlled HOME. Explicit
+    # askpass credentials take precedence over that narrow native fallback.
+    environment.update({
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_1": "credential.helper",
+        "GIT_CONFIG_VALUE_1": "",
+        "GIT_CONFIG_KEY_2": "credential.interactive",
+        "GIT_CONFIG_VALUE_2": "false",
+    })
+    if os.name == "nt" and "GIT_ASKPASS" not in supplied:
+        environment.update({
+            "GIT_CONFIG_COUNT": "4",
+            "GIT_CONFIG_KEY_3": "credential.helper",
+            "GIT_CONFIG_VALUE_3": "manager",
+        })
+    if "GIT_SSH" in supplied and "GIT_SSH_COMMAND" not in supplied:
+        # Git gives SSH_COMMAND precedence; the built-in default must not hide
+        # an explicitly configured SSH executable.
+        environment.pop("GIT_SSH_COMMAND", None)
+    if os.name == "nt" and not any(name in supplied for name in ("GIT_SSH", "GIT_SSH_COMMAND", "SSH_AUTH_SOCK", "SSH_ASKPASS")):
+        native_ssh = _windows_ssh_command()
+        if native_ssh:
+            environment["GIT_SSH_COMMAND"] = native_ssh
     return environment
 
 
@@ -1536,7 +1593,7 @@ class WorktreeRepository:
         self, prepared: PreparedWorktree, mapping: RepositoryMapping
     ) -> None:
         if self.remote_base_oid(prepared, mapping) != prepared.base_commit:
-            raise RepositoryIdentityError("remote base branch changed after approval")
+            raise RemoteBaseChangedError("remote base branch changed after approval")
 
     def _publication_context(
         self, run: WorkflowRun

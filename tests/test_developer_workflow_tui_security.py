@@ -6,7 +6,7 @@ import io
 import pytest
 from rich.console import Console
 from rich.text import Text
-from textual.widgets import Button, Input
+from textual.widgets import Button, Input, Select, SelectionList
 
 from src.developer_workflow.contracts import WorkflowState, WorkflowType
 from src.developer_workflow.tui.app import (
@@ -19,7 +19,9 @@ from src.developer_workflow.tui.controller import (
 )
 from src.developer_workflow.tui.models import (
     DangerousActionRequest,
+    DefectFilterOptions,
     DefectChoice,
+    FilterChoice,
     MappingCandidateView,
     PublicationView,
     RepositoryCandidateView,
@@ -178,6 +180,16 @@ class _SecurityController:
             ),
         )
 
+    @property
+    def default_defect_project(self) -> str:
+        return "P"
+
+    def load_defect_filter_options(self, project: str) -> DefectFilterOptions:
+        assert project == "P"
+        return DefectFilterOptions(iterations=(FilterChoice("I", "Iteration"),),
+            assignees=(FilterChoice("A", "Assignee"),),
+            statuses=(FilterChoice("todo-id", "Todo"), FilterChoice("fixing-id", "Fixing")))
+
     def start_defect(self, session_id: str, candidate_id: str) -> RunDetail:
         assert session_id == self.fake_ones_snapshot_token
         assert candidate_id == "d" * 32
@@ -333,13 +345,10 @@ async def test_defect_wizard_all_stages_and_error_notice_are_secret_free() -> No
         await pilot.press("n")
         await pilot.click("#workflow-defect")
         _audit(app, "defect-filter")
-        for widget_id, value in (
-            ("project", "P"),
-            ("iteration", "I"),
-            ("assignee", "A"),
-            ("status-ids", "todo-id,fixing-id"),
-        ):
-            app.screen.query_one(f"#{widget_id}", Input).value = value
+        await pilot.pause()
+        app.screen.query_one("#iteration", Select).value = "I"
+        app.screen.query_one("#assignee", Select).value = "A"
+        app.screen.query_one("#status-ids", SelectionList).select_all()
         app.screen.query_one("#query-defects", Button).focus()
         await pilot.press("enter")
         _audit(app, "defect-candidate")
@@ -354,8 +363,9 @@ async def test_defect_wizard_all_stages_and_error_notice_are_secret_free() -> No
     async with failed.run_test(size=(120, 32)) as pilot:
         await pilot.press("n")
         await pilot.click("#workflow-defect")
-        for widget_id in ("project", "iteration", "assignee"):
-            failed.screen.query_one(f"#{widget_id}", Input).value = "safe-id"
+        await pilot.pause()
+        failed.screen.query_one("#iteration", Select).value = "I"
+        failed.screen.query_one("#assignee", Select).value = "A"
         failed.screen.query_one("#query-defects", Button).focus()
         await pilot.press("enter")
         _audit(failed, "defect-error-notice")

@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Sequence
 
 import pytest
-from textual.widgets import Button, Input
+from textual.widgets import Button, Input, Select, SelectionList
 
 from src.contracts import (
     ProjectRef,
@@ -58,7 +58,11 @@ from src.developer_workflow.requirement_flow import (
 from src.developer_workflow.state_store import FileRunStore
 from src.developer_workflow.tui.app import DeveloperWorkflowTuiApp, TuiTaskMessage
 from src.developer_workflow.tui.controller import TuiController
-from src.developer_workflow.tui.models import RunActivity
+from src.developer_workflow.tui.models import (
+    DefectFilterOptions,
+    FilterChoice,
+    RunActivity,
+)
 from src.developer_workflow.tui.run_index import RunIndex
 
 
@@ -844,6 +848,13 @@ def _group_ui_runtime(tmp_path: Path):
     )
 
     class Gateway:
+        async def list_role_members(self, project_id):
+            return [{"members": ["operator"]}]
+
+        async def list_team_members(self, *, uuids=None):
+            assert uuids == ["operator"]
+            return [{"uuid": "operator", "name": "操作员"}]
+
         def get_normalized_requirement_sync(self, issue_id: str):
             assert issue_id == requirement.requirement_id
             return requirement
@@ -1066,7 +1077,7 @@ async def test_real_group_ui_approval_is_first_remote_effect_and_publishes_once(
                 app._dashboard._runs,
                 app._dashboard.query_one("#notice").render(),
             )
-            app.screen.query_one("#actor", Input).value = "operator"
+            app.screen.query_one("#actor", Select).value = "operator"
             await pilot.click("#confirm-approve")
             await asyncio.wait_for(approval_finished.wait(), 180)
             await pilot.pause()
@@ -1132,7 +1143,7 @@ async def test_real_group_ui_version_drift_has_zero_remote_effects(
                 waiting.summary.version,
             )
             assert drifted.version == waiting.summary.version + 1
-            app.screen.query_one("#actor", Input).value = "operator"
+            app.screen.query_one("#actor", Select).value = "operator"
             await pilot.click("#confirm-approve")
             await pilot.pause(0.1)
     finally:
@@ -1179,19 +1190,33 @@ async def test_real_candidate_query_creates_no_run_or_worktree(
         requirement_flow=None,  # type: ignore[arg-type]
         defect_flow=None,  # type: ignore[arg-type]
         publisher=None,  # type: ignore[arg-type]
-        config=None,  # type: ignore[arg-type]
+        config=SimpleNamespace(normalized_groups=lambda: (
+            SimpleNamespace(project_id="P"),
+        )),  # type: ignore[arg-type]
         defect_candidates=Candidates(),  # type: ignore[arg-type]
     )
     controller = TuiController(orchestrator, RunIndex(store))
+    controller.load_defect_filter_options = lambda project: DefectFilterOptions(
+        iterations=(FilterChoice("I", "Iteration"),),
+        assignees=(FilterChoice("A", "Assignee", selected=True),),
+        statuses=(
+            FilterChoice("todo-id", "Todo", selected=True),
+            FilterChoice("fixing-id", "Fixing", selected=True),
+        ),
+    )  # type: ignore[method-assign]
     app = DeveloperWorkflowTuiApp(controller, 3, poll_interval=10)
     try:
         async with app.run_test(size=(120, 32)) as pilot:
             await pilot.press("n")
             await pilot.click("#workflow-defect")
-            app.screen.query_one("#project", Input).value = "P"
-            app.screen.query_one("#iteration", Input).value = "I"
-            app.screen.query_one("#assignee", Input).value = "A"
-            app.screen.query_one("#status-ids", Input).value = "todo-id,fixing-id"
+            await pilot.pause()
+            assert app.screen.query_one("#project", Input).value == "P"
+            assert app.screen.query_one("#iteration", Select).value == "I"
+            assert app.screen.query_one("#assignee", Select).value == "A"
+            assert app.screen.query_one("#status-ids", SelectionList).selected == [
+                "todo-id",
+                "fixing-id",
+            ]
             app.screen.query_one("#query-defects", Button).focus()
             await pilot.press("enter")
             await pilot.pause()

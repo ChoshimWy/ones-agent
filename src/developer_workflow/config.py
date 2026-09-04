@@ -13,6 +13,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictInt,
+    StrictBool,
     ValidationError,
     field_validator,
     model_validator,
@@ -25,6 +26,7 @@ from .contracts import (
     WorkflowModel,
     validate_git_ref_name,
 )
+from .verification_models import VerificationNode
 
 
 class ConfigSecretError(ValueError):
@@ -82,6 +84,7 @@ def _profile_source_validation_error(model: type[WorkflowModel]) -> ValidationEr
 
 class PublishingConfig(WorkflowModel):
     provider: PublishingProvider
+    defer_external_verification_to_pr: StrictBool = True
     default_target_branch: str = "main"
     commit_template: str = "{summary}"
     pr_title_template: str = "{summary}"
@@ -136,10 +139,24 @@ class DeveloperWorkflowConfig(WorkflowModel):
         SandboxPermissionProfileSource.MANAGED
     )
     max_codex_attempts: int = Field(ge=1, le=10)
+    max_baseline_refreshes: StrictInt = Field(default=3, ge=0, le=5)
     tui_max_concurrency: StrictInt = Field(default=3, ge=1, le=8)
     repositories: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
     repository_groups: tuple[RepositoryGroupMapping, ...] = Field(default_factory=tuple)
     publishing: PublishingConfig
+    verification_nodes: tuple[VerificationNode, ...] = Field(default=(), max_length=64)
+
+    @field_validator("verification_nodes")
+    @classmethod
+    def unique_nodes(cls, nodes: tuple[VerificationNode, ...]) -> tuple[VerificationNode, ...]:
+        if len({node.key for node in nodes}) != len(nodes):
+            raise ValueError("duplicate verification node")
+        for node in nodes:
+            if node.enabled and node.transport == "ssh" and (not node.ssh_alias or not node.worker_argv):
+                raise ValueError("SSH verification node needs alias and worker argv")
+            if len({recipe.key for recipe in node.recipes}) != len(node.recipes):
+                raise ValueError("duplicate verification recipe")
+        return nodes
 
     def __init__(self, **data: Any) -> None:
         sanitize_error = False

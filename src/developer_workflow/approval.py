@@ -20,10 +20,12 @@ from .contracts import (
     RepositoryGroupMapping,
     RepositoryMapping,
     RootCauseEvidence,
+    WorkflowRun,
     utc_now,
     validate_git_ref_name,
 )
 from .command_utils import parse_command_argv
+from .test_evidence import defect_reproduction_argv, defect_verification_prefix
 
 
 _FINGERPRINT_PATTERN = re.compile(r"[0-9a-f]{64}")
@@ -40,6 +42,17 @@ _SAFE_FAILURE_MESSAGES = frozenset(
     }
 )
 _T = TypeVar("_T")
+
+
+def collect_defect_risks(run: WorkflowRun) -> tuple[str, ...]:
+    """Keep reviewable limitations identical at preview and publication time."""
+    results = (*run.codex_results, *((run.review,) if run.review is not None else ()))
+    return tuple(dict.fromkeys((
+        *(risk for result in results for risk in result.risks),
+        *(f"Implementation follow-up: {note}"
+          for result in run.codex_results[2:] for note in result.unresolved_items),
+        f"risk_level={run.risk_level}",
+    )))
 
 
 class ApprovalError(RuntimeError):
@@ -266,6 +279,13 @@ def _canonical_bytes(package: ApprovalPackage) -> bytes:
 
     def encode() -> bytes:
         payload = normalized.model_dump(mode="json", exclude=_EXCLUDED_FIELDS)
+        # Preserve fingerprints of legacy approvals that did not need node verification.
+        if not payload.get("verification_records"):
+            payload.pop("verification_records", None)
+        if not payload.get("deferred_verification"):
+            payload.pop("deferred_verification", None)
+        if not payload.get("baseline_evidence_missing"):
+            payload.pop("baseline_evidence_missing", None)
         _validate_json_tree(payload)
         canonical = json.dumps(
             payload,
@@ -336,8 +356,8 @@ def _validate_group_package(
             or not package.behavior_after.strip()
             or not package.impact_scope
             or package.risk_level not in {"low", "medium", "high"}
-            or len(package.pre_fix_tests) != 1
-            or package.pre_fix_tests[0].outcome.value != "test_failed"
+            or (not package.baseline_evidence_missing and (len(package.pre_fix_tests) != 1
+                or package.pre_fix_tests[0].outcome.value != "test_failed"))
             or re.fullmatch(r"[0-9a-f]{64}", package.reproduction_test_sha256)
             is None
         ):
@@ -355,13 +375,16 @@ def _validate_group_package(
         expected_argv = tuple(parse_command_argv(command) for command in configured)
         actual = item.tests
         if defect and reproduction_binding is not None and key == reproduction_binding[0]:
-            _, base_command, selector = reproduction_binding
-            if base_command not in item.mapping.test_commands:
+            focused = defect_reproduction_argv(package.root_cause_evidence, item.mapping)
+            if not package.baseline_evidence_missing and (package.pre_fix_tests[0].argv != focused
+                or package.pre_fix_tests[0].exit_code == 0):
                 raise _ApprovalFailure("Approval package is not ready for approval")
             expected_argv = (
-                (*parse_command_argv(base_command), selector),
+                *defect_verification_prefix(focused, item.changed_files),
                 *expected_argv,
             )
+        if defect and item.changed_files and not expected_argv:
+            raise _ApprovalFailure("Approval package is not ready for approval")
         if (
             len(actual) != len(expected_argv)
             or tuple(result.argv for result in actual) != expected_argv
@@ -396,6 +419,18 @@ def validate_for_approval(package: ApprovalPackage) -> ApprovalPackage:
     normalized = _normalized_package(package)
 
     def validate() -> ApprovalPackage:
+        if any(record.status != "passed" for record in normalized.verification_records):
+            raise _ApprovalFailure("Approval package is not ready for approval")
+        deferred = normalized.deferred_verification
+        if normalized.baseline_evidence_missing:
+            from .verification_models import MISSING_BASELINE_DESCRIPTION
+            if (normalized.pre_fix_tests or not normalized.root_cause_evidence
+                    or not any(task.need.description == MISSING_BASELINE_DESCRIPTION for task in deferred)):
+                raise _ApprovalFailure("Missing baseline requires an explicit Draft PR verification obligation")
+        if (any(task.status not in {"manual", "ready", "waiting_environment"} for task in deferred)
+                or len({task.key for task in deferred}) != len(deferred)
+                or {task.key for task in deferred} & {r.task_key for r in normalized.verification_records}):
+            raise _ApprovalFailure("Deferred verification must contain only pending checks")
         common_required = (
             normalized.work_item_id,
             normalized.work_item_title,
@@ -460,12 +495,11 @@ def validate_for_approval(package: ApprovalPackage) -> ApprovalPackage:
                 or normalized.risk_level not in {"low", "medium", "high"}
                 or len(reproduction_bindings) != 1
                 or normalized.repository is None
-                or base_command not in normalized.repository.test_commands
                 or not normalized.reproduction_command.strip()
                 or re.fullmatch(r"[0-9a-f]{64}", normalized.reproduction_test_sha256) is None
-                or len(normalized.pre_fix_tests) != 1
-                or normalized.pre_fix_tests[0].exit_code == 0
-                or normalized.pre_fix_tests[0].outcome.value != "test_failed"
+                or (not normalized.baseline_evidence_missing and (len(normalized.pre_fix_tests) != 1
+                    or normalized.pre_fix_tests[0].exit_code == 0
+                    or normalized.pre_fix_tests[0].outcome.value != "test_failed"))
                 or not normalized.tests
                 or normalized.tests[0].exit_code != 0
                 or any(item.outcome.value != "passed" for item in normalized.tests)
@@ -477,9 +511,9 @@ def validate_for_approval(package: ApprovalPackage) -> ApprovalPackage:
                 raise _ApprovalFailure("Approval package is not ready for approval")
 
             assert normalized.repository is not None
-            focused_argv = (*parse_command_argv(base_command), selector)
+            focused_argv = defect_reproduction_argv(normalized.root_cause_evidence, normalized.repository)
             expected_argv = (
-                focused_argv,
+                *defect_verification_prefix(focused_argv, normalized.changed_files),
                 *(parse_command_argv(command) for command in normalized.repository.lint_commands),
                 *(parse_command_argv(command) for command in normalized.repository.build_commands),
                 *(parse_command_argv(command) for command in normalized.repository.test_commands),
@@ -487,7 +521,7 @@ def validate_for_approval(package: ApprovalPackage) -> ApprovalPackage:
             if (
                 len(expected_argv) != len(set(expected_argv))
                 or any(not item.argv for item in (*normalized.pre_fix_tests, *normalized.tests))
-                or normalized.pre_fix_tests[0].argv != expected_argv[0]
+                or (not normalized.baseline_evidence_missing and normalized.pre_fix_tests[0].argv != expected_argv[0])
                 or tuple(item.argv for item in normalized.tests) != expected_argv
             ):
                 raise _ApprovalFailure("Approval package is not ready for approval")
@@ -602,6 +636,7 @@ __all__ = [
     "ApprovalInvalidatedError",
     "ApprovalValidationError",
     "approval_fingerprint",
+    "collect_defect_risks",
     "issue_approval",
     "validate_for_approval",
     "verify_approval",

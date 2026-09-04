@@ -51,10 +51,14 @@ class PublicationRepository(Protocol):
 
 
 class PullRequestClient(Protocol):
-    def find(self, *, repo_url: str, head: str, base: str, marker: str) -> str | None: ...
+    def find(self, *, repo_url: str, head: str, base: str, marker: str,
+             draft: bool = False, expected_sha: str = "") -> str | None: ...
     def create(
-        self, *, repo_url: str, head: str, base: str, title: str, body: str, marker: str
+        self, *, repo_url: str, head: str, base: str, title: str, body: str, marker: str,
+        draft: bool = False, expected_sha: str = ""
     ) -> str: ...
+
+    def set_verification_pending(self, *, repo_url: str, sha: str, branch: str) -> None: ...
 
 
 class Commenter(Protocol):
@@ -114,7 +118,7 @@ class Publisher:
         if run.repository_group is not None:
             return self._publish_group_locked(run)
 
-        if run.state is WorkflowState.COMPLETED:
+        if run.state in {WorkflowState.COMPLETED, WorkflowState.WAITING_PR_VERIFICATION}:
             return run
         if run.state is WorkflowState.PARTIAL_SUCCESS:
             return self._retry_comment_locked(run)
@@ -132,7 +136,7 @@ class Publisher:
         return self._ensure_comment(run)
 
     def _publish_group_locked(self, run: WorkflowRun) -> WorkflowRun:
-        if run.state is WorkflowState.COMPLETED:
+        if run.state in {WorkflowState.COMPLETED, WorkflowState.WAITING_PR_VERIFICATION}:
             return run
         recovering = run.group_publication is not None
         if run.state is WorkflowState.WAITING_APPROVAL:
@@ -248,6 +252,7 @@ class Publisher:
                     current_url = self.pr_client.find(
                         repo_url=item.repo_url, head=item.pr_head,
                         base=item.pr_base, marker=item.pr_marker,
+                        **({"draft": True, "expected_sha": item.commit_hash} if item.draft_pr else {}),
                     )
                 except Exception:
                     raise PublicationBlocked(
@@ -264,7 +269,7 @@ class Publisher:
     def retry_comment(self, run: WorkflowRun) -> WorkflowRun:
         with self.store.operation_lock(run.run_id, "publish"):
             current = self.store.load(run.run_id)
-            if current.state is WorkflowState.COMPLETED:
+            if current.state in {WorkflowState.COMPLETED, WorkflowState.WAITING_PR_VERIFICATION}:
                 return current
             return self._retry_comment_locked(current)
 
@@ -335,6 +340,7 @@ class Publisher:
             if not item.changed_files:
                 continue
             provisional = RepositoryPublicationResult(
+                draft_pr=current.draft_pr,
                 repository_key=key,
                 approved_fingerprint=approval.fingerprint,
                 repo_url=item.mapping.repo_url,
@@ -464,12 +470,18 @@ class Publisher:
             "repo_url": item.repo_url, "head": item.pr_head,
             "base": item.pr_base, "marker": item.pr_marker,
         }
+        if item.draft_pr:
+            kwargs.update(draft=True, expected_sha=item.commit_hash)
         try:
+            if item.draft_pr:
+                if self.repository.remote_branch_oid(projection) != item.commit_hash:
+                    raise PublicationBlocked("Draft PR branch no longer matches the approved commit")
+                self.pr_client.set_verification_pending(repo_url=item.repo_url, sha=item.commit_hash, branch=item.pr_head)
             pr_url = self.pr_client.find(**kwargs)
             if not pr_url:
                 try:
                     pr_url = self.pr_client.create(
-                        **kwargs, title=item.pr_title, body=item.pr_body
+                        **kwargs, title=item.pr_title, body=self._publication_body(item)
                     )
                 except Exception:
                     pr_url = self.pr_client.find(**kwargs)
@@ -510,7 +522,7 @@ class Publisher:
         assert run.group_publication is not None
         if run.group_publication.comment_id:
             return self.store.transition(
-                run.run_id, run.version, WorkflowState.COMPLETED,
+                run.run_id, run.version, self._delivered_state(run),
                 "repository group publication completed",
             )
         try:
@@ -525,7 +537,7 @@ class Publisher:
         )
         run = self.store.save(run.validated_update(group_publication=updated), run.version)
         return self.store.transition(
-            run.run_id, run.version, WorkflowState.COMPLETED,
+            run.run_id, run.version, self._delivered_state(run),
             "repository group publication completed",
         )
 
@@ -540,6 +552,7 @@ class Publisher:
         except Exception:
             raise PublicationBlocked("Approved repository snapshot could not be prepared") from None
         publication = PublicationResult(
+            draft_pr=current.draft_pr,
             approved_fingerprint=approval.fingerprint,
             repo_url=current.repo_url,
             provider=self.provider,
@@ -605,14 +618,21 @@ class Publisher:
             "base": run.publication.pr_base,
             "marker": run.publication.pr_marker,
         }
+        if run.publication.draft_pr:
+            kwargs.update(draft=True, expected_sha=run.publication.commit_hash)
         try:
+            if run.publication.draft_pr:
+                if self.repository.remote_branch_oid(run) != run.publication.commit_hash:
+                    raise PublicationBlocked("Draft PR branch no longer matches the approved commit")
+                self.pr_client.set_verification_pending(repo_url=run.publication.repo_url,
+                    sha=run.publication.commit_hash, branch=run.publication.pr_head)
             pr_url = self.pr_client.find(**kwargs)
             if not pr_url:
                 try:
                     pr_url = self.pr_client.create(
                         **kwargs,
                         title=run.publication.pr_title,
-                        body=run.publication.pr_body,
+                        body=self._publication_body(run.publication),
                     )
                 except Exception:
                     pr_url = self.pr_client.find(**kwargs)
@@ -631,7 +651,7 @@ class Publisher:
     def _ensure_comment(self, run: WorkflowRun) -> WorkflowRun:
         if run.publication.comment_id:
             return self.store.transition(
-                run.run_id, run.version, WorkflowState.COMPLETED, "publication completed"
+                run.run_id, run.version, self._delivered_state(run), "PR delivery completed"
             )
         try:
             locked = getattr(self.commenter, "ensure_comment_locked", None)
@@ -652,8 +672,19 @@ class Publisher:
         updated = run.publication.validated_update(comment_id=comment_id.strip(), error="")
         run = self.store.save(run.validated_update(publication=updated), run.version)
         return self.store.transition(
-            run.run_id, run.version, WorkflowState.COMPLETED, "publication completed"
+            run.run_id, run.version, self._delivered_state(run), "PR delivery completed"
         )
+
+    @staticmethod
+    def _publication_body(publication: PublicationResult) -> str:
+        if not publication.draft_pr:
+            return publication.pr_body
+        return publication.pr_body + f"\n\n实际待验证提交 SHA：`{publication.commit_hash}`\n"
+
+    @staticmethod
+    def _delivered_state(run: WorkflowRun) -> WorkflowState:
+        return (WorkflowState.WAITING_PR_VERIFICATION if run.approval and run.approval.draft_pr
+                else WorkflowState.COMPLETED)
 
 
 __all__ = ["PublicationBlocked", "PublicationError", "Publisher"]

@@ -38,6 +38,7 @@ def test_workflow_state_contains_complete_persisted_vocabulary() -> None:
         "TESTING",
         "AI_REVIEW",
         "WAITING_APPROVAL",
+        "WAITING_PR_VERIFICATION",
         "PUBLISHING",
         "COMPLETED",
         "BLOCKED",
@@ -335,6 +336,20 @@ def test_revision_blocks_run_sets_resume_point_and_clears_approval() -> None:
         revised.for_revision("  ")
 
 
+def test_human_revision_resets_only_review_repair_budget_window() -> None:
+    run = WorkflowRun.new_defect("project", "iteration", "user", "DEF-1").validated_update(
+        state=WorkflowState.BLOCKED,
+        resume_state=WorkflowState.AI_REVIEW,
+        review_repair_attempts=3,
+        review_repair_snapshot_sha256="a" * 64,
+    )
+    revised = run.for_revision("Use the new compatibility approach")
+    assert revised.review_repair_budget_start == revised.review_repair_attempts == 3
+    assert revised.review_repair_snapshot_sha256 == run.review_repair_snapshot_sha256
+    assert revised.revisions[-1].source == "human"
+    assert revised.resume_state is WorkflowState.IMPLEMENTING
+
+
 def test_approval_is_only_recorded_at_waiting_approval() -> None:
     package = ApprovalPackage(work_item_id="REQ-1", fingerprint="fingerprint")
     created = WorkflowRun.new("requirement", "REQ-1").model_copy(
@@ -547,6 +562,14 @@ def test_codex_acceptance_coverage_is_strict_and_old_results_keep_safe_defaults(
     assert restored.acceptance_coverage == (coverage,)
     assert restored.unrelated_changes_checked is False
     assert CodexResult.model_validate({"summary": "legacy"}).acceptance_coverage == ()
+    legacy_review = CodexResult.model_validate({
+        "summary": "legacy review",
+        "review_requires_repair": False,
+        "unresolved_items": ["Run the platform package matrix."],
+    })
+    assert legacy_review.review_requires_repair is False
+    assert "review_requires_repair" not in legacy_review.model_dump(mode="json")
+    assert legacy_review.review_external_validation == ()
     with pytest.raises(ValidationError):
         AcceptanceCoverage(
             criterion_id="1",

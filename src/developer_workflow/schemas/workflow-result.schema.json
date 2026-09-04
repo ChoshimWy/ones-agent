@@ -5,12 +5,15 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "verification_needs",
     "summary",
     "changed_files",
     "repository_changes",
     "commands",
     "evidence",
     "review_findings",
+    "review_repair_scope",
+    "review_external_validation",
     "risks",
     "unresolved_items",
     "acceptance_coverage",
@@ -57,6 +60,31 @@
     },
     "evidence": {"$ref": "#/$defs/stringList"},
     "review_findings": {"$ref": "#/$defs/stringList"},
+    "review_repair_scope": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["repository_key", "path"],
+        "properties": {
+          "repository_key": {"type": "string"},
+          "path": {"$ref": "#/$defs/repositoryPath"}
+        }
+      }
+    },
+    "review_external_validation": {"$ref": "#/$defs/stringList"},
+    "verification_needs": {
+      "type": "array", "maxItems": 32,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["description", "capabilities", "acceptance"],
+        "properties": {
+          "description": {"type": "string", "minLength": 1, "maxLength": 4096},
+          "capabilities": {"type": "array", "maxItems": 32, "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_.:-]{0,95}$"}},
+          "acceptance": {"type": "string", "maxLength": 4096}
+        }
+      }
+    },
     "risks": {"$ref": "#/$defs/stringList"},
     "unresolved_items": {"$ref": "#/$defs/stringList"},
     "acceptance_coverage": {

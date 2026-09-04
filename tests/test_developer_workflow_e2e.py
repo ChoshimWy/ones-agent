@@ -250,9 +250,10 @@ class FakeRequirementCodex:
 
 
 class FakeDefectCodex:
-    def __init__(self) -> None:
+    def __init__(self, fail_first_repair: bool = False) -> None:
         self.stages: list[str] = []
         self.command = ""
+        self.fail_first_repair = fail_first_repair
 
     def preflight(self, **kwargs):
         return CodexResult(summary="ONES defect source contains concrete reproduction clues.")
@@ -288,8 +289,10 @@ class FakeDefectCodex:
                 changed_files=("tests/test_report.py",), unrelated_changes_checked=True, **common,
             )
         if stage == "implementation":
+            incomplete = self.fail_first_repair and self.stages.count("implementation") == 1
             (prepared.path / "src" / "report.py").write_text(
-                "def export(rows):\n    return [] if not rows else rows[0]\n", encoding="utf-8"
+                "def export(rows):\n    return None if not rows else rows[0]\n" if incomplete
+                else "def export(rows):\n    return [] if not rows else rows[0]\n", encoding="utf-8"
             )
             return CodexResult(
                 summary="Guarded empty rows.", changed_files=("src/report.py", "tests/test_report.py"),
@@ -297,6 +300,8 @@ class FakeDefectCodex:
                 **common,
             )
         assert stage == "review"
+        assert "at least three independent" in kwargs["prompt"]
+        assert "read-only review sub-agents" in kwargs["prompt"]
         return CodexResult(
             summary="Root cause, reproduction, repair and final tests agree.",
             changed_files=("src/report.py", "tests/test_report.py"),
@@ -398,10 +403,27 @@ def test_requirement_wiki_to_approved_publish_is_end_to_end(tmp_path: Path, bare
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("fail_first_repair", [False, True])
+@pytest.mark.parametrize("review_repair", [False, True])
 async def test_defect_snapshot_single_selection_evidence_and_publish_is_end_to_end(
-    tmp_path: Path, bare_remote: Path,
+    tmp_path: Path, bare_remote: Path, fail_first_repair: bool, review_repair: bool,
 ) -> None:
-    orchestrator, ones, pr, comment, _, remap, codex, runner, repository = _assembly(tmp_path, bare_remote, FakeDefectCodex())
+    orchestrator, ones, pr, comment, _, remap, codex, runner, repository = _assembly(tmp_path, bare_remote, FakeDefectCodex(fail_first_repair))
+    original_stage = codex.run_stage
+    def review_requests_correction(stage: str, **kwargs):
+        result = original_stage(stage, **kwargs)
+        if stage == "review" and review_repair and codex.stages.count("review") == 1:
+            return result.validated_update(
+                root_cause_evidence=tuple(item.validated_update(fix_steps=("Rephrased guard recommendation",)) for item in result.root_cause_evidence),
+                unresolved_items=("Preserve empty input behavior explicitly.",),
+            )
+        if stage == "implementation" and "review" in codex.stages:
+            assert "Preserve empty input behavior explicitly." in kwargs["prompt"]
+            (kwargs["prepared"].path / "src/report.py").write_text(
+                "def export(rows):\n    if not rows:\n        return []\n    return rows[0]\n", encoding="utf-8"
+            )
+        return result
+    codex.run_stage = review_requests_correction
     candidates = await orchestrator.defect_candidates.list_candidates("P", "I", "alice")
     assert len(candidates) == 1
     selected = candidates[0]
@@ -410,6 +432,9 @@ async def test_defect_snapshot_single_selection_evidence_and_publish_is_end_to_e
     assert waiting.state is WorkflowState.VALIDATING
     waiting = orchestrator.confirm_repository(waiting.run_id, "sample")
     assert waiting.state is WorkflowState.WAITING_APPROVAL, (waiting.blocked_reason, waiting.resume_state, codex.stages, runner.outputs)
+    assert codex.stages == ["root_cause", "reproduction", "implementation", *(["implementation"] if fail_first_repair else []), "review", *(["implementation", "review"] if review_repair else [])]
+    assert waiting.review_repair_attempts == int(review_repair)
+    assert all(item.outcome is CommandOutcome.PASSED for item in waiting.approval.tests)
     assert waiting.pre_fix_test_results[0].outcome is CommandOutcome.TEST_FAILED
     assert len(waiting.reproduction_test_sha256) == 64
     assert (repository.prepare_commit_calls, repository.commit_calls, repository.push_calls) == (0, 0, 0)
@@ -421,3 +446,76 @@ async def test_defect_snapshot_single_selection_evidence_and_publish_is_end_to_e
     assert (repository.prepare_commit_calls, repository.commit_calls, repository.push_calls) == (1, 1, 1)
     assert pr.creates == 1 and comment.calls == 1 and ones.status_updates == 0
     assert ones.comment_writes == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_legacy_block", [False, True])
+async def test_already_fixed_head_runs_real_tests_and_review_without_publication(
+    tmp_path: Path, bare_remote: Path, monkeypatch: pytest.MonkeyPatch,
+    resume_legacy_block: bool,
+) -> None:
+    # This fixture's upstream already contains the fix before the workflow starts.
+    source = tmp_path / "source"
+    (source / "src" / "report.py").write_text(
+        "def export(rows):\n    return [] if not rows else rows[0]\n", encoding="utf-8"
+    )
+    _git("add", "src/report.py", cwd=source)
+    _git("commit", "-m", "already fixed upstream", cwd=source)
+    _git("push", str(bare_remote), "main", cwd=source)
+    codex = FakeDefectCodex()
+    orchestrator, ones, pr, comment, _, remap, _, runner, repository = _assembly(
+        tmp_path, bare_remote, codex
+    )
+    original_stage = codex.run_stage
+
+    def verify_checkout(stage: str, **kwargs):
+        assert stage != "implementation", "do not fabricate a production change"
+        result = original_stage(stage, **kwargs)
+        evidence = tuple(item.validated_update(
+            mechanism="HEAD already guards empty rows before indexing.",
+            code_excerpt="return [] if not rows else rows[0]",
+        ) for item in result.root_cause_evidence)
+        result = result.validated_update(
+            root_cause_evidence=evidence,
+            behavior_before="Reported empty export crash is not reproducible at HEAD.",
+        )
+        if stage == "review":
+            current = orchestrator.store.load(kwargs["run_id"])
+            result = result.validated_update(
+                summary="The focused test verifies the existing guard at HEAD; no production repair.",
+                changed_files=("tests/test_report.py",), behavior_after=current.behavior_after,
+                review_external_validation=("The originally reported installed package remains unverified.",),
+            )
+        return result
+
+    codex.run_stage = verify_checkout
+    candidates = await orchestrator.defect_candidates.list_candidates("P", "I", "alice")
+    selected = candidates[0]
+    validating = orchestrator.start_defect("P", "I", "alice", selected.snapshot_token, selected.uuid)
+    if resume_legacy_block:
+        # Recreate the actual persisted checkpoint: baseline passed, two results,
+        # frozen test present, but older code rejected the absence of repair.
+        with monkeypatch.context() as patch:
+            patch.setattr(DefectFlow, "_begin_verification_only", lambda self, run: self.store.block(
+                run.run_id, run.version, "repair evidence is incomplete",
+                resume_state=WorkflowState.IMPLEMENTING,
+            ))
+            blocked = orchestrator.confirm_repository(validating.run_id, "sample")
+        assert blocked.state is WorkflowState.BLOCKED
+        assert blocked.pre_fix_test_results[0].outcome is CommandOutcome.PASSED
+        completed = orchestrator.resume(blocked.run_id)
+    else:
+        completed = orchestrator.confirm_repository(validating.run_id, "sample")
+
+    assert completed.state is WorkflowState.COMPLETED, (completed.blocked_reason, runner.outputs)
+    assert orchestrator.store.load(completed.run_id) == completed
+    assert completed.verification_only
+    assert codex.stages == ["root_cause", "reproduction", "review"]
+    assert completed.pre_fix_test_results[0].exit_code == 0
+    assert completed.test_results and all(test.outcome is CommandOutcome.PASSED for test in completed.test_results)
+    assert completed.review.review_external_validation
+    assert completed.changed_files == ("tests/test_report.py",)
+    assert completed.approval is None and not completed.publication.pr_url
+    assert (repository.prepare_commit_calls, repository.commit_calls, repository.push_calls) == (0, 0, 0)
+    assert pr.creates == comment.calls == ones.comment_writes == ones.status_updates == 0
+    assert not any("push" in command for command in remap.commands)

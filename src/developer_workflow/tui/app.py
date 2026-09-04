@@ -15,6 +15,7 @@ from textual.timer import Timer
 from textual.widgets import Button
 
 from .controller import TuiController
+from ..setup_models import OnesProbePublicConfig
 from .models import RunActivity
 from .screens import DashboardScreen, HelpScreen, SettingsView
 from .runtime_session import TuiRuntimeSession
@@ -616,11 +617,30 @@ class DeveloperWorkflowTuiApp(App[None]):
     async def _pressed_runtime_setup_navigation(self) -> None:
         await self._begin_reconfigure()
 
-    async def _begin_reconfigure(self) -> None:
+    async def read_inline_ones(self) -> dict[str, str]:
+        controller = self._new_setup_controller()
+        try:
+            await asyncio.to_thread(controller.load_active_public_draft)
+            return {key: value for key, value in controller.runtime_public_fields.items()
+                    if key in {"ones_base_url", "ones_team_id", "ones_issue_type_id"}}
+        finally:
+            await controller.aclose()
+
+    async def save_inline_ones(self, fields, credentials) -> None:
+        OnesProbePublicConfig(base_url=fields["ones_base_url"], team_id=fields["ones_team_id"], issue_type_id=fields["ones_issue_type_id"])
+        if self.runtime_session is None:
+            raise RuntimeError("editable runtime is unavailable")
+        if any(activity is not RunActivity.IDLE for activity in self.activities.values()):
+            raise RuntimeError("workflow is active")
+        await self._begin_reconfigure(inline_fields=fields, inline_credentials=credentials)
+
+    async def _begin_reconfigure(self, *, inline_fields=None, inline_credentials=None) -> None:
         """Close the stable runtime completely before constructing setup UI."""
 
         safe_exit = False
         async with self._transition_lock:
+            if inline_fields is not None and any(activity is not RunActivity.IDLE for activity in self.activities.values()):
+                raise RuntimeError("workflow is active")
             if self._ui_closed or self.runtime_session is None:
                 return
             if self._poll_timer is not None:
@@ -660,7 +680,23 @@ class DeveloperWorkflowTuiApp(App[None]):
                     await asyncio.to_thread(controller.load_active_public_draft)
                     self.setup_controller = controller
                     self._reconfiguring = True
-                    await self._show_setup()
+                    if inline_fields is None:
+                        await self._show_setup()
+                    else:
+                        try:
+                            await controller.prepare_inline_ones(inline_fields, inline_credentials or {})
+                            handle = await controller.save_and_activate()
+                            saved = True
+                        except Exception:
+                            handle = await controller.activate_existing()
+                            saved = False
+                        if handle is None:
+                            await self._show_setup()
+                        else:
+                            await self._finish_setup(handle)
+                            if self._dashboard is not None:
+                                self._dashboard.action_show_settings()
+                            self.notify("ONES 配置已保存并应用" if saved else "配置未应用，已恢复原配置；请检查必填项及连接后重试。", severity="information" if saved else "warning")
                 except BaseException as error:
                     if isinstance(error, (KeyboardInterrupt, SystemExit)):
                         raise

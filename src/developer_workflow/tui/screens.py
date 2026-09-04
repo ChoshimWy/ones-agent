@@ -12,6 +12,8 @@ import unicodedata
 from urllib.parse import urlsplit
 
 from rich.text import Text
+from rich.console import Group
+from rich.panel import Panel
 from textual import events, on
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -21,6 +23,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
 from textual.widgets import (
     Button,
+    Collapsible,
     Input,
     Label,
     ListItem,
@@ -46,6 +49,7 @@ from .models import (
     MappingCandidateView,
     RequirementChoice,
     RepositoryView,
+    ReviewView,
     RunActivity,
     RunDetail,
     RunFilter,
@@ -56,6 +60,11 @@ from .models import (
     validate_tui_input_text,
 )
 from .supervisor import RunTaskSupervisor
+from .verification_modal import VerificationModal, VerificationSubmission
+from .verification_settings import VerificationNodesPane
+from .ones_settings import OnesSettingsPane
+from . import detail_rendering
+from ..verification import public_text
 
 
 _DETAIL_TABS = (
@@ -83,8 +92,15 @@ _ACTION_INPUT_REQUIRED = "required action fields are missing"
 
 
 def _workflow_phase(detail: RunDetail) -> str:
+    if detail.summary.state is WorkflowState.COMPLETED and detail.status_message:
+        return detail.status_message
     if detail.summary.state is WorkflowState.BLOCKED:
-        return "workflow stopped safely"
+        return detail.status_message or "workflow stopped safely"
+    if (
+        detail.summary.state is WorkflowState.VALIDATING
+        and detail.mapping_candidates
+    ):
+        return "waiting for repository selection"
     state = (
         detail.resume_state
         if detail.summary.state is WorkflowState.BLOCKED
@@ -102,6 +118,7 @@ def _workflow_phase(detail: RunDetail) -> str:
         WorkflowState.WAITING_APPROVAL: "waiting for approval",
         WorkflowState.PUBLISHING: "publishing approved changes",
         WorkflowState.COMPLETED: "workflow completed",
+        WorkflowState.WAITING_PR_VERIFICATION: "Draft PR 已交付，等待 PR 人工验证",
         WorkflowState.BLOCKED: "workflow stopped safely",
         WorkflowState.CANCELLED: "workflow cancelled",
         WorkflowState.FAILED: "workflow failed safely",
@@ -408,6 +425,57 @@ class RunListPane(Vertical):
             run_list.index = 0
 
 
+def _review_text(value: str) -> Text:
+    # Values are escaped at the view-model boundary. Render inline code as
+    # literal text, never as Markdown links or executable Rich markup.
+    text = Text.from_markup(value)
+    for match in re.finditer(r"`([^`]+)`", text.plain):
+        text.stylize("cyan", match.start(), match.end())
+    return text
+
+
+def _review_renderable(report: ReviewView) -> Group:
+    def numbered(items: tuple[str, ...]) -> Text:
+        text = Text()
+        for index, item in enumerate(items, 1):
+            if index > 1:
+                text.append("\n\n")
+            text.append(f"{index}. ", style="bold")
+            text.append_text(_review_text(item))
+        return text
+
+    sections: list[Panel] = []
+    if report.pause_reason:
+        sections.append(Panel(
+            Text(f"{report.pause_reason}。累计自动回修 {report.review_repair_attempts} 轮。\n"
+                 "点击 Continue repair，确认继续或补充修复方向后开启新一轮；不会自动发布。"),
+            title=Text("自动回修已暂停", style="bold yellow"), title_align="left", border_style="yellow",
+        ))
+    if report.blockers:
+        sections.append(Panel(
+            numbered(report.blockers), title=Text(f"待处理问题 · {len(report.blockers)}", style="bold bright_red"),
+            title_align="left", border_style="bright_red", padding=(1, 2),
+        ))
+        action = "点击 Continue repair 确认续修；无需重复运行同一份 review。" if report.pause_reason else (
+            "可执行问题会自动交回修复，再运行测试并重新审查；旧任务点击 Continue repair 可恢复。"
+            "若自动修复无进展或达到轮次上限，请先查看 Overview 中的暂停原因。"
+        )
+        sections.append(Panel(Text(action), title=Text("下一步", style="bold yellow"), title_align="left", border_style="yellow"))
+    sections.append(Panel(_review_text(report.summary), title=Text("审查结论", style="bold cyan"), title_align="left", border_style="cyan", padding=(1, 2)))
+    if report.external_validation:
+        note = Text()
+        note.append(
+            "以下是环境或发布验证限制，与上方待处理问题分开记录。\n"
+            + ("不单独阻断本地验证完成；不代表发布验收已通过。\n\n" if report.verification_only
+               else "待执行验证可随 Draft PR 交给人工审核；不代表已通过。合并/发布前仍需对应验证证据。\n\n"), style="dim",
+        )
+        note.append_text(numbered(report.external_validation))
+        sections.append(Panel(note, title=Text(f"外部验证 · {len(report.external_validation)}", style="bold yellow"), title_align="left", border_style="yellow", padding=(1, 2)))
+    if report.findings:
+        sections.append(Panel(numbered(report.findings), title=Text(f"审查依据 · {len(report.findings)}", style="bold white"), title_align="left", border_style="bright_black", padding=(1, 2)))
+    return Group(*sections)
+
+
 class RunDetailPane(Vertical):
     """Fixed evidence tabs backed only by safe view-model fields."""
 
@@ -415,66 +483,45 @@ class RunDetailPane(Vertical):
         super().__init__(*args, **kwargs)
         self._initial_tab = initial_tab
         self._report_opened = False
+        self._review_identity: tuple[object, ...] | None = None
 
     def compose(self) -> ComposeResult:
         yield Label("Task detail", classes="pane-title")
         with TabbedContent(initial=self._initial_tab, id="detail-tabs"):
             with TabPane("Overview", id="overview"):
                 with VerticalScroll(classes="detail-scroll", id="overview-scroll"):
-                    yield Static("No run selected", id="overview-content", markup=True)
+                    yield Static("请选择一个任务查看详情。", id="overview-content", markup=False)
             with TabPane("AI activity", id="ai-activity"):
                 with VerticalScroll(classes="detail-scroll", id="ai-activity-scroll"):
                     yield Static("No AI activity", id="ai-activity-content", markup=False)
             with TabPane("Repositories", id="repositories"):
                 with VerticalScroll(classes="detail-scroll", id="repositories-scroll"):
                     yield Static(
-                        "No repository evidence",
+                        "暂无仓库证据。",
                         id="repositories-content",
-                        markup=True,
+                        markup=False,
                     )
             with TabPane("Tests", id="tests"):
                 with VerticalScroll(classes="detail-scroll", id="tests-scroll"):
-                    yield Static("No test evidence", id="tests-content", markup=True)
+                    yield Static("暂无测试记录。没有记录不代表测试通过。", id="tests-content", markup=False)
             with TabPane("Review", id="review"):
+                yield Static("", id="review-status", markup=False)
                 with VerticalScroll(classes="detail-scroll", id="review-scroll"):
                     yield Static("No review evidence", id="review-content", markup=True)
             with TabPane("Publication", id="publication"):
                 with VerticalScroll(classes="detail-scroll", id="publication-scroll"):
                     yield Static(
-                        "No publication evidence",
+                        "暂无发布记录。",
                         id="publication-content",
-                        markup=True,
+                        markup=False,
                     )
             with TabPane("History", id="history"):
                 with VerticalScroll(classes="detail-scroll", id="history-scroll"):
-                    yield Static("No history", id="history-content", markup=True)
+                    yield Static("暂无状态变更记录。", id="history-content", markup=False)
 
     def set_detail(self, detail: RunDetail) -> None:
         summary = detail.summary
-        self.query_one("#overview-content", Static).update(
-            "\n".join(
-                (
-                    summary.work_item_id,
-                    summary.state.value,
-                    f"version: {summary.version}",
-                    f"fingerprint: {detail.fingerprint or 'not available'}",
-                    f"risks: {detail.risk_count}",
-                    f"unresolved: {detail.unresolved_count}",
-                    f"blocked: {detail.blocked_reason or 'no'}",
-                    f"status: {detail.status_message or _workflow_phase(detail)}",
-                    "resume state: "
-                    + (
-                        detail.resume_state.value
-                        if detail.resume_state is not None
-                        else "not available"
-                    ),
-                )
-            )
-        )
-        repository_lines = tuple(
-            _repository_text(item)
-            for item in detail.repositories
-        )
+        self.query_one("#overview-content", Static).update(detail_rendering.overview(detail))
         if detail.ai_activity:
             activity_text: str | Text = _ai_activity_renderable(
                 detail.ai_activity
@@ -493,36 +540,45 @@ class RunDetailPane(Vertical):
         if follow_latest:
             activity_scroll.anchor(animate=False)
         self.query_one("#ai-activity-content", Static).update(activity_text)
-        test_lines = tuple(
-            f"{item.command}  {item.outcome}  exit: {item.exit_code}"
-            for item in detail.tests
-        )
-        self.query_one("#repositories-content", Static).update(
-            "\n".join(repository_lines) or "No repository evidence"
-        )
-        self.query_one("#tests-content", Static).update(
-            "\n".join(test_lines) or "No test evidence"
-        )
-        self.query_one("#review-content", Static).update(
-            "\n".join(detail.review) or "No review evidence"
-        )
-        publication = detail.publication
-        publication_text = "\n\n".join(
-            _repository_text(item) for item in publication.repositories
-        )
-        publication_status = publication.error or (
-            "comment delivered" if publication.comment_id else "Not published"
-        )
-        self.query_one("#publication-content", Static).update(
-            "\n\n".join(item for item in (publication_text, publication_status) if item)
-        )
-        self.query_one("#history-content", Static).update(
-            "\n".join(
-                f"{item.source} -> {item.target}  {item.occurred_at.isoformat()}"
-                for item in detail.history
+        self.query_one("#repositories-content", Static).update(detail_rendering.repositories(detail))
+        self.query_one("#tests-content", Static).update(detail_rendering.tests(detail))
+        report = detail.review_report
+        status = self.query_one("#review-status", Static)
+        status.display = report is not None
+        if report is not None:
+            heading = (
+                f"审查待处理  ·  {len(report.blockers)} 项问题"
+                if report.blockers else "未发现待处理问题"
             )
-            or "No history"
-        )
+            heading += f"  ·  {len(report.external_validation)} 项外部验证"
+            status.update(Text(heading, style="bold yellow" if report.blockers else "bold cyan"))
+            status.border_title = (
+                "本地验证 · 含复审修正（不发布）" if report.verification_only and report.review_repair_attempts
+                else "当前代码验证 · 未实施生产修复" if report.verification_only else "代码审查"
+            )
+        review_body = _review_renderable(report) if report is not None else Text.from_markup("\n\n".join(detail.review) or "No review evidence")
+        if detail.verification_tasks:
+            states = {"ready": "待确认执行", "waiting_environment": "等待匹配环境", "manual": "等待人工验证",
+                      "running": "正在验证", "passed": "已通过", "failed": "验证失败", "error": "执行异常", "stale": "证据已过期"}
+            lines = [f"{states.get(t.status, t.status)} · {t.node_key or '未分配节点'} · {t.need.description}"
+                     for t in detail.verification_tasks]
+            review_body = Group(Panel(Text(public_text("\n\n".join(lines))), title="环境验证计划", border_style="cyan"), review_body)
+        if detail.summary.state is WorkflowState.BLOCKED and detail.status_message:
+            review_body = Group(Panel(
+                Text(detail.status_message + "\n\n" + detail_rendering.next_step(detail)),
+                title="当前流程暂停原因（与待验证清单分开）", border_style="yellow",
+            ), review_body)
+        if detail.verification_results:
+            review_body = Group(review_body, Panel(Text("\n\n".join(detail.verification_results)),
+                title="最近验证记录（以当前快照为准）", border_style="cyan"))
+        self.query_one("#review-content", Static).update(review_body)
+        review_identity = (summary.run_id, report, detail.verification_tasks, detail.verification_results)
+        if self._review_identity != review_identity:
+            self.query_one("#review-scroll", VerticalScroll).scroll_home(animate=False)
+            self._review_identity = review_identity
+            self.call_after_refresh(self.query_one("#review-scroll", VerticalScroll).scroll_home, animate=False)
+        self.query_one("#publication-content", Static).update(detail_rendering.publication(detail))
+        self.query_one("#history-content", Static).update(detail_rendering.history(detail))
         if (
             not self._report_opened
             and summary.state is WorkflowState.COMPLETED
@@ -534,17 +590,19 @@ class RunDetailPane(Vertical):
                 self._report_opened = True
 
     def clear_detail(self) -> None:
-        self.query_one("#overview-content", Static).update("No run selected")
+        self._review_identity = None
+        self.query_one("#review-status", Static).display = False
+        self.query_one("#overview-content", Static).update("请选择一个任务查看详情。")
         self.query_one("#ai-activity-content", Static).update("No AI activity")
         self.query_one("#repositories-content", Static).update(
-            "No repository evidence"
+            "暂无仓库证据。"
         )
-        self.query_one("#tests-content", Static).update("No test evidence")
+        self.query_one("#tests-content", Static).update("暂无测试记录。没有记录不代表测试通过。")
         self.query_one("#review-content", Static).update("No review evidence")
         self.query_one("#publication-content", Static).update(
-            "No publication evidence"
+            "暂无发布记录。"
         )
-        self.query_one("#history-content", Static).update("No history")
+        self.query_one("#history-content", Static).update("暂无状态变更记录。")
 
     def show_error(self, message: str) -> None:
         self.clear_detail()
@@ -559,23 +617,6 @@ class RunDetailPane(Vertical):
         tabs = self.query_one("#detail-tabs", TabbedContent)
         index = _DETAIL_TABS.index(tabs.active)
         tabs.active = _DETAIL_TABS[(index - 1) % len(_DETAIL_TABS)]
-
-
-def _repository_text(item: RepositoryView) -> str:
-    changed_files = ", ".join(item.changed_files) or "none"
-    return "\n".join(
-        (
-            f"{item.key}  {item.role}",
-            f"base: {item.base_commit or 'not available'}",
-            f"head: {item.head_commit or 'not available'}",
-            f"tree: {item.tree_hash or 'not available'}",
-            f"files ({item.changed_file_count}): {changed_files}",
-            f"commit: {item.commit_hash or 'not available'}",
-            f"pushed: {'yes' if item.pushed else 'no'}",
-            f"PR: {item.pr_url or 'not available'}",
-            f"error: {item.error or 'none'}",
-        )
-    )
 
 
 def _mapping_candidate_text(candidate: MappingCandidateView) -> str:
@@ -1304,7 +1345,7 @@ _HELP_TEXT = """Developer workflow help
 Workspaces  list or create workspaces
 Create workspace  choose ONES Project, iteration, and local/remote repositories
 Query defects  open a workspace, query defects, then choose AI analysis or analysis and repair
-Configuration  view or edit global ONES configuration
+Configuration  ONES settings, verification nodes, and runtime information
 g  return to workspace list
 s  show configuration
 n  legacy new workflow shortcut
@@ -1545,39 +1586,84 @@ class ApprovalModal(_DangerousActionModal):
     def __init__(self, request: DangerousActionRequest) -> None:
         super().__init__(request, screen_id="approval-modal")
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # Enter may open/select a member, but must never press the approval button.
+        if action == "ignore_enter":
+            actor = self.query_one("#actor", Select)
+            if actor.has_focus or actor.expanded:
+                return False
+        return super().check_action(action, parameters)
+
     def compose(self) -> ComposeResult:
-        with VerticalScroll():
-            yield Label("Approve workflow")
-            yield Static(self.request.fingerprint, id="fingerprint")
-            yield Static(
-                "\n".join(
-                    (
-                        f"work item: {self.request.work_item_id}",
-                        f"repositories: {len(self.request.repositories)}",
-                        f"changed files: {self.request.changed_file_count}",
-                        f"tests: {self.request.test_count}",
-                        f"risks: {self.request.risk_count}",
-                        f"unresolved: {self.request.unresolved_count}",
+        request = self.request
+        changed = sum(bool(repo.changed_file_count) for repo in request.repositories)
+        with Vertical(id="approval-dialog"):
+            yield Label("审批并创建 Draft PR" if request.draft_pr else "审批并创建 PR", id="approval-title")
+            yield Static(detail_rendering.literal(f"工作项 {request.work_item_id} · 请核对本次操作范围"), id="approval-subtitle")
+            with VerticalScroll(id="approval-body"):
+                with Vertical(classes="approval-card approval-warning"):
+                    yield Label("本次授权范围", classes="approval-heading")
+                    yield Static(
+                        "提交代码 → 推送新分支 → 创建草稿 PR" if request.draft_pr else "提交代码 → 推送新分支 → 创建 PR",
+                        markup=False,
                     )
+                    yield Static("不授权合并或发布，不视为实机验证通过。", markup=False)
+                    if request.draft_pr:
+                        yield Static(f"待人工验证 {request.deferred_check_count} 项 · 随 Draft PR 交由审核人核验。", markup=False)
+                if request.baseline_evidence_missing:
+                    with Vertical(classes="approval-card approval-warning"):
+                        yield Label("重要 · 修复证据存在缺口", classes="approval-heading")
+                        yield Static("缺少修复前失败复现记录。当前测试通过不能单独证明修复有效。"
+                                     "本次批准仅创建披露该缺口的 Draft PR，请由审核人补验或明确评估证据限制。", markup=False)
+                with Vertical(classes="approval-card"):
+                    yield Label("变更摘要", classes="approval-heading")
+                    yield Static(f"关联仓库 {len(request.repositories)} · 有改动 {changed} · 变更文件 {request.changed_file_count}", markup=False)
+                    yield Static(f"测试记录 {request.test_count} · 风险提示 {request.risk_count} · 未解决项 {request.unresolved_count}", markup=False)
+                for repository in request.repositories:
+                    with Vertical(classes="approval-card approval-repository"):
+                        role = {"primary": "主仓库", "dependency": "依赖仓库"}.get(repository.role, repository.role)
+                        yield Static(detail_rendering.literal(f"{repository.key} · {role}", "bold cyan"))
+                        yield Static(
+                            f"变更 {repository.changed_file_count} 个文件 · 纳入本次 PR 创建范围" if repository.changed_file_count
+                            else "无代码变更 · 不创建 PR，仅保留关联证据",
+                            classes="approval-repository-scope", markup=False,
+                        )
+                        yield Static(detail_rendering.literal(f"目标分支：{repository.pr_target or '暂无记录'}"))
+                        test_summary = re.sub(r"^(\d+) verified test facts?$", r"\1 条已核验测试记录", repository.test_summary)
+                        yield Static(detail_rendering.literal(test_summary))
+                        if repository.changed_files:
+                            yield Static(detail_rendering.literal("变更文件：\n" + "\n".join(f"  • {path}" for path in repository.changed_files)))
+                        if repository.error:
+                            yield Static(detail_rendering.literal(f"仓库错误：{repository.error}"), classes="approval-error")
+                        with Collapsible(title="查看完整快照与提交状态", collapsed=True):
+                            yield Static(detail_rendering.literal(f"基线：{repository.base_commit or '暂无记录'}"))
+                            yield Static(detail_rendering.literal(f"HEAD：{repository.head_commit or '暂无记录'}"))
+                            yield Label("工作树哈希")
+                            yield Static(detail_rendering.literal(repository.tree_hash or "暂无记录"), classes="tree-hash")
+                            yield Static(detail_rendering.literal(f"提交：{repository.commit_hash or '尚未创建'}"))
+                            yield Static(f"推送：{'已完成' if repository.pushed else '尚未完成'}", markup=False)
+                            yield Static(detail_rendering.literal(f"PR：{repository.pr_url or '尚未创建'}"))
+                with Collapsible(title="审批指纹与交付信息", collapsed=True):
+                    yield Static(detail_rendering.literal(request.fingerprint), id="fingerprint")
+                    comment_status = {"not delivered": "尚未交付", "delivered": "已交付"}.get(request.comment_status, request.comment_status)
+                    yield Static(detail_rendering.literal(f"评论状态：{comment_status}"))
+                if request.publication_error:
+                    yield Static(detail_rendering.literal(f"交付错误：{request.publication_error}"), classes="approval-error")
+            with Vertical(id="approval-footer"):
+                yield Select(
+                    [(detail_rendering.literal(f"{member.name} · {member.id}"), member.id) for member in request.approvers],
+                    prompt="选择 ONES 审批成员（必选）", id="actor",
+                    disabled=not request.approvers,
                 )
-            )
-            for repository in self.request.repositories:
-                yield from _repository_action_facts(repository)
-            yield Static(f"comment: {self.request.comment_status}")
-            yield Static(
-                f"publication error: {self.request.publication_error or 'none'}"
-            )
-            yield Input(placeholder="Approver actor", id="actor")
-        yield Static("", id="modal-notice", markup=False)
-        yield Button("Approve", id="confirm-approve", variant="warning")
-        yield Button("Back", id="cancel-action")
+                yield Static(request.approver_error or ("" if request.approvers else "暂无可选 ONES 成员，请重新打开审批加载。"), id="modal-notice", markup=False)
+                with Horizontal(id="approval-buttons"):
+                    yield Button("返回", id="cancel-action")
+                    yield Button("批准创建 Draft PR" if request.draft_pr else "批准创建 PR", id="confirm-approve", variant="warning", disabled=not request.approvers)
 
     def _confirm(self) -> None:
-        actor = _valid_action_text(
-            self.query_one("#actor", Input).value, maximum=128
-        )
-        if actor is None:
-            self._notice(_ACTION_INPUT_REQUIRED)
+        actor = self.query_one("#actor", Select).value
+        if not isinstance(actor, str) or actor not in {member.id for member in self.request.approvers}:
+            self._notice("请从 ONES 成员列表选择审批人")
             return
         self.dismiss(ApprovalSubmission(self.request, actor))
 
@@ -1592,17 +1678,20 @@ class ApprovalModal(_DangerousActionModal):
 class RevisionModal(_DangerousActionModal):
     """Collect bounded revision feedback and an explicit workflow scope."""
 
-    def __init__(self, request: DangerousActionRequest) -> None:
+    def __init__(self, request: DangerousActionRequest, *, review_repair: bool = False) -> None:
         super().__init__(request, screen_id="revision-modal")
+        self._review_repair = review_repair
 
     def compose(self) -> ComposeResult:
         with VerticalScroll():
-            yield Label("Revise workflow")
+            yield Label("确认继续修复" if self._review_repair else "Revise workflow")
             yield Static(f"work item: {self.request.work_item_id}")
-            yield Input(placeholder="Revision feedback", id="feedback")
-            yield Input(placeholder="implementation or repair", id="scope")
+            if self._review_repair:
+                yield Static("本轮自动回修已暂停。确认后处理最新 Review 问题，重新测试、复审；不授权发布。可补充新的修复方向。")
+            yield Input(value="继续修复最新 Review 中的待处理问题，保留已完成修复和冻结测试。" if self._review_repair else "", placeholder="Revision feedback", id="feedback")
+            yield Input(value="repair" if self._review_repair else "", placeholder="implementation or repair", id="scope", disabled=self._review_repair)
         yield Static("", id="modal-notice", markup=False)
-        yield Button("Revise", id="confirm-revise", variant="warning")
+        yield Button("确认继续修复" if self._review_repair else "Revise", id="confirm-revise", variant="warning")
         yield Button("Back", id="cancel-action")
 
     def _confirm(self) -> None:
@@ -1877,6 +1966,58 @@ class TaskDeleteConfirmation(ModalScreen[bool]):
         self.dismiss(False)
 
 
+@dataclass(frozen=True, slots=True)
+class RepositoryMappingSelection:
+    run_id: str
+    version: int
+    mapping_key: str
+
+
+class RepositoryMappingModal(ModalScreen[RepositoryMappingSelection | None]):
+    """Resume the repository-confirmation checkpoint from the task detail page."""
+
+    BINDINGS = [Binding("escape", "cancel", "Cancel", priority=True)]
+
+    def __init__(self, detail: RunDetail) -> None:
+        super().__init__(id="repository-mapping-modal")
+        self.detail = detail
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll():
+            yield Label("Select an authorized repository mapping", classes="pane-title")
+            for index, candidate in enumerate(self.detail.mapping_candidates):
+                yield Button(
+                    f"Select {candidate.key}",
+                    id=f"resume-mapping-{index}",
+                    variant="primary" if index == 0 else "default",
+                )
+                yield Static(_mapping_candidate_text(candidate), markup=True)
+            yield Button("Cancel", id="cancel-repository-mapping")
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        button_id = event.button.id or ""
+        if button_id == "cancel-repository-mapping":
+            self.action_cancel()
+            return
+        if not button_id.startswith("resume-mapping-"):
+            return
+        try:
+            index = int(button_id.removeprefix("resume-mapping-"))
+            candidate = self.detail.mapping_candidates[index]
+        except (ValueError, IndexError):
+            self.action_cancel()
+            return
+        self.dismiss(RepositoryMappingSelection(
+            run_id=self.detail.summary.run_id,
+            version=self.detail.summary.version,
+            mapping_key=candidate.key,
+        ))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class WorkspaceDeleteConfirmation(ModalScreen[bool]):
     """Require an explicit click before removing a workspace configuration."""
 
@@ -2014,6 +2155,16 @@ class DashboardScreen(Screen[None]):
         Binding("delete", "delete_task", "Delete task", show=False, priority=True),
     ]
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        settings = self.query("#settings-page")
+        if settings and settings.first().display and action in {
+            "cursor_down", "cursor_up", "open_run", "resume", "revise", "approve", "cancel_run", "delete_task",
+        }:
+            # Let the focused configuration list/button handle arrows and Enter;
+            # never route configuration input to the hidden selected task.
+            return False
+        return True
+
     def __init__(
         self,
         controller: TuiController,
@@ -2055,6 +2206,12 @@ class DashboardScreen(Screen[None]):
                 with Vertical(id="task-detail-column"):
                     yield RunDetailPane(id="run-detail")
                     with Horizontal(id="action-bar"):
+                        yield Button("审批并创建 PR", id="action-approve", variant="warning")
+                        yield Button(
+                            "Continue task",
+                            id="action-resume",
+                            variant="primary",
+                        )
                         yield Button(
                             "Accept solution",
                             id="action-accept-analysis",
@@ -2070,17 +2227,14 @@ class DashboardScreen(Screen[None]):
                             variant="warning",
                         )
             with Vertical(id="settings-page"):
-                yield Static(
-                    Text(self._settings.display_text()),
-                    id="settings",
-                    markup=False,
-                )
-                if self._workspace_mode:
-                    yield Button(
-                        "Edit global configuration",
-                        id="nav-runtime-setup",
-                        variant="primary",
-                    )
+                with TabbedContent(initial="settings-ones", id="configuration-tabs"):
+                    with TabPane("ONES 配置", id="settings-ones"):
+                        yield OnesSettingsPane()
+                    with TabPane("验证节点", id="settings-nodes"):
+                        yield VerificationNodesPane(self._controller, self._supervisor)
+                    with TabPane("运行信息", id="settings-runtime"):
+                        with VerticalScroll():
+                            yield Static(Text(self._settings.display_text()), id="settings", markup=False)
         yield Static("", id="notice", markup=False)
 
     def on_mount(self) -> None:
@@ -2098,10 +2252,14 @@ class DashboardScreen(Screen[None]):
         accept = self.query_one("#action-accept-analysis", Button)
         regenerate = self.query_one("#action-regenerate-analysis", Button)
         retry = self.query_one("#action-retry-analysis", Button)
+        resume = self.query_one("#action-resume", Button)
+        approve = self.query_one("#action-approve", Button)
         workflow_running = bool(
             detail
             and detail.summary.run_id in self._workflow_running_run_ids
         )
+        approve.display = bool(detail and not workflow_running and detail.summary.state is WorkflowState.WAITING_APPROVAL)
+        approve.label = "审批并创建 Draft PR" if detail and detail.draft_pr else "审批并创建 PR"
         accept.display = bool(
             detail and detail.can_accept_analysis and not workflow_running
         )
@@ -2115,9 +2273,36 @@ class DashboardScreen(Screen[None]):
             and detail.resume_state is WorkflowState.IMPLEMENTING
             and detail.status_message == "Codex result format repair failed"
         )
+        resumable = bool(
+            detail
+            and not workflow_running
+            and detail.summary.state is WorkflowState.BLOCKED
+            and detail.resume_state is not None
+            and detail.resume_state is not WorkflowState.PUBLISHING
+        )
+        mapping_required = bool(
+            detail
+            and not workflow_running
+            and detail.summary.state is WorkflowState.VALIDATING
+            and detail.mapping_candidates
+        )
+        resume.display = (resumable or mapping_required) and not retry.display
+        if resume.display and detail is not None:
+            resume.label = (
+                "重新检查审批条件" if detail.status_message.startswith(("缺少修复前失败复现记录", "远程目标分支已变化", "Git 命令执行失败", "流程内部检查失败")) else
+                "环境验证" if detail.can_verify else
+                "Continue repair" if detail.can_request_review_repair else "Select repository"
+                if mapping_required
+                else {
+                    WorkflowState.IMPLEMENTING: "Continue repair",
+                    WorkflowState.TESTING: "Continue testing",
+                    WorkflowState.AI_REVIEW: "Continue review",
+                    WorkflowState.WAITING_APPROVAL: "Continue task",
+                }.get(detail.resume_state, "Resume task")
+            )
         self.query_one("#action-bar").display = bool(
             self.query_one("#workspace").display
-            and (accept.display or regenerate.display or retry.display)
+            and (resume.display or approve.display or accept.display or regenerate.display or retry.display)
         )
 
     def _set_active_navigation(self, active_id: str) -> None:
@@ -2344,10 +2529,21 @@ class DashboardScreen(Screen[None]):
             )
 
     def action_next_tab(self) -> None:
+        if self.query_one("#settings-page").display:
+            self._step_configuration_tab(1)
+            return
         self.query_one(RunDetailPane).next_tab()
 
     def action_previous_tab(self) -> None:
+        if self.query_one("#settings-page").display:
+            self._step_configuration_tab(-1)
+            return
         self.query_one(RunDetailPane).previous_tab()
+
+    def _step_configuration_tab(self, step: int) -> None:
+        tabs = self.query_one("#configuration-tabs", TabbedContent)
+        names = ("settings-ones", "settings-nodes", "settings-runtime")
+        tabs.active = names[(names.index(tabs.active) + step) % len(names)]
 
     def action_show_settings(self) -> None:
         self.query_one("#workspace-home").display = False
@@ -2355,6 +2551,15 @@ class DashboardScreen(Screen[None]):
         self.query_one("#settings-page").display = True
         self.query_one("#action-bar").display = False
         self._set_active_navigation("nav-settings")
+        self.run_worker(self.query_one(OnesSettingsPane).load())
+        if self.query_one("#configuration-tabs", TabbedContent).active == "settings-nodes":
+            self.run_worker(self.query_one(VerificationNodesPane).load_nodes())
+
+    @on(TabbedContent.TabActivated, "#configuration-tabs")
+    async def _configuration_tab_changed(self, event: TabbedContent.TabActivated) -> None:
+        event.stop()
+        if event.pane.id == "settings-nodes":
+            await self.query_one(VerificationNodesPane).load_nodes()
 
     def action_show_runs(self) -> None:
         self.query_one("#settings-page").display = False
@@ -2457,6 +2662,9 @@ class DashboardScreen(Screen[None]):
 
     async def action_revise(self) -> None:
         summary = self._selected_summary()
+        if summary is not None and self._supervisor.is_run_active(summary.run_id):
+            self._show_action_notice("Workflow is already running; see AI activity")
+            return
         if summary is None or summary.state not in {
             WorkflowState.WAITING_APPROVAL,
             WorkflowState.BLOCKED,
@@ -2545,6 +2753,9 @@ class DashboardScreen(Screen[None]):
 
     async def action_resume(self) -> None:
         summary = self._selected_summary()
+        if summary is not None and self._supervisor.is_run_active(summary.run_id):
+            self._show_action_notice("Workflow is already running; see AI activity")
+            return
         if (
             summary is None
             or self._terminal(summary)
@@ -2558,6 +2769,26 @@ class DashboardScreen(Screen[None]):
             )
         except Exception:
             self._show_action_notice(_ACTION_FAILED)
+            return
+        if detail.can_verify and detail.verification_tasks:
+            nodes = await self._supervisor.run_readonly("verification-nodes", self._controller.verification_nodes)
+            self.app.push_screen(VerificationModal(detail, nodes), callback=self._verification_done)
+            return
+        if detail.can_request_review_repair:
+            request = await self._prepare_action("revise")
+            if request is not None and request.version == detail.summary.version:
+                self.app.push_screen(RevisionModal(request, review_repair=True), callback=self._revision_done)
+            else:
+                self._show_action_notice(_ACTION_UNAVAILABLE)
+            return
+        if (
+            detail.summary.state is WorkflowState.VALIDATING
+            and detail.mapping_candidates
+        ):
+            self.app.push_screen(
+                RepositoryMappingModal(detail),
+                callback=self._repository_mapping_selected,
+            )
             return
         publication_resume = (
             detail.summary.state
@@ -2586,19 +2817,55 @@ class DashboardScreen(Screen[None]):
             elif request is not None:
                 self._show_action_notice(_ACTION_UNAVAILABLE)
             return
-        try:
-            await self._supervisor.run_mutation(
-                detail.summary.run_id,
-                "resume",
-                self._controller.resume,
+        self._set_analysis_actions(None)
+        self._show_action_notice(
+            "Continuing workflow from "
+            + (detail.resume_state.value if detail.resume_state is not None else "saved state")
+        )
+        self._submit_workflow_task(
+            detail.summary.run_id,
+            "resume",
+            lambda: self._controller.resume(
                 detail.summary.run_id,
                 detail.summary.version,
-            )
-        except StaleTuiActionError:
-            self._show_action_notice(_ACTION_STALE)
-        except Exception:
-            self._show_action_notice(_ACTION_FAILED)
-        await self.refresh_runs()
+            ),
+        )
+
+    def _verification_done(self, submission: VerificationSubmission | None) -> None:
+        if submission is None:
+            return
+        if self._supervisor.is_run_active(submission.run_id):
+            self._show_action_notice("Workflow is already running; see AI activity")
+            return
+        if submission.replan:
+            self._submit_workflow_task(submission.run_id, "verification-plan", lambda:
+                self._controller.replan_verification(submission.run_id, submission.version))
+            return
+        if submission.defer_to_pr:
+            self._submit_workflow_task(submission.run_id, "resume", lambda:
+                self._controller.resume(submission.run_id, submission.version))
+            return
+        self._show_action_notice("正在执行环境验证；完成后会自动推进，失败或缺少环境会保留具体状态。")
+        self._submit_workflow_task(submission.run_id, "verify", lambda: self._controller.verify(
+            submission.run_id, submission.task_key, submission.actor, submission.version,
+            submission.evidence, submission.passed, submission.recipe_digest))
+
+    def _repository_mapping_selected(
+        self, selection: RepositoryMappingSelection | None
+    ) -> None:
+        if selection is None:
+            return
+        self._set_analysis_actions(None)
+        self._show_action_notice("Repository mapping confirmed; continuing workflow")
+        self._submit_workflow_task(
+            selection.run_id,
+            "confirm-repository",
+            lambda: self._controller.confirm_repository(
+                selection.run_id,
+                selection.mapping_key,
+                selection.version,
+            ),
+        )
 
     async def _run_analysis_decision(self, *, accept: bool) -> None:
         detail = self._selected_detail
@@ -2706,13 +2973,20 @@ class DashboardScreen(Screen[None]):
     async def _revision_done(self, submission: object | None) -> None:
         if not isinstance(submission, RevisionSubmission):
             return
-        await self._run_dangerous(
-            submission.request,
+        run_id = submission.request.run_id
+        if self._supervisor.is_run_active(run_id):
+            self._show_action_notice("Workflow is already running; see AI activity")
+            return
+        self._set_analysis_actions(None)
+        self._show_action_notice("Repair workflow started; see AI activity")
+        # Modal dismissal callbacks run on Textual's message pump. Awaiting the
+        # entire repair here stalls UI messages even though Codex runs in a thread.
+        self._submit_workflow_task(
+            run_id,
             "revise",
-            self._controller.revise,
-            submission.request,
-            submission.feedback,
-            submission.scope,
+            lambda: self._controller.revise(
+                submission.request, submission.feedback, submission.scope,
+            ),
         )
 
     async def _cancel_done(self, submission: object | None) -> None:
@@ -2881,6 +3155,8 @@ __all__ = [
     "HelpScreen",
     "NavigationPane",
     "PublicationResumeModal",
+    "RepositoryMappingModal",
+    "RepositoryMappingSelection",
     "RunDetailPane",
     "RunDetailScreen",
     "RunListPane",

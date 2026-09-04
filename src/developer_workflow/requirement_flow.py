@@ -6,6 +6,8 @@ isolated worktree.  Publication is deliberately outside this boundary.
 
 from __future__ import annotations
 
+from . import verification, pr_handoff
+
 import asyncio
 import ctypes
 import hashlib
@@ -35,6 +37,7 @@ from .approval import ApprovalValidationError, validate_for_approval
 from .command_utils import CommandArgvError, parse_command_argv
 from .codex_runner import (
     CodexCommand,
+    CodexOutputError,
     CodexRunner,
     CommandExecutor,
     _bounded_subprocess,
@@ -305,6 +308,33 @@ class CodexRequirementAdapter:
 
     runner: CodexRunner
 
+    def _normalize_root_cause_result(
+        self, run_id: str, error: CodexOutputError
+    ) -> CodexResult:
+        """Normalize one completed analysis without re-running repository work."""
+
+        repair = getattr(self.runner, "repair_root_cause_result", None)
+        raw_output = error.raw_output
+        if not callable(repair) or not raw_output.strip():
+            raise error
+        activity = getattr(self.runner, "activity", None)
+        if callable(activity):
+            trace = tuple(activity(run_id, limit=200))
+            if trace:
+                raw_output = (
+                    raw_output
+                    + "\n\nOBSERVED_ANALYSIS_ACTIVITY:\n"
+                    + "\n".join(trace)
+                )
+        record = getattr(self.runner, "record_analysis_recovery", None)
+        if callable(record):
+            record(run_id)
+        return repair(
+            run_id=run_id,
+            raw_output=raw_output,
+            validation_hint=error.validation_hint or "workflow result contract",
+        )
+
     def activity(self, run_id: str, *, limit: int = 40) -> tuple[str, ...]:
         """Expose the runner's sanitized observable activity to the TUI."""
 
@@ -359,13 +389,18 @@ class CodexRequirementAdapter:
                 recovered = resume_format_repair(run_id=run_id)
                 if recovered is not None:
                     return recovered
-        return operation(
-            prepared,
-            mapping,
-            run_id=run_id,
-            prompt=prompt,
-            allow_changes=allow_changes,
-        )
+        try:
+            return operation(
+                prepared,
+                mapping,
+                run_id=run_id,
+                prompt=prompt,
+                allow_changes=allow_changes,
+            )
+        except CodexOutputError as error:
+            if stage != "root_cause":
+                raise
+            return self._normalize_root_cause_result(run_id, error)
 
     def analyze_testing(self, *, run_id: str, prompt: str) -> CodexResult:
         return self.runner.run_preflight(run_id=run_id, prompt=prompt)
@@ -404,13 +439,18 @@ class CodexRequirementAdapter:
                 recovered = resume_format_repair(run_id=run_id)
                 if recovered is not None:
                     return recovered
-        return operation(
-            group,
-            prepared,
-            run_id=run_id,
-            prompt=prompt,
-            allow_changes=allow_changes,
-        )
+        try:
+            return operation(
+                group,
+                prepared,
+                run_id=run_id,
+                prompt=prompt,
+                allow_changes=allow_changes,
+            )
+        except CodexOutputError as error:
+            if stage != "root_cause":
+                raise
+            return self._normalize_root_cause_result(run_id, error)
 
 
 _TEST_ENV_KEYS = frozenset(
@@ -1364,8 +1404,15 @@ class SubprocessConfiguredTestRunner:
         elif (
             completed.returncode == 1
             and any("pytest" in item.casefold() for item in argv[:4])
-            and len(argv) > 1
-            and argv[-1] in (stdout + "\n" + stderr)
+            and any(
+                re.search(
+                    rf"(?m)^(?:FAILED\s+{re.escape(item)}(?:::|\s|$)|"
+                    rf"{re.escape(item)}(?:::[^\s]+)?\s+FAILED\b)",
+                    stdout + "\n" + stderr,
+                )
+                for item in argv[1:]
+                if ".py" in item and not item.startswith("-")
+            )
         ):
             outcome = CommandOutcome.TEST_FAILED
         else:
@@ -1481,13 +1528,15 @@ class RequirementFlow:
             if current.resume_state is None:
                 return current
             resume_state = current.resume_state
+            preserve_review = current.blocked_reason in verification.VERIFICATION_REASONS
             current = self.store.transition(
                 current.run_id,
                 current.version,
                 resume_state,
                 "resume from persisted safe checkpoint",
             )
-            current = self._reset_resumed_stage(current, resume_state)
+            if not (preserve_review and resume_state is WorkflowState.AI_REVIEW):
+                current = self._reset_resumed_stage(current, resume_state)
         try:
             while True:
                 if current.state is WorkflowState.CREATED:
@@ -2079,7 +2128,8 @@ class RequirementFlow:
                 _Blocked("repository diff changed after tests", WorkflowState.AI_REVIEW),
                 current,
             )
-        package = self._approval_package(current, approval_snapshot, latest_tests)
+        current = self._verification_plan(current)
+        package = pr_handoff.prepare(current, self._approval_package(current, approval_snapshot, latest_tests))
         try:
             package = validate_for_approval(package)
         except ApprovalValidationError as error:
@@ -2147,7 +2197,8 @@ class RequirementFlow:
                 _Blocked("repository group changed after tests", WorkflowState.AI_REVIEW),
                 current,
             ) from error
-        package = self._group_approval_package(current, final)
+        current = self._verification_plan(current)
+        package = pr_handoff.prepare(current, self._group_approval_package(current, final))
         try:
             package = validate_for_approval(package)
         except ApprovalValidationError as error:
@@ -2156,6 +2207,14 @@ class RequirementFlow:
             ) from error
         current = self._save(current.validated_update(approval=package))
         return self._transition(current, WorkflowState.WAITING_APPROVAL, "await human approval")
+
+    def _verification_plan(self, run: WorkflowRun) -> WorkflowRun:
+        tasks = verification.plan(run, self.config.verification_nodes)
+        current = self._save(run.validated_update(verification_plan=tasks)) if tasks != run.verification_plan else run
+        reason = pr_handoff.blocking_reason(tasks, defer=self.config.publishing.defer_external_verification_to_pr)
+        if reason:
+            raise _FlowBlocked(_Blocked(reason, WorkflowState.AI_REVIEW), current)
+        return current
 
     def _group_approval_package(
         self, run: WorkflowRun, snapshots: dict[str, RepositorySnapshot]
@@ -2205,6 +2264,7 @@ class RequirementFlow:
             item for result in (*run.codex_results, review) for item in result.evidence
         )) or ("verified repository group diff and configured tests",)
         return ApprovalPackage(
+            verification_records=verification.records_for_approval(run),
             work_item_id=requirement.requirement_id,
             work_item_title=requirement.title,
             work_item_status=requirement.status.name or requirement.status.id,
@@ -2257,6 +2317,7 @@ class RequirementFlow:
             )
         ) or ("verified repository diff and configured tests",)
         return ApprovalPackage(
+            verification_records=verification.records_for_approval(run),
             work_item_id=requirement.requirement_id,
             work_item_title=requirement.title,
             work_item_status=requirement.status.name or requirement.status.id,
@@ -2635,6 +2696,13 @@ class RequirementFlow:
     @staticmethod
     def _review_prompt(run: WorkflowRun) -> str:
         return (
+            "Describe necessary external checks in verification_needs: description (same text as review_external_validation), "
+            "capabilities (platform-neutral tags such as os:macos, os:windows, arch:arm64, device:camera), "
+            "acceptance (concrete pass criteria). Never supply executable commands. Missing environment is not a code defect. "
+            "Assess existing verification records before requesting another check: "
+            + json.dumps([r.model_dump(mode='json') for r in run.verification_records
+                          if r.snapshot_digest == verification.snapshot_digest(run)], ensure_ascii=False)
+            + "\n"
             "只 review 当前真实 diff 与测试证据，覆盖异常路径、回归、安全、验收标准遗漏和无关改动。"
             "发现任何未解决问题必须写入 unresolved_items，不得修改 HEAD 或发布；"
             "完成无关改动检查后必须设置 unrelated_changes_checked=true。"

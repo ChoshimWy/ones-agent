@@ -29,6 +29,7 @@ from .config import (
     _profile_source_validation_error,
 )
 from .contracts import RepositoryGroupMapping, RepositoryMapping, WorkflowModel
+from .verification_models import VerificationNode
 
 
 class SetupValidationError(ValueError):
@@ -398,10 +399,12 @@ class WorkflowDraft(SetupModel):
         SandboxPermissionProfileSource.MANAGED
     )
     max_codex_attempts: StrictInt = Field(default=3, ge=1, le=10)
+    max_baseline_refreshes: StrictInt = Field(default=3, ge=0, le=5)
     tui_max_concurrency: StrictInt = Field(default=3, ge=1, le=8)
     repositories: tuple[RepositoryMapping, ...] = Field(default_factory=tuple)
     repository_groups: tuple[RepositoryGroupMapping, ...] = Field(default_factory=tuple)
     publishing: PublishingConfig | None = None
+    verification_nodes: tuple["VerificationNode", ...] = Field(default=())
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in {

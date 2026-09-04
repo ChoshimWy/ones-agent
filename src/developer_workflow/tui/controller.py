@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from concurrent.futures import CancelledError, Future, wait
@@ -14,6 +15,7 @@ from threading import Event, Lock, Thread, current_thread
 from typing import Literal
 
 from ..config import DeveloperWorkflowConfig
+from ..verification import digest
 from ..contracts import (
     DefectAction,
     RepositoryGroupMapping,
@@ -87,6 +89,10 @@ class TuiControllerError(RuntimeError):
 
 class StaleCandidateError(TuiControllerError):
     """The one-shot defect candidate capability is invalid or expired."""
+
+
+class ApprovalMembersError(TuiControllerError):
+    """Only fixed, non-sensitive member lookup diagnostics may cross the UI."""
 
 
 class StaleTuiActionError(TuiControllerError):
@@ -854,6 +860,46 @@ class TuiController:
             expected_version=expected_version,
         )
 
+    def verification_nodes(self) -> tuple[dict, ...]:
+        return self._orchestrator.verification_nodes()
+
+    def verification_repositories(self) -> tuple[str, ...]:
+        """Public repository identifiers for the node recipe form."""
+        config = self._orchestrator.config
+        return tuple(dict.fromkeys([
+            *(repository.key for repository in config.repositories),
+            *(repository.key for group in config.repository_groups for repository in group.repositories),
+        ]))
+
+    def save_verification_nodes(self, raw: str, expected_digest: str) -> None:
+        """Persist node configuration through the existing owned workflow saver."""
+        try:
+            if self._workflow_saver is None or type(raw) is not str or len(raw) > 128 * 1024:
+                raise ValueError
+            nodes = json.loads(raw)
+            if type(nodes) is not list:
+                raise ValueError
+            with self._workspace_lock:
+                current = self._orchestrator.config
+                if digest(self.verification_nodes()) != expected_digest:
+                    raise ValueError
+                candidate = current.validated_update(verification_nodes=nodes)
+                self._workflow_saver(candidate)
+                current.verification_nodes = candidate.verification_nodes
+                self._orchestrator.defect_flow.config.verification_nodes = candidate.verification_nodes
+                self._orchestrator.requirement_flow.config.verification_nodes = candidate.verification_nodes
+        except Exception:
+            raise TuiControllerError("节点配置未保存：请检查格式、保存权限，或重新打开以加载最新配置。") from None
+
+    def replan_verification(self, run_id: str, expected_version: int) -> RunDetail:
+        return self._command(self._orchestrator.replan_verification, run_id, expected_version=expected_version)
+
+    def verify(self, run_id: str, task_key: str, actor: str, expected_version: int,
+               manual_evidence: str | None = None, passed: bool = True, expected_recipe_digest: str | None = None) -> RunDetail:
+        return self._command(self._orchestrator.verify, run_id, task_key, actor,
+            expected_version=expected_version, manual_evidence=manual_evidence, passed=passed,
+            expected_recipe_digest=expected_recipe_digest)
+
     def resume(self, run_id: str, expected_version: int) -> RunDetail:
         try:
             run = self._orchestrator.show(run_id, read_only=True)
@@ -877,14 +923,85 @@ class TuiController:
         action: Literal["approve", "revise", "cancel", "resume-publication"],
     ) -> DangerousActionRequest:
         try:
-            return DangerousActionRequest.from_run(
+            request = DangerousActionRequest.from_run(
                 self._orchestrator.show(run_id, read_only=True), action=action
             )
         except Exception:
             raise TuiControllerError(_ACTION_ERROR) from None
+        if action == "approve":
+            try:
+                return replace(request, approvers=self.load_approval_members(run_id))
+            except ApprovalMembersError as exc:
+                return replace(request, approver_error=str(exc))
+        return request
+
+    def load_approval_members(self, run_id: str | None = None) -> tuple[FilterChoice, ...]:
+        """Use the configured ONES team directory, never free-form identities."""
+        try:
+            gateway = getattr(self._orchestrator.defect_candidates, "gateway", None)
+            if gateway is None:
+                gateway = self._orchestrator.requirement_flow.gateway
+            project_id = ""
+            if run_id is not None:
+                run = self._orchestrator.show(run_id, read_only=True)
+                project_id = run.project_id
+                if not project_id:
+                    item = run.defect or run.requirement
+                    project_id = item.project.id if item and item.project else ""
+
+            async def load():
+                if not project_id:
+                    return await gateway.list_team_members(uuids=None)
+                roles = await gateway.list_role_members(project_id)
+                if not isinstance(roles, list):
+                    raise ApprovalMembersError("ONES 项目成员响应格式异常，请重新加载。")
+                identities = set()
+                for role in roles:
+                    if not isinstance(role, dict) or not isinstance(role.get("members"), list):
+                        continue
+                    for member in role["members"]:
+                        identity = member if isinstance(member, str) else member.get("uuid", member.get("id")) if isinstance(member, dict) else None
+                        if isinstance(identity, str) and identity:
+                            identities.add(validate_tui_input_text(identity, maximum=128))
+                if not identities:
+                    raise ApprovalMembersError("ONES 项目未返回可选成员，请检查该项目的成员配置与访问权限。")
+                members = []
+                ordered = sorted(identities)
+                for offset in range(0, len(ordered), 100):
+                    batch = await gateway.list_team_members(uuids=ordered[offset:offset + 100])
+                    if not isinstance(batch, list):
+                        raise ApprovalMembersError("ONES 成员资料响应格式异常，请重新加载。")
+                    members.extend(item for item in batch if isinstance(item, dict)
+                                   and item.get("uuid", item.get("id")) in identities)
+                return members
+
+            members = self._async_runtime.submit(load())
+            if not isinstance(members, list):
+                raise ValueError
+            choices: dict[str, FilterChoice] = {}
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                identity = member.get("uuid", member.get("id"))
+                name = member.get("name")
+                if type(identity) is not str or not identity or type(name) is not str or not name.strip():
+                    continue
+                identity = validate_tui_input_text(identity, maximum=128)
+                choices[identity] = FilterChoice(id=identity, name=safe_tui_text(name, maximum=256))
+            if not choices:
+                raise ApprovalMembersError("ONES 未返回可选成员资料，请检查项目成员是否具有可见的姓名和成员 ID。")
+            return tuple(sorted(choices.values(), key=lambda item: (item.name.casefold(), item.id)))
+        except ApprovalMembersError:
+            raise
+        except Exception:
+            raise ApprovalMembersError("ONES 成员接口调用失败，请检查连接与账号权限后重新打开审批。") from None
 
     def approve(self, request: DangerousActionRequest, actor: str) -> RunDetail:
         self._assert_request(request, "approve")
+        if actor not in {member.id for member in request.approvers}:
+            raise TuiControllerError("请从 ONES 成员列表选择审批人")
+        if actor not in {member.id for member in self.load_approval_members(request.run_id)}:
+            raise TuiControllerError("所选 ONES 成员已不可用，请重新打开审批")
         return self._dangerous(
             self._orchestrator.approve,
             request.run_id,
@@ -963,7 +1080,12 @@ class TuiController:
     def _detail(self, run: WorkflowRun) -> RunDetail:
         try:
             detail = RunDetail.from_run(run)
-            return replace(detail, ai_activity=self.ai_activity(run.run_id))
+            publishing = getattr(getattr(self._orchestrator, "config", None), "publishing", None)
+            can_defer = (detail.can_verify and bool(detail.verification_tasks)
+                         and getattr(publishing, "defer_external_verification_to_pr", False) is True
+                         and all(task.status in {"passed", "manual", "ready", "waiting_environment"}
+                                 for task in detail.verification_tasks))
+            return replace(detail, ai_activity=self.ai_activity(run.run_id), can_defer_verification=can_defer)
         except (TuiDisplayError, TypeError, AttributeError):
             raise TuiControllerError(_ACTION_ERROR) from None
 

@@ -952,7 +952,7 @@ async def test_empty_setup_uses_all_seven_steps_then_activates_dashboard_once(
         await app.screen.refresh_runs()
         await pilot.press("a")
         assert effects == []
-        app.screen.query_one("#actor", Input).value = "operator"
+        app.screen.query_one("#actor", Select).value = "operator"
         await pilot.click("#confirm-approve")
         await asyncio.wait_for(approval_finished.wait(), 180)
         await pilot.pause()

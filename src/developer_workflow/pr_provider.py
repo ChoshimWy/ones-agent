@@ -143,7 +143,9 @@ class HttpPullRequestClient:
                 raise PullRequestProviderError("PR provider returned malformed JSON") from None
         raise PullRequestProviderError("PR provider GET failed")
 
-    def find(self, *, repo_url: str, head: str, base: str, marker: str) -> str | None:
+    def find(self, *, repo_url: str, head: str, base: str, marker: str,
+             draft: bool = False, expected_sha: str = "") -> str | None:
+        self._validate_draft_request(draft, expected_sha)
         owner, repo = self._repository(repo_url)
         head = validate_git_ref_name(_safe_text(head, "head branch"))
         base = validate_git_ref_name(_safe_text(base, "base branch"))
@@ -168,14 +170,18 @@ class HttpPullRequestClient:
                     item_head, item_base = item.get("source_branch"), item.get("target_branch")
                     body, url = item.get("description"), item.get("web_url")
                 if item_head == head and item_base == base and isinstance(body, str) and marker in body:
+                    if draft:
+                        self._assert_draft(item, expected_sha)
                     return self._url(url)
             if len(payload) < 100:
                 return None
         raise PullRequestProviderError("PR provider pagination limit was exceeded")
 
     def create(
-        self, *, repo_url: str, head: str, base: str, title: str, body: str, marker: str
+        self, *, repo_url: str, head: str, base: str, title: str, body: str, marker: str,
+        draft: bool = False, expected_sha: str = ""
     ) -> str:
+        self._validate_draft_request(draft, expected_sha)
         owner, repo = self._repository(repo_url)
         head = validate_git_ref_name(_safe_text(head, "head branch"))
         base = validate_git_ref_name(_safe_text(base, "base branch"))
@@ -186,11 +192,15 @@ class HttpPullRequestClient:
         if self.provider == "github":
             path = f"/repos/{quote(owner, safe='/')}/{quote(repo, safe='')}/pulls"
             payload = {"title":title, "head":head, "base":base, "body":description}
+            if draft:
+                payload["draft"] = True
             url_field = "html_url"
         else:
             project = quote(f"{owner}/{repo}", safe="")
             path = f"/api/v4/projects/{project}/merge_requests"
             payload = {"source_branch":head, "target_branch":base, "title":title, "description":description}
+            if draft:
+                payload["title"] = title if title.startswith("Draft:") else f"Draft: {title}"
             url_field = "web_url"
         try:
             response = self.client.post(
@@ -208,7 +218,49 @@ class HttpPullRequestClient:
             raise PullRequestProviderError("PR creation response is malformed") from None
         if not isinstance(result, dict):
             raise PullRequestProviderError("PR creation response is malformed")
+        if draft:
+            self._assert_draft(result, expected_sha)
         return self._url(result.get(url_field))
+
+    @staticmethod
+    def _validate_draft_request(draft: bool, expected_sha: str) -> None:
+        if type(draft) is not bool or (draft and (type(expected_sha) is not str
+                or re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", expected_sha) is None)):
+            raise PullRequestProviderError("Draft PR requires the approved commit identity")
+
+    def _assert_draft(self, item: dict, expected_sha: str) -> None:
+        head = item.get("head")
+        sha = head.get("sha") if self.provider == "github" and isinstance(head, dict) else item.get("sha")
+        if not expected_sha or sha != expected_sha or item.get("draft") is not True:
+            raise PullRequestProviderError("PR must remain draft at the approved commit")
+
+    def set_verification_pending(self, *, repo_url: str, sha: str, branch: str) -> None:
+        """Commit-bound pending check. Never report success from PR prose/checkboxes."""
+        from .pr_handoff import CHECK_CONTEXT
+
+        if re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", sha) is None:
+            raise PullRequestProviderError("Verification commit identity is invalid")
+        branch = validate_git_ref_name(branch)
+        owner, repo = self._repository(repo_url)
+        if self.provider == "github":
+            path = f"/repos/{quote(owner, safe='/')}/{quote(repo, safe='')}/statuses/{sha}"
+            payload = {"state": "pending", "context": CHECK_CONTEXT,
+                       "description": "External verification required for this commit"}
+        else:
+            project = quote(f"{owner}/{repo}", safe="")
+            path = f"/api/v4/projects/{project}/statuses/{sha}"
+            payload = {"state": "pending", "name": CHECK_CONTEXT, "ref": branch,
+                       "description": "External verification required for this commit"}
+        try:
+            response = self.client.post(f"{self.api_base_url}{path}", json=payload, headers=self._headers())
+            response.raise_for_status()
+            result = response.json()
+        except (httpx.HTTPError, ValueError):
+            raise PullRequestProviderError("External verification pending check could not be confirmed") from None
+        state_key = "state" if self.provider == "github" else "status"
+        name_key = "context" if self.provider == "github" else "name"
+        if not isinstance(result, dict) or result.get(state_key) != "pending" or result.get(name_key) != CHECK_CONTEXT:
+            raise PullRequestProviderError("External verification pending check response is invalid")
 
     def _url(self, value: object) -> str:
         if not isinstance(value, str) or not value.strip():
