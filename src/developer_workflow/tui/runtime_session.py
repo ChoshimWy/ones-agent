@@ -64,12 +64,15 @@ class TuiRuntimeSession:
         handle: RuntimeHandle,
         max_concurrency: int,
         event_sink: Callable[[TaskEvent], None],
+        *,
+        publishing_enabled: bool = True,
     ) -> "TuiRuntimeSession":
         index = RunIndex(handle.orchestrator.store)
         controller = TuiController(
             handle.orchestrator,
             index,
             workflow_saver=getattr(handle, "workflow_saver", None),
+            publishing_enabled=publishing_enabled,
         )
         session: TuiRuntimeSession
 
