@@ -3,7 +3,6 @@ recursive-include config *.py
 recursive-include src *.py *.json *.tcss
 recursive-include src *.md
 prune tests
-prune agent-gui
 prune data
 prune docs
 prune openspec

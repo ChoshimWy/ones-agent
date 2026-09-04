@@ -15,9 +15,6 @@ import structlog
 import uvicorn
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
-from starlette.types import ASGIApp
 from pydantic import BaseModel
 
 from config.settings import Settings
@@ -1367,86 +1364,10 @@ async def _process_webhook(payload: WebhookPayload) -> None:
     tasks_total.labels(type=payload.type or "unknown", status="processing").inc()
 
 
-# ── Frontend Static Files ─────────────────────────────
-
-_frontend_path = argparse.Namespace(path=None)
-
-
-def _serve_spa() -> HTMLResponse:
-    import pathlib
-    base = _frontend_path.path
-    if not base:
-        return HTMLResponse("<h1>ONES Agent API</h1><p>Frontend not built. Run <code>cd agent-gui && npm run build</code></p>")
-    index = pathlib.Path(base) / "index.html"
-    if not index.exists():
-        return HTMLResponse("<h1>ONES Agent API</h1><p>Frontend not found</p>")
-    return HTMLResponse(index.read_text(encoding="utf-8"))
-
-
-class _SPAFallbackMiddleware:
-    def __init__(self, app: ASGIApp) -> None:
-        self.app = app
-
-    async def __call__(self, scope: dict, receive, send):
-        if scope["type"] != "http":
-            await self.app(scope, receive, send)
-            return
-        from starlette.requests import Request
-        from starlette.responses import Response
-
-        request = Request(scope, receive)
-        path = request.url.path
-
-        if path.startswith("/api/") or path.startswith("/assets/") or path in ("/health", "/metrics", "/docs", "/redoc", "/openapi.json"):
-            await self.app(scope, receive, send)
-            return
-
-        async def _send_wrapper(message):
-            if message["type"] == "http.response.start" and message.get("status") == 404:
-                response = _serve_spa()
-                await response(scope, receive, send)
-                return
-            await send(message)
-
-        intercepted = False
-
-        async def _send_intercept(message):
-            nonlocal intercepted
-            if message["type"] == "http.response.start":
-                if message.get("status") == 404:
-                    intercepted = True
-                    response = _serve_spa()
-                    await response(scope, receive, send)
-                    return
-            if not intercepted:
-                await send(message)
-
-        await self.app(scope, receive, _send_intercept)
-
-
-@app.get("/", response_class=HTMLResponse)
-async def serve_index():
-    return _serve_spa()
-
-
-def _mount_frontend(app: FastAPI, dist_path: str) -> None:
-    import pathlib
-    p = pathlib.Path(dist_path)
-    if not (p.exists() and (p / "index.html").exists()):
-        log.warning("frontend_not_found", path=str(p))
-        return
-    _frontend_path.path = str(p)
-    app.mount("/assets", StaticFiles(directory=str(p / "assets")), name="assets")
-    app.add_middleware(_SPAFallbackMiddleware)
-    log.info("frontend_mounted", path=str(p))
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument("--frontend", default="agent-gui/dist", help="Frontend dist path")
     args = parser.parse_args()
 
-    _mount_frontend(app, args.frontend)
     uvicorn.run(app, host=args.host, port=args.port)

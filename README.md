@@ -39,3 +39,14 @@ uv run ones-dev defect --project <project> --iteration <iteration> --assignee <a
 ## 安全边界
 
 配置向导只执行认证和读取 ONES 元数据。生产运行时通过本机 `codex` CLI 使用本机登录状态，并把分析和修复限制在隔离 worktree；连接失败显示固定类别，不回显响应正文或秘密。MVP 不接受 Provider token，也不会推送、创建 PR 或自动发布。上线检查清单见 `docs/ones_dev_tui_release_readiness.md`。
+
+## 后端与工具入口
+
+- `uv run ones-dev --help`：查看开发工作流命令和终端界面入口。
+- `uv run python server.py`：启动 MCP 工具服务。
+- `uv run python main.py --host 0.0.0.0 --port 8000`：启动 REST API 和 Webhook 服务。
+- `uv run pytest`：运行后端测试。
+
+网页前端已移除，无需 Node.js 或前端构建。HTTP 服务保留 `/docs`、`/redoc` 和 `/openapi.json` API 文档；根路径及原网页路由返回 404。
+
+开发工作流说明见 [docs/ones_dev_cli.md](docs/ones_dev_cli.md)。
